@@ -15,8 +15,8 @@ importers:
         specifier: ^8.17.0
         version: 8.20.0
       apcore-js:
-        specifier: '>=0.32.3'
-        version: 0.32.3
+        specifier: '>=0.33.0'
+        version: 0.33.0
       js-yaml:
         specifier: ^4.3.2
         version: 4.3.2
@@ -565,8 +565,8 @@ packages:
     resolution: {integrity: sha512-zbB9rCJAT1rbjiVDb2hqKFHNYLxgtk8NURxZ3IZwD3F6NtxbXZQCnnSi1Lkx+IDohdPlFp222wVALIheZJQSEg==}
     engines: {node: '>=8'}
 
-  apcore-js@0.32.3:
-    resolution: {integrity: sha512-kmIDULt35c4vv9fxopnUomDi2Vvb9TzX4JdO9xfv6+XAE62OxuH4a6cvIQCuu62A5ESsIiwa2evhNX+PbPyqtA==}
+  apcore-js@0.33.0:
+    resolution: {integrity: sha512-+0UPovkB37qKy9kUwZmgSK6an+RqOUy+XOU9sEAauXStmQYIWmPBV7ACymQ9nwPI4RVAKiWbU4upMIqrCitxoQ==}
     engines: {node: '>=20.0.0'}
 
   apdev-js@0.2.4:
@@ -1492,7 +1492,7 @@ snapshots:
     dependencies:
       color-convert: 2.0.1
 
-  apcore-js@0.32.3:
+  apcore-js@0.33.0:
     dependencies:
       '@sinclair/typebox': 0.34.48
       js-yaml: 4.3.2
