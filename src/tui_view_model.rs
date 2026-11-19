@@ -594,10 +594,7 @@ fn passes_filter(module: &ScannedModule, flt: Option<&Filter>, description: &str
         .and_then(|a| a.extra.get("deprecated"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !flt.deprecated && is_deprecated {
-        return false;
-    }
-    true
+    flt.deprecated || !is_deprecated
 }
 
 fn sort_key(column_key: &str, module: &ScannedModule, alias: &str, description: &str) -> String {
