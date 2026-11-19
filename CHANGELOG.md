@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.3] - 2026-11-19
+
+### Security
+
+- Upgrade the runtime dependency `js-yaml` to `^4.3.2`.
+
+### Changed
+
+- Refresh the development toolchain to `vitest` / `@vitest/coverage-v8` 5.1.0.
+  No runtime API changes.
+
 ## [0.14.2] - 2026-11-09
 
 ### Fixed
