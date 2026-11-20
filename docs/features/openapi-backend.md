@@ -224,6 +224,21 @@ Two requirements, and they are not the same mechanism:
 
 ---
 
+### Forwarding checks before registration
+
+The standalone backend uses the toolkit's effective-parameter scanner and
+proxy diagnostics. The scanner merges inherited parameters, resolves local
+references, and applies operation-level overrides. The backend checks the
+modules that remain after the scanner filters and module-ID checks. If any of
+those operations cannot be forwarded, backend construction fails before any
+OpenAPI module is registered. Each reported finding identifies its operation
+and reason. An excluded operation does not block startup.
+
+For OpenAPI routes, only braces delimit path parameters. The preflight also
+checks that the proxy can encode the declared path and query parameters.
+
+This entry point requires apcore-toolkit 0.15.0 or later.
+
 ## Governance
 
 This is the part of the feature that is not mechanical. An OpenAPI document is a description of an
@@ -528,7 +543,7 @@ exists to avoid.
 
 ### Dependencies
 
-- **apcore-toolkit >= 0.14.0** — `load_spec`, `OpenAPIScanner`, `derive_module_id`,
+- **apcore-toolkit >= 0.15.0** — `load_spec`, `OpenAPIScanner`, `derive_module_id`,
   `HTTPProxyRegistryWriter`. **0.13.0** is the correctness floor: it is the first release whose
   scanner emits module IDs in apcore's Canonical ID alphabet, and the bridge — which no longer
   projects IDs itself — registers what the scanner emits. Below it a camelCase or hyphenated
@@ -592,6 +607,7 @@ exists to avoid.
 - `ValueError` / `Error` / `ConfigError` — one or more derived module IDs collide with IDs already
   in the target registry. Raised by the pre-write preflight, naming every colliding ID, before
   anything is written. Fatal and atomic.
+- `ValueError` / `Error` / `ConfigError` — a selected operation cannot be forwarded by the proxy. The error names the operation and reason before any OpenAPI module is registered.
 - A failed `WriteResult` for an individual module is **not** an error: it is logged at ERROR,
   naming the module ID, and the remaining modules still register. This covers schema and proxy
   construction failures only — a duplicate ID never reaches it, having been caught by the

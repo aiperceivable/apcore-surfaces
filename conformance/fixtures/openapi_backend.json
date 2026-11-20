@@ -79,6 +79,14 @@
         ],
         "paths": {
           "/users/{user_id}": {
+            "parameters": [
+              {
+                "name": "user_id",
+                "in": "path",
+                "required": true,
+                "schema": {"type": "string"}
+              }
+            ],
             "get": {
               "responses": {
                 "200": {
@@ -265,6 +273,14 @@
             }
           },
           "/users/{user_id}": {
+            "parameters": [
+              {
+                "name": "user_id",
+                "in": "path",
+                "required": true,
+                "schema": {"type": "string"}
+              }
+            ],
             "get": {
               "responses": {
                 "200": {
@@ -350,6 +366,14 @@
         ],
         "paths": {
           "/pets/{pet_id}": {
+            "parameters": [
+              {
+                "name": "pet_id",
+                "in": "path",
+                "required": true,
+                "schema": {"type": "string"}
+              }
+            ],
             "delete": {
               "operationId": "deletePet",
               "responses": {
