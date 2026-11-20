@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.15.0] - Unreleased
+## [0.15.0] - 2026-11-20
 
 ### Added
 
@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
   registering HTTP proxies. They use the scanner's effective inputs and the
   proxy writer's routing contract.
 
-## [0.14.3] - Unreleased
+## [0.14.3] - 2026-11-20
 
 ### Added
 
