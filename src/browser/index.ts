@@ -40,6 +40,8 @@ export {
   extractInputSchema,
   extractOutputSchema,
 } from '../openapi.js';
+export { readOpenApiProxyInputs } from '../openapi-parameters.js';
+export type { OpenApiParameterProblem, OpenApiParameterScope, OpenApiProxyInputs } from '../openapi-parameters.js';
 
 // ---- Serializers & formatting (pure) -------------------------------------
 export {
@@ -83,6 +85,8 @@ export { RegistryVerifier, runVerifierChain } from '../output/verify-core.js';
 export {
   HTTPProxyRegistryWriter,
   HTTPProxyRegistryWriterError,
+  proxyUsesJsonBody,
+  readProxyRoute,
 } from '../output/http-proxy-writer.js';
 export type {
   HTTPProxyRegistryWriterOptions,

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.4] - Unreleased
+
+### Added
+
+- Opt-in `OpenAPIScanner.scanWithEffectiveParameters()` resolves Path Item
+  parameter inheritance and local Parameter Object references before extracting
+  the tool schema. Operation declarations override inherited inputs by name and
+  location. The opt-in schema may expose previously omitted required fields.
+- `readOpenApiProxyInputs()` reports the effective path, query and JSON body
+  fields used by the scanner, with per-operation resolution diagnostics.
+  `proxyUsesJsonBody()` exposes the HTTP proxy writer's method decision.
+  Existing calls to `scan()` retain their input contract.
+
 ## [0.14.3] - 2026-11-19
 
 ### Security

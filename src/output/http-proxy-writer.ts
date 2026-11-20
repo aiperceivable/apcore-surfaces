@@ -32,12 +32,19 @@ import {
 import type { Context, ModuleExample } from 'apcore-js';
 
 import { extractPathParamNames, substitutePathParams } from '../http-verb-map.js';
+import { schemaObject } from '../openapi.js';
+import { readOpenApiProxyInputs } from '../openapi-parameters.js';
 import type { ScannedModule } from '../types.js';
 import type { WriteResult } from './types.js';
 import { createWriteResult } from './types.js';
 
 /** HTTP methods that conventionally carry a JSON request body. */
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH']);
+
+/** Whether the proxy writer sends non-path inputs as a JSON body. */
+export function proxyUsesJsonBody(method: string): boolean {
+  return BODY_METHODS.has(method.toUpperCase());
+}
 
 /** Matches any unfilled placeholder ({name} or :name) left after substitution. */
 const UNFILLED_PARAM_RE = /\{[^}]+\}|:[a-zA-Z_]\w*/;
@@ -114,26 +121,56 @@ interface HttpFields {
   urlPath: string;
 }
 
+/** Resolve the route supplied to the proxy, before applying runtime defaults. */
+export function readProxyRoute(mod: ScannedModule): Partial<HttpFields> {
+  const metadata = mod.metadata ?? {};
+  const { httpMethod, urlPath } = mod as ScannedModule & { httpMethod?: unknown; urlPath?: unknown };
+  const firstString = (...values: unknown[]): string | undefined =>
+    values.find((value): value is string => typeof value === 'string' && value.length > 0);
+  return {
+    httpMethod: firstString(httpMethod, metadata.http_method, metadata.httpMethod),
+    urlPath: firstString(urlPath, metadata.url_path, metadata.urlPath),
+  };
+}
+
 function getHttpFields(mod: ScannedModule): HttpFields {
-  const metadata = (mod.metadata ?? {}) as Record<string, unknown>;
-  const m = (mod as unknown as { httpMethod?: unknown }).httpMethod;
-  const httpMethod = (typeof m === 'string' && m)
-    || (typeof metadata.http_method === 'string' && metadata.http_method)
-    || (typeof metadata.httpMethod === 'string' && metadata.httpMethod)
-    || 'GET';
-  const p = (mod as unknown as { urlPath?: unknown }).urlPath;
-  let urlPath = (typeof p === 'string' && p)
-    || (typeof metadata.url_path === 'string' && metadata.url_path)
-    || (typeof metadata.urlPath === 'string' && metadata.urlPath)
-    || '/';
-  urlPath = String(urlPath);
+  const { httpMethod = 'GET', urlPath = '/' } = readProxyRoute(mod);
   if (/^(https?|file|ftp):\/\//i.test(urlPath)) {
     throw new HTTPProxyRegistryWriterError(
       mod.moduleId,
       `url_path must be a relative path, not an absolute URL: ${JSON.stringify(urlPath)}`,
     );
   }
-  return { httpMethod: String(httpMethod), urlPath };
+  return { httpMethod, urlPath };
+}
+
+// apcore-js's TypeBox converter expects object schemas. Translate only
+// schema-valued positions and keep the original scanned JSON Schema intact.
+function objectSchemaForTypeBox(schema: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...schema };
+  for (const key of ['properties', 'patternProperties', 'dependentSchemas', '$defs', 'definitions']) {
+    const map = result[key];
+    if (map && typeof map === 'object' && !Array.isArray(map)) {
+      result[key] = Object.fromEntries(Object.entries(map).map(([name, value]) => [name, objectSchemaNode(value)]));
+    }
+  }
+  for (const key of ['allOf', 'anyOf', 'oneOf', 'prefixItems', 'items']) {
+    const values = result[key];
+    if (Array.isArray(values)) result[key] = values.map(objectSchemaNode);
+  }
+  for (const key of ['items', 'contains', 'propertyNames', 'additionalProperties', 'not', 'if', 'then', 'else']) {
+    if (!(key in result)) continue;
+    if (key === 'additionalProperties' && typeof result[key] === 'boolean') continue;
+    result[key] = objectSchemaNode(result[key]);
+  }
+  return result;
+}
+
+function objectSchemaNode(value: unknown): unknown {
+  if (typeof value === 'boolean') return schemaObject(value);
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? objectSchemaForTypeBox(value as Record<string, unknown>)
+    : value;
 }
 
 function joinUrl(baseUrl: string, path: string): string {
@@ -252,6 +289,8 @@ export class HTTPProxyRegistryWriter {
   private buildFunctionModule(mod: ScannedModule): FunctionModule {
     const { httpMethod, urlPath } = getHttpFields(mod);
     const pathParams = extractPathParamNames(urlPath);
+    const effectiveInputs = readOpenApiProxyInputs(mod);
+    const queryNames = new Set(effectiveInputs?.query);
     const baseUrl = this.baseUrl;
     const authFactory = this.authHeaderFactory;
     const timeoutMs = this.timeoutMs;
@@ -305,21 +344,27 @@ export class HTTPProxyRegistryWriter {
 
       let body: string | undefined;
       const methodUpper = httpMethod.toUpperCase();
-      if (Object.keys(nonPath).length > 0) {
-        if (BODY_METHODS.has(methodUpper)) {
+      const hasNonPathInputs = Object.keys(nonPath).length > 0;
+      if (proxyUsesJsonBody(methodUpper)) {
+        if (hasNonPathInputs || effectiveInputs?.required_json_body) {
           body = JSON.stringify(nonPath);
-        } else {
-          const params = new URLSearchParams();
-          for (const [k, v] of Object.entries(nonPath)) {
-            if (v === undefined || v === null) continue;
-            if (typeof v === 'object') {
-              // Non-body HTTP methods cannot carry nested JSON — log and str-serialize
-              // to match Python's behaviour rather than silently drop.
-              params.append(k, JSON.stringify(v));
-            } else {
-              params.append(k, String(v));
+        }
+      } else if (hasNonPathInputs) {
+        const params = new URLSearchParams();
+        for (const [k, v] of Object.entries(nonPath)) {
+          if (v === undefined || v === null) continue;
+          if (queryNames.has(k) && Array.isArray(v)) {
+            if (!v.every(item => typeof item === 'string' || typeof item === 'boolean' ||
+              (typeof item === 'number' && Number.isFinite(item)))) {
+              throw new ModuleError(ErrorCodes.MODULE_EXECUTE_ERROR,
+                `Query array ${JSON.stringify(k)} must contain only strings, booleans, or numbers`, { parameter: k });
             }
+            for (const item of v) params.append(k, String(item));
+          } else {
+            params.append(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
           }
+        }
+        if (params.size > 0 || !effectiveInputs) {
           const sep = fullUrl.includes('?') ? '&' : '?';
           fullUrl = `${fullUrl}${sep}${params.toString()}`;
         }
@@ -390,8 +435,8 @@ export class HTTPProxyRegistryWriter {
     return new FunctionModule({
       execute,
       moduleId: mod.moduleId,
-      inputSchema: jsonSchemaToTypeBox(mod.inputSchema),
-      outputSchema: jsonSchemaToTypeBox(mod.outputSchema),
+      inputSchema: jsonSchemaToTypeBox(objectSchemaForTypeBox(mod.inputSchema)),
+      outputSchema: jsonSchemaToTypeBox(objectSchemaForTypeBox(mod.outputSchema)),
       description: mod.description,
       documentation: mod.documentation,
       tags: mod.tags.length > 0 ? [...mod.tags] : null,

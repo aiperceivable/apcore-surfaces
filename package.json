@@ -1,6 +1,6 @@
 {
   "name": "apcore-toolkit",
-  "version": "0.14.3",
+  "version": "0.14.4",
   "description": "Shared scanner, schema extraction, and output toolkit for apcore framework adapters",
   "type": "module",
   "main": "./dist/index.js",

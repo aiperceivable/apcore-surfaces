@@ -17,7 +17,8 @@
 import { BaseScanner } from './scanner.js';
 import type { ScannedModule } from './types.js';
 import { cloneModule, createScannedModule } from './types.js';
-import { extractInputSchema, extractOutputSchema, resolveRef } from './openapi.js';
+import { extractEffectiveOutputSchema, extractInputSchema, extractOutputSchema, resolveRef } from './openapi.js';
+import { extractEffectiveOperationInputs, OPENAPI_PROXY_INPUTS_KEY } from './openapi-parameters.js';
 
 /**
  * Thrown by {@link OpenAPIScanner.scan} when the input document is not a
@@ -357,6 +358,21 @@ export interface OpenAPIScanOptions {
  */
 export class OpenAPIScanner extends BaseScanner {
   scan(spec: Record<string, unknown>, options: OpenAPIScanOptions = {}): ScannedModule[] {
+    return this.scanOperations(spec, options, false);
+  }
+
+  /**
+   * Resolve Path Item parameters and local references before extracting each
+   * operation's schema. Proxy consumers can check the accompanying metadata
+   * after selection and before registration.
+   */
+  scanWithEffectiveParameters(spec: Record<string, unknown>, options: OpenAPIScanOptions = {}): ScannedModule[] {
+    return this.scanOperations(spec, options, true);
+  }
+
+  private scanOperations(
+    spec: Record<string, unknown>, options: OpenAPIScanOptions, effectiveParameters: boolean,
+  ): ScannedModule[] {
     validateSpec(spec);
 
     const {
@@ -426,8 +442,9 @@ export class OpenAPIScanner extends BaseScanner {
 
         const warnings = refWarnings(operation, spec);
 
-        const inputSchema = extractInputSchema(operation, spec);
-        const outputSchema = extractOutputSchema(operation, spec);
+        const effective = effectiveParameters ? extractEffectiveOperationInputs(pathItem, operation, spec) : undefined;
+        const inputSchema = effective?.inputSchema ?? extractInputSchema(operation, spec);
+        const outputSchema = effectiveParameters ? extractEffectiveOutputSchema(operation, spec) : extractOutputSchema(operation, spec);
         const responses = operation['responses'];
         const hasSuccess =
           responses !== null && typeof responses === 'object' && !Array.isArray(responses)
@@ -452,6 +469,7 @@ export class OpenAPIScanner extends BaseScanner {
         const description = summary ?? firstLine(documentation) ?? '';
 
         const openapiMeta: Record<string, unknown> = { spec_version: openapiVersion };
+        if (effective) openapiMeta[OPENAPI_PROXY_INPUTS_KEY] = effective.proxyInputs;
         const operationIdVal = operation['operationId'];
         if (typeof operationIdVal === 'string' && operationIdVal) {
           openapiMeta['operation_id'] = operationIdVal;

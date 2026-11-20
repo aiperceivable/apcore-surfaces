@@ -26,6 +26,8 @@ export {
   extractInputSchema,
   extractOutputSchema,
 } from './openapi.js';
+export { readOpenApiProxyInputs } from './openapi-parameters.js';
+export type { OpenApiParameterProblem, OpenApiParameterScope, OpenApiProxyInputs } from './openapi-parameters.js';
 export {
   annotationsToDict,
   moduleToDict,
@@ -70,6 +72,8 @@ export { RegistryWriter } from './output/registry-writer.js';
 export {
   HTTPProxyRegistryWriter,
   HTTPProxyRegistryWriterError,
+  proxyUsesJsonBody,
+  readProxyRoute,
 } from './output/http-proxy-writer.js';
 export type {
   HTTPProxyRegistryWriterOptions,
