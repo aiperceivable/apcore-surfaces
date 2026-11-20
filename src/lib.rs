@@ -53,6 +53,7 @@ pub mod display;
 pub mod formatting;
 pub mod http_verb_map;
 pub mod openapi;
+mod openapi_parameters;
 pub mod openapi_scanner;
 pub mod output;
 pub mod resolve_target;
@@ -80,6 +81,7 @@ pub use http_verb_map::{
 pub use openapi::{
     deep_resolve_refs, extract_input_schema, extract_output_schema, resolve_ref, resolve_schema,
 };
+pub use openapi_parameters::{OpenApiParameterProblem, OpenApiParameterScope, OpenApiProxyInputs};
 pub use openapi_scanner::{
     derive_module_id, DeriveModuleIdHook, OpenAPIScanner, ScanOptions, ScannerError,
     TransformModuleHook, TransformOperationHook,
@@ -108,7 +110,10 @@ pub use types::{clone_module, create_scanned_module, ScannedModule};
 #[cfg(feature = "http-proxy")]
 pub use openapi_scanner::{load_spec, load_spec_with_options, LoadSpecError, LoadSpecOptions};
 #[cfg(feature = "http-proxy")]
-pub use output::http_proxy_writer::{HTTPProxyRegistryWriter, HTTPProxyRegistryWriterError};
+pub use output::http_proxy_writer::{
+    http_proxy_route_metadata, proxy_supports_http_method, proxy_uses_json_body,
+    HTTPProxyRegistryWriter, HTTPProxyRegistryWriterError,
+};
 
 // RFC 8628 device authorization flow. Only the names a consumer needs to build
 // and drive a flow are lifted to the crate root; the rest stay reachable under

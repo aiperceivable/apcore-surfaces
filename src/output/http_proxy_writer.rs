@@ -20,6 +20,7 @@ use apcore::module::Module;
 use apcore::Registry;
 
 use crate::http_verb_map::{extract_path_param_names, substitute_path_params};
+use crate::openapi_parameters::OpenApiProxyInputs;
 use crate::output::types::WriteResult;
 use crate::types::ScannedModule;
 
@@ -114,11 +115,19 @@ impl HTTPProxyRegistryWriter {
         for module in modules {
             let (http_method, url_path) = get_http_fields(module);
             let path_params = extract_path_param_names(&url_path);
+            let inputs = OpenApiProxyInputs::from_module(module).ok().flatten();
+            let required_json_body =
+                inputs.is_some() && OpenApiProxyInputs::requires_json_body(module);
+            let effective_query_names = inputs
+                .map(|inputs| inputs.query.into_iter().collect())
+                .unwrap_or_default();
             let proxy = ProxyModule {
                 base_url: self.base_url.clone(),
                 http_method,
                 url_path,
                 path_params,
+                effective_query_names,
+                required_json_body,
                 input_schema: module.input_schema.clone(),
                 output_schema: module.output_schema.clone(),
                 description: module.description.clone(),
@@ -166,26 +175,60 @@ impl HTTPProxyRegistryWriter {
 
 /// Extract http_method and url_path from a ScannedModule's metadata.
 fn get_http_fields(module: &ScannedModule) -> (String, String) {
+    let (http_method, url_path) = http_proxy_route_metadata(module);
+    (
+        http_method.unwrap_or("GET").to_string(),
+        url_path.unwrap_or("/").to_string(),
+    )
+}
+
+/// Read the explicit HTTP method and URL path used by the proxy writer.
+///
+/// Missing or non-string fields are returned as `None` so callers can check
+/// the route before registration. The writer applies its defaults separately.
+#[must_use]
+pub fn http_proxy_route_metadata(module: &ScannedModule) -> (Option<&str>, Option<&str>) {
     let http_method = module
         .metadata
         .get("http_method")
-        .and_then(|v| v.as_str())
-        .unwrap_or("GET")
-        .to_string();
+        .and_then(|value| value.as_str());
     let url_path = module
         .metadata
         .get("url_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("/")
-        .to_string();
+        .and_then(|value| value.as_str());
     (http_method, url_path)
+}
+
+/// Whether the proxy writer can send this exact, case-sensitive HTTP method.
+#[must_use]
+pub fn proxy_supports_http_method(http_method: &str) -> bool {
+    proxy_http_method(http_method).is_some()
+}
+
+fn proxy_http_method(http_method: &str) -> Option<reqwest::Method> {
+    Some(match http_method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "PATCH" => reqwest::Method::PATCH,
+        "DELETE" => reqwest::Method::DELETE,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        "TRACE" => reqwest::Method::TRACE,
+        _ => return None,
+    })
 }
 
 /// HTTP methods that conventionally carry a JSON request body. Other
 /// methods (`GET`, `HEAD`, `DELETE`, `OPTIONS`) forward non-path inputs
 /// via the query string so they are not silently dropped, matching the
 /// Python and TypeScript SDKs.
-const BODY_METHODS: &[&str] = &["POST", "PUT", "PATCH"];
+#[must_use]
+pub fn proxy_uses_json_body(http_method: &str) -> bool {
+    ["POST", "PUT", "PATCH"]
+        .iter()
+        .any(|method| method.eq_ignore_ascii_case(http_method))
+}
 
 /// Validate that all `{param}` placeholders in `actual_path` were substituted.
 ///
@@ -277,12 +320,44 @@ struct ProxyModule {
     http_method: String,
     url_path: String,
     path_params: HashSet<String>,
+    effective_query_names: HashSet<String>,
+    required_json_body: bool,
     input_schema: serde_json::Value,
     output_schema: serde_json::Value,
     description: String,
     auth_header_factory: Option<Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>>,
     // Shared HTTP client — cloned from HTTPProxyRegistryWriter to reuse connection pool.
     client: reqwest::Client,
+}
+
+#[allow(clippy::result_large_err)] // Preserve the shared ModuleError boundary.
+fn append_query_value<'a>(
+    query: &mut Vec<(&'a str, String)>,
+    name: &'a str,
+    value: &serde_json::Value,
+    prefer_repeated_keys: bool,
+) -> Result<(), ModuleError> {
+    if let Some(items) = value.as_array().filter(|_| prefer_repeated_keys) {
+        for item in items {
+            if item.is_array() || item.is_object() || item.is_null() {
+                return Err(ModuleError::new(
+                    apcore::errors::ErrorCode::ModuleExecuteError,
+                    format!("Query array '{name}' requires string, number, or boolean values"),
+                ));
+            }
+            query.push((name, query_value(item)));
+        }
+    } else {
+        query.push((name, query_value(value)));
+    }
+    Ok(())
+}
+
+fn query_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
 }
 
 #[async_trait]
@@ -319,11 +394,11 @@ impl ProxyModule {
         token: Option<&CancelToken>,
     ) -> Result<serde_json::Value, ModuleError> {
         let mut path_param_values: HashMap<&str, String> = HashMap::new();
-        let mut query: HashMap<String, String> = HashMap::new();
+        let mut query = Vec::new();
         let mut body: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
+        let uses_body = proxy_uses_json_body(&self.http_method);
         if let Some(obj) = inputs.as_object() {
-            let uses_body = BODY_METHODS.contains(&self.http_method.as_str());
             for (key, value) in obj {
                 if self.path_params.contains(key) {
                     let val_str = match value {
@@ -334,13 +409,12 @@ impl ProxyModule {
                 } else if uses_body {
                     body.insert(key.clone(), value.clone());
                 } else {
-                    // GET / HEAD / DELETE / OPTIONS — forward as query
-                    // string to mirror Python / TypeScript behaviour.
-                    let val_str = match value {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    query.insert(key.clone(), val_str);
+                    append_query_value(
+                        &mut query,
+                        key,
+                        value,
+                        self.effective_query_names.contains(key),
+                    )?;
                 }
             }
         }
@@ -363,29 +437,13 @@ impl ProxyModule {
 
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), actual_path);
 
-        // Defect W2 fix: HEAD/OPTIONS/TRACE are OpenAPI-recognised
-        // operations (see `openapi_scanner::RECOGNIZED_METHODS`) that
-        // previously errored here with "Unsupported HTTP method" before
-        // any network call was attempted — Python/TypeScript writers
-        // carry no such restriction. `reqwest::Client` has a `.head()`
-        // convenience method; OPTIONS/TRACE have none, so the generic
-        // `.request(Method, url)` form is used for those two.
-        let mut request = match self.http_method.as_str() {
-            "GET" => self.client.get(&url),
-            "POST" => self.client.post(&url),
-            "PUT" => self.client.put(&url),
-            "PATCH" => self.client.patch(&url),
-            "DELETE" => self.client.delete(&url),
-            "HEAD" => self.client.head(&url),
-            "OPTIONS" => self.client.request(reqwest::Method::OPTIONS, &url),
-            "TRACE" => self.client.request(reqwest::Method::TRACE, &url),
-            other => {
-                return Err(ModuleError::new(
-                    apcore::errors::ErrorCode::ModuleExecuteError,
-                    format!("Unsupported HTTP method: {other}"),
-                ))
-            }
-        };
+        let method = proxy_http_method(&self.http_method).ok_or_else(|| {
+            ModuleError::new(
+                apcore::errors::ErrorCode::ModuleExecuteError,
+                format!("Unsupported HTTP method: {}", self.http_method),
+            )
+        })?;
+        let mut request = self.client.request(method, &url);
 
         // Apply auth headers from the factory, if configured
         if let Some(ref factory) = self.auth_header_factory {
@@ -395,9 +453,9 @@ impl ProxyModule {
         }
 
         if !query.is_empty() {
-            request = request.query(&query.iter().collect::<Vec<_>>());
+            request = request.query(&query);
         }
-        if !body.is_empty() && matches!(self.http_method.as_str(), "POST" | "PUT" | "PATCH") {
+        if uses_body && (!body.is_empty() || self.required_json_body) {
             request = request.json(&body);
         }
 
@@ -761,6 +819,8 @@ mod tests {
                 http_method: method.to_string(),
                 url_path: "/widgets".to_string(),
                 path_params: HashSet::new(),
+                effective_query_names: HashSet::new(),
+                required_json_body: false,
                 input_schema: json!({}),
                 output_schema: json!({}),
                 description: "test".to_string(),
@@ -840,6 +900,8 @@ mod tests {
             http_method: "GET".to_string(),
             url_path: "/users/:id".to_string(),
             path_params,
+            effective_query_names: HashSet::new(),
+            required_json_body: false,
             input_schema: json!({}),
             output_schema: json!({}),
             description: "test".to_string(),
@@ -879,6 +941,8 @@ mod tests {
             http_method: "TRACE".to_string(),
             url_path: "/widgets".to_string(),
             path_params: HashSet::new(),
+            effective_query_names: HashSet::new(),
+            required_json_body: false,
             input_schema: json!({}),
             output_schema: json!({}),
             description: "test".to_string(),
@@ -903,19 +967,19 @@ mod tests {
         assert_eq!(result.chars().count(), 200);
     }
 
-    // D11-1 regression: BODY_METHODS = {POST, PUT, PATCH}. All other methods
+    // D11-1 regression: only POST, PUT and PATCH use a JSON body. All other methods
     // (GET, HEAD, DELETE, OPTIONS) MUST forward non-path inputs as the query
     // string, mirroring Python and TypeScript. Previously Rust routed any
     // non-GET method into the JSON body — DELETE proxies were emitting bodies
     // that most servers ignore or reject (RFC 9110 §9.3.5).
     #[test]
     fn test_body_methods_set_contents() {
-        assert!(BODY_METHODS.contains(&"POST"));
-        assert!(BODY_METHODS.contains(&"PUT"));
-        assert!(BODY_METHODS.contains(&"PATCH"));
-        assert!(!BODY_METHODS.contains(&"GET"));
-        assert!(!BODY_METHODS.contains(&"DELETE"));
-        assert!(!BODY_METHODS.contains(&"HEAD"));
-        assert!(!BODY_METHODS.contains(&"OPTIONS"));
+        assert!(proxy_uses_json_body("POST"));
+        assert!(proxy_uses_json_body("put"));
+        assert!(proxy_uses_json_body("PaTcH"));
+        assert!(!proxy_uses_json_body("GET"));
+        assert!(!proxy_uses_json_body("DELETE"));
+        assert!(!proxy_uses_json_body("HEAD"));
+        assert!(!proxy_uses_json_body("OPTIONS"));
     }
 }

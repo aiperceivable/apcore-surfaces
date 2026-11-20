@@ -182,6 +182,22 @@ for module in &modules {
 }
 ```
 
+For proxy imports, opt in with
+`OpenAPIScanner::scan_with_effective_parameters(&spec, &options)`.
+Path Item parameters are inherited, an operation overrides an inherited
+parameter with the same name and location, and same-document parameter
+references are resolved. Modules that previously omitted those inputs can
+gain fields, including required ones. The ordinary `scan` method continues
+to use only directly declared operation parameters.
+
+The opt-in scanner records effective path/query names and JSON body
+properties in `OpenApiProxyInputs`. A flat field name can occur in more than
+one location. Before registering selected modules for HTTP forwarding,
+validate these inputs using `OpenApiProxyInputs::from_module` and report
+operation-local parameter problems as well as any unrepresentable location
+collisions. The proxy continues to support the existing path/query and JSON
+body formats.
+
 ### Direct Registry Registration
 
 ```rust

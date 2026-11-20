@@ -1,6 +1,6 @@
 [package]
 name = "apcore-toolkit"
-version = "0.14.2"
+version = "0.14.3"
 edition = "2021"
 description = "Shared scanner, schema extraction, and output toolkit for apcore framework adapters"
 license = "Apache-2.0"
@@ -35,6 +35,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 thiserror = "2"
 indexmap = "2"
+percent-encoding = "2"
 async-trait = "0.1"
 walkdir = "2"
 # Runtime-independent, cancellable HTTP deadline watchdog for injected auth

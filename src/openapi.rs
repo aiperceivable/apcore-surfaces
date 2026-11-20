@@ -3,8 +3,15 @@
 // Standalone functions for resolving JSON $ref pointers and extracting
 // input/output schemas from OpenAPI operation objects.
 
-use serde_json::{json, Value};
+use percent_encoding::percent_decode_str;
+use serde_json::{json, Map, Value};
 use tracing::warn;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchemaReferenceMode {
+    Legacy,
+    Effective,
+}
 
 /// Decode a JSON Pointer token per RFC 6901.
 ///
@@ -23,6 +30,43 @@ fn decode_pointer_token(token: &str) -> std::borrow::Cow<'_, str> {
 /// Decodes RFC 6901 escape sequences in path segments (`~1` → `/`, `~0` → `~`).
 /// Returns the resolved schema, or an empty object on failure.
 pub fn resolve_ref(ref_string: &str, openapi_doc: &Value) -> Value {
+    resolve_schema_reference(ref_string, openapi_doc, SchemaReferenceMode::Legacy)
+}
+
+/// Read a same-document URI fragment before applying the containing object's type rules.
+pub(crate) fn resolve_local_pointer<'a>(
+    reference: &str,
+    document: &'a Value,
+) -> Result<&'a Value, &'static str> {
+    let fragment = reference
+        .strip_prefix('#')
+        .ok_or("expected a same-document JSON Pointer")?;
+    let pointer = percent_decode_str(fragment)
+        .decode_utf8()
+        .map_err(|_| "fragment is not valid UTF-8")?;
+    if !pointer.starts_with('/') {
+        return Err("expected a same-document JSON Pointer");
+    }
+    document.pointer(&pointer).ok_or("pointer target not found")
+}
+
+fn resolve_schema_reference(
+    ref_string: &str,
+    openapi_doc: &Value,
+    mode: SchemaReferenceMode,
+) -> Value {
+    if mode == SchemaReferenceMode::Effective {
+        if let Ok(value) = resolve_local_pointer(ref_string, openapi_doc) {
+            if value.is_object() || value.is_boolean() {
+                return value.clone();
+            }
+        }
+        warn!(
+            ref_string,
+            "resolve_ref: pointer does not identify a schema"
+        );
+        return json!({});
+    }
     if !ref_string.starts_with("#/") {
         warn!(
             ref_string,
@@ -76,20 +120,25 @@ pub fn resolve_schema(schema: &Value, openapi_doc: Option<&Value>) -> Value {
 /// Depth-limited: resolves through depth 16 (cuts off at depth > 16),
 /// matching the Python and TypeScript implementations.
 pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> Value {
+    deep_resolve_schema_refs(schema, openapi_doc, depth, SchemaReferenceMode::Legacy)
+}
+
+pub(crate) fn deep_resolve_schema_refs(
+    schema: &Value,
+    openapi_doc: &Value,
+    depth: usize,
+    mode: SchemaReferenceMode,
+) -> Value {
     if depth > 16 {
         warn!(depth, "deep_resolve_refs: depth limit reached — returning schema as-is to prevent infinite recursion");
         return schema.clone();
     }
 
-    // Direct $ref resolution. The keys sitting BESIDE the `$ref` are merged
-    // back over the target rather than discarded: dropping them silently loses
-    // `x-sensitive`, which apcore reads off the *resolved* schema to decide
-    // what to redact, so a field the OpenAPI document marked sensitive reaches
-    // apcore carrying nothing to redact on. apcore closed the same hole in its
-    // own resolver as D-98 in 0.31.0; see docs/features/openapi.md.
+    // Keep sibling annotations visible to consumers that read the resolved
+    // schema directly, such as apcore's x-sensitive redaction lookup.
     if let Some(ref_str) = schema.get("$ref").and_then(|v| v.as_str()) {
-        let resolved =
-            deep_resolve_refs(&resolve_ref(ref_str, openapi_doc), openapi_doc, depth + 1);
+        let target = resolve_schema_reference(ref_str, openapi_doc, mode);
+        let resolved = deep_resolve_schema_refs(&target, openapi_doc, depth + 1, mode);
         let siblings: serde_json::Map<String, Value> = schema
             .as_object()
             .map(|o| {
@@ -104,17 +153,11 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
         }
         // Siblings are walked at the SAME depth: following the reference has
         // already consumed a level and they are not a second hop.
-        let walked = deep_resolve_refs(&Value::Object(siblings), openapi_doc, depth);
-        let mut merged = match resolved {
-            Value::Object(m) => m,
-            other => return other,
-        };
-        if let Value::Object(w) = walked {
-            for (k, v) in w {
-                merged.insert(k, v);
-            }
+        let walked = deep_resolve_schema_refs(&Value::Object(siblings), openapi_doc, depth, mode);
+        if let Value::Object(walked) = walked {
+            return merge_schema_ref_siblings(resolved, walked, mode);
         }
-        return Value::Object(merged);
+        return resolved;
     }
 
     let mut result = schema.clone();
@@ -125,7 +168,7 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
             if let Some(Value::Array(items)) = obj.get(*key).cloned() {
                 let resolved: Vec<Value> = items
                     .iter()
-                    .map(|item| deep_resolve_refs(item, openapi_doc, depth + 1))
+                    .map(|item| deep_resolve_schema_refs(item, openapi_doc, depth + 1, mode))
                     .collect();
                 obj.insert(key.to_string(), Value::Array(resolved));
             }
@@ -136,12 +179,12 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
             if items.is_object() {
                 obj.insert(
                     "items".to_string(),
-                    deep_resolve_refs(&items, openapi_doc, depth + 1),
+                    deep_resolve_schema_refs(&items, openapi_doc, depth + 1, mode),
                 );
             } else if let Value::Array(arr) = items {
                 let resolved: Vec<Value> = arr
                     .iter()
-                    .map(|item| deep_resolve_refs(item, openapi_doc, depth + 1))
+                    .map(|item| deep_resolve_schema_refs(item, openapi_doc, depth + 1, mode))
                     .collect();
                 obj.insert("items".to_string(), Value::Array(resolved));
             }
@@ -151,7 +194,7 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
         if let Some(Value::Array(prefix)) = obj.get("prefixItems").cloned() {
             let resolved: Vec<Value> = prefix
                 .iter()
-                .map(|item| deep_resolve_refs(item, openapi_doc, depth + 1))
+                .map(|item| deep_resolve_schema_refs(item, openapi_doc, depth + 1, mode))
                 .collect();
             obj.insert("prefixItems".to_string(), Value::Array(resolved));
         }
@@ -160,7 +203,12 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
         if let Some(Value::Object(props)) = obj.get("properties").cloned() {
             let resolved: serde_json::Map<String, Value> = props
                 .into_iter()
-                .map(|(k, v)| (k, deep_resolve_refs(&v, openapi_doc, depth + 1)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        deep_resolve_schema_refs(&v, openapi_doc, depth + 1, mode),
+                    )
+                })
                 .collect();
             obj.insert("properties".to_string(), Value::Object(resolved));
         }
@@ -169,7 +217,12 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
         if let Some(Value::Object(pat_props)) = obj.get("patternProperties").cloned() {
             let resolved: serde_json::Map<String, Value> = pat_props
                 .into_iter()
-                .map(|(k, v)| (k, deep_resolve_refs(&v, openapi_doc, depth + 1)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        deep_resolve_schema_refs(&v, openapi_doc, depth + 1, mode),
+                    )
+                })
                 .collect();
             obj.insert("patternProperties".to_string(), Value::Object(resolved));
         }
@@ -179,7 +232,7 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
             if add_props.is_object() {
                 obj.insert(
                     "additionalProperties".to_string(),
-                    deep_resolve_refs(&add_props, openapi_doc, depth + 1),
+                    deep_resolve_schema_refs(&add_props, openapi_doc, depth + 1, mode),
                 );
             }
         }
@@ -190,7 +243,7 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
                 if sub.is_object() {
                     obj.insert(
                         key.to_string(),
-                        deep_resolve_refs(&sub, openapi_doc, depth + 1),
+                        deep_resolve_schema_refs(&sub, openapi_doc, depth + 1, mode),
                     );
                 }
             }
@@ -200,60 +253,143 @@ pub fn deep_resolve_refs(schema: &Value, openapi_doc: &Value, depth: usize) -> V
     result
 }
 
+fn merge_schema_ref_siblings(
+    resolved: Value,
+    mut siblings: Map<String, Value>,
+    mode: SchemaReferenceMode,
+) -> Value {
+    match resolved {
+        Value::Object(mut target) => {
+            if mode == SchemaReferenceMode::Effective
+                && siblings.keys().any(|key| !is_schema_annotation(key))
+            {
+                return intersect_schemas(target, siblings);
+            }
+            target.extend(siblings);
+            Value::Object(target)
+        }
+        Value::Bool(true) => Value::Object(siblings),
+        Value::Bool(false) => {
+            // Keep sibling annotations while retaining the always-false assertion.
+            let mut all_of = vec![Value::Bool(false)];
+            if let Some(Value::Array(existing)) = siblings.remove("allOf") {
+                all_of.extend(existing);
+            }
+            siblings.insert("allOf".to_string(), Value::Array(all_of));
+            Value::Object(siblings)
+        }
+        other => other,
+    }
+}
+
+fn is_schema_annotation(key: &str) -> bool {
+    matches!(
+        key,
+        "title"
+            | "description"
+            | "$comment"
+            | "default"
+            | "examples"
+            | "example"
+            | "deprecated"
+            | "readOnly"
+            | "writeOnly"
+            | "externalDocs"
+    ) || key.starts_with("x-")
+}
+
+fn intersect_schemas(target: Map<String, Value>, mut siblings: Map<String, Value>) -> Value {
+    for (key, value) in &target {
+        // Keeping an explicit top-level type is redundant with allOf, but
+        // consumers use it to decide how to present the input.
+        if is_schema_annotation(key) || key == "type" {
+            siblings.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    // Keep siblings adjacent to the applicator so unevaluatedProperties
+    // can see the properties evaluated by the reference target.
+    let mut all_of = vec![Value::Object(target)];
+    if let Some(Value::Array(existing)) = siblings.remove("allOf") {
+        all_of.extend(existing);
+    }
+    siblings.insert("allOf".to_string(), Value::Array(all_of));
+    Value::Object(siblings)
+}
+
 /// Extract input schema from an OpenAPI operation.
 ///
 /// Combines query/path parameters and request body properties into a
 /// single `{"type": "object", "properties": ..., "required": ...}` schema.
 pub fn extract_input_schema(operation: &Value, openapi_doc: Option<&Value>) -> Value {
+    let parameters = operation
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let body = extract_json_body_schema(operation, openapi_doc);
+    extract_input_schema_from_parameters(
+        parameters,
+        body.as_ref(),
+        openapi_doc,
+        SchemaReferenceMode::Legacy,
+    )
+}
+
+/// Resolve the JSON body schema used by both flat extraction and routing metadata.
+pub(crate) fn extract_json_body_schema(
+    operation: &Value,
+    openapi_doc: Option<&Value>,
+) -> Option<Value> {
+    let content = operation.pointer("/requestBody/content")?.as_object()?;
+    // Keep the first accepted JSON variant in document order.
+    let (_, entry) = content.iter().find(|(kind, _)| {
+        kind.starts_with("application/json") || kind.as_str() == "application/vnd.api+json"
+    })?;
+    Some(resolve_schema(entry.get("schema")?, openapi_doc))
+}
+
+pub(crate) fn extract_input_schema_from_parameters<'a>(
+    parameters: impl Iterator<Item = &'a Value>,
+    body_schema: Option<&Value>,
+    openapi_doc: Option<&Value>,
+    mode: SchemaReferenceMode,
+) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required: Vec<Value> = Vec::new();
 
-    // Query/path parameters
-    if let Some(Value::Array(params)) = operation.get("parameters") {
-        for param in params {
-            let in_value = param.get("in").and_then(|v| v.as_str()).unwrap_or("");
-            if in_value == "query" || in_value == "path" {
-                if let Some(name) = param.get("name").and_then(|v| v.as_str()) {
-                    let param_schema = param
-                        .get("schema")
-                        .cloned()
-                        .unwrap_or_else(|| json!({"type": "string"}));
-                    let resolved = resolve_schema(&param_schema, openapi_doc);
-                    properties.insert(name.to_string(), resolved);
+    for param in parameters {
+        if !matches!(
+            param.get("in").and_then(Value::as_str),
+            Some("query" | "path")
+        ) {
+            continue;
+        }
+        let Some(name) = param.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let schema = param
+            .get("schema")
+            .map(|schema| match mode {
+                SchemaReferenceMode::Legacy => resolve_schema(schema, openapi_doc),
+                SchemaReferenceMode::Effective => schema.clone(),
+            })
+            .unwrap_or_else(|| json!({"type": "string"}));
+        properties.insert(name.to_string(), schema);
 
-                    if param
-                        .get("required")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
-                        required.push(Value::String(name.to_string()));
-                    }
-                }
-            }
+        if param.get("required").and_then(Value::as_bool) == Some(true) {
+            required.push(Value::String(name.to_string()));
         }
     }
 
-    // Request body — try "application/json" first, then "application/vnd.api+json"
-    // as a fallback. This matches the Python implementation which iterates all
-    // content-type keys and accepts both.
-    let body_content = operation
-        .get("requestBody")
-        .and_then(|rb| rb.get("content"));
-    let body_schema_opt = body_content.and_then(|c| c.as_object()).and_then(|m| {
-        m.iter()
-            .find(|(k, _)| {
-                k.starts_with("application/json") || k.as_str() == "application/vnd.api+json"
-            })
-            .and_then(|(_, v)| v.get("schema"))
-    });
-    if let Some(body_schema) = body_schema_opt {
-        let resolved = resolve_schema(body_schema, openapi_doc);
-        if let Some(props) = resolved.get("properties").and_then(|p| p.as_object()) {
-            for (k, v) in props {
-                properties.insert(k.clone(), v.clone());
-            }
+    if let Some(body_schema) = body_schema {
+        if let Some(props) = body_schema.get("properties").and_then(Value::as_object) {
+            properties.extend(
+                props
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
         }
-        if let Some(req) = resolved.get("required").and_then(|r| r.as_array()) {
+        if let Some(req) = body_schema.get("required").and_then(Value::as_array) {
             required.extend(req.iter().cloned());
         }
     }
@@ -262,7 +398,7 @@ pub fn extract_input_schema(operation: &Value, openapi_doc: Option<&Value>) -> V
     if let Some(doc) = openapi_doc {
         let resolved_props: serde_json::Map<String, Value> = properties
             .into_iter()
-            .map(|(k, v)| (k, deep_resolve_refs(&v, doc, 0)))
+            .map(|(k, v)| (k, deep_resolve_schema_refs(&v, doc, 0, mode)))
             .collect();
         properties = resolved_props;
     }
@@ -289,6 +425,14 @@ pub fn extract_input_schema(operation: &Value, openapi_doc: Option<&Value>) -> V
 /// which filters on /^2\d\d$/. Codes are checked in lexicographic order so
 /// 200 is preferred over 201, 201 over 202, and so on.
 pub fn extract_output_schema(operation: &Value, openapi_doc: Option<&Value>) -> Value {
+    extract_output_schema_with_mode(operation, openapi_doc, SchemaReferenceMode::Legacy)
+}
+
+pub(crate) fn extract_output_schema_with_mode(
+    operation: &Value,
+    openapi_doc: Option<&Value>,
+    mode: SchemaReferenceMode,
+) -> Value {
     let responses = match operation.get("responses") {
         Some(r) => r,
         None => return json!({"type": "object", "properties": {}}),
@@ -329,15 +473,34 @@ pub fn extract_output_schema(operation: &Value, openapi_doc: Option<&Value>) -> 
                     .map(|(_, v)| v)
             });
         if let Some(schema) = json_content.and_then(|jc| jc.get("schema")) {
-            let mut resolved = resolve_schema(schema, openapi_doc);
-            if let Some(doc) = openapi_doc {
-                resolved = deep_resolve_refs(&resolved, doc, 0);
-            }
-            return resolved;
+            return resolve_output_schema(schema, openapi_doc, mode);
         }
     }
 
     json!({"type": "object", "properties": {}})
+}
+
+fn resolve_output_schema(
+    schema: &Value,
+    openapi_doc: Option<&Value>,
+    mode: SchemaReferenceMode,
+) -> Value {
+    let initial = match mode {
+        SchemaReferenceMode::Legacy => resolve_schema(schema, openapi_doc),
+        SchemaReferenceMode::Effective => schema.clone(),
+    };
+    let resolved = match openapi_doc {
+        Some(doc) => deep_resolve_schema_refs(&initial, doc, 0, mode),
+        None => initial,
+    };
+    if mode == SchemaReferenceMode::Effective {
+        return match resolved {
+            Value::Bool(true) => json!({}),
+            Value::Bool(false) => json!({"not": {}}),
+            other => other,
+        };
+    }
+    resolved
 }
 
 #[cfg(test)]
@@ -1366,5 +1529,24 @@ mod tests {
             result["properties"]["result"].is_object(),
             "application/json; charset=utf-8 output schema should be extracted; got: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_effective_reference_siblings_preserve_target_constraints() {
+        let doc =
+            json!({"components":{"schemas":{"Color":{"type":"string", "enum":["red", "blue"]}}}});
+        let schema =
+            json!({"$ref":"#/components/schemas/Color", "enum":["red", "green"], "title":"Color"});
+        let effective = deep_resolve_schema_refs(&schema, &doc, 0, SchemaReferenceMode::Effective);
+        let validator = apcore::schema::SchemaValidator::new();
+        assert!(validator.validate_input(&json!("red"), &effective).is_ok());
+        assert!(validator
+            .validate_input(&json!("blue"), &effective)
+            .is_err());
+        assert!(validator
+            .validate_input(&json!("green"), &effective)
+            .is_err());
+        assert_eq!(effective["type"], "string");
+        assert_eq!(effective["title"], "Color");
     }
 }

@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "apcore-toolkit"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "apcore",
  "async-trait",
@@ -84,6 +84,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "indexmap",
+ "percent-encoding",
  "regex",
  "reqwest",
  "serde",

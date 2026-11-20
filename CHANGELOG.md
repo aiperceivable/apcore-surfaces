@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.3] - Unreleased
+
+### Added
+
+- Opt-in `OpenAPIScanner::scan_with_effective_parameters` resolves Path Item
+  inheritance and local Parameter Object references. Operation overrides are
+  matched by name and location. The opt-in tool schema can therefore expose
+  new inputs, including required ones previously omitted.
+- `OpenApiProxyInputs::from_module` exposes the same effective path and query
+  parameter names and JSON body properties used by the scanner, together with
+  operation-local resolution problems. `proxy_uses_json_body` exposes the
+  HTTP writer's method decision for pre-registration diagnostics. Existing
+  `scan` calls and the HTTP proxy's wire encoding retain their behavior.
+
 ## [0.14.2] - 2026-11-19
 
 ### Changed

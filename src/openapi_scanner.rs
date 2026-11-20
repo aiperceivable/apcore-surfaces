@@ -35,7 +35,11 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::openapi::{extract_input_schema, extract_output_schema, resolve_ref};
+use crate::openapi::{
+    extract_input_schema, extract_output_schema_with_mode, resolve_local_pointer, resolve_ref,
+    SchemaReferenceMode,
+};
+use crate::openapi_parameters::{effective_input_schema, OpenApiProxyInputs};
 use crate::scanner::{deduplicate_ids, filter_modules, infer_annotations_from_method};
 use crate::types::ScannedModule;
 
@@ -224,7 +228,7 @@ fn collect_refs(node: &Value, out: &mut Vec<String>) {
 /// Internal refs (`#/...`) that resolve successfully are silent — this
 /// only flags the failure cases enumerated in the Error Model:
 /// unresolvable internal `$ref` and external `$ref` (never fetched).
-fn ref_warnings(operation: &Value, spec: &Value) -> Vec<String> {
+fn ref_warnings(operation: &Value, spec: &Value, mode: SchemaReferenceMode) -> Vec<String> {
     let mut refs: Vec<String> = Vec::new();
     if let Some(request_body) = operation.get("requestBody") {
         collect_refs(request_body, &mut refs);
@@ -239,7 +243,16 @@ fn ref_warnings(operation: &Value, spec: &Value) -> Vec<String> {
         if !seen.insert(r.clone()) {
             continue;
         }
-        if !r.starts_with("#/") {
+        if mode == SchemaReferenceMode::Effective {
+            if !r.starts_with('#') {
+                warnings.push(format!("external $ref not fetched: {r}"));
+            } else if !matches!(
+                resolve_local_pointer(&r, spec),
+                Ok(value) if value.is_object() || value.is_boolean()
+            ) {
+                warnings.push(format!("unresolvable $ref: {r}"));
+            }
+        } else if !r.starts_with("#/") {
             warnings.push(format!("external $ref not fetched: {r}"));
         } else {
             let resolved = resolve_ref(&r, spec);
@@ -441,11 +454,42 @@ impl OpenAPIScanner {
     /// Returns [`ScannerError::InvalidSpec`] when `spec` is not OpenAPI
     /// 3.0.x/3.1.x. Returns [`ScannerError::Pattern`] when `include` or
     /// `exclude` is not a valid regex.
-    #[allow(clippy::too_many_lines)]
     pub async fn scan(
         &self,
         spec: &Value,
         options: &ScanOptions,
+    ) -> Result<Vec<ScannedModule>, ScannerError> {
+        Self::scan_operations(spec, options, false)
+    }
+
+    /// Scan using Path Item parameters and same-document Parameter Object references.
+    ///
+    /// Operation parameters replace Path Item parameters by (name, location).
+    /// The resulting modules carry routing inputs and per-operation diagnostics
+    /// readable with [OpenApiProxyInputs::from_module]. Proxy consumers should
+    /// check the metadata after selecting modules and before forwarding requests.
+    /// Transformation hooks run as in [Self::scan]; the operation hook runs
+    /// before parameter resolution.
+    ///
+    /// The input format still supports the existing path/query parameters and
+    /// flat JSON body fields. This does not add request serialization formats.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same document and filter errors as [Self::scan].
+    pub async fn scan_with_effective_parameters(
+        &self,
+        spec: &Value,
+        options: &ScanOptions,
+    ) -> Result<Vec<ScannedModule>, ScannerError> {
+        Self::scan_operations(spec, options, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn scan_operations(
+        spec: &Value,
+        options: &ScanOptions,
+        resolve_parameters: bool,
     ) -> Result<Vec<ScannedModule>, ScannerError> {
         Self::validate_spec(spec)?;
 
@@ -508,10 +552,21 @@ impl OpenAPIScanner {
                     }
                 }
 
-                let mut warnings = ref_warnings(&operation, spec);
+                let schema_mode = if resolve_parameters {
+                    SchemaReferenceMode::Effective
+                } else {
+                    SchemaReferenceMode::Legacy
+                };
+                let mut warnings = ref_warnings(&operation, spec, schema_mode);
 
-                let input_schema = extract_input_schema(&operation, Some(spec));
-                let output_schema = extract_output_schema(&operation, Some(spec));
+                let (input_schema, proxy_inputs) = if resolve_parameters {
+                    let (schema, sources) = effective_input_schema(path_item, &operation, spec);
+                    (schema, Some(sources))
+                } else {
+                    (extract_input_schema(&operation, Some(spec)), None)
+                };
+                let output_schema =
+                    extract_output_schema_with_mode(&operation, Some(spec), schema_mode);
                 if !has_2xx_response(&operation) {
                     warnings.push("no 2xx response defined; output_schema is empty".to_string());
                 }
@@ -536,6 +591,9 @@ impl OpenAPIScanner {
                     .unwrap_or_default();
 
                 let mut openapi_meta = Map::new();
+                if let Some(sources) = proxy_inputs {
+                    openapi_meta.insert(OpenApiProxyInputs::METADATA_KEY.into(), sources);
+                }
                 openapi_meta.insert(
                     "spec_version".to_string(),
                     Value::String(openapi_version.clone()),
@@ -1172,6 +1230,212 @@ mod tests {
                 .and_then(Value::as_str),
             Some("GET")
         );
+    }
+
+    #[test]
+    fn test_scan_effective_parameters_merges_refs_and_keeps_legacy_scan_unchanged() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "parameters": {
+                    "Item/ID": {"name": "id", "in": "path", "required": true,
+                        "schema": {"type": "string"}},
+                    "Link": {"$ref": "#/components/parameters/Item~1ID"},
+                    "Query Filter": {"name": "id", "in": "query", "schema": {"type": "integer"}},
+                    "Trace": {"name": "trace", "in": "query", "schema": {"type": "boolean"}}
+                },
+                "schemas": {"Payload": {"type": "object", "properties": {
+                    "label": {"type": "string"}
+                }, "required": ["label"]}}
+            },
+            "paths": {"/items/{id}": {
+                "parameters": [
+                    {"$ref": "#/components/parameters/Link"},
+                    {"$ref": "#/components/parameters/Query%20Filter"},
+                    {"name": "limit", "in": "query", "required": true, "schema": {"type": "integer"}}
+                ],
+                "post": {
+                    "parameters": [
+                        {"name": "limit", "in": "query", "schema": {"type": "number"}},
+                        {"$ref": "#/components/parameters/Trace"}
+                    ],
+                    "requestBody": {"content": {"application/json": {"schema":
+                        {"$ref": "#/components/schemas/Payload"}
+                    }}}
+                }
+            }}
+        });
+        let scanner = OpenAPIScanner::new();
+        let legacy = block_on(scanner.scan(&spec, &ScanOptions::new())).unwrap();
+        let modules =
+            block_on(scanner.scan_with_effective_parameters(&spec, &ScanOptions::new())).unwrap();
+        assert_eq!(modules[0].module_id, legacy[0].module_id);
+        assert!(legacy[0].input_schema["properties"]["id"].is_null());
+        assert!(legacy[0].input_schema["properties"]["trace"].is_null());
+        assert!(OpenApiProxyInputs::from_module(&legacy[0])
+            .unwrap()
+            .is_none());
+        let module = &modules[0];
+        assert_eq!(module.input_schema["properties"]["limit"]["type"], "number");
+        assert_eq!(
+            module.input_schema["properties"]["trace"]["type"],
+            "boolean"
+        );
+        assert_eq!(module.input_schema["required"], json!(["id", "label"]));
+        let inputs = OpenApiProxyInputs::from_module(module).unwrap().unwrap();
+        assert_eq!(inputs.path, ["id"]);
+        assert_eq!(inputs.query, ["id", "limit", "trace"]);
+        assert_eq!(inputs.body, ["label"]);
+        assert!(inputs.problems.is_empty());
+    }
+
+    #[test]
+    fn test_scan_effective_parameters_preserves_openapi_boolean_schemas() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "paths": {"/items": {
+                "parameters": [
+                    {"$ref": "#/components/parameters/Allowed"},
+                    {"$ref": "#/components/parameters/Forbidden"}
+                ],
+                "get": {"parameters": [
+                    {"name": "from_schema_ref", "in": "query",
+                        "schema": {"$ref": "#/components/schemas/RejectAll"}},
+                    {"name": "nested", "in": "query", "schema": {"allOf": [
+                        true, {"type": "object", "properties": {
+                            "direct": false,
+                            "from_ref": {"$ref": "#/components/schemas/AcceptAll"},
+                            "accept_with_siblings": {
+                                "$ref": "#/components/schemas/AcceptAll", "type": "integer"
+                            },
+                            "reject_with_siblings": {
+                                "$ref": "#/components/schemas/RejectAll",
+                                "allOf": [{"type": "integer"}], "x-sensitive": true
+                            }
+                        }}
+                    ]}}
+                ]}
+            }},
+            "components": {
+                "parameters": {
+                    "Allowed": {"name": "allowed", "in": "query", "schema": true},
+                    "Forbidden": {"name": "forbidden", "in": "query", "schema": false}
+                },
+                "schemas": {"AcceptAll": true, "RejectAll": false}
+            }
+        });
+        let scanner = OpenAPIScanner::new();
+        let modules =
+            block_on(scanner.scan_with_effective_parameters(&spec, &ScanOptions::new())).unwrap();
+        let module = &modules[0];
+        assert_eq!(
+            module.input_schema["properties"],
+            json!({"allowed": true, "forbidden": false, "from_schema_ref": false,
+            "nested": {"allOf": [true, {"type": "object",
+                "properties": {
+                    "direct": false,
+                    "from_ref": true,
+                    "accept_with_siblings": {"type": "integer"},
+                    "reject_with_siblings": {
+                        "allOf": [false, {"type": "integer"}], "x-sensitive": true
+                    }
+                }}]}})
+        );
+        let inputs = OpenApiProxyInputs::from_module(module).unwrap().unwrap();
+        assert_eq!(
+            inputs.query,
+            ["allowed", "forbidden", "from_schema_ref", "nested"]
+        );
+        assert!(inputs.problems.is_empty());
+
+        let legacy = block_on(scanner.scan(&spec, &ScanOptions::new())).unwrap();
+        assert_eq!(
+            legacy[0].input_schema["properties"]["from_schema_ref"],
+            json!({})
+        );
+        assert_eq!(
+            legacy[0].input_schema["properties"]["nested"]["allOf"][1]["properties"]["from_ref"],
+            json!({})
+        );
+    }
+
+    #[test]
+    fn test_scan_effective_parameter_problems_are_local_to_selected_operations() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/ok": {"get": {}},
+                "/broken": {"get": {"parameters": [
+                    {"$ref": "#/components/parameters/Cycle"},
+                    {"$ref": "#/components/parameters/Missing"},
+                    {"$ref": "other.json#/components/parameters/Outside"},
+                    {"name": "repeated", "in": "query"},
+                    {"name": "repeated", "in": "query"}
+                ]}}
+            },
+            "components": {"parameters": {
+                "Cycle": {"$ref": "#/components/parameters/Cycle"}
+            }}
+        });
+        let scanner = OpenAPIScanner::new();
+        let options = ScanOptions {
+            include: Some("^ok\\.get$".into()),
+            ..ScanOptions::new()
+        };
+        let filtered = block_on(scanner.scan_with_effective_parameters(&spec, &options)).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert!(OpenApiProxyInputs::from_module(&filtered[0])
+            .unwrap()
+            .unwrap()
+            .problems
+            .is_empty());
+        let modules =
+            block_on(scanner.scan_with_effective_parameters(&spec, &ScanOptions::new())).unwrap();
+        let broken = modules
+            .iter()
+            .find(|module| module.module_id == "broken.get")
+            .unwrap();
+        let problems = OpenApiProxyInputs::from_module(broken)
+            .unwrap()
+            .unwrap()
+            .problems;
+        assert_eq!(problems.len(), 4);
+        let messages: Vec<String> = problems.iter().map(ToString::to_string).collect();
+        assert!(messages[0].contains("cyclic"));
+        assert!(messages[1].contains("Missing"));
+        assert!(messages[2].contains("same-document"));
+        assert!(messages[3].contains("repeated"));
+    }
+
+    #[test]
+    fn test_scan_effective_parameters_runs_after_transform_operation() {
+        let spec = json!({
+            "openapi": "3.0.3",
+            "paths": {"/items": {
+                "parameters": [{"name": "limit", "in": "query",
+                    "required": true, "schema": {"type": "integer"}}],
+                "get": {"parameters": [{"name": "old", "in": "query"}]}
+            }}
+        });
+        let options = ScanOptions {
+            transform_operation: Some(Box::new(|_, _, operation| {
+                let mut transformed = operation.clone();
+                transformed["parameters"] = json!([
+                    {"name": "limit", "in": "query", "schema": {"type": "number"}},
+                    {"name": "new", "in": "query", "schema": {"type": "boolean"}}
+                ]);
+                Some(transformed)
+            })),
+            ..ScanOptions::new()
+        };
+        let scanner = OpenAPIScanner::new();
+        let modules = block_on(scanner.scan_with_effective_parameters(&spec, &options)).unwrap();
+        let module = &modules[0];
+        let inputs = OpenApiProxyInputs::from_module(module).unwrap().unwrap();
+        assert_eq!(inputs.query, ["limit", "new"]);
+        assert!(module.input_schema["properties"]["old"].is_null());
+        assert_eq!(module.input_schema["properties"]["limit"]["type"], "number");
+        assert_eq!(module.input_schema["required"], json!([]));
     }
 
     #[test]
