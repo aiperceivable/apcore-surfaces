@@ -17,7 +17,7 @@
 import { BaseScanner } from './scanner.js';
 import type { ScannedModule } from './types.js';
 import { cloneModule, createScannedModule } from './types.js';
-import { extractEffectiveOutputSchema, extractInputSchema, extractOutputSchema, resolveRef } from './openapi.js';
+import { effectiveReferenceLabel, extractEffectiveOutputSchema, extractInputSchema, extractOutputSchema, resolveRef } from './openapi.js';
 import { extractEffectiveOperationInputs, OPENAPI_PROXY_INPUTS_KEY } from './openapi-parameters.js';
 
 /**
@@ -211,7 +211,9 @@ function collectRefs(node: unknown): string[] {
  * flags the failure cases enumerated in the Error Model: unresolvable
  * internal `$ref` and external `$ref` (never fetched).
  */
-function refWarnings(operation: Record<string, unknown>, spec: Record<string, unknown>): string[] {
+function refWarnings(
+  operation: Record<string, unknown>, spec: Record<string, unknown>, effectiveParameters: boolean,
+): string[] {
   const warnings: string[] = [];
   const seen = new Set<string>();
   const refs = [
@@ -222,7 +224,7 @@ function refWarnings(operation: Record<string, unknown>, spec: Record<string, un
     if (seen.has(ref)) continue;
     seen.add(ref);
     if (!ref.startsWith('#/')) {
-      warnings.push(`external $ref not fetched: ${ref}`);
+      warnings.push(`external $ref not fetched: ${effectiveParameters ? effectiveReferenceLabel(ref) : ref}`);
     } else if (Object.keys(resolveRef(ref, spec)).length === 0) {
       warnings.push(`unresolvable $ref: ${ref}`);
     }
@@ -440,7 +442,7 @@ export class OpenAPIScanner extends BaseScanner {
           mid = `${basePathPrefix}.${mid}`;
         }
 
-        const warnings = refWarnings(operation, spec);
+        const warnings = refWarnings(operation, spec, effectiveParameters);
 
         const effective = effectiveParameters ? extractEffectiveOperationInputs(pathItem, operation, spec) : undefined;
         const inputSchema = effective?.inputSchema ?? extractInputSchema(operation, spec);

@@ -32,6 +32,7 @@ import {
 import type { Context, ModuleExample } from 'apcore-js';
 
 import { extractPathParamNames, substitutePathParams } from '../http-verb-map.js';
+import { parseEffectiveOpenApiPath, type EffectiveOpenApiPath } from '../openapi-path.js';
 import { schemaObject } from '../openapi.js';
 import { readOpenApiProxyInputs } from '../openapi-parameters.js';
 import type { ScannedModule } from '../types.js';
@@ -133,8 +134,14 @@ export function readProxyRoute(mod: ScannedModule): Partial<HttpFields> {
   };
 }
 
-function getHttpFields(mod: ScannedModule): HttpFields {
-  const { httpMethod = 'GET', urlPath = '/' } = readProxyRoute(mod);
+function getHttpFields(mod: ScannedModule, effective: boolean): HttpFields & { openApiPath?: EffectiveOpenApiPath } {
+  const route = readProxyRoute(mod);
+  const { httpMethod = 'GET', urlPath = '/' } = route;
+  if (effective) {
+    const openApiPath = parseEffectiveOpenApiPath(route.urlPath);
+    if (!openApiPath) throw new HTTPProxyRegistryWriterError(mod.moduleId, 'url_path must be an origin-relative OpenAPI path');
+    return { httpMethod, urlPath, openApiPath };
+  }
   if (/^(https?|file|ftp):\/\//i.test(urlPath)) {
     throw new HTTPProxyRegistryWriterError(
       mod.moduleId,
@@ -164,6 +171,11 @@ function objectSchemaForTypeBox(schema: Record<string, unknown>): Record<string,
     result[key] = objectSchemaNode(result[key]);
   }
   return result;
+}
+
+function isProxyScalar(value: unknown): value is string | boolean | number {
+  return typeof value === 'string' || typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value));
 }
 
 function objectSchemaNode(value: unknown): unknown {
@@ -287,9 +299,9 @@ export class HTTPProxyRegistryWriter {
   }
 
   private buildFunctionModule(mod: ScannedModule): FunctionModule {
-    const { httpMethod, urlPath } = getHttpFields(mod);
-    const pathParams = extractPathParamNames(urlPath);
     const effectiveInputs = readOpenApiProxyInputs(mod);
+    const { httpMethod, urlPath, openApiPath } = getHttpFields(mod, effectiveInputs !== undefined);
+    const pathParams = openApiPath?.parameterNames ?? extractPathParamNames(urlPath);
     const queryNames = new Set(effectiveInputs?.query);
     const baseUrl = this.baseUrl;
     const authFactory = this.authHeaderFactory;
@@ -324,20 +336,24 @@ export class HTTPProxyRegistryWriter {
       const nonPath: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(inputs)) {
         if (pathParams.has(k)) {
+          if (openApiPath && !isProxyScalar(v)) {
+            throw new ModuleError(ErrorCodes.MODULE_EXECUTE_ERROR,
+              `Path parameter ${JSON.stringify(k)} must be a string, boolean, or number`, { parameter: k });
+          }
           pathValues[k] = v == null ? '' : percentEncodePathSegment(String(v));
         } else {
           nonPath[k] = v;
         }
       }
-      const actualPath = substitutePathParams(urlPath, pathValues);
+      const actualPath = openApiPath ? openApiPath.substitute(pathValues) : substitutePathParams(urlPath, pathValues);
       // Reject the request if any placeholder went unfilled — otherwise a
       // forgotten input would silently leak `{name}` into the request URL.
-      const unfilled = UNFILLED_PARAM_RE.exec(actualPath);
-      if (unfilled !== null) {
+      const unfilled = openApiPath ? openApiPath.firstUnfilled(actualPath) : UNFILLED_PARAM_RE.exec(actualPath)?.[0];
+      if (unfilled !== undefined) {
         throw new ModuleError(
           ErrorCodes.MODULE_EXECUTE_ERROR,
-          `path parameter not provided: ${JSON.stringify(unfilled[0])} in url_path ${JSON.stringify(urlPath)}`,
-          { url_path: urlPath, missing: unfilled[0] },
+          `path parameter not provided: ${JSON.stringify(unfilled)} in url_path ${JSON.stringify(urlPath)}`,
+          { url_path: urlPath, missing: unfilled },
         );
       }
       let fullUrl = joinUrl(baseUrl, actualPath);
@@ -354,13 +370,16 @@ export class HTTPProxyRegistryWriter {
         for (const [k, v] of Object.entries(nonPath)) {
           if (v === undefined || v === null) continue;
           if (queryNames.has(k) && Array.isArray(v)) {
-            if (!v.every(item => typeof item === 'string' || typeof item === 'boolean' ||
-              (typeof item === 'number' && Number.isFinite(item)))) {
+            if (!v.every(isProxyScalar)) {
               throw new ModuleError(ErrorCodes.MODULE_EXECUTE_ERROR,
                 `Query array ${JSON.stringify(k)} must contain only strings, booleans, or numbers`, { parameter: k });
             }
             for (const item of v) params.append(k, String(item));
           } else {
+            if (queryNames.has(k) && !isProxyScalar(v)) {
+              throw new ModuleError(ErrorCodes.MODULE_EXECUTE_ERROR,
+                `Query parameter ${JSON.stringify(k)} must be a string, boolean, or number`, { parameter: k });
+            }
             params.append(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
           }
         }

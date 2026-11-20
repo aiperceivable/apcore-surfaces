@@ -1,4 +1,4 @@
-import { extractFlatBodyProperties, extractInputSchemaFromParts, resolveEffectiveSchemaValue, resolveLocalPointer } from './openapi.js';
+import { effectiveReferenceLabel, extractFlatBodyProperties, extractInputSchemaFromParts, resolveEffectiveSchemaValue, resolveLocalPointer } from './openapi.js';
 import type { JsonBodyInput } from './openapi.js';
 import { PROTO_DENY } from './safe-keys.js';
 import type { ScannedModule } from './types.js';
@@ -10,7 +10,7 @@ export type OpenApiParameterProblem =
   | { kind: 'invalid_parameter'; scope: OpenApiParameterScope; index: number }
   | { kind: 'reference'; scope: OpenApiParameterScope; index: number; reference: string; reason: string }
   | { kind: 'duplicate'; scope: OpenApiParameterScope; name: string; location: string }
-  | { kind: 'unsupported_input'; scope: 'operation'; name: string; location: 'query' | 'body'; reason: string };
+  | { kind: 'unsupported_input'; scope: 'operation'; name: string; location: 'path' | 'query' | 'body'; reason: string };
 
 export interface OpenApiProxyInputs {
   path: string[];
@@ -34,7 +34,7 @@ function isProblem(value: unknown): value is OpenApiParameterProblem {
   if (value.kind === 'duplicate') return typeof value.name === 'string' && typeof value.location === 'string';
   if (value.kind === 'unsupported_input') {
     return value.scope === 'operation' && typeof value.name === 'string' && typeof value.reason === 'string'
-      && (value.location === 'query' || value.location === 'body');
+      && (value.location === 'path' || value.location === 'query' || value.location === 'body');
   }
   const hasIndex = typeof value.index === 'number' && Number.isSafeInteger(value.index) && value.index >= 0;
   if (value.kind === 'invalid_parameter') return hasIndex;
@@ -56,9 +56,16 @@ export function readOpenApiProxyInputs(module: ScannedModule): OpenApiProxyInput
     throw new TypeError('Invalid OpenAPI effective parameter metadata');
   }
   return {
-    path: value.path, query: value.query, body: value.body, problems: value.problems,
+    path: value.path, query: value.query, body: value.body, problems: value.problems.map(sanitizeStoredProblem),
     ...(value.required_json_body === true ? { required_json_body: true } : {}),
   };
+}
+
+function sanitizeStoredProblem(problem: OpenApiParameterProblem): OpenApiParameterProblem {
+  if (problem.kind !== 'reference' || problem.reference === '<non-string>' || problem.reference.startsWith('#')) {
+    return problem;
+  }
+  return { ...problem, reference: effectiveReferenceLabel(problem.reference), reason: 'expected a same-document JSON Pointer' };
 }
 
 function resolveEntry(
@@ -71,6 +78,8 @@ function resolveEntry(
     let reason: string;
     if (typeof reference !== 'string') {
       reason = 'expected a string reference';
+    } else if (!reference.startsWith('#')) {
+      reason = 'expected a same-document JSON Pointer';
     } else if (seen.has(value)) {
       reason = 'cyclic parameter reference';
     } else {
@@ -83,7 +92,7 @@ function resolveEntry(
         reason = 'invalid URI fragment encoding';
       }
     }
-    problems.push({ kind: 'reference', scope, index, reference: typeof reference === 'string' ? reference : '<non-string>', reason });
+    problems.push({ kind: 'reference', scope, index, reference: effectiveReferenceLabel(reference), reason });
     return undefined;
   }
   return value;
@@ -168,11 +177,44 @@ function schemaHasType(schema: JsonObject, type: string): boolean {
   return schema.type === type || (Array.isArray(schema.type) && schema.type.includes(type));
 }
 
-function hasUnsupportedQueryArray(parameter: JsonObject, schema: unknown): boolean {
-  if (!isObject(schema) || !schemaHasType(schema, 'array')) return false;
+const schemaCombinators = ['allOf', 'anyOf', 'oneOf'];
+const scalarSchemaTypes = new Set(['string', 'boolean', 'number', 'integer']);
+
+function someSchemaBranch(schema: unknown, predicate: (branch: JsonObject) => boolean): boolean {
+  if (!isObject(schema)) return false;
+  return predicate(schema) || schemaCombinators.some(keyword => {
+    const branches = schema[keyword];
+    return Array.isArray(branches) && branches.some(branch => someSchemaBranch(branch, predicate));
+  });
+}
+
+function hasComplexType(schema: unknown): boolean {
+  return someSchemaBranch(schema, branch => schemaHasType(branch, 'array') || schemaHasType(branch, 'object'));
+}
+
+function hasUnsupportedArrayElement(schema: unknown): boolean {
+  return someSchemaBranch(schema, branch =>
+    schemaHasType(branch, 'array') || schemaHasType(branch, 'object') || schemaHasType(branch, 'null'));
+}
+
+function hasExplicitScalarType(schema: unknown): boolean {
+  if (!isObject(schema)) return false;
+  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+  return types.length > 0 && types.every(type => typeof type === 'string' && scalarSchemaTypes.has(type));
+}
+
+function unsupportedParameterSerialization(parameter: JsonObject, schema: unknown, location: 'path' | 'query'): boolean {
+  if (Object.hasOwn(parameter, 'content')) return true;
+  if (location === 'path') {
+    return (parameter.style !== undefined && parameter.style !== 'simple') || hasComplexType(schema);
+  }
   if ((parameter.style !== undefined && parameter.style !== 'form') ||
-      (parameter.explode !== undefined && parameter.explode !== true)) return true;
-  return isObject(schema.items) && (schemaHasType(schema.items, 'array') || schemaHasType(schema.items, 'object'));
+      someSchemaBranch(schema, branch => schemaHasType(branch, 'object')) ||
+      (parameter.explode !== undefined && parameter.explode !== true && !hasExplicitScalarType(schema))) return true;
+  if (!someSchemaBranch(schema, branch => schemaHasType(branch, 'array'))) return false;
+  return (parameter.explode !== undefined && parameter.explode !== true) ||
+    someSchemaBranch(schema, branch => hasUnsupportedArrayElement(branch.items) ||
+      (Array.isArray(branch.prefixItems) && branch.prefixItems.some(hasUnsupportedArrayElement)));
 }
 
 /** Use the same resolved declarations for schema extraction and proxy routing. */
@@ -191,12 +233,11 @@ export function extractEffectiveOperationInputs(
   const properties = inputSchema.properties as JsonObject;
   for (const parameter of parameters.values()) {
     const name = parameter.name as string;
-    if (parameter.in === 'path') proxyInputs.path.push(name);
-    if (parameter.in === 'query') {
-      proxyInputs.query.push(name);
-      if (hasUnsupportedQueryArray(parameter, properties[name])) {
-        problems.push({ kind: 'unsupported_input', scope: 'operation', location: 'query', name, reason: 'query_serialization' });
-      }
+    const location = parameter.in;
+    if (location !== 'path' && location !== 'query') continue;
+    proxyInputs[location].push(name);
+    if (unsupportedParameterSerialization(parameter, properties[name], location)) {
+      problems.push({ kind: 'unsupported_input', scope: 'operation', location, name, reason: `${location}_serialization` });
     }
   }
   return { inputSchema, proxyInputs };

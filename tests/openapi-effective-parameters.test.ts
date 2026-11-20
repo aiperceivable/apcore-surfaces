@@ -3,7 +3,12 @@ import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 import { Context, Registry } from 'apcore-js';
 import { Value } from '@sinclair/typebox/value';
-import { HTTPProxyRegistryWriter, OpenAPIScanner, readOpenApiProxyInputs } from '../src/index.js';
+import {
+  detectEffectiveProxyHazards,
+  HTTPProxyRegistryWriter,
+  OpenAPIScanner,
+  readOpenApiProxyInputs,
+} from '../src/index.js';
 
 const response = { 200: { description: 'OK' } };
 const parameter = (name: string, location: string, type: string, required = false) => ({
@@ -321,4 +326,123 @@ describe('effective OpenAPI parameters', () => {
       { url: '/items', body: '', contentType: 'application/json' },
     ]);
   });
+});
+
+it('reports unsupported effective parameter serialization in composed schemas', () => {
+  const spec = { openapi: '3.1.0', paths: {
+    '/labels/{name}/{parts}': { get: {
+      parameters: [
+        { ...parameter('name', 'path', 'string', true), style: 'label' },
+        { name: 'parts', in: 'path', required: true, schema: { oneOf: [{ type: 'array' }, { type: 'string' }] } },
+        { name: 'tags', in: 'query', explode: false, schema: { allOf: [{ type: 'array', items: { type: 'string' } }] } },
+        { name: 'filters', in: 'query', schema: { anyOf: [{ type: 'object' }, { type: 'string' }] } },
+        { name: 'nested', in: 'query', schema: { type: 'array', items: { anyOf: [{ type: 'object' }, { type: 'string' }] } } },
+        { name: 'split_tuple', in: 'query', schema: { allOf: [{ type: 'array' }, { prefixItems: [{ type: 'null' }] }] } },
+        { name: 'allowed', in: 'query', schema: { allOf: [{ type: 'array', items: { type: 'string' } }] } },
+        { ...parameter('count', 'query', 'integer'), explode: false },
+        { name: 'untyped', in: 'query', explode: false, schema: true },
+        { name: 'content_param', in: 'query', content: { 'application/json': { schema: { type: 'string' } } } },
+      ],
+      responses: response,
+    } },
+  } };
+  const modules = new OpenAPIScanner().scanWithEffectiveParameters(spec);
+  expect(detectEffectiveProxyHazards(modules).map(hazard => hazard.kind)).toEqual([
+    { code: 'parameter_resolution', problem: { kind: 'unsupported_input', scope: 'operation', name: 'name', location: 'path', reason: 'path_serialization' } },
+    { code: 'parameter_resolution', problem: { kind: 'unsupported_input', scope: 'operation', name: 'parts', location: 'path', reason: 'path_serialization' } },
+    { code: 'parameter_resolution', problem: { kind: 'unsupported_input', scope: 'operation', name: 'tags', location: 'query', reason: 'query_serialization' } },
+    { code: 'parameter_resolution', problem: { kind: 'unsupported_input', scope: 'operation', name: 'filters', location: 'query', reason: 'query_serialization' } },
+    { code: 'parameter_resolution', problem: { kind: 'unsupported_input', scope: 'operation', name: 'nested', location: 'query', reason: 'query_serialization' } },
+    { code: 'parameter_resolution', problem: { kind: 'unsupported_input', scope: 'operation', name: 'split_tuple', location: 'query', reason: 'query_serialization' } },
+    { code: 'parameter_resolution', problem: { kind: 'unsupported_input', scope: 'operation', name: 'untyped', location: 'query', reason: 'query_serialization' } },
+    { code: 'parameter_resolution', problem: { kind: 'unsupported_input', scope: 'operation', name: 'content_param', location: 'query', reason: 'query_serialization' } },
+  ]);
+});
+
+it('forwards literal OpenAPI colons and uses only brace placeholders', async () => {
+  const document = { openapi: '3.1.0', paths: {
+    '/inventory/{item}:search': { get: {
+      operationId: 'inventory_search',
+      parameters: [parameter('item', 'path', 'string', true)],
+      responses: response,
+    } },
+    '/inventory:search': { get: { operationId: 'static_search', responses: response } },
+  } };
+  const modules = new OpenAPIScanner().scanWithEffectiveParameters(document);
+  expect(detectEffectiveProxyHazards(modules)).toEqual([]);
+  const requests = await captureProxyRequests(async writer => {
+    const registry = new Registry();
+    expect(writer.write(modules, registry).every(result => result.verified)).toBe(true);
+    await registry.get('inventory_search')!.execute({ item: 'a/b' }, Context.create());
+    await registry.get('static_search')!.execute({}, Context.create());
+
+    const legacy = new Registry();
+    const legacyModules = new OpenAPIScanner().scan({ openapi: '3.1.0', paths: {
+      '/legacy/:item': { get: { parameters: [parameter('item', 'path', 'string', true)], responses: response } },
+    } });
+    expect(writer.write(legacyModules, legacy)[0].verified).toBe(true);
+    await legacy.get(legacyModules[0].moduleId)!.execute({ item: 'a/b' }, Context.create());
+  });
+  expect(requests.map(request => request.url)).toEqual([
+    '/inventory/a%2Fb:search', '/inventory:search', '/legacy/a%2Fb',
+  ]);
+});
+
+it.each(['https://example.invalid/absolute', '//example.invalid/network', 'relative-fixture', '/items?filter=x',
+  '/items#fragment', String.raw`/items\nested`, '/items/{id', '/items/{}'])('rejects invalid effective proxy path %s without exposing it', route => {
+  const [baseModule] = new OpenAPIScanner().scanWithEffectiveParameters({
+    openapi: '3.1.0', paths: { '/items': { get: { responses: response } } },
+  });
+  const module = { ...baseModule, metadata: { ...baseModule.metadata, url_path: route } };
+  const hazards = detectEffectiveProxyHazards([module]);
+  expect(hazards.map(({ urlPath, kind }) => ({ urlPath, kind }))).toEqual([
+    { urlPath: '?', kind: { code: 'missing_route_metadata', key: 'url_path' } },
+  ]);
+  const registry = new Registry();
+  const writer = new HTTPProxyRegistryWriter({ baseUrl: 'https://example.invalid' });
+  const [result] = writer.write([module], registry);
+  expect(result.verified).toBe(false);
+  expect(result.verificationError).not.toContain(route);
+  expect(registry.list()).toEqual([]);
+});
+
+it('redacts external references across effective scan diagnostics and warnings', () => {
+  const remote = 'https://example.invalid/parameters.json?marker=fixture-value';
+  const local = '#/components/parameters/Missing';
+  const scanner = new OpenAPIScanner();
+  const [module] = scanner.scanWithEffectiveParameters({ openapi: '3.1.0', paths: {
+    '/items': { get: { parameters: [{ $ref: remote }, { $ref: local }], responses: response } },
+  } });
+  expect(readOpenApiProxyInputs(module)?.problems).toMatchObject([
+    { reference: '<external-ref>', reason: 'expected a same-document JSON Pointer' },
+    { reference: local },
+  ]);
+  expect(JSON.stringify(module)).not.toContain('fixture-value');
+
+  const metadata = module.metadata.openapi as { proxy_inputs: { problems: unknown[] } };
+  metadata.proxy_inputs.problems[0] = {
+    kind: 'reference', scope: 'operation', index: 0, reference: remote, reason: remote,
+  };
+  expect(JSON.stringify(detectEffectiveProxyHazards([module]))).not.toContain('fixture-value');
+});
+
+it('refuses complex effective input to an otherwise scalar path or query at execution', async () => {
+  const [module] = new OpenAPIScanner().scanWithEffectiveParameters({
+    openapi: '3.1.0',
+    paths: { '/inventory/{id}': { get: {
+      parameters: [
+        { name: 'id', in: 'path', required: true, schema: true },
+        { name: 'filter', in: 'query', schema: true },
+      ],
+      responses: response,
+    } } },
+  });
+  const requests = await captureProxyRequests(async writer => {
+    const registry = new Registry();
+    expect(writer.write([module], registry)[0].verified).toBe(true);
+    const proxy = registry.get(module.moduleId)!;
+    await expect(proxy.execute({ id: ['one'] }, Context.create())).rejects.toThrow(/Path parameter "id"/);
+    await expect(proxy.execute({ id: 'one', filter: { color: 'red' } }, Context.create())).rejects.toThrow(/Query parameter "filter"/);
+  });
+  expect(requests).toEqual([]);
 });

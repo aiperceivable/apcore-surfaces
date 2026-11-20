@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.14.4] - Unreleased
+## [0.15.0] - Unreleased
 
 ### Added
 
@@ -14,6 +14,9 @@ All notable changes to this project will be documented in this file.
   fields used by the scanner, with per-operation resolution diagnostics.
   `proxyUsesJsonBody()` exposes the HTTP proxy writer's method decision.
   Existing calls to `scan()` retain their input contract.
+
+- Export shared effective OpenAPI proxy diagnostics and selected-module
+  validation for downstream adapters.
 
 ## [0.14.3] - 2026-11-19
 

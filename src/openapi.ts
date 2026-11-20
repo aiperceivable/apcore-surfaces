@@ -9,6 +9,12 @@ function isSchemaValue(value: unknown): value is SchemaValue {
     || (typeof value === "object" && value !== null && !Array.isArray(value));
 }
 
+/** A printable reference for effective OpenAPI diagnostics. */
+export function effectiveReferenceLabel(reference: unknown): string {
+  if (typeof reference !== 'string') return '<non-string>';
+  return reference.startsWith('#') ? reference : '<external-ref>';
+}
+
 /** Resolve a same-document URI fragment without assuming the target's type. */
 export function resolveLocalPointer(reference: string, doc: Record<string, unknown>): unknown {
   if (!reference.startsWith('#')) return undefined;

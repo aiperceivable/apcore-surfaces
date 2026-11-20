@@ -41,6 +41,12 @@ export {
   extractOutputSchema,
 } from '../openapi.js';
 export { readOpenApiProxyInputs } from '../openapi-parameters.js';
+export {
+  describeEffectiveProxyHazard, detectEffectiveProxyHazards, effectiveHazardToWire, validateEffectiveProxyModules,
+} from '../openapi-proxy-hazards.js';
+export type {
+  EffectiveProxyHazard, EffectiveProxyHazardKind, EffectiveProxyHazardWire, OpenApiInputLocation,
+} from '../openapi-proxy-hazards.js';
 export type { OpenApiParameterProblem, OpenApiParameterScope, OpenApiProxyInputs } from '../openapi-parameters.js';
 
 // ---- Serializers & formatting (pure) -------------------------------------
