@@ -54,6 +54,8 @@ pub mod formatting;
 pub mod http_verb_map;
 pub mod openapi;
 mod openapi_parameters;
+#[cfg(feature = "http-proxy")]
+mod openapi_proxy;
 pub mod openapi_scanner;
 pub mod output;
 pub mod resolve_target;
@@ -107,6 +109,11 @@ pub use tui_view_model::{
 };
 pub use types::{clone_module, create_scanned_module, ScannedModule};
 
+#[cfg(feature = "http-proxy")]
+pub use openapi_proxy::{
+    detect_effective_proxy_hazards, validate_effective_proxy_modules, EffectiveProxyHazard,
+    EffectiveProxyHazardKind, EffectiveProxyValidationError, OpenApiInputLocation,
+};
 #[cfg(feature = "http-proxy")]
 pub use openapi_scanner::{load_spec, load_spec_with_options, LoadSpecError, LoadSpecOptions};
 #[cfg(feature = "http-proxy")]

@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "apcore-toolkit"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "apcore",
  "async-trait",

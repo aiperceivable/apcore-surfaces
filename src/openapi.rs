@@ -50,6 +50,14 @@ pub(crate) fn resolve_local_pointer<'a>(
     document.pointer(&pointer).ok_or("pointer target not found")
 }
 
+pub(crate) fn display_effective_reference(reference: &str) -> &str {
+    if reference.starts_with('#') {
+        reference
+    } else {
+        "<external-ref>"
+    }
+}
+
 fn resolve_schema_reference(
     ref_string: &str,
     openapi_doc: &Value,
@@ -62,7 +70,7 @@ fn resolve_schema_reference(
             }
         }
         warn!(
-            ref_string,
+            ref_string = display_effective_reference(ref_string),
             "resolve_ref: pointer does not identify a schema"
         );
         return json!({});

@@ -19,7 +19,10 @@ use apcore::errors::ModuleError;
 use apcore::module::Module;
 use apcore::Registry;
 
-use crate::http_verb_map::{extract_path_param_names, substitute_path_params};
+use crate::http_verb_map::{
+    extract_openapi_path_param_names, extract_path_param_names, is_openapi_proxy_path,
+    substitute_openapi_path_params, substitute_path_params,
+};
 use crate::openapi_parameters::OpenApiProxyInputs;
 use crate::output::types::WriteResult;
 use crate::types::ScannedModule;
@@ -113,26 +116,12 @@ impl HTTPProxyRegistryWriter {
         let mut results: Vec<WriteResult> = Vec::new();
 
         for module in modules {
-            let (http_method, url_path) = get_http_fields(module);
-            let path_params = extract_path_param_names(&url_path);
-            let inputs = OpenApiProxyInputs::from_module(module).ok().flatten();
-            let required_json_body =
-                inputs.is_some() && OpenApiProxyInputs::requires_json_body(module);
-            let effective_query_names = inputs
-                .map(|inputs| inputs.query.into_iter().collect())
-                .unwrap_or_default();
-            let proxy = ProxyModule {
-                base_url: self.base_url.clone(),
-                http_method,
-                url_path,
-                path_params,
-                effective_query_names,
-                required_json_body,
-                input_schema: module.input_schema.clone(),
-                output_schema: module.output_schema.clone(),
-                description: module.description.clone(),
-                auth_header_factory: self.auth_header_factory.clone(),
-                client: self.client.clone(),
+            let proxy = match self.proxy_module(module) {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    results.push(WriteResult::failed(module.module_id.clone(), None, error));
+                    continue;
+                }
             };
 
             let descriptor = apcore::registry::registry::ModuleDescriptor {
@@ -171,15 +160,39 @@ impl HTTPProxyRegistryWriter {
 
         results
     }
-}
 
-/// Extract http_method and url_path from a ScannedModule's metadata.
-fn get_http_fields(module: &ScannedModule) -> (String, String) {
-    let (http_method, url_path) = http_proxy_route_metadata(module);
-    (
-        http_method.unwrap_or("GET").to_string(),
-        url_path.unwrap_or("/").to_string(),
-    )
+    fn proxy_module(&self, module: &ScannedModule) -> Result<ProxyModule, String> {
+        let inputs = OpenApiProxyInputs::from_module(module)
+            .map_err(|error| format!("effective input metadata is invalid: {error}"))?;
+        let effective_route = inputs.is_some();
+        let (http_method, url_path) = http_proxy_route_metadata(module);
+        if effective_route && !url_path.is_some_and(is_openapi_proxy_path) {
+            return Err("routing metadata is missing or invalid: 'url_path'".to_string());
+        }
+        let url_path = url_path.unwrap_or("/");
+        let path_params = if effective_route {
+            extract_openapi_path_param_names(url_path)
+        } else {
+            extract_path_param_names(url_path)
+        };
+        let effective_query_names = inputs
+            .map(|inputs| inputs.query.into_iter().collect())
+            .unwrap_or_default();
+        Ok(ProxyModule {
+            base_url: self.base_url.clone(),
+            http_method: http_method.unwrap_or("GET").to_string(),
+            url_path: url_path.to_string(),
+            path_params,
+            effective_route,
+            effective_query_names,
+            required_json_body: effective_route && OpenApiProxyInputs::requires_json_body(module),
+            input_schema: module.input_schema.clone(),
+            output_schema: module.output_schema.clone(),
+            description: module.description.clone(),
+            auth_header_factory: self.auth_header_factory.clone(),
+            client: self.client.clone(),
+        })
+    }
 }
 
 /// Read the explicit HTTP method and URL path used by the proxy writer.
@@ -247,8 +260,12 @@ pub fn proxy_uses_json_body(http_method: &str) -> bool {
 /// [`extract_path_param_names`] — the same function that already governs
 /// extraction and substitution — closes that gap and removes the second,
 /// divergent regex literal entirely.
-fn validate_path_params_filled(actual_path: &str) -> Result<(), String> {
-    let unfilled = extract_path_param_names(actual_path);
+fn validate_path_params_filled(actual_path: &str, effective_route: bool) -> Result<(), String> {
+    let unfilled = if effective_route {
+        extract_openapi_path_param_names(actual_path)
+    } else {
+        extract_path_param_names(actual_path)
+    };
     if unfilled.is_empty() {
         Ok(())
     } else {
@@ -320,6 +337,7 @@ struct ProxyModule {
     http_method: String,
     url_path: String,
     path_params: HashSet<String>,
+    effective_route: bool,
     effective_query_names: HashSet<String>,
     required_json_body: bool,
     input_schema: serde_json::Value,
@@ -337,6 +355,12 @@ fn append_query_value<'a>(
     value: &serde_json::Value,
     prefer_repeated_keys: bool,
 ) -> Result<(), ModuleError> {
+    if prefer_repeated_keys && value.is_object() {
+        return Err(ModuleError::new(
+            apcore::errors::ErrorCode::ModuleExecuteError,
+            format!("Query parameter '{name}' cannot forward an object"),
+        ));
+    }
     if let Some(items) = value.as_array().filter(|_| prefer_repeated_keys) {
         for item in items {
             if item.is_array() || item.is_object() || item.is_null() {
@@ -401,6 +425,14 @@ impl ProxyModule {
         if let Some(obj) = inputs.as_object() {
             for (key, value) in obj {
                 if self.path_params.contains(key) {
+                    if self.effective_route
+                        && (value.is_array() || value.is_object() || value.is_null())
+                    {
+                        return Err(ModuleError::new(
+                            apcore::errors::ErrorCode::ModuleExecuteError,
+                            format!("Path parameter '{key}' requires a string, number, or boolean"),
+                        ));
+                    }
                     let val_str = match value {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
@@ -419,16 +451,13 @@ impl ProxyModule {
             }
         }
 
-        // Use the shared, general-purpose substitution helper so both
-        // `{name}` and `:name` placeholder styles are filled in. A manual
-        // brace-only `.replace()` here previously left colon-style
-        // placeholders (e.g. `:id`) untouched even though their values
-        // were correctly extracted out of `inputs` above, causing every
-        // request against a colon-style route to fail path-param
-        // validation below.
-        let actual_path = substitute_path_params(&self.url_path, &path_param_values);
+        let actual_path = if self.effective_route {
+            substitute_openapi_path_params(&self.url_path, &path_param_values)
+        } else {
+            substitute_path_params(&self.url_path, &path_param_values)
+        };
 
-        if let Err(msg) = validate_path_params_filled(&actual_path) {
+        if let Err(msg) = validate_path_params_filled(&actual_path, self.effective_route) {
             return Err(ModuleError::new(
                 apcore::errors::ErrorCode::ModuleExecuteError,
                 msg,
@@ -614,9 +643,10 @@ mod tests {
             vec![],
             "app:func".into(),
         );
-        let (method, path) = get_http_fields(&module);
-        assert_eq!(method, "GET");
-        assert_eq!(path, "/");
+        let writer = HTTPProxyRegistryWriter::new("http://localhost".into(), None, 1.0).unwrap();
+        let proxy = writer.proxy_module(&module).unwrap();
+        assert_eq!(proxy.http_method, "GET");
+        assert_eq!(proxy.url_path, "/");
     }
 
     #[test]
@@ -637,9 +667,10 @@ mod tests {
             "url_path".into(),
             serde_json::Value::String("/users".into()),
         );
-        let (method, path) = get_http_fields(&module);
-        assert_eq!(method, "POST");
-        assert_eq!(path, "/users");
+        let writer = HTTPProxyRegistryWriter::new("http://localhost".into(), None, 1.0).unwrap();
+        let proxy = writer.proxy_module(&module).unwrap();
+        assert_eq!(proxy.http_method, "POST");
+        assert_eq!(proxy.url_path, "/users");
     }
 
     #[test]
@@ -724,17 +755,17 @@ mod tests {
 
     #[test]
     fn test_validate_path_params_filled_no_placeholders() {
-        assert!(validate_path_params_filled("/users/123/tasks/456").is_ok());
+        assert!(validate_path_params_filled("/users/123/tasks/456", false).is_ok());
     }
 
     #[test]
     fn test_validate_path_params_filled_static_path() {
-        assert!(validate_path_params_filled("/health").is_ok());
+        assert!(validate_path_params_filled("/health", false).is_ok());
     }
 
     #[test]
     fn test_validate_path_params_filled_unfilled_placeholder() {
-        let result = validate_path_params_filled("/users/{user_id}/tasks");
+        let result = validate_path_params_filled("/users/{user_id}/tasks", false);
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(
@@ -745,7 +776,7 @@ mod tests {
 
     #[test]
     fn test_validate_path_params_filled_multiple_unfilled() {
-        let result = validate_path_params_filled("/users/{user_id}/tasks/{task_id}");
+        let result = validate_path_params_filled("/users/{user_id}/tasks/{task_id}", false);
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(msg.contains("user_id") || msg.contains("task_id"), "{msg}");
@@ -761,7 +792,7 @@ mod tests {
     // flagged as unfilled.
     #[test]
     fn test_validate_path_params_filled_hyphenated_param_now_flagged() {
-        let result = validate_path_params_filled("/items/{item-id}");
+        let result = validate_path_params_filled("/items/{item-id}", false);
         assert!(
             result.is_err(),
             "a hyphenated unfilled path param must now be flagged (W1 fix)"
@@ -819,6 +850,7 @@ mod tests {
                 http_method: method.to_string(),
                 url_path: "/widgets".to_string(),
                 path_params: HashSet::new(),
+                effective_route: false,
                 effective_query_names: HashSet::new(),
                 required_json_body: false,
                 input_schema: json!({}),
@@ -900,6 +932,7 @@ mod tests {
             http_method: "GET".to_string(),
             url_path: "/users/:id".to_string(),
             path_params,
+            effective_route: false,
             effective_query_names: HashSet::new(),
             required_json_body: false,
             input_schema: json!({}),
@@ -941,6 +974,7 @@ mod tests {
             http_method: "TRACE".to_string(),
             url_path: "/widgets".to_string(),
             path_params: HashSet::new(),
+            effective_route: false,
             effective_query_names: HashSet::new(),
             required_json_body: false,
             input_schema: json!({}),

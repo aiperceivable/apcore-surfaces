@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0] - Unreleased
+
+### Added
+
+- Shared `detect_effective_proxy_hazards` and `validate_effective_proxy_modules`
+  APIs for hosts that need to diagnose the final OpenAPI selection before
+  registering HTTP proxies. They use the scanner's effective inputs and the
+  proxy writer's routing contract.
+
 ## [0.14.3] - Unreleased
 
 ### Added

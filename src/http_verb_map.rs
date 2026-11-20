@@ -43,6 +43,33 @@ static PATH_PARAM_NAMED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\{(?P<brace>[^}]+)\}|:(?P<colon>[a-zA-Z_]\w*)").expect("valid regex")
 });
 
+#[cfg(feature = "http-proxy")]
+static OPENAPI_PATH_PARAM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{(?P<brace>[^{}]+)\}").expect("valid OpenAPI path regex"));
+
+#[cfg(feature = "http-proxy")]
+pub(crate) fn is_openapi_proxy_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains(['?', '#', '\\'])
+        && OPENAPI_PATH_PARAM_RE
+            .split(path)
+            .all(|part| !part.contains(['{', '}']))
+}
+
+#[cfg(feature = "http-proxy")]
+pub(crate) fn extract_openapi_path_param_names(path: &str) -> HashSet<String> {
+    extract_names(path, &OPENAPI_PATH_PARAM_RE)
+}
+
+#[cfg(feature = "http-proxy")]
+pub(crate) fn substitute_openapi_path_params<V: AsRef<str>>(
+    path: &str,
+    values: &HashMap<&str, V>,
+) -> String {
+    substitute_with_pattern(path, values, &OPENAPI_PATH_PARAM_RE)
+}
+
 /// Check if a URL path contains path parameter placeholders.
 ///
 /// Detects both brace-style (`{param}`) and colon-style (`:param`) parameters,
@@ -146,8 +173,12 @@ pub fn resolve_http_verb(method: &str, path_has_params: bool) -> String {
 /// assert!(names.contains("m"));
 /// ```
 pub fn extract_path_param_names(path: &str) -> HashSet<String> {
+    extract_names(path, &PATH_PARAM_NAMED_RE)
+}
+
+fn extract_names(path: &str, pattern: &Regex) -> HashSet<String> {
     let mut names: HashSet<String> = HashSet::new();
-    for caps in PATH_PARAM_NAMED_RE.captures_iter(path) {
+    for caps in pattern.captures_iter(path) {
         if let Some(m) = caps.name("brace").or_else(|| caps.name("colon")) {
             names.insert(m.as_str().to_string());
         }
@@ -172,9 +203,17 @@ pub fn extract_path_param_names(path: &str) -> HashSet<String> {
 /// assert_eq!(substitute_path_params("/users/{id}", &values), "/users/42");
 /// ```
 pub fn substitute_path_params<V: AsRef<str>>(path: &str, values: &HashMap<&str, V>) -> String {
+    substitute_with_pattern(path, values, &PATH_PARAM_NAMED_RE)
+}
+
+fn substitute_with_pattern<V: AsRef<str>>(
+    path: &str,
+    values: &HashMap<&str, V>,
+    pattern: &Regex,
+) -> String {
     let mut result = String::with_capacity(path.len());
     let mut last = 0usize;
-    for caps in PATH_PARAM_NAMED_RE.captures_iter(path) {
+    for caps in pattern.captures_iter(path) {
         let whole = caps.get(0).expect("full match present");
         result.push_str(&path[last..whole.start()]);
         let name = caps

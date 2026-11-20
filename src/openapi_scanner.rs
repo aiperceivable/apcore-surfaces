@@ -36,8 +36,8 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::openapi::{
-    extract_input_schema, extract_output_schema_with_mode, resolve_local_pointer, resolve_ref,
-    SchemaReferenceMode,
+    display_effective_reference, extract_input_schema, extract_output_schema_with_mode,
+    resolve_local_pointer, resolve_ref, SchemaReferenceMode,
 };
 use crate::openapi_parameters::{effective_input_schema, OpenApiProxyInputs};
 use crate::scanner::{deduplicate_ids, filter_modules, infer_annotations_from_method};
@@ -245,7 +245,10 @@ fn ref_warnings(operation: &Value, spec: &Value, mode: SchemaReferenceMode) -> V
         }
         if mode == SchemaReferenceMode::Effective {
             if !r.starts_with('#') {
-                warnings.push(format!("external $ref not fetched: {r}"));
+                warnings.push(format!(
+                    "external $ref not fetched: {}",
+                    display_effective_reference(&r)
+                ));
             } else if !matches!(
                 resolve_local_pointer(&r, spec),
                 Ok(value) if value.is_object() || value.is_boolean()
@@ -1291,6 +1294,8 @@ mod tests {
 
     #[test]
     fn test_scan_effective_parameters_preserves_openapi_boolean_schemas() {
+        use crate::openapi_parameters::{OpenApiParameterProblem, OpenApiParameterScope};
+
         let spec = json!({
             "openapi": "3.1.0",
             "paths": {"/items": {
@@ -1346,7 +1351,15 @@ mod tests {
             inputs.query,
             ["allowed", "forbidden", "from_schema_ref", "nested"]
         );
-        assert!(inputs.problems.is_empty());
+        assert_eq!(
+            inputs.problems,
+            [OpenApiParameterProblem::UnsupportedInput {
+                scope: OpenApiParameterScope::Operation,
+                location: "query".into(),
+                name: "nested".into(),
+                reason: "query_serialization".into(),
+            }]
+        );
 
         let legacy = block_on(scanner.scan(&spec, &ScanOptions::new())).unwrap();
         assert_eq!(

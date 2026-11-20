@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::openapi::{
-    deep_resolve_schema_refs, extract_input_schema_from_parameters, resolve_local_pointer,
-    SchemaReferenceMode,
+    deep_resolve_schema_refs, display_effective_reference, extract_input_schema_from_parameters,
+    resolve_local_pointer, SchemaReferenceMode,
 };
 use crate::ScannedModule;
 
@@ -53,15 +53,23 @@ impl OpenApiProxyInputs {
                 "required_json_body must be a boolean",
             ));
         }
-        let inputs = Self::deserialize(value)?;
+        let mut inputs = Self::deserialize(value)?;
         if inputs.problems.iter().any(|problem| {
             matches!(problem, OpenApiParameterProblem::UnsupportedInput {scope, location, ..}
                 if *scope != OpenApiParameterScope::Operation
-                    || !matches!(location.as_str(), "body" | "query"))
+                    || !matches!(location.as_str(), "body" | "path" | "query"))
         }) {
             return Err(serde_json::Error::custom(
                 "invalid unsupported input problem",
             ));
+        }
+        for problem in &mut inputs.problems {
+            if let OpenApiParameterProblem::Reference { reference, .. } = problem {
+                let redacted = display_effective_reference(reference);
+                if reference != "<non-string>" && redacted != reference.as_str() {
+                    *reference = redacted.to_string();
+                }
+            }
         }
         Ok(inputs)
     }
@@ -180,11 +188,19 @@ pub(crate) fn effective_input_schema(
         problems,
     };
     for (&(name, location), parameter) in &parameters {
+        let parameter_schema = &schema["properties"][name];
         match location {
-            "path" => sources.path.push(name.to_string()),
+            "path" => {
+                sources.path.push(name.to_string());
+                if unsupported_path_parameter(parameter, parameter_schema) {
+                    sources
+                        .problems
+                        .push(unsupported_input("path", name, "path_serialization"));
+                }
+            }
             "query" => {
                 sources.query.push(name.to_string());
-                if unsupported_query_array(parameter, &schema["properties"][name]) {
+                if unsupported_query_parameter(parameter, parameter_schema) {
                     sources
                         .problems
                         .push(unsupported_input("query", name, "query_serialization"));
@@ -209,19 +225,70 @@ fn unsupported_input(location: &str, name: &str, reason: &str) -> OpenApiParamet
     }
 }
 
-fn unsupported_query_array(parameter: &Value, schema: &Value) -> bool {
-    if !schema_has_type(schema, "array") {
-        return false;
+fn unsupported_path_parameter(parameter: &Value, schema: &Value) -> bool {
+    parameter
+        .get("style")
+        .is_some_and(|style| style != "simple")
+        || parameter.get("content").is_some()
+        || any_schema_branch(schema, &|branch| {
+            schema_has_type(branch, "object") || schema_has_type(branch, "array")
+        })
+}
+
+fn unsupported_query_parameter(parameter: &Value, schema: &Value) -> bool {
+    if parameter.get("style").is_some_and(|style| style != "form")
+        || parameter.get("content").is_some()
+        || any_schema_branch(schema, &|branch| schema_has_type(branch, "object"))
+    {
+        return true;
     }
-    let custom_style = parameter.get("style").is_some_and(|style| style != "form");
     let non_exploded = parameter
         .get("explode")
         .is_some_and(|explode| explode != true);
-    let items = &schema["items"];
-    custom_style
-        || non_exploded
-        || schema_has_type(items, "object")
-        || schema_has_type(items, "array")
+    if non_exploded && !declares_scalar_type(schema) {
+        return true;
+    }
+    any_schema_branch(schema, &|branch| schema_has_type(branch, "array"))
+        && any_schema_branch(schema, &unsupported_array_items)
+}
+
+fn declares_scalar_type(schema: &Value) -> bool {
+    let scalar = |value: &Value| {
+        matches!(
+            value.as_str(),
+            Some("string" | "number" | "integer" | "boolean")
+        )
+    };
+    let kind = &schema["type"];
+    scalar(kind)
+        || kind
+            .as_array()
+            .is_some_and(|types| !types.is_empty() && types.iter().all(scalar))
+}
+
+fn unsupported_array_items(schema: &Value) -> bool {
+    let unsupported_item = |item: &Value| {
+        any_schema_branch(item, &|branch| {
+            schema_has_type(branch, "object")
+                || schema_has_type(branch, "array")
+                || schema_has_type(branch, "null")
+        })
+    };
+    schema.get("items").is_some_and(unsupported_item)
+        || schema
+            .get("prefixItems")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(unsupported_item))
+}
+
+fn any_schema_branch(schema: &Value, predicate: &impl Fn(&Value) -> bool) -> bool {
+    predicate(schema)
+        || ["allOf", "anyOf", "oneOf"].iter().any(|keyword| {
+            schema
+                .get(*keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| any_schema_branch(item, predicate)))
+        })
 }
 
 fn schema_has_type(schema: &Value, name: &str) -> bool {
@@ -334,7 +401,8 @@ fn resolve_object<'a>(
         if !seen.insert(reference) {
             return Err((reference, cycle_error));
         }
-        value = resolve_local_pointer(reference, spec).map_err(|reason| (reference, reason))?;
+        value = resolve_local_pointer(reference, spec)
+            .map_err(|reason| (display_effective_reference(reference), reason))?;
         if !value.is_object() {
             return Err((reference, "pointer does not identify an object"));
         }
