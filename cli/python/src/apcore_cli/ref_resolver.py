@@ -1,0 +1,184 @@
+"""$ref resolution and schema composition (FE-02)."""
+
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+
+class RefResolverError(Exception):
+    """Base class for $ref resolution errors."""
+
+
+class CircularRefError(RefResolverError):
+    """Raised when a circular $ref is detected."""
+
+
+class UnresolvableRefError(RefResolverError):
+    """Raised when a $ref target cannot be found."""
+
+
+class MaxDepthExceededError(RefResolverError):
+    """Raised when $ref resolution depth exceeds the configured maximum."""
+
+
+def resolve_refs(schema: dict, max_depth: int = 32, module_id: str = "") -> dict:
+    """Resolve all $ref references in a JSON Schema.
+
+    Returns a fully inlined schema with $defs/definitions removed.
+    """
+    schema = copy.deepcopy(schema)
+    defs = schema.get("$defs", schema.get("definitions", {}))
+    result = _resolve_node(schema, defs, visited=set(), depth=0, max_depth=max_depth, module_id=module_id)
+
+    # Remove definition keys
+    result.pop("$defs", None)
+    result.pop("definitions", None)
+    return result
+
+
+def _resolve_node(
+    node: Any,
+    defs: dict,
+    visited: set,
+    depth: int,
+    max_depth: int,
+    module_id: str = "",
+) -> Any:
+    """Recursively resolve $ref, allOf, anyOf, oneOf in a schema node."""
+    if not isinstance(node, dict):
+        return node
+
+    # Handle $ref
+    if "$ref" in node:
+        ref_path = node["$ref"]
+
+        if depth >= max_depth:
+            raise MaxDepthExceededError(
+                f"$ref resolution depth exceeded maximum of {max_depth} for module '{module_id}'."
+            )
+
+        if ref_path in visited:
+            raise CircularRefError(f"Circular $ref detected in schema for module '{module_id}' at path '{ref_path}'.")
+
+        # Parse ref target: extract key from "#/$defs/Address" → "Address"
+        parts = ref_path.split("/")
+        key = parts[-1]
+
+        if key not in defs:
+            raise UnresolvableRefError(f"Unresolvable $ref '{ref_path}' in schema for module '{module_id}'.")
+
+        # D11-002: per-chain mutable visited set (matching Rust). Add on the
+        # way down, remove on the way out so sibling subtrees that reference
+        # the same $def don't see a stale "already visited" entry.
+        visited.add(ref_path)
+        try:
+            return _resolve_node(defs[key], defs, visited, depth + 1, max_depth, module_id)
+        finally:
+            visited.discard(ref_path)
+
+    # Handle allOf
+    if "allOf" in node:
+        merged: dict[str, Any] = {"properties": {}, "required": []}
+        # Merge sibling properties/required from the composing node itself first
+        # so the composition branches can extend (not overwrite) them.
+        if isinstance(node.get("properties"), dict):
+            merged["properties"].update(node["properties"])
+        if isinstance(node.get("required"), list):
+            merged["required"].extend(node["required"])
+        for sub_schema in node["allOf"]:
+            resolved = _resolve_node(sub_schema, defs, visited, depth + 1, max_depth, module_id)
+            if "properties" in resolved:
+                merged["properties"].update(resolved["properties"])
+            if "required" in resolved:
+                merged["required"].extend(resolved["required"])
+        # Dedup `required` while preserving first-seen order. Cross-SDK parity
+        # with TS ref-resolver.ts (`new Set`) and Rust merge_allof (post-merge
+        # dedup). Audit D9-NEW-002 (2026-05-08).
+        seen_req: set[str] = set()
+        deduped_req: list[str] = []
+        for r in merged["required"]:
+            if r not in seen_req:
+                seen_req.add(r)
+                deduped_req.append(r)
+        merged["required"] = deduped_req
+        # Copy remaining non-composition keys (skip already-handled ones)
+        for k, v in node.items():
+            if k not in ("allOf", "properties", "required") and k not in merged:
+                merged[k] = v
+        return merged
+
+    # Handle anyOf / oneOf
+    for keyword in ("anyOf", "oneOf"):
+        if keyword in node:
+            merged = {"properties": {}, "required": []}
+            # Merge sibling properties from the composing node first.
+            if isinstance(node.get("properties"), dict):
+                merged["properties"].update(node["properties"])
+            sibling_required: list[str] = list(node["required"]) if isinstance(node.get("required"), list) else []
+            all_required_sets: list[set[str]] = []
+            resolved_branches: list[dict] = []
+            for sub_schema in node[keyword]:
+                resolved = _resolve_node(sub_schema, defs, visited, depth + 1, max_depth, module_id)
+                resolved_branches.append(resolved)
+                if "properties" in resolved:
+                    merged["properties"].update(resolved["properties"])
+                if "required" in resolved:
+                    all_required_sets.append(set(resolved["required"]))
+            # Required = sibling required ∪ intersection of all branches
+            branch_required = list(set.intersection(*all_required_sets)) if all_required_sets else []
+            seen: set[str] = set()
+            combined_required: list[str] = []
+            for r in sibling_required + branch_required:
+                if r not in seen:
+                    seen.add(r)
+                    combined_required.append(r)
+            merged["required"] = combined_required
+            # Copy remaining non-composition keys
+            for k, v in node.items():
+                if k not in (keyword, "properties", "required") and k not in merged:
+                    merged[k] = v
+            # Pydantic v2 emits Optional[X] as {"anyOf": [<X-schema>, {"type": "null"}]}.
+            # The branch merge above copies properties but never the scalar `type` from
+            # branches, so Optional[str]/Optional[int]/etc. lose their type entirely.
+            # Recover it: if the merged result has no `type`, pick the type of the first
+            # non-null branch (ignoring {"type": "null"} sentinels).
+            if "type" not in merged:
+                for branch in resolved_branches:
+                    branch_type = branch.get("type")
+                    if isinstance(branch_type, str) and branch_type != "null":
+                        merged["type"] = branch_type
+                        break
+                    if isinstance(branch_type, list):
+                        # JSON Schema list-form type (e.g. ["string", "null"]):
+                        # recover the first non-null string so downstream never
+                        # sees an unhashable list type.
+                        recovered = next(
+                            (t for t in branch_type if isinstance(t, str) and t != "null"),
+                            None,
+                        )
+                        if recovered is not None:
+                            merged["type"] = recovered
+                            break
+            return merged
+
+    # Recursively process every dict-valued child of this node.
+    # Audit D11-001 (2026-05-12): previously only `properties` was walked, leaving
+    # $ref unresolved under `items`, `additionalProperties`, `patternProperties`,
+    # `if`/`then`/`else`, `not`, `contains`, `propertyNames`, etc. Cross-SDK
+    # parity with TypeScript ref-resolver.ts:210 and Rust ref_resolver.rs:343,
+    # both of which iterate every object child.
+    #
+    # Audit D11-NEW-003 (2026-05-08): max_depth counts $ref hops only — plain
+    # nested-schema recursion does NOT increment `depth`. Previously
+    # incrementing here caused valid deeply-nested schemas to be rejected even
+    # when no $ref chain existed. Aligned with Rust's interpretation of the
+    # spec ("Maximum $ref resolution recursion depth", schema-parser.md
+    # §Contract).
+    for k, v in node.items():
+        if k in ("$ref", "allOf", "anyOf", "oneOf"):
+            continue
+        if isinstance(v, dict):
+            node[k] = _resolve_node(v, defs, visited, depth, max_depth, module_id)
+
+    return node

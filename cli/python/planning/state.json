@@ -1,0 +1,100 @@
+{
+  "project": "apcore-cli-python",
+  "source": "../apcore-cli",
+  "created": "2026-03-14",
+  "features": {
+    "config-resolver": {
+      "status": "completed",
+      "plan": "config-resolver.md",
+      "priority": "P0",
+      "depends_on": []
+    },
+    "core-dispatcher": {
+      "status": "completed",
+      "plan": "core-dispatcher.md",
+      "priority": "P0",
+      "depends_on": ["config-resolver"]
+    },
+    "schema-parser": {
+      "status": "completed",
+      "plan": "schema-parser.md",
+      "priority": "P0",
+      "depends_on": ["core-dispatcher"]
+    },
+    "output-formatter": {
+      "status": "completed",
+      "plan": "output-formatter.md",
+      "priority": "P1",
+      "depends_on": ["core-dispatcher"]
+    },
+    "discovery": {
+      "status": "completed",
+      "plan": "discovery.md",
+      "priority": "P1",
+      "depends_on": ["core-dispatcher", "output-formatter"]
+    },
+    "approval-gate": {
+      "status": "completed",
+      "plan": "approval-gate.md",
+      "priority": "P1",
+      "depends_on": ["schema-parser"]
+    },
+    "security-manager": {
+      "status": "completed",
+      "plan": "security-manager.md",
+      "priority": "P1",
+      "depends_on": ["config-resolver"]
+    },
+    "shell-integration": {
+      "status": "completed",
+      "plan": "shell-integration.md",
+      "priority": "P2",
+      "depends_on": ["core-dispatcher", "schema-parser"]
+    },
+    "grouped-commands": {
+      "status": "completed",
+      "plan": "grouped-commands.md",
+      "priority": "P0",
+      "depends_on": ["core-dispatcher", "discovery", "output-formatter", "shell-integration"],
+      "tasks": {
+        "task-1-resolve-group": "completed",
+        "task-2-build-group-map": "completed",
+        "task-3-list-get-command": "completed",
+        "task-4-lazy-group": "completed",
+        "task-5-format-help": "completed",
+        "task-6-wire-create-cli": "completed",
+        "task-7-discovery-grouped": "completed",
+        "task-8-shell-completion": "completed",
+        "task-9-e2e-integration": "completed"
+      }
+    },
+    "exposure-filtering": {
+      "status": "completed",
+      "plan": "exposure-filtering.md",
+      "priority": "P1",
+      "depends_on": ["core-dispatcher", "grouped-commands", "config-resolver", "discovery"],
+      "tasks": {
+        "task-1-glob-match": "completed",
+        "task-2-exposure-filter": "completed",
+        "task-3-from-config": "completed",
+        "task-4-wire-grouped-module-group": "completed",
+        "task-5-wire-create-cli": "completed",
+        "task-6-config-resolver": "completed",
+        "task-7-list-exposure-option": "completed",
+        "task-8-e2e-integration": "completed"
+      }
+    }
+  },
+  "implementation_order": [
+    "config-resolver",
+    "core-dispatcher",
+    "schema-parser",
+    "output-formatter",
+    "discovery",
+    "approval-gate",
+    "security-manager",
+    "shell-integration",
+    "grouped-commands",
+    "exposure-filtering"
+  ]
+}

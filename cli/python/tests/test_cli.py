@@ -1,0 +1,1485 @@
+"""Tests for Core Dispatcher (FE-01)."""
+
+import logging
+from unittest.mock import MagicMock
+
+import click
+import pytest
+
+from apcore_cli.cli import (
+    GroupedModuleGroup,
+    LazyModuleGroup,
+    _LazyGroup,
+    build_module_command,
+    collect_input,
+    validate_module_id,
+)
+
+
+def _make_mock_registry(module_ids=None, raise_on_list=False):
+    """Create a mock Registry with configurable module list."""
+    registry = MagicMock()
+    if raise_on_list:
+        registry.list.side_effect = RuntimeError("Registry error")
+    else:
+        registry.list.return_value = module_ids or []
+    return registry
+
+
+def _make_mock_executor(result=None):
+    """Create a mock Executor."""
+    executor = MagicMock()
+    executor.call.return_value = result
+    return executor
+
+
+def _make_mock_module_def(module_id="math.add", description="Add two numbers."):
+    """Create a mock ModuleDefinition."""
+    module_def = MagicMock()
+    module_def.module_id = module_id
+    module_def.description = description
+    module_def.input_schema = {"properties": {}, "required": []}
+    module_def.annotations = None
+    module_def.tags = []
+    return module_def
+
+
+class TestLazyModuleGroupSkeleton:
+    """Task 1: LazyModuleGroup init and list_commands."""
+
+    def test_lazy_module_group_init(self):
+        registry = _make_mock_registry()
+        executor = _make_mock_executor()
+        group = LazyModuleGroup(
+            registry=registry,
+            executor=executor,
+            name="apcore-cli",
+        )
+        assert group._registry is registry
+        assert group._executor is executor
+        assert group._module_cache == {}
+
+    def test_list_commands_returns_registered(self):
+        """FE-13: built-in commands live under the `apcli` group at runtime,
+        not as root-level entries on LazyModuleGroup itself. list_commands
+        returns whatever was registered via add_command."""
+        registry = _make_mock_registry()
+        executor = _make_mock_executor()
+        group = LazyModuleGroup(
+            registry=registry,
+            executor=executor,
+            name="apcore-cli",
+        )
+        # Simulate the factory registering the `apcli` group.
+        apcli = click.Group("apcli")
+        group.add_command(apcli)
+        ctx = click.Context(group)
+        commands = group.list_commands(ctx)
+        assert "apcli" in commands
+
+    def test_list_commands_includes_modules(self):
+        registry = _make_mock_registry(["math.add", "text.summarize"])
+        executor = _make_mock_executor()
+        group = LazyModuleGroup(
+            registry=registry,
+            executor=executor,
+            name="apcore-cli",
+        )
+        ctx = click.Context(group)
+        commands = group.list_commands(ctx)
+        assert "math.add" in commands
+        assert "text.summarize" in commands
+
+    def test_list_commands_registry_error(self):
+        """When registry.list() fails, list_commands degrades gracefully
+        and returns whatever was already registered instead of crashing."""
+        registry = _make_mock_registry(raise_on_list=True)
+        executor = _make_mock_executor()
+        group = LazyModuleGroup(
+            registry=registry,
+            executor=executor,
+            name="apcore-cli",
+        )
+        apcli = click.Group("apcli")
+        group.add_command(apcli)
+        ctx = click.Context(group)
+        commands = group.list_commands(ctx)
+        assert "apcli" in commands  # registered command survives the error
+
+
+class TestGetCommandAndBuild:
+    """Task 2: get_command and build_module_command."""
+
+    def test_get_command_builtin(self):
+        registry = _make_mock_registry()
+        executor = _make_mock_executor()
+        group = LazyModuleGroup(registry=registry, executor=executor, name="apcore-cli")
+        # Register a dummy built-in
+        dummy_cmd = click.Command("list", callback=lambda: None)
+        group.add_command(dummy_cmd)
+        ctx = click.Context(group)
+        result = group.get_command(ctx, "list")
+        assert result is dummy_cmd
+
+    def test_get_command_module(self):
+        module_def = _make_mock_module_def()
+        registry = _make_mock_registry(["math.add"])
+        registry.get_definition.return_value = module_def
+        executor = _make_mock_executor()
+        group = LazyModuleGroup(registry=registry, executor=executor, name="apcore-cli")
+        ctx = click.Context(group)
+        result = group.get_command(ctx, "math.add")
+        assert result is not None
+        assert result.name == "math.add"
+
+    def test_get_command_not_found(self):
+        registry = _make_mock_registry()
+        registry.get_definition.return_value = None
+        executor = _make_mock_executor()
+        group = LazyModuleGroup(registry=registry, executor=executor, name="apcore-cli")
+        ctx = click.Context(group)
+        result = group.get_command(ctx, "nonexistent")
+        assert result is None
+
+    def test_get_command_caches_module(self):
+        module_def = _make_mock_module_def()
+        registry = _make_mock_registry(["math.add"])
+        registry.get_definition.return_value = module_def
+        executor = _make_mock_executor()
+        group = LazyModuleGroup(registry=registry, executor=executor, name="apcore-cli")
+        ctx = click.Context(group)
+        first = group.get_command(ctx, "math.add")
+        second = group.get_command(ctx, "math.add")
+        assert first is second
+        # get_definition should only be called once
+        assert registry.get_definition.call_count == 1
+
+    def test_build_module_command_creates_command(self):
+        module_def = _make_mock_module_def(module_id="math.add", description="Add two numbers.")
+        executor = _make_mock_executor()
+        cmd = build_module_command(module_def, executor)
+        assert isinstance(cmd, click.Command)
+        assert cmd.name == "math.add"
+        assert cmd.help == "Add two numbers."
+
+
+class TestCollectInput:
+    """Task 3: STDIN JSON handling."""
+
+    def test_collect_input_no_stdin(self):
+        result = collect_input(None, {"a": 5, "b": None})
+        assert result == {"a": 5}
+
+    def test_collect_input_stdin_valid_json(self, monkeypatch):
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO('{"a": 5, "b": 10}'))
+        result = collect_input("-", {})
+        assert result == {"a": 5, "b": 10}
+
+    def test_collect_input_stdin_cli_overrides(self, monkeypatch):
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO('{"a": 5}'))
+        result = collect_input("-", {"a": 99})
+        assert result == {"a": 99}
+
+    def test_collect_input_stdin_exceeds_limit(self, monkeypatch):
+        import io
+
+        large_data = '{"x": "' + "a" * (11 * 1024 * 1024) + '"}'
+        monkeypatch.setattr("sys.stdin", io.StringIO(large_data))
+        with pytest.raises(SystemExit) as exc_info:
+            collect_input("-", {}, large_input=False)
+        assert exc_info.value.code == 2
+
+    def test_collect_input_stdin_large_input_allowed(self, monkeypatch):
+        import io
+
+        large_data = '{"x": "' + "a" * (11 * 1024 * 1024) + '"}'
+        monkeypatch.setattr("sys.stdin", io.StringIO(large_data))
+        result = collect_input("-", {}, large_input=True)
+        assert "x" in result
+
+    def test_collect_input_stdin_invalid_json(self, monkeypatch):
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+        with pytest.raises(SystemExit) as exc_info:
+            collect_input("-", {})
+        assert exc_info.value.code == 2
+
+    def test_collect_input_stdin_not_object(self, monkeypatch):
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO("[1, 2, 3]"))
+        with pytest.raises(SystemExit) as exc_info:
+            collect_input("-", {})
+        assert exc_info.value.code == 2
+
+    def test_collect_input_stdin_empty(self, monkeypatch):
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+        result = collect_input("-", {})
+        assert result == {}
+
+    # W1: --input file-path form.
+
+    def test_collect_input_reads_json_file(self, tmp_path):
+        """W1: non-'-' value is treated as a file path and parsed as JSON."""
+        f = tmp_path / "payload.json"
+        f.write_text('{"a": 1, "b": "x"}')
+        result = collect_input(str(f), {})
+        assert result == {"a": 1, "b": "x"}
+
+    def test_collect_input_file_cli_overrides(self, tmp_path):
+        """W1: CLI kwargs still override file keys, matching stdin semantics."""
+        f = tmp_path / "payload.json"
+        f.write_text('{"a": 1, "b": "x"}')
+        result = collect_input(str(f), {"a": 99})
+        assert result == {"a": 99, "b": "x"}
+
+    def test_collect_input_file_missing_exits_2(self, tmp_path):
+        """W1: missing file must emit a clear error and exit 2 (not stacktrace)."""
+        with pytest.raises(SystemExit) as exc_info:
+            collect_input(str(tmp_path / "does-not-exist.json"), {})
+        assert exc_info.value.code == 2
+
+    def test_collect_input_file_invalid_json_exits_2(self, tmp_path):
+        f = tmp_path / "bad.json"
+        f.write_text("{not json")
+        with pytest.raises(SystemExit) as exc_info:
+            collect_input(str(f), {})
+        assert exc_info.value.code == 2
+
+    def test_collect_input_file_non_object_exits_2(self, tmp_path):
+        f = tmp_path / "arr.json"
+        f.write_text("[1, 2, 3]")
+        with pytest.raises(SystemExit) as exc_info:
+            collect_input(str(f), {})
+        assert exc_info.value.code == 2
+
+    def test_collect_input_file_size_cap(self, tmp_path):
+        """W1: file path is subject to the same 10 MB cap as STDIN."""
+        f = tmp_path / "big.json"
+        f.write_text('{"x": "' + "a" * (11 * 1024 * 1024) + '"}')
+        with pytest.raises(SystemExit) as exc_info:
+            collect_input(str(f), {}, large_input=False)
+        assert exc_info.value.code == 2
+
+    def test_collect_input_file_size_cap_bypassed_by_large_input(self, tmp_path):
+        f = tmp_path / "big.json"
+        f.write_text('{"x": "' + "a" * (11 * 1024 * 1024) + '"}')
+        result = collect_input(str(f), {}, large_input=True)
+        assert "x" in result
+
+
+class TestValidateModuleId:
+    """Task 4: Module ID validation."""
+
+    def test_validate_module_id_valid(self):
+        for mid in ["math.add", "text.summarize", "a", "a.b.c"]:
+            validate_module_id(mid)  # Should not raise
+
+    def test_validate_module_id_too_long(self):
+        # PROTOCOL_SPEC §2.7 — bumped from 128 to 192 in spec 1.6.0-draft.
+        long_id = "a" * 193
+        with pytest.raises(SystemExit) as exc_info:
+            validate_module_id(long_id)
+        assert exc_info.value.code == 2
+
+    def test_validate_module_id_invalid_format(self):
+        for mid in ["INVALID!ID", "123abc", ".leading.dot", "a..b", "a."]:
+            with pytest.raises(SystemExit) as exc_info:
+                validate_module_id(mid)
+            assert exc_info.value.code == 2, f"Expected exit 2 for '{mid}'"
+
+    def test_validate_module_id_max_length(self):
+        # PROTOCOL_SPEC §2.7 — bumped from 128 to 192 in spec 1.6.0-draft.
+        max_id = "a" * 192
+        validate_module_id(max_id)  # Should not raise
+
+    def test_max_module_id_length_constant_is_192(self):
+        """Conformance: apcore.MAX_MODULE_ID_LENGTH must equal 192 (spec 1.6.0-draft §2.7)."""
+        try:
+            from apcore.registry.registry import MAX_MODULE_ID_LENGTH
+
+            assert MAX_MODULE_ID_LENGTH == 192, (
+                f"Expected MAX_MODULE_ID_LENGTH=192, got {MAX_MODULE_ID_LENGTH}. "
+                "Update validate_module_id() if apcore changes the limit."
+            )
+        except ImportError:
+            pytest.skip("apcore not installed — skipping MAX_MODULE_ID_LENGTH constant check")
+
+    def test_validate_module_id_192_accepted_129_not_special(self):
+        """A 192-char ID must be accepted; a 193-char ID must be rejected."""
+        # 192 chars: accepted
+        validate_module_id("a" * 192)  # must not raise
+        # 193 chars: rejected (over the limit)
+        with pytest.raises(SystemExit) as exc_info:
+            validate_module_id("a" * 193)
+        assert exc_info.value.code == 2
+
+
+class TestMainEntryPoint:
+    """Task 5: main() entry point and CLI integration."""
+
+    def test_main_help_flag(self, tmp_path):
+        from click.testing import CliRunner
+
+        from apcore_cli.__main__ import create_cli
+
+        runner = CliRunner()
+        result = runner.invoke(create_cli(extensions_dir=str(tmp_path)), ["--help"])
+        assert result.exit_code == 0
+        assert "apcore-cli" in result.output.lower() or "apcore" in result.output.lower()
+
+    def test_main_version_flag(self, tmp_path):
+        # Issue #18: --version is opt-in. When the host application passes
+        # `version=` to create_cli(), `-V/--version` prints that string. When
+        # version is omitted, the flag is not registered at all.
+        from click.testing import CliRunner
+
+        from apcore_cli import __version__
+        from apcore_cli.__main__ import create_cli
+
+        runner = CliRunner()
+        cli_with_version = create_cli(
+            extensions_dir=str(tmp_path),
+            prog_name="apcore-cli",
+            version=__version__,
+        )
+        result = runner.invoke(cli_with_version, ["--version"])
+        assert result.exit_code == 0
+        assert "apcore-cli" in result.output
+        assert __version__ in result.output
+
+        # When version is not supplied, --version is unrecognised (issue #18).
+        cli_without_version = create_cli(
+            extensions_dir=str(tmp_path),
+            prog_name="apcore-cli",
+        )
+        result_no_version = runner.invoke(cli_without_version, ["--version"])
+        assert result_no_version.exit_code != 0
+
+    def test_main_extensions_dir_not_found(self):
+        import pytest
+
+        from apcore_cli.__main__ import create_cli
+
+        with pytest.raises(SystemExit) as exc_info:
+            create_cli(extensions_dir="/nonexistent/path")
+        assert exc_info.value.code == 47
+
+    def test_main_extensions_dir_valid(self, tmp_path):
+        from click.testing import CliRunner
+
+        from apcore_cli.__main__ import create_cli
+
+        # Create a minimal extensions dir
+        (tmp_path / "apcore.yaml").write_text("modules: {}\n")
+        runner = CliRunner()
+        result = runner.invoke(
+            create_cli(extensions_dir=str(tmp_path)),
+            ["--help"],
+        )
+        assert result.exit_code == 0
+
+    def test_log_level_flag_takes_effect(self, tmp_path):
+        import logging
+
+        from click.testing import CliRunner
+
+        from apcore_cli.__main__ import create_cli
+
+        original_level = logging.getLogger().level
+        try:
+            runner = CliRunner()
+            cli = create_cli(extensions_dir=str(tmp_path), prog_name="apcore-cli")
+            # Use a real subcommand — --help is an eager flag that exits before the callback runs
+            result = runner.invoke(cli, ["--log-level", "DEBUG", "apcli", "completion", "bash"])
+            assert result.exit_code == 0
+            # After invoking with --log-level DEBUG the root logger level should be DEBUG
+            assert logging.getLogger().level == logging.DEBUG
+        finally:
+            logging.getLogger().setLevel(original_level)
+
+    def test_apcore_logging_level_env_var(self, tmp_path, monkeypatch):
+        import logging
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("APCORE_LOGGING_LEVEL", "INFO")
+        from apcore_cli.__main__ import create_cli
+
+        runner = CliRunner()
+        cli = create_cli(extensions_dir=str(tmp_path), prog_name="apcore-cli")
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        # INFO level means apcore logger should NOT be silenced to ERROR
+        assert logging.getLogger("apcore").level != logging.ERROR
+
+    def test_cli_logging_level_takes_priority_over_global(self, tmp_path, monkeypatch):
+        import logging
+
+        from click.testing import CliRunner
+
+        from apcore_cli.__main__ import create_cli
+
+        original_level = logging.getLogger().level
+        try:
+            # Global says ERROR, CLI-specific says DEBUG — CLI-specific must win
+            monkeypatch.setenv("APCORE_LOGGING_LEVEL", "ERROR")
+            monkeypatch.setenv("APCORE_CLI_LOGGING_LEVEL", "DEBUG")
+            cli = create_cli(extensions_dir=str(tmp_path), prog_name="apcore-cli")
+            runner = CliRunner()
+            result = runner.invoke(cli, ["apcli", "completion", "bash"])
+            assert result.exit_code == 0
+            assert logging.getLogger().level == logging.DEBUG
+        finally:
+            logging.getLogger().setLevel(original_level)
+
+    def test_cli_logging_level_fallback_to_global(self, tmp_path, monkeypatch):
+        import logging
+
+        from click.testing import CliRunner
+
+        from apcore_cli.__main__ import create_cli
+
+        # CLI-specific not set — must fall back to global
+        monkeypatch.delenv("APCORE_CLI_LOGGING_LEVEL", raising=False)
+        monkeypatch.setenv("APCORE_LOGGING_LEVEL", "INFO")
+        cli = create_cli(extensions_dir=str(tmp_path), prog_name="apcore-cli")
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert logging.getLogger("apcore").level != logging.ERROR
+
+
+class TestExecCallback:
+    """Task 6: Module execution callback."""
+
+    def test_exec_module_success(self):
+        from click.testing import CliRunner
+
+        module_def = _make_mock_module_def()
+        executor = _make_mock_executor(result={"sum": 15})
+        cmd = build_module_command(module_def, executor)
+        runner = CliRunner()
+        result = runner.invoke(cmd, [])
+        assert result.exit_code == 0
+        assert "15" in result.output
+
+    def test_exec_module_not_found(self):
+        from apcore.errors import ModuleNotFoundError as ApModNotFound
+        from click.testing import CliRunner
+
+        module_def = _make_mock_module_def()
+        executor = _make_mock_executor()
+        executor.call.side_effect = ApModNotFound(module_id="math.add")
+        cmd = build_module_command(module_def, executor)
+        runner = CliRunner()
+        result = runner.invoke(cmd, [])
+        assert result.exit_code == 44
+
+    def test_exec_module_validation_error(self):
+        from apcore.errors import SchemaValidationError
+        from click.testing import CliRunner
+
+        module_def = _make_mock_module_def()
+        executor = _make_mock_executor()
+        executor.call.side_effect = SchemaValidationError(message="missing field 'a'")
+        cmd = build_module_command(module_def, executor)
+        runner = CliRunner()
+        result = runner.invoke(cmd, [])
+        assert result.exit_code == 45
+
+    def test_exec_module_execution_error(self):
+        from apcore.errors import ModuleExecuteError
+        from click.testing import CliRunner
+
+        module_def = _make_mock_module_def()
+        executor = _make_mock_executor()
+        executor.call.side_effect = ModuleExecuteError(module_id="math.add", message="division by zero")
+        cmd = build_module_command(module_def, executor)
+        runner = CliRunner()
+        result = runner.invoke(cmd, [])
+        assert result.exit_code == 1
+
+    def test_exec_module_disabled(self):
+        from apcore.errors import ModuleDisabledError
+        from click.testing import CliRunner
+
+        module_def = _make_mock_module_def()
+        executor = _make_mock_executor()
+        executor.call.side_effect = ModuleDisabledError(module_id="math.add")
+        cmd = build_module_command(module_def, executor)
+        runner = CliRunner()
+        result = runner.invoke(cmd, [])
+        assert result.exit_code == 44
+
+    def test_exec_acl_denied(self):
+        from apcore.errors import ACLDeniedError
+        from click.testing import CliRunner
+
+        module_def = _make_mock_module_def()
+        executor = _make_mock_executor()
+        executor.call.side_effect = ACLDeniedError(caller_id="user", target_id="math.add")
+        cmd = build_module_command(module_def, executor)
+        runner = CliRunner()
+        result = runner.invoke(cmd, [])
+        assert result.exit_code == 77
+
+    def test_exec_keyboard_interrupt(self):
+        from click.testing import CliRunner
+
+        module_def = _make_mock_module_def()
+        executor = _make_mock_executor()
+        executor.call.side_effect = KeyboardInterrupt()
+        cmd = build_module_command(module_def, executor)
+        runner = CliRunner()
+        result = runner.invoke(cmd, [])
+        assert result.exit_code == 130
+
+
+class TestDisplayOverlayAliasRouting:
+    """Tests for CLI alias routing via metadata['display']['cli']['alias'] (§5.13)."""
+
+    def _make_module_def_with_alias(self, module_id: str, cli_alias: str, description: str = "desc"):
+        module_def = _make_mock_module_def(module_id=module_id, description=description)
+        module_def.metadata = {"display": {"cli": {"alias": cli_alias}, "alias": cli_alias}}
+        return module_def
+
+    def test_list_commands_uses_cli_alias(self):
+        """list_commands returns the CLI alias instead of module_id when alias is set."""
+        module_def = self._make_module_def_with_alias("payment.status", "pay-status")
+        registry = _make_mock_registry(["payment.status"])
+        registry.get_definition.return_value = module_def
+        group = LazyModuleGroup(registry=registry, executor=_make_mock_executor(), name="cli")
+        ctx = click.Context(group)
+        commands = group.list_commands(ctx)
+        assert "pay-status" in commands
+        assert "payment.status" not in commands
+
+    def test_get_command_by_cli_alias(self):
+        """get_command resolves an alias name to the correct module."""
+        module_def = self._make_module_def_with_alias("payment.status", "pay-status")
+        registry = _make_mock_registry(["payment.status"])
+        registry.get_definition.return_value = module_def
+        group = LazyModuleGroup(registry=registry, executor=_make_mock_executor(), name="cli")
+        ctx = click.Context(group)
+        cmd = group.get_command(ctx, "pay-status")
+        assert cmd is not None
+        assert cmd.name == "pay-status"
+
+    def test_get_command_alias_uses_descriptor_cache(self):
+        """After alias map is built, get_command should NOT call get_definition again."""
+        module_def = self._make_module_def_with_alias("payment.status", "pay-status")
+        registry = _make_mock_registry(["payment.status"])
+        registry.get_definition.return_value = module_def
+        group = LazyModuleGroup(registry=registry, executor=_make_mock_executor(), name="cli")
+        ctx = click.Context(group)
+        # First call builds alias map (calls get_definition) and caches descriptor
+        group.get_command(ctx, "pay-status")
+        # Second call should use module_cache — no additional get_definition calls
+        group.get_command(ctx, "pay-status")
+        # get_definition called once during _build_alias_map, then cached
+        assert registry.get_definition.call_count == 1
+
+    def test_get_command_fallback_to_module_id_when_no_alias(self):
+        """Modules without a CLI alias are still accessible by their module_id."""
+        module_def = _make_mock_module_def(module_id="math.add")
+        module_def.metadata = {}
+        registry = _make_mock_registry(["math.add"])
+        registry.get_definition.return_value = module_def
+        group = LazyModuleGroup(registry=registry, executor=_make_mock_executor(), name="cli")
+        ctx = click.Context(group)
+        cmd = group.get_command(ctx, "math.add")
+        assert cmd is not None
+
+    def test_build_module_command_uses_display_alias_as_name(self):
+        """build_module_command uses cmd_name (alias) as the Click command name."""
+        module_def = self._make_module_def_with_alias("payment.status", "pay-status", "Check payment status")
+        cmd = build_module_command(module_def, _make_mock_executor(), cmd_name="pay-status")
+        assert cmd.name == "pay-status"
+
+    def test_build_module_command_uses_display_description(self):
+        """build_module_command uses display.cli.description if present."""
+        module_def = _make_mock_module_def(module_id="math.add", description="Original description")
+        module_def.metadata = {
+            "display": {
+                "cli": {"alias": "add", "description": "CLI-specific description"},
+                "alias": "add",
+            }
+        }
+        cmd = build_module_command(module_def, _make_mock_executor(), cmd_name="add")
+        assert cmd.help == "CLI-specific description"
+
+
+# ---------------------------------------------------------------------------
+# Grouped-commands feature tests (Tasks 1-6)
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_module_def_with_display(module_id, description="desc", display=None, metadata=None):
+    m = _make_mock_module_def(module_id, description)
+    m.metadata = metadata or {}
+    if display:
+        m.metadata["display"] = display
+    return m
+
+
+def _make_grouped_group(module_defs, builtins=True, exposure_filter=None):
+    """Helper: build a GroupedModuleGroup from a list of (module_id, descriptor) pairs."""
+    ids = [mid for mid, _ in module_defs]
+    registry = _make_mock_registry(ids)
+    # Map module_id → descriptor for get_definition
+    def_map = dict(module_defs)
+    registry.get_definition.side_effect = lambda mid: def_map.get(mid)
+    executor = _make_mock_executor()
+    kwargs = dict(registry=registry, executor=executor, name="cli")
+    if exposure_filter is not None:
+        kwargs["exposure_filter"] = exposure_filter
+    group = GroupedModuleGroup(**kwargs)
+    if builtins:
+        for name in ["exec", "list", "describe", "completion", "man"]:
+            group.add_command(click.Command(name, callback=lambda: None))
+    return group
+
+
+class TestResolveGroup:
+    """Tests for GroupedModuleGroup._resolve_group."""
+
+    def test_resolve_group_explicit_group(self):
+        desc = _make_mock_module_def_with_display("x.y", display={"cli": {"group": "mygrp", "alias": "cmd1"}})
+        assert GroupedModuleGroup._resolve_group("x.y", desc) == ("mygrp", "cmd1")
+
+    def test_resolve_group_explicit_group_no_alias(self):
+        desc = _make_mock_module_def_with_display("x.y", display={"cli": {"group": "mygrp"}})
+        assert GroupedModuleGroup._resolve_group("x.y", desc) == ("mygrp", "x.y")
+
+    def test_resolve_group_opt_out_empty_string(self):
+        desc = _make_mock_module_def_with_display("math.add", display={"cli": {"group": "", "alias": "add"}})
+        assert GroupedModuleGroup._resolve_group("math.add", desc) == (None, "add")
+
+    def test_resolve_group_auto_from_alias_dot(self):
+        desc = _make_mock_module_def_with_display("payment.status", display={"cli": {"alias": "pay.status"}})
+        assert GroupedModuleGroup._resolve_group("payment.status", desc) == ("pay", "status")
+
+    def test_resolve_group_auto_from_module_id_dot(self):
+        desc = _make_mock_module_def_with_display("math.add")
+        assert GroupedModuleGroup._resolve_group("math.add", desc) == ("math", "add")
+
+    def test_resolve_group_no_dot_top_level(self):
+        desc = _make_mock_module_def_with_display("status")
+        assert GroupedModuleGroup._resolve_group("status", desc) == (None, "status")
+
+    def test_resolve_group_multi_dot_first_only(self):
+        desc = _make_mock_module_def_with_display("a.b.c")
+        assert GroupedModuleGroup._resolve_group("a.b.c", desc) == ("a", "b.c")
+
+    def test_resolve_group_empty_module_id_warns(self, caplog):
+        desc = _make_mock_module_def_with_display("")
+        with caplog.at_level(logging.WARNING):
+            result = GroupedModuleGroup._resolve_group("", desc)
+        assert result == (None, "")
+        assert "Empty module_id" in caplog.text
+
+    def test_resolve_group_none_metadata(self):
+        """_resolve_group handles descriptor with metadata=None."""
+        desc = _make_mock_module_def("user.create")
+        desc.metadata = None
+        group, cmd = GroupedModuleGroup._resolve_group("user.create", desc)
+        assert group == "user"
+        assert cmd == "create"
+
+
+class TestBuildGroupMap:
+    """Tests for GroupedModuleGroup._build_group_map."""
+
+    def test_build_group_map_three_groups(self):
+        defs = [
+            ("math.add", _make_mock_module_def_with_display("math.add")),
+            ("math.sub", _make_mock_module_def_with_display("math.sub")),
+            ("text.upper", _make_mock_module_def_with_display("text.upper")),
+            ("io.read", _make_mock_module_def_with_display("io.read")),
+        ]
+        group = _make_grouped_group(defs, builtins=False)
+        group._build_group_map()
+        assert "math" in group._group_map
+        assert "text" in group._group_map
+        assert "io" in group._group_map
+        assert len(group._group_map["math"]) == 2
+
+    def test_build_group_map_idempotent(self):
+        defs = [("math.add", _make_mock_module_def_with_display("math.add"))]
+        group = _make_grouped_group(defs, builtins=False)
+        group._build_group_map()
+        first_map = dict(group._group_map)
+        group._build_group_map()  # second call — should be no-op
+        assert group._group_map == first_map
+
+    def test_build_group_map_reserved_name_rejected_explicit_group(self):
+        """FE-13 §4.10: module with display.cli.group='apcli' is rejected."""
+        desc = _make_mock_module_def_with_display("my.mod", display={"cli": {"group": "apcli", "alias": "foo"}})
+        defs = [("my.mod", desc)]
+        group = _make_grouped_group(defs, builtins=False)
+        with pytest.raises(click.UsageError, match="reserved"):
+            group._build_group_map()
+
+    def test_build_group_map_reserved_name_rejected_auto_grouped(self):
+        """FE-13: module whose dotted ID auto-groups under 'apcli' is rejected."""
+        desc = _make_mock_module_def_with_display("apcli.foo")
+        defs = [("apcli.foo", desc)]
+        group = _make_grouped_group(defs, builtins=False)
+        with pytest.raises(click.UsageError, match="reserved"):
+            group._build_group_map()
+
+    def test_build_group_map_reserved_name_rejected_top_level(self):
+        """FE-13: top-level alias 'apcli' is rejected."""
+        desc = _make_mock_module_def_with_display("my_module", display={"cli": {"alias": "apcli"}})
+        defs = [("my_module", desc)]
+        group = _make_grouped_group(defs, builtins=False)
+        with pytest.raises(click.UsageError, match="reserved"):
+            group._build_group_map()
+
+    def test_build_group_map_failure_allows_retry(self):
+        registry = _make_mock_registry(["math.add"])
+        registry.get_definition.return_value = _make_mock_module_def_with_display("math.add")
+        executor = _make_mock_executor()
+        group = GroupedModuleGroup(registry=registry, executor=executor, name="cli")
+        # Force _build_alias_map to raise
+        group._build_alias_map = MagicMock(side_effect=RuntimeError("boom"))
+        group._build_group_map()
+        assert not group._group_map_built  # flag not set on failure
+        # Fix the problem
+        group._build_alias_map = MagicMock()
+        group._build_group_map()  # should retry now
+        assert group._group_map_built
+
+    def test_build_group_map_invalid_group_name_falls_back(self, caplog):
+        """Invalid group names from display.cli.group are treated as top-level."""
+        import logging
+
+        desc = _make_mock_module_def_with_display(
+            "my.mod",
+            display={"cli": {"group": "INVALID!", "alias": "cmd"}},
+        )
+        defs = [("my.mod", desc)]
+        group = _make_grouped_group(defs, builtins=False)
+        with caplog.at_level(logging.WARNING, logger="apcore_cli.cli"):
+            group._build_group_map()
+        assert "INVALID!" not in group._group_map
+        assert "cmd" in group._top_level_modules
+        assert "not shell-safe" in caplog.text
+
+    def test_build_group_map_with_display_overlay_group(self):
+        desc = _make_mock_module_def_with_display(
+            "payment.check_status",
+            display={"cli": {"group": "billing", "alias": "status"}},
+        )
+        defs = [("payment.check_status", desc)]
+        group = _make_grouped_group(defs, builtins=False)
+        group._build_group_map()
+        assert "billing" in group._group_map
+        assert "status" in group._group_map["billing"]
+
+
+class TestGroupedModuleGroupRouting:
+    """Tests for GroupedModuleGroup.list_commands and get_command."""
+
+    def test_list_commands_shows_groups_and_top_level(self):
+        defs = [
+            ("math.add", _make_mock_module_def_with_display("math.add")),
+            ("status", _make_mock_module_def_with_display("status")),
+        ]
+        group = _make_grouped_group(defs)
+        ctx = click.Context(group)
+        commands = group.list_commands(ctx)
+        assert "math" in commands  # group
+        assert "status" in commands  # top-level
+        assert "exec" in commands  # builtin
+
+    def test_get_command_returns_lazy_group(self):
+        defs = [("math.add", _make_mock_module_def_with_display("math.add"))]
+        group = _make_grouped_group(defs)
+        ctx = click.Context(group)
+        result = group.get_command(ctx, "math")
+        assert isinstance(result, click.Group)
+        assert isinstance(result, _LazyGroup)
+
+    def test_get_command_returns_top_level_command(self):
+        defs = [("status", _make_mock_module_def_with_display("status"))]
+        group = _make_grouped_group(defs)
+        ctx = click.Context(group)
+        result = group.get_command(ctx, "status")
+        assert isinstance(result, click.Command)
+        assert not isinstance(result, click.Group)
+
+    def test_get_command_returns_builtin(self):
+        defs = []
+        group = _make_grouped_group(defs)
+        ctx = click.Context(group)
+        result = group.get_command(ctx, "exec")
+        assert result is not None
+        assert result.name == "exec"
+
+    def test_get_command_unknown_returns_none(self):
+        defs = []
+        group = _make_grouped_group(defs)
+        ctx = click.Context(group)
+        result = group.get_command(ctx, "nonexistent")
+        assert result is None
+
+    def test_get_command_caches_lazy_group(self):
+        defs = [("math.add", _make_mock_module_def_with_display("math.add"))]
+        group = _make_grouped_group(defs)
+        ctx = click.Context(group)
+        first = group.get_command(ctx, "math")
+        second = group.get_command(ctx, "math")
+        assert first is second
+
+
+class TestLazyGroupInner:
+    """Tests for _LazyGroup."""
+
+    def _make_lazy_group(self):
+        d1 = _make_mock_module_def_with_display("math.add")
+        d2 = _make_mock_module_def_with_display("math.sub")
+        members = {
+            "add": ("math.add", d1),
+            "sub": ("math.sub", d2),
+        }
+        return _LazyGroup(
+            members=members,
+            executor=_make_mock_executor(),
+            name="math",
+        )
+
+    def test_lazy_group_list_commands(self):
+        grp = self._make_lazy_group()
+        ctx = click.Context(grp)
+        assert grp.list_commands(ctx) == ["add", "sub"]
+
+    def test_lazy_group_get_command(self):
+        grp = self._make_lazy_group()
+        ctx = click.Context(grp)
+        cmd = grp.get_command(ctx, "add")
+        assert cmd is not None
+        assert cmd.name == "add"
+
+    def test_lazy_group_get_command_not_found(self):
+        grp = self._make_lazy_group()
+        ctx = click.Context(grp)
+        assert grp.get_command(ctx, "nonexistent") is None
+
+    def test_lazy_group_caches_commands(self):
+        grp = self._make_lazy_group()
+        ctx = click.Context(grp)
+        first = grp.get_command(ctx, "add")
+        second = grp.get_command(ctx, "add")
+        assert first is second
+
+
+class TestGroupedHelpDisplay:
+    """Tests for GroupedModuleGroup.format_help output."""
+
+    def _get_help_text(self, defs):
+        group = _make_grouped_group(defs)
+        ctx = click.Context(group)
+        formatter = click.HelpFormatter()
+        group.format_help(ctx, formatter)
+        return formatter.getvalue()
+
+    def test_root_help_shows_groups_section(self):
+        defs = [("math.add", _make_mock_module_def_with_display("math.add"))]
+        text = self._get_help_text(defs)
+        assert "Groups:" in text
+
+    def test_root_help_shows_group_with_count(self):
+        defs = [
+            ("math.add", _make_mock_module_def_with_display("math.add")),
+            ("math.sub", _make_mock_module_def_with_display("math.sub")),
+        ]
+        text = self._get_help_text(defs)
+        assert "(2 commands)" in text
+
+    def test_root_help_shows_top_level_modules(self):
+        defs = [("status", _make_mock_module_def_with_display("status", description="Check status"))]
+        text = self._get_help_text(defs)
+        assert "Modules:" in text
+        assert "status" in text
+
+    def test_root_help_shows_builtin_commands(self):
+        defs = []
+        text = self._get_help_text(defs)
+        assert "Commands:" in text
+        assert "exec" in text
+
+    def test_group_help_shows_commands(self):
+        d1 = _make_mock_module_def_with_display("math.add")
+        d2 = _make_mock_module_def_with_display("math.sub")
+        members = {"add": ("math.add", d1), "sub": ("math.sub", d2)}
+        grp = _LazyGroup(members=members, executor=_make_mock_executor(), name="math")
+        ctx = click.Context(grp)
+        formatter = click.HelpFormatter()
+        grp.format_help(ctx, formatter)
+        text = formatter.getvalue()
+        assert "add" in text
+        assert "sub" in text
+
+
+class TestCreateCliGrouped:
+    """Test that create_cli uses GroupedModuleGroup."""
+
+    def test_create_cli_uses_grouped_module_group(self, tmp_path):
+        from apcore_cli.__main__ import create_cli
+
+        cli = create_cli(extensions_dir=str(tmp_path), prog_name="test-cli")
+        assert isinstance(cli, GroupedModuleGroup)
+
+
+class TestGroupedE2E:
+    """End-to-end integration tests for grouped command invocation."""
+
+    def _make_e2e_group(self):
+        """Build a GroupedModuleGroup with product (2), health (1), standalone (1)."""
+        defs = [
+            ("product.list", _make_mock_module_def_with_display("product.list", "List products")),
+            ("product.get", _make_mock_module_def_with_display("product.get", "Get product")),
+            ("health.check", _make_mock_module_def_with_display("health.check", "Run health check")),
+            ("standalone", _make_mock_module_def_with_display("standalone", "Standalone cmd")),
+        ]
+        return _make_grouped_group(defs)
+
+    def test_grouped_invocation_product_get(self):
+        from click.testing import CliRunner
+
+        group = self._make_e2e_group()
+        result = CliRunner().invoke(group, ["product", "get"])
+        assert result.exit_code == 0
+
+    def test_single_command_group_works(self):
+        from click.testing import CliRunner
+
+        group = self._make_e2e_group()
+        result = CliRunner().invoke(group, ["health", "check"])
+        assert result.exit_code == 0
+
+    def test_top_level_module_works(self):
+        from click.testing import CliRunner
+
+        group = self._make_e2e_group()
+        result = CliRunner().invoke(group, ["standalone"])
+        assert result.exit_code == 0
+
+    def test_unknown_group_exits_2(self):
+        from click.testing import CliRunner
+
+        group = self._make_e2e_group()
+        result = CliRunner().invoke(group, ["nonexistent"])
+        assert result.exit_code == 2
+
+    def test_unknown_command_in_group_exits_2(self):
+        from click.testing import CliRunner
+
+        group = self._make_e2e_group()
+        result = CliRunner().invoke(group, ["product", "nonexistent"])
+        assert result.exit_code == 2
+
+
+class TestVerboseHelp:
+    """Tests for --all-options help flag controlling built-in option visibility."""
+
+    def test_builtin_options_hidden_by_default(self):
+        """Built-in options are hidden from help by default."""
+        from apcore_cli import cli as cli_mod
+
+        cli_mod._all_options_help = False
+        try:
+            module_def = _make_mock_module_def()
+            cmd = build_module_command(module_def, _make_mock_executor())
+            hidden_names = [p.name for p in cmd.params if getattr(p, "hidden", False)]
+            assert "input" in hidden_names
+            assert "yes" in hidden_names
+            assert "large_input" in hidden_names
+            assert "format" in hidden_names
+            assert "sandbox" in hidden_names
+        finally:
+            cli_mod._all_options_help = False
+
+    def test_builtin_options_shown_when_verbose(self):
+        """Built-in options are visible when --all-options help is enabled."""
+        from apcore_cli import cli as cli_mod
+
+        cli_mod._all_options_help = True
+        try:
+            module_def = _make_mock_module_def()
+            cmd = build_module_command(module_def, _make_mock_executor())
+            hidden_names = [p.name for p in cmd.params if getattr(p, "hidden", False)]
+            assert "input" not in hidden_names
+            assert "yes" not in hidden_names
+            assert "large_input" not in hidden_names
+            assert "format" not in hidden_names
+            # sandbox is always hidden (not yet implemented)
+            assert "sandbox" in hidden_names
+        finally:
+            cli_mod._all_options_help = False
+
+    def test_set_verbose_help_function(self):
+        """set_verbose_help correctly sets the module-level _all_options_help flag."""
+        from apcore_cli import cli as cli_mod
+        from apcore_cli.cli import set_verbose_help
+
+        original = cli_mod._all_options_help
+        try:
+            set_verbose_help(True)
+            assert cli_mod._all_options_help is True
+            set_verbose_help(False)
+            assert cli_mod._all_options_help is False
+        finally:
+            cli_mod._all_options_help = original
+
+
+class TestCreateCliWithApp:
+    """Tests for the create_cli(app=...) parameter (apcore >= 0.18.0)."""
+
+    def _make_mock_app(self, module_ids=None):
+        """Create a mock APCore app object with registry and executor."""
+        app = MagicMock()
+        registry = MagicMock()
+        module_list = module_ids or []
+        registry.list_modules.return_value = module_list
+        registry.list.return_value = module_list
+        app.registry = registry
+        app.executor = _make_mock_executor()
+        return app
+
+    def test_app_mutually_exclusive_with_registry(self):
+        """Passing both app= and registry= raises ValueError."""
+        from apcore_cli.__main__ import create_cli
+
+        app = self._make_mock_app(["math.add"])
+        registry = _make_mock_registry(["math.add"])
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            create_cli(app=app, registry=registry)
+
+    def test_app_mutually_exclusive_with_executor(self):
+        """Passing both app= and executor= raises ValueError."""
+        from apcore_cli.__main__ import create_cli
+
+        app = self._make_mock_app(["math.add"])
+        executor = _make_mock_executor()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            create_cli(app=app, executor=executor)
+
+    def test_app_extracts_registry_and_executor(self):
+        """When app has a pre-populated registry, create_cli skips filesystem discovery."""
+        from unittest.mock import patch
+
+        from apcore_cli.__main__ import create_cli
+
+        app = self._make_mock_app(["math.add"])
+
+        # The function does `from apcore import Executor as _Executor` inside create_cli;
+        # patch builtins.__import__ would be fragile, so instead patch the import at the
+        # module level by injecting a fake apcore into sys.modules temporarily.
+        import sys
+
+        fake_apcore = MagicMock()
+        fake_apcore.Executor.return_value = _make_mock_executor()
+        with patch.dict(sys.modules, {"apcore": fake_apcore}):
+            # app.executor is already set, so a new Executor should NOT be constructed
+            cli = create_cli(app=app, prog_name="test-cli")
+
+        assert isinstance(cli, GroupedModuleGroup)
+
+    def test_app_with_empty_registry_falls_through_to_discovery(self, tmp_path):
+        """When app.registry is empty, create_cli attempts filesystem discovery."""
+        from apcore_cli.__main__ import create_cli
+
+        # Empty registry — no modules registered yet
+        app = self._make_mock_app(module_ids=[])
+
+        # Point to a non-existent extensions dir so discovery fails with EXIT_CONFIG_NOT_FOUND
+        nonexistent_dir = str(tmp_path / "no_such_dir")
+
+        with pytest.raises(SystemExit) as exc_info:
+            create_cli(app=app, extensions_dir=nonexistent_dir, prog_name="test-cli")
+
+        assert exc_info.value.code == 47  # EXIT_CONFIG_NOT_FOUND
+
+    def test_app_without_executor_uses_app_executor(self):
+        """The executor extracted from app is used in the returned CLI group."""
+        import sys
+        from unittest.mock import patch
+
+        from apcore_cli.__main__ import create_cli
+
+        mock_exec = _make_mock_executor()
+        app = self._make_mock_app(["math.add"])
+        app.executor = mock_exec
+
+        fake_apcore = MagicMock()
+        fake_apcore.Executor.return_value = _make_mock_executor()
+        with patch.dict(sys.modules, {"apcore": fake_apcore}):
+            cli = create_cli(app=app, prog_name="test-cli")
+
+        assert isinstance(cli, GroupedModuleGroup)
+        # The executor stored in the group should be app.executor (not a newly-constructed one)
+        assert cli._executor is mock_exec
+
+
+class TestExposureInGroupedModuleGroup:
+    """Task 4: ExposureFilter integration into GroupedModuleGroup."""
+
+    def test_build_group_map_with_include_filter(self):
+        from apcore_cli.exposure import ExposureFilter
+
+        defs = [
+            ("admin.users", _make_mock_module_def_with_display("admin.users")),
+            ("admin.config", _make_mock_module_def_with_display("admin.config")),
+            ("webhooks.stripe", _make_mock_module_def_with_display("webhooks.stripe")),
+            ("user.create", _make_mock_module_def_with_display("user.create")),
+        ]
+        ef = ExposureFilter(mode="include", include=["admin.*"])
+        group = _make_grouped_group(defs, builtins=False, exposure_filter=ef)
+        group._build_group_map()
+        assert "admin" in group._group_map
+        assert len(group._group_map["admin"]) == 2
+        assert "webhooks" not in group._group_map
+        assert "user" not in group._group_map
+        assert len(group._top_level_modules) == 0
+
+    def test_build_group_map_with_exclude_filter(self):
+        from apcore_cli.exposure import ExposureFilter
+
+        defs = [
+            ("admin.users", _make_mock_module_def_with_display("admin.users")),
+            ("webhooks.stripe", _make_mock_module_def_with_display("webhooks.stripe")),
+            ("user.create", _make_mock_module_def_with_display("user.create")),
+        ]
+        ef = ExposureFilter(mode="exclude", exclude=["webhooks.*"])
+        group = _make_grouped_group(defs, builtins=False, exposure_filter=ef)
+        group._build_group_map()
+        assert "admin" in group._group_map
+        assert "user" in group._group_map
+        assert "webhooks" not in group._group_map
+
+    def test_build_group_map_default_filter_exposes_all(self):
+        defs = [
+            ("admin.users", _make_mock_module_def_with_display("admin.users")),
+            ("webhooks.stripe", _make_mock_module_def_with_display("webhooks.stripe")),
+        ]
+        group = _make_grouped_group(defs, builtins=False)
+        group._build_group_map()
+        assert "admin" in group._group_map
+        assert "webhooks" in group._group_map
+
+    def test_list_commands_respects_filter(self):
+        from apcore_cli.exposure import ExposureFilter
+
+        defs = [
+            ("admin.users", _make_mock_module_def_with_display("admin.users")),
+            ("user.create", _make_mock_module_def_with_display("user.create")),
+            ("webhooks.stripe", _make_mock_module_def_with_display("webhooks.stripe")),
+        ]
+        ef = ExposureFilter(mode="include", include=["admin.*"])
+        group = _make_grouped_group(defs, builtins=True, exposure_filter=ef)
+        ctx = click.Context(group)
+        cmds = group.list_commands(ctx)
+        assert "admin" in cmds
+        assert "user" not in cmds
+        assert "webhooks" not in cmds
+
+    def test_get_command_hidden_group_returns_none(self):
+        from apcore_cli.exposure import ExposureFilter
+
+        defs = [
+            ("admin.users", _make_mock_module_def_with_display("admin.users")),
+            ("user.create", _make_mock_module_def_with_display("user.create")),
+        ]
+        ef = ExposureFilter(mode="include", include=["admin.*"])
+        group = _make_grouped_group(defs, builtins=True, exposure_filter=ef)
+        ctx = click.Context(group)
+        assert group.get_command(ctx, "user") is None
+        assert group.get_command(ctx, "admin") is not None
+
+
+class TestCreateCliExposure:
+    """Task 5: create_cli() with expose parameter."""
+
+    def test_create_cli_with_exposure_filter_instance(self, tmp_path):
+        from apcore_cli.__main__ import create_cli
+        from apcore_cli.exposure import ExposureFilter
+
+        ef = ExposureFilter(mode="include", include=["admin.*"])
+        cli = create_cli(extensions_dir=str(tmp_path), prog_name="test-cli", expose=ef)
+        assert isinstance(cli, GroupedModuleGroup)
+        assert cli._exposure_filter is ef
+
+    def test_create_cli_with_exposure_dict(self, tmp_path):
+        from apcore_cli.__main__ import create_cli
+
+        cli = create_cli(
+            extensions_dir=str(tmp_path),
+            prog_name="test-cli",
+            expose={"mode": "exclude", "exclude": ["webhooks.*"]},
+        )
+        assert cli._exposure_filter._mode == "exclude"
+
+    def test_create_cli_default_no_exposure(self, tmp_path):
+        from apcore_cli.__main__ import create_cli
+
+        cli = create_cli(extensions_dir=str(tmp_path), prog_name="test-cli")
+        assert cli._exposure_filter._mode == "all"
+
+
+class TestExposureE2E:
+    """Task 8: End-to-end exposure filtering tests."""
+
+    def _make_e2e_group_with_filter(self, include=None, exclude=None, mode="include"):
+        from apcore_cli.exposure import ExposureFilter
+
+        defs = [
+            ("admin.users", _make_mock_module_def_with_display("admin.users", "Manage users")),
+            ("admin.config", _make_mock_module_def_with_display("admin.config", "Manage config")),
+            ("user.create", _make_mock_module_def_with_display("user.create", "Create user")),
+            ("webhooks.stripe", _make_mock_module_def_with_display("webhooks.stripe", "Stripe hooks")),
+        ]
+        ef = ExposureFilter(mode=mode, include=include or [], exclude=exclude or [])
+        return _make_grouped_group(defs, builtins=True, exposure_filter=ef)
+
+    def test_help_only_shows_exposed_groups(self):
+        from click.testing import CliRunner
+
+        group = self._make_e2e_group_with_filter(include=["admin.*"])
+        result = CliRunner().invoke(group, ["--help"])
+        assert result.exit_code == 0
+        assert "admin" in result.output
+        # The hidden groups should not appear anywhere in the help output
+        # (except possibly inside the word "Commands" etc. — check the Groups section)
+        if "Groups:" in result.output:
+            groups_section = result.output.split("Groups:")[1].split("\n\n")[0]
+            assert "user" not in groups_section
+            assert "webhooks" not in groups_section
+
+    def test_hidden_command_not_in_help(self):
+        from click.testing import CliRunner
+
+        group = self._make_e2e_group_with_filter(include=["admin.*"])
+        result = CliRunner().invoke(group, ["user", "--help"])
+        assert result.exit_code == 2
+
+    def test_exec_bypasses_exposure_filter(self):
+        """Hidden modules are still in the registry and accessible via exec."""
+        from apcore_cli.exposure import ExposureFilter
+
+        defs = [
+            ("admin.users", _make_mock_module_def_with_display("admin.users", "Manage users")),
+            ("webhooks.stripe", _make_mock_module_def_with_display("webhooks.stripe", "Stripe hooks")),
+        ]
+        ef = ExposureFilter(mode="include", include=["admin.*"])
+        group = _make_grouped_group(defs, builtins=True, exposure_filter=ef)
+        # The registry still has webhooks.stripe even though it's hidden from CLI
+        assert group._registry.get_definition("webhooks.stripe") is not None
+
+
+class TestBuildModuleCommandRefResolverErrorTranslation:
+    """D10-003: typed RefResolverError subclasses must translate to documented
+    exit codes (48 for circular/depth, 45 for unresolvable) instead of leaking
+    a traceback through the bare ``raise`` clause.
+    """
+
+    def _module_def_with_schema(self, schema: dict):
+        module_def = MagicMock()
+        module_def.module_id = "math.add"
+        module_def.description = "Add two numbers."
+        module_def.input_schema = schema
+        module_def.annotations = None
+        module_def.tags = []
+        return module_def
+
+    def test_circular_ref_in_schema_exits_48(self):
+        """Circular $ref must surface as sys.exit(EXIT_SCHEMA_CIRCULAR_REF)."""
+        schema = {
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {"next": {"$ref": "#/$defs/node"}},
+                }
+            },
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/node"}},
+        }
+        module_def = self._module_def_with_schema(schema)
+        executor = _make_mock_executor()
+        with pytest.raises(SystemExit) as excinfo:
+            build_module_command(module_def, executor)
+        assert excinfo.value.code == 48
+
+    def test_unresolvable_ref_in_schema_exits_45(self):
+        """Unresolvable $ref must surface as sys.exit(EXIT_SCHEMA_VALIDATION_ERROR)."""
+        schema = {
+            "type": "object",
+            "properties": {"missing": {"$ref": "#/$defs/does_not_exist"}},
+        }
+        module_def = self._module_def_with_schema(schema)
+        executor = _make_mock_executor()
+        with pytest.raises(SystemExit) as excinfo:
+            build_module_command(module_def, executor)
+        assert excinfo.value.code == 45
+
+    def test_max_depth_in_schema_exits_48(self):
+        """MaxDepthExceededError must surface as exit 48."""
+        # Build a chain longer than max_depth=32 by referencing through 40 levels.
+        defs = {}
+        for i in range(40):
+            defs[f"l{i}"] = {
+                "type": "object",
+                "properties": {"next": {"$ref": f"#/$defs/l{i + 1}"}},
+            }
+        defs["l40"] = {"type": "string"}
+        schema = {
+            "$defs": defs,
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/l0"}},
+        }
+        module_def = self._module_def_with_schema(schema)
+        executor = _make_mock_executor()
+        with pytest.raises(SystemExit) as excinfo:
+            build_module_command(module_def, executor)
+        assert excinfo.value.code == 48
+
+
+@pytest.mark.parametrize("tty", [False, True])
+def test_native_validation_errors_preserve_json_pointers(tty, capsys):
+    import json
+
+    from apcore.errors import SchemaValidationError
+    from apcore.schema import SchemaValidator
+    from pydantic import Field, create_model
+
+    from apcore_cli.cli import _emit_error_json, _emit_error_tty
+
+    item = create_model("ValidationItem", count=(int, ...))
+    model = create_model(
+        "ValidationInput",
+        count=(int, ...),
+        items=(list[item], ...),
+        escaped=(int, Field(alias="a/b~c")),
+    )
+    with pytest.raises(SchemaValidationError) as caught:
+        SchemaValidator().validate_input({"items": [{"count": "bad"}], "a/b~c": "bad"}, model)
+    error = caught.value
+    assert error.code == "SCHEMA_VALIDATION_ERROR"
+    emit = _emit_error_tty if tty else _emit_error_json
+    emit(error, 45)
+    output = capsys.readouterr().err
+    if tty:
+        assert "/items/0/count" in output
+        assert "/a~1b~0c" in output
+        assert "unknown" not in output
+    else:
+        payload = json.loads(output)
+        assert payload["exit_code"] == 45
+        assert payload["details"] == error.details
+        errors = payload["details"]["errors"]
+        assert {entry["path"] for entry in errors} == {"", "/items/0/count", "/a~1b~0c"}
+        assert all(set(entry) == {"path", "keyword", "message"} for entry in errors)
+
+
+@pytest.mark.parametrize("args", [["math", "add"], ["apcli", "exec", "math.add"]])
+def test_embedded_result_from_factory(args):
+    from click.testing import CliRunner
+
+    from apcore_cli.factory import create_cli
+
+    module_def = _make_mock_module_def()
+    registry = _make_mock_registry(["math.add"])
+    registry.get_definition.return_value = module_def
+    payload = {"sum": 3, "details": {"count": 2}}
+    on_result = MagicMock()
+    cli = create_cli(
+        registry=registry,
+        executor=_make_mock_executor(payload),
+        print_result=False,
+        on_result=on_result,
+    )
+
+    result = CliRunner().invoke(cli, [*args, "--format", "json", "--fields", "sum"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ""
+    on_result.assert_called_once_with(payload, "math.add")
+
+
+def test_embedded_result_from_single_command():
+    from click.testing import CliRunner
+
+    payload = {"sum": 3}
+    on_result = MagicMock()
+    cmd = build_module_command(
+        _make_mock_module_def(),
+        _make_mock_executor(payload),
+        print_result=False,
+        on_result=on_result,
+    )
+
+    result = CliRunner().invoke(cmd, [])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ""
+    on_result.assert_called_once_with(payload, "math.add")
+
+
+@pytest.mark.parametrize("args", [["math", "add"], ["apcli", "exec", "math.add"]])
+@pytest.mark.parametrize("extra", [["--trace"], ["--strategy", "standard"], ["--stream"]])
+def test_sandbox_rejects_options_that_require_in_process_execution(args, extra, monkeypatch):
+    from apcore import ModuleAnnotations
+    from click.testing import CliRunner
+
+    from apcore_cli.factory import create_cli
+
+    async def stream(*_args):
+        yield {"sum": 3}
+
+    module_def = _make_mock_module_def()
+    module_def.annotations = ModuleAnnotations(streaming=True)
+    registry = _make_mock_registry(["math.add"])
+    registry.get_definition.return_value = module_def
+    executor = _make_mock_executor({"sum": 3})
+    executor.call_with_trace.return_value = ({"sum": 3}, MagicMock(steps=[]))
+    executor.stream.side_effect = stream
+    sandbox_execute = MagicMock(return_value={"sum": 3})
+    monkeypatch.setattr("apcore_cli.security.sandbox.Sandbox.execute", sandbox_execute)
+    cli = create_cli(registry=registry, executor=executor)
+
+    result = CliRunner().invoke(cli, [*args, "--sandbox", *extra])
+
+    assert result.exit_code == 2, result.output
+    assert "--sandbox cannot be combined with" in result.stderr
+    executor.call.assert_not_called()
+    executor.call_with_trace.assert_not_called()
+    executor.stream.assert_not_called()
+    sandbox_execute.assert_not_called()
+
+
+def test_embedded_table_trace_remains_on_stderr_when_print_disabled(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    payload = {"sum": 3}
+    executor = _make_mock_executor()
+    trace = SimpleNamespace(strategy_name="standard", total_duration_ms=4.2, steps=[])
+    executor.call_with_trace.return_value = (payload, trace)
+    on_result = MagicMock()
+    cmd = build_module_command(_make_mock_module_def(), executor, print_result=False, on_result=on_result)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    cmd.main(["--trace", "--format", "table"], standalone_mode=False)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Pipeline Trace (strategy: standard, 0 steps, 4.2ms)" in captured.err
+    on_result.assert_called_once_with(payload, "math.add")
