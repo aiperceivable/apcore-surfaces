@@ -1,0 +1,24 @@
+# Zero-code binding: maps myapp.word_count → apcore module
+# auto_schema infers input/output from Python type hints.
+
+bindings:
+- module_id: word_count
+  target: myapp:word_count
+  description: Count words, characters, and lines in a text string
+  tags:
+    - text
+    - utility
+  version: 1.0.0
+  annotations:
+    readonly: true
+    destructive: false
+    idempotent: true
+    open_world: false
+  auto_schema: true
+  # NOTE: examples defined here are not yet supported by apcore BindingLoader.
+  # Once apcore propagates binding examples to _module_meta, uncomment below:
+  # examples:
+  #   - title: '{"text": "hello world foo bar"}'
+  #     inputs: { text: "hello world foo bar" }
+  #   - title: '{"text": "one\ntwo\nthree"}'
+  #     inputs: { text: "one\ntwo\nthree" }

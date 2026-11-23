@@ -1,0 +1,464 @@
+"""ApCoreAgentExecutor: bridges apcore execution to the a2a-sdk AgentExecutor ABC."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
+
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events.event_queue_v2 import EventQueue
+from a2a.types import (
+    Artifact,
+    Message,
+    Part,
+    Role,
+    Task,
+    TaskArtifactUpdateEvent,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+)
+from google.protobuf.timestamp_pb2 import Timestamp
+
+# Imported at module level — no circular dependency (middleware.py does not import executor.py)
+from apcore_a2a.adapters.errors import GOVERNANCE_REFUSAL_CODES, carries_caller_detail, sanitize_message
+from apcore_a2a.auth.middleware import auth_identity_var
+
+logger = logging.getLogger(__name__)
+
+
+def _make_timestamp() -> Timestamp:
+    ts = Timestamp()
+    ts.FromDatetime(datetime.now(tz=UTC))
+    return ts
+
+
+def _make_status(state: int, message: Message | None = None) -> TaskStatus:
+    status = TaskStatus(state=state)
+    status.timestamp.CopyFrom(_make_timestamp())
+    if message is not None:
+        status.message.CopyFrom(message)
+    return status
+
+
+def _text_message(text: str) -> Message:
+    return Message(
+        role=Role.ROLE_AGENT,
+        parts=[Part(text=text)],
+        message_id=str(uuid4()),
+    )
+
+
+class ApCoreAgentExecutor(AgentExecutor):
+    """Bridges apcore executor to a2a-sdk's AgentExecutor interface."""
+
+    def __init__(
+        self,
+        executor: Any,
+        part_converter: Any,
+        error_mapper: Any,
+        registry: Any = None,
+        execution_timeout: int = 300,
+        on_state_change: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self._executor = executor
+        self._part_converter = part_converter
+        self._error_mapper = error_mapper
+        self._registry = registry
+        self._execution_timeout = execution_timeout
+        self._on_state_change = on_state_change
+        # Cache inspect.signature results keyed by stable method qualified name
+        self._context_accepts_cache: dict[str, bool] = {}
+        # P0-B: per-task CancelToken map
+        self._cancel_tokens: dict[str, Any] = {}
+
+    def _notify(self, old_state: str, new_state: str) -> None:
+        if self._on_state_change is not None:
+            try:
+                self._on_state_change(old_state, new_state)
+            except Exception:
+                logger.debug("on_state_change callback raised", exc_info=True)
+
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # a2a-sdk 1.0: Establish the Task in the store before any TaskStatusUpdateEvent
+        context_id = context.context_id or context.task_id
+        initial_task = Task(
+            id=context.task_id,
+            context_id=context_id,
+            status=_make_status(TaskState.TASK_STATE_SUBMITTED),
+        )
+        await event_queue.enqueue_event(initial_task)
+
+        # 1. Get skill_id from message metadata
+        # metadata is a protobuf Struct; convert to dict for .get() access
+        raw_metadata = context.message.metadata if context.message else None
+        metadata: dict = dict(raw_metadata) if raw_metadata else {}
+        skill_id = metadata.get("skillId")
+        if not skill_id:
+            self._notify("submitted", "failed")
+            await self._fail(context, event_queue, "Missing required parameter: metadata.skillId")
+            return
+
+        # 2. Validate skill exists in registry (fail closed).
+        # Spec: validate skill_id is a known module → error if not. Matching the
+        # Rust SDK, we fail closed: if the registry is unavailable (list() raises)
+        # OR the skill_id is not a known module, the task fails with "Skill not
+        # found" rather than proceeding optimistically.
+        if self._registry is not None:
+            try:
+                known = self._registry.list()
+            except Exception:
+                logger.warning("Registry unavailable while validating skill %s", skill_id)
+                self._notify("submitted", "failed")
+                await self._fail(context, event_queue, f"Skill not found: {skill_id}")
+                return
+            if skill_id not in known:
+                self._notify("submitted", "failed")
+                await self._fail(context, event_queue, f"Skill not found: {skill_id}")
+                return
+
+        # 3. Parse Parts → apcore input
+        parts = list(context.message.parts) if context.message else []
+        descriptor = None
+        if self._registry is not None:
+            try:
+                descriptor = self._registry.get_definition(skill_id)
+            except Exception:
+                logger.warning("Failed to get descriptor for %s", skill_id)
+
+        try:
+            inputs = self._part_converter.parts_to_input(parts, descriptor)
+        except Exception as e:
+            self._notify("submitted", "failed")
+            await self._fail(context, event_queue, str(e))
+            return
+
+        # 4. Build apcore Identity context with CancelToken (P0-B)
+        identity = auth_identity_var.get()
+        apcore_ctx = None
+        token = None
+        try:
+            from apcore import CancelToken, Context  # type: ignore[import]
+
+            token = CancelToken()
+            if context.task_id:
+                self._cancel_tokens[context.task_id] = token
+            # Map the A2A execution_timeout onto apcore's first-class
+            # global_deadline (0.22.0). apcore enforces it cooperatively at
+            # pipeline Step 8 AND between streaming chunks (executor.stream),
+            # which is the only timeout the streaming path would otherwise have.
+            #
+            # Epoch seconds, per apcore >= 0.31.0 / D-99 (PROTOCOL_SPEC): the
+            # documented `Context.create` contract was always `time.time() +
+            # budget`, but apcore-python's own enforcement compared it against
+            # `time.monotonic()` until 0.31.0 — against that bug, an
+            # epoch-seconds deadline is ~1.8e9 versus a ~1e5 monotonic clock, so
+            # it never fires (silent, fail-open). This code used to work around
+            # that bug by passing a monotonic value instead of the documented
+            # one; apcore 0.31.0 fixes its own comparison to match the
+            # documented contract, so passing a monotonic value now reads as
+            # already-expired against `time.time()` and fails every call
+            # immediately. Must be `time.time()`, not `time.monotonic()`.
+            global_deadline = time.time() + self._execution_timeout
+            apcore_ctx = Context.create(
+                identity=identity,
+                cancel_token=token,
+                global_deadline=global_deadline,
+            )
+        except Exception:
+            pass
+
+        # 5. Execute — streaming if available, single otherwise (P0-A)
+        self._notify("submitted", "working")
+        try:
+            stream_fn = getattr(self._executor, "stream", None)
+            # Stream selection is based on the executor's stream method alone,
+            # matching TS's canStream (AsyncGeneratorFunction check). The apcore
+            # context is NOT required: _execute_streaming tolerates a None ctx,
+            # so streaming is still chosen in the degraded no-apcore-binding state.
+            _can_stream = (
+                stream_fn is not None
+                and callable(stream_fn)
+                and (inspect.isasyncgenfunction(stream_fn) or inspect.iscoroutinefunction(stream_fn))
+            )
+
+            if _can_stream:
+                await self._execute_streaming(context, event_queue, skill_id, inputs, apcore_ctx, context_id)
+            else:
+                output = await self._execute_single(skill_id, inputs, apcore_ctx)
+                # Publish artifact + completed event
+                artifact = self._part_converter.output_to_parts(output, context.task_id)
+                await event_queue.enqueue_event(
+                    TaskArtifactUpdateEvent(
+                        task_id=context.task_id,
+                        context_id=context_id,
+                        artifact=artifact,
+                        append=False,
+                        last_chunk=True,
+                    )
+                )
+                await event_queue.enqueue_event(
+                    TaskStatusUpdateEvent(
+                        task_id=context.task_id,
+                        context_id=context_id,
+                        status=_make_status(TaskState.TASK_STATE_COMPLETED),
+                    )
+                )
+                self._notify("working", "completed")
+        except asyncio.CancelledError:
+            raise  # let a2a-sdk handle asyncio cancellation
+        except TimeoutError:
+            self._notify("working", "failed")
+            await self._fail(context, event_queue, "Execution timed out")
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if code == "MODULE_TIMEOUT":
+                # apcore enforced global_deadline (streaming or cooperative step)
+                self._notify("working", "failed")
+                await self._fail(context, event_queue, "Execution timed out")
+            elif code == "EXECUTION_CANCELLED":
+                # P0-C: cooperative cancellation via CancelToken
+                self._notify("working", "canceled")
+                await self._emit_canceled(context, event_queue, "Execution cancelled")
+            elif code == "APPROVAL_PENDING":
+                # A resumable pause, not a refusal: the message carries the
+                # approval_id the caller resumes with (srs FR-EXE-002). Must not
+                # be swept in with the governance codes below — `rejected` is
+                # terminal, so re-coding it would end the conversation.
+                self._notify("working", "input_required")
+                await self._input_required(context, event_queue, str(exc))
+            elif code in GOVERNANCE_REFUSAL_CODES:
+                # A2A 1.0 defines `rejected` as terminal, and a policy refusal is
+                # what it describes (srs FR-ERR-012). `failed` said only
+                # "something broke", which for a refusal is both wrong and an
+                # invitation to retry. This is the surface that matters on
+                # message/send, where the response is a JSON-RPC `result` and the
+                # error code never reaches the caller at all.
+                self._notify("working", "rejected")
+                await self._reject(context, event_queue, self._failure_text(exc))
+            else:
+                logger.exception("Execution failed for task %s skill %s", context.task_id, skill_id)
+                self._notify("working", "failed")
+                await self._fail(context, event_queue, self._failure_text(exc))
+        finally:
+            self._cancel_tokens.pop(context.task_id, None)
+
+    async def _execute_streaming(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+        skill_id: str,
+        inputs: Any,
+        apcore_ctx: Any,
+        context_id: str,
+    ) -> None:
+        """Stream chunks from executor.stream(), emitting TaskArtifactUpdateEvents.
+
+        Bound the whole streaming loop by a host-side wall-clock budget
+        (execution_timeout) in addition to apcore's cooperative global_deadline.
+        A monotonic deadline is computed once; each chunk fetch is wrapped with
+        asyncio.wait_for(remaining). On timeout we stop the loop and emit a failed
+        status, matching the Rust SDK's stream_channel tokio timeout.
+        """
+        artifact_id = f"art-{context.task_id or str(uuid4())}"
+        chunk_index = 0
+        deadline = time.monotonic() + self._execution_timeout
+        # Mirror TS's `apcoreCtx ? ...with ctx : ...without ctx`: only pass the
+        # apcore context when present, so the degraded no-binding state still
+        # streams instead of erroring on a None positional argument.
+        stream = (
+            self._executor.stream(skill_id, inputs, apcore_ctx)
+            if apcore_ctx is not None
+            else self._executor.stream(skill_id, inputs)
+        )
+        iterator = stream.__aiter__()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self._fail_stream_timeout(context, event_queue)
+                return
+            try:
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                await self._fail_stream_timeout(context, event_queue)
+                return
+            parts = self._part_converter.output_to_parts(chunk, context.task_id).parts
+            await event_queue.enqueue_event(
+                TaskArtifactUpdateEvent(
+                    task_id=context.task_id,
+                    context_id=context_id,
+                    artifact=Artifact(artifact_id=artifact_id, parts=parts),
+                    append=(chunk_index > 0),
+                    last_chunk=False,
+                )
+            )
+            chunk_index += 1
+        # Emit last_chunk=True to signal stream end
+        await event_queue.enqueue_event(
+            TaskArtifactUpdateEvent(
+                task_id=context.task_id,
+                context_id=context_id,
+                artifact=Artifact(artifact_id=artifact_id),
+                append=True,
+                last_chunk=True,
+            )
+        )
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=context.task_id,
+                context_id=context_id,
+                status=_make_status(TaskState.TASK_STATE_COMPLETED),
+            )
+        )
+        self._notify("working", "completed")
+
+    async def _fail_stream_timeout(self, context: RequestContext, event_queue: EventQueue) -> None:
+        """Emit a failed status when the streaming wall-clock budget is exceeded.
+
+        Mirrors the MODULE_TIMEOUT handling in execute(): the host-side budget
+        bounds the whole streaming loop, matching Rust's stream_channel timeout.
+        """
+        logger.warning(
+            "Streaming execution timed out after %ss for task %s",
+            self._execution_timeout,
+            context.task_id,
+        )
+        self._notify("working", "failed")
+        await self._fail(context, event_queue, "Execution timed out")
+
+    async def _execute_single(self, skill_id: str, inputs: Any, apcore_ctx: Any) -> Any:
+        """Single call_async() execution with timeout."""
+        call_async = self._executor.call_async
+        cache_key = getattr(call_async, "__qualname__", repr(call_async))
+        accepts_ctx = self._context_accepts_cache.get(cache_key)
+        if accepts_ctx is None:
+            accepts_ctx = "context" in inspect.signature(call_async).parameters
+            self._context_accepts_cache[cache_key] = accepts_ctx
+        coro = (
+            call_async(skill_id, inputs, apcore_ctx)
+            if (apcore_ctx is not None and accepts_ctx)
+            else call_async(skill_id, inputs)
+        )
+        return await asyncio.wait_for(coro, timeout=self._execution_timeout)
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # P0-B: Signal cooperative cancellation BEFORE emitting the canceled status
+        token = self._cancel_tokens.pop(context.task_id, None)
+        if token is not None:
+            token.cancel()
+        context_id = context.context_id or context.task_id
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=context.task_id,
+                context_id=context_id,
+                status=_make_status(
+                    TaskState.TASK_STATE_CANCELED,
+                    _text_message("Canceled by client"),
+                ),
+            )
+        )
+        self._notify("working", "canceled")
+
+    async def _emit_canceled(self, context: RequestContext, event_queue: EventQueue, message: str) -> None:
+        """Emit CANCELED status (for cooperative cancellation via CancelToken)."""
+        context_id = context.context_id or context.task_id
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=context.task_id,
+                context_id=context_id,
+                status=_make_status(
+                    TaskState.TASK_STATE_CANCELED,
+                    _text_message(message),
+                ),
+            )
+        )
+
+    def _failure_text(self, error: Exception) -> str:
+        """Caller-facing text for a FAILED task status.
+
+        Delegates to the injected ``ErrorMapper``, this package's single
+        error-redaction policy, so the task-status surface classifies exactly
+        like the JSON-RPC surface instead of collapsing every code to one
+        string:
+
+        - internal / unrecognized errors keep the fixed ``"Internal server
+          error"`` (srs FR-ERR-004 / FR-ERR-008, locked by the shared
+          ``error_mapping.json`` and ``streaming_events.json`` fixtures);
+        - ``ACL_DENIED`` carries the fixed ``"Access denied"`` message (srs FR-ERR-003);
+        - caller-fixable classes (schema validation, invalid input, unknown
+          module) carry their sanitized detail, which srs FR-ERR-002 requires
+          precisely so a caller "can correct their input without guessing".
+
+        For those detail-carrying classes the error's ``ai_guidance`` is
+        appended when apcore supplied one: it exists to tell an agent what to do
+        next, and an A2A caller sees only this status message. It is withheld
+        for every other class, where the message is a fixed per-class string
+        that must stay fixed.
+
+        The gate is :func:`~apcore_a2a.adapters.errors.carries_caller_detail` —
+        the same partition ``ErrorMapper`` itself branches on. Gating on
+        ``error.user_fixable`` instead would be a different partition: six
+        apcore codes are ``user_fixable=True`` yet fall into the mapper's
+        catch-all, so e.g. a ``DEPENDENCY_NOT_FOUND`` failure would send the
+        caller ``"Internal server error (module 'x' requires 'y' >= 2.1; ...)"``
+        — the deliberately-opaque string extended with dependency-graph detail
+        that :func:`~apcore_a2a.adapters.errors.sanitize_message` does not strip
+        (it removes only paths and traceback-shaped lines, not module ids,
+        versions, env-var names or hostnames). ``user_fixable`` is settable
+        per-error by the module author, so any module could widen the fixed
+        string further.
+        """
+        message = str(self._error_mapper.to_jsonrpc_error(error).get("message", ""))
+        guidance = getattr(error, "ai_guidance", None)
+        disclose = getattr(self._error_mapper, "disclose_refusal_reason", False)
+        if carries_caller_detail(error, disclose) and isinstance(guidance, str) and guidance.strip():
+            return f"{message} ({sanitize_message(guidance)})"
+        return message
+
+    async def _fail(self, context: RequestContext, event_queue: EventQueue, message: str) -> None:
+        context_id = context.context_id or context.task_id
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=context.task_id,
+                context_id=context_id,
+                status=_make_status(
+                    TaskState.TASK_STATE_FAILED,
+                    _text_message(message),
+                ),
+            )
+        )
+
+    async def _reject(self, context: RequestContext, event_queue: EventQueue, message: str) -> None:
+        """Emit REJECTED status for a governance refusal (srs FR-ERR-012)."""
+        context_id = context.context_id or context.task_id
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=context.task_id,
+                context_id=context_id,
+                status=_make_status(
+                    TaskState.TASK_STATE_REJECTED,
+                    _text_message(message),
+                ),
+            )
+        )
+
+    async def _input_required(self, context: RequestContext, event_queue: EventQueue, message: str) -> None:
+        context_id = context.context_id or context.task_id
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=context.task_id,
+                context_id=context_id,
+                status=_make_status(
+                    TaskState.TASK_STATE_INPUT_REQUIRED,
+                    _text_message(message),
+                ),
+            )
+        )
