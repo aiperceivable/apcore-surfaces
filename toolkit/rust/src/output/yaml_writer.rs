@@ -1,0 +1,751 @@
+// YAML binding file generator.
+//
+// Writes ScannedModule instances as .binding.yaml files compatible with
+// apcore::BindingLoader.
+
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+use std::sync::LazyLock;
+
+use chrono::Utc;
+use regex::Regex;
+use tracing::{debug, warn};
+
+use crate::output::errors::WriteError;
+use crate::output::types::{Verifier, WriteResult};
+use crate::output::verifiers::{run_verifier_chain, YAMLVerifier};
+use crate::serializers::annotations_to_dict;
+use crate::types::ScannedModule;
+
+/// Generates `.binding.yaml` files from ScannedModule instances.
+pub struct YAMLWriter;
+
+impl YAMLWriter {
+    /// Write YAML binding files for each ScannedModule.
+    ///
+    /// - `output_dir`: Directory path to write files to.
+    /// - `dry_run`: If true, return results without writing to disk.
+    /// - `verify`: If true, verify written files are valid YAML with required fields.
+    /// - `verifiers`: Optional custom verifiers run after the built-in check.
+    ///
+    /// # Error handling vs. Python/TypeScript
+    ///
+    /// Unlike the Python and TypeScript implementations which raise/throw on I/O
+    /// failures, this method returns `Err(WriteError)` for any I/O error (e.g.
+    /// permission denied, disk full). Callers expecting the Python/TypeScript error
+    /// contract should propagate errors with `?` or handle them via `match`.
+    pub fn write(
+        &self,
+        modules: &[ScannedModule],
+        output_dir: &str,
+        dry_run: bool,
+        verify: bool,
+        verifiers: Option<&[&dyn Verifier]>,
+    ) -> Result<Vec<WriteResult>, WriteError> {
+        if modules.is_empty() {
+            return Ok(vec![]);
+        }
+
+        if !dry_run {
+            fs::create_dir_all(output_dir).map_err(|e| WriteError::io(output_dir.into(), e))?;
+        }
+
+        let output_path = if dry_run {
+            Path::new(output_dir).to_path_buf()
+        } else {
+            Path::new(output_dir)
+                .canonicalize()
+                .map_err(|e| WriteError::io(output_dir.into(), e))?
+        };
+
+        let mut results: Vec<WriteResult> = Vec::new();
+        let timestamp = Utc::now().to_rfc3339();
+        // Track filenames written in this batch to detect collisions within a single
+        // write() call. When two module_ids sanitize to the same filename, the second
+        // and subsequent modules receive a numeric suffix (e.g. `foo_1.binding.yaml`).
+        // This matches the TypeScript YAMLWriter collision-avoidance behaviour.
+        let mut written_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for module in modules {
+            let binding_data = build_binding(module);
+
+            if dry_run {
+                results.push(WriteResult::new(module.module_id.clone()));
+                continue;
+            }
+
+            // sanitize_filename removes all unsafe chars and collapses consecutive dots,
+            // ensuring the resulting filename cannot escape output_path.
+            let safe_id = sanitize_filename(&module.module_id);
+            let base_filename = format!("{safe_id}.binding.yaml");
+
+            // Resolve filename collision within this batch.
+            let mut final_filename = base_filename.clone();
+            let mut counter = 0u32;
+            while written_names.contains_key(&final_filename) {
+                counter += 1;
+                final_filename = format!("{safe_id}_{counter}.binding.yaml");
+            }
+            written_names.insert(final_filename.clone(), module.module_id.clone());
+
+            let file_path = output_path.join(&final_filename);
+
+            // Pre-write symlink check (TOCTOU mitigation — matches the Python
+            // (`is_symlink`) and TypeScript (`lstatSync`) writers). A symlink at
+            // the target path could redirect the atomic rename to an attacker-
+            // controlled location outside `output_path`, even though the parent
+            // directory passed canonicalization. Refuse to overwrite a symlink
+            // and record the result as unverified, matching Python/TS wording.
+            if let Ok(meta) = file_path.symlink_metadata() {
+                if meta.file_type().is_symlink() {
+                    warn!(file_path = %file_path.display(), "Skipping symlink escape at target path");
+                    results.push(WriteResult::failed(
+                        module.module_id.clone(),
+                        Some(file_path.display().to_string()),
+                        "Security skip: symlink at target path".into(),
+                    ));
+                    continue;
+                }
+            }
+
+            if file_path.exists() {
+                warn!(file_path = %file_path.display(), "Overwriting existing file");
+            }
+
+            let header = format!(
+                "# Auto-generated by apcore-toolkit scanner\n\
+                 # Generated: {timestamp}\n\
+                 # Do not edit manually unless you intend to customize schemas.\n\n"
+            );
+            let yaml_content = serde_yaml_ng::to_string(&binding_data)
+                .map_err(|e| WriteError::new(file_path.display().to_string(), e.to_string()))?;
+            let full_content = format!("{header}{yaml_content}");
+
+            // Atomic write: write bytes to a sibling .yaml.tmp file, call sync_all()
+            // to flush OS page cache to durable storage, then rename atomically.
+            // fs::rename on the same filesystem is atomic on POSIX; on Windows it
+            // replaces any existing target atomically on NTFS.
+            // On Unix we also fsync the parent directory after rename to make the
+            // new directory entry durable.
+            // The tmp file is removed on any failure so no stale `.yaml.tmp` is left.
+            let tmp_path = file_path.with_extension("yaml.tmp");
+            let write_res = (|| -> std::io::Result<()> {
+                let mut tmp_file = fs::File::create(&tmp_path)?;
+                tmp_file.write_all(full_content.as_bytes())?;
+                tmp_file.flush()?;
+                tmp_file.sync_all()
+            })();
+            if let Err(e) = write_res {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WriteError::io(tmp_path.display().to_string(), e));
+            }
+            if let Err(e) = fs::rename(&tmp_path, &file_path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WriteError::io(file_path.display().to_string(), e));
+            }
+            // Post-rename defence-in-depth: warn if the result is a symlink
+            // (would indicate a TOCTOU race). Matches Python/TS writers.
+            if let Ok(meta) = file_path.symlink_metadata() {
+                if meta.file_type().is_symlink() {
+                    warn!(
+                        file_path = %file_path.display(),
+                        "YAMLWriter: post-rename symlink detected — possible race"
+                    );
+                }
+            }
+            #[cfg(unix)]
+            {
+                if let Some(parent) = file_path.parent() {
+                    if let Ok(dir) = fs::File::open(parent) {
+                        let _ = dir.sync_all();
+                    }
+                }
+            }
+            debug!(file_path = %file_path.display(), "Written");
+
+            let mut result =
+                WriteResult::with_path(module.module_id.clone(), file_path.display().to_string());
+
+            if verify {
+                result = verify_yaml(&result, &file_path);
+            }
+            if result.verified {
+                if let Some(vs) = verifiers {
+                    let chain_result =
+                        run_verifier_chain(vs, &file_path.display().to_string(), &module.module_id);
+                    if !chain_result.ok {
+                        result = WriteResult::failed(
+                            result.module_id,
+                            result.path,
+                            chain_result.error.unwrap_or_default(),
+                        );
+                    }
+                }
+            }
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+}
+
+/// Regex matching characters unsafe for filenames.
+static UNSAFE_CHARS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[^a-zA-Z0-9._-]").expect("static regex"));
+
+/// Regex matching consecutive dots (path traversal prevention).
+static CONSECUTIVE_DOTS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.{2,}").expect("static regex"));
+
+/// Sanitize module_id for safe filename construction.
+fn sanitize_filename(module_id: &str) -> String {
+    let safe = UNSAFE_CHARS_RE.replace_all(module_id, "_");
+    // Collapse consecutive dots to prevent path traversal
+    CONSECUTIVE_DOTS_RE.replace_all(&safe, "_").to_string()
+}
+
+/// Build the YAML-serializable value for a ScannedModule.
+fn build_binding(module: &ScannedModule) -> serde_json::Value {
+    let mut binding = serde_json::Map::new();
+    binding.insert(
+        "module_id".into(),
+        serde_json::Value::from(module.module_id.clone()),
+    );
+    binding.insert(
+        "target".into(),
+        serde_json::Value::from(module.target.clone()),
+    );
+    binding.insert(
+        "description".into(),
+        serde_json::Value::from(module.description.clone()),
+    );
+    binding.insert(
+        "documentation".into(),
+        serde_json::to_value(&module.documentation).unwrap_or(serde_json::Value::Null),
+    );
+    binding.insert(
+        "tags".into(),
+        serde_json::to_value(&module.tags).unwrap_or(serde_json::json!([])),
+    );
+    binding.insert(
+        "version".into(),
+        serde_json::Value::from(module.version.clone()),
+    );
+    binding.insert(
+        "annotations".into(),
+        annotations_to_dict(module.annotations.as_ref()),
+    );
+    binding.insert(
+        "examples".into(),
+        serde_json::to_value(&module.examples).unwrap_or(serde_json::json!([])),
+    );
+    binding.insert(
+        "metadata".into(),
+        serde_json::to_value(&module.metadata).unwrap_or(serde_json::json!({})),
+    );
+    if let Some(alias) = &module.suggested_alias {
+        binding.insert(
+            "suggested_alias".into(),
+            serde_json::Value::from(alias.clone()),
+        );
+    }
+    binding.insert("input_schema".into(), module.input_schema.clone());
+    binding.insert("output_schema".into(), module.output_schema.clone());
+    if let Some(display) = &module.display {
+        binding.insert("display".into(), display.clone());
+    }
+
+    serde_json::json!({
+        "spec_version": "1.0",
+        "bindings": [serde_json::Value::Object(binding)]
+    })
+}
+
+/// Verify that a written YAML file is well-formed and contains required fields.
+fn verify_yaml(result: &WriteResult, file_path: &Path) -> WriteResult {
+    let vr = YAMLVerifier.verify(&file_path.display().to_string(), &result.module_id);
+    if vr.ok {
+        result.clone()
+    } else {
+        WriteResult::failed(
+            result.module_id.clone(),
+            result.path.clone(),
+            vr.error.unwrap_or_default(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn sample_module() -> ScannedModule {
+        ScannedModule::new(
+            "users.get_user".into(),
+            "Get a user".into(),
+            json!({"type": "object", "properties": {"user_id": {"type": "integer"}}}),
+            json!({"type": "object"}),
+            vec!["users".into()],
+            "myapp.views:get_user".into(),
+        )
+    }
+
+    #[test]
+    fn test_sanitize_filename_basic() {
+        assert_eq!(sanitize_filename("users.get_user"), "users.get_user");
+    }
+
+    #[test]
+    fn test_sanitize_filename_special_chars() {
+        assert_eq!(sanitize_filename("a/b\\c d"), "a_b_c_d");
+    }
+
+    #[test]
+    fn test_sanitize_filename_path_traversal() {
+        let result = sanitize_filename("../../etc/passwd");
+        assert!(!result.contains(".."));
+    }
+
+    #[test]
+    fn test_write_empty_modules() {
+        let writer = YAMLWriter;
+        let result = writer.write(&[], "/tmp/test", false, false, None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_write_dry_run() {
+        let writer = YAMLWriter;
+        let modules = vec![sample_module()];
+        let result = writer
+            .write(&modules, "/tmp/nonexistent", true, false, None)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].module_id, "users.get_user");
+        assert!(result[0].path.is_none());
+    }
+
+    #[test]
+    fn test_write_creates_file() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let modules = vec![sample_module()];
+        let result = writer
+            .write(&modules, dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].path.is_some());
+
+        let file_path = result[0].path.as_ref().unwrap();
+        assert!(Path::new(file_path).exists());
+        let content = fs::read_to_string(file_path).unwrap();
+        assert!(content.contains("Auto-generated"));
+        assert!(content.contains("users.get_user"));
+    }
+
+    #[test]
+    fn test_write_with_verify() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let modules = vec![sample_module()];
+        let result = writer
+            .write(&modules, dir.path().to_str().unwrap(), false, true, None)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].verified);
+    }
+
+    #[test]
+    fn test_write_multiple_modules() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let modules = vec![
+            ScannedModule::new(
+                "mod_a".into(),
+                "Module A".into(),
+                json!({"type": "object"}),
+                json!({"type": "object"}),
+                vec![],
+                "app:a".into(),
+            ),
+            ScannedModule::new(
+                "mod_b".into(),
+                "Module B".into(),
+                json!({"type": "object"}),
+                json!({"type": "object"}),
+                vec![],
+                "app:b".into(),
+            ),
+            ScannedModule::new(
+                "mod_c".into(),
+                "Module C".into(),
+                json!({"type": "object"}),
+                json!({"type": "object"}),
+                vec![],
+                "app:c".into(),
+            ),
+        ];
+        let results = writer
+            .write(&modules, dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        // Each result should have a file path and the file should exist
+        for result in &results {
+            let path = result.path.as_ref().expect("path should be set");
+            assert!(Path::new(path).exists(), "file should exist: {path}");
+        }
+    }
+
+    #[test]
+    fn test_binding_contains_all_fields() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let mut module = sample_module();
+        module.documentation = Some("Full docs here".into());
+        module.version = "2.0.0".into();
+        let modules = vec![module];
+        let results = writer
+            .write(&modules, dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+        let file_path = results[0].path.as_ref().unwrap();
+        let content = fs::read_to_string(file_path).unwrap();
+        // Verify all expected fields are present in the YAML content
+        for field in &[
+            "spec_version",
+            "module_id",
+            "target",
+            "description",
+            "documentation",
+            "tags",
+            "version",
+            "annotations",
+            "examples",
+            "metadata",
+            "input_schema",
+            "output_schema",
+        ] {
+            assert!(
+                content.contains(field),
+                "YAML should contain field '{field}'"
+            );
+        }
+        assert!(content.contains("users.get_user"));
+        assert!(content.contains("Full docs here"));
+        assert!(content.contains("2.0.0"));
+    }
+
+    #[test]
+    fn test_creates_nested_output_dir() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a").join("b").join("c");
+        let writer = YAMLWriter;
+        let modules = vec![sample_module()];
+        // The nested directory does not exist yet
+        assert!(!nested.exists());
+        let results = writer
+            .write(&modules, nested.to_str().unwrap(), false, false, None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(nested.exists(), "nested directory should have been created");
+        let file_path = results[0].path.as_ref().unwrap();
+        assert!(Path::new(file_path).exists());
+    }
+
+    #[test]
+    fn test_filename_sanitization_dots() {
+        let result = sanitize_filename("foo..bar");
+        assert!(
+            !result.contains(".."),
+            "consecutive dots should be collapsed: got '{result}'"
+        );
+        let result2 = sanitize_filename("a...b....c");
+        assert!(
+            !result2.contains(".."),
+            "consecutive dots should be collapsed: got '{result2}'"
+        );
+    }
+
+    #[test]
+    fn test_display_omitted_when_none() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let module = sample_module();
+        let modules = vec![module];
+        let results = writer
+            .write(&modules, dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+        let file_path = results[0].path.as_ref().unwrap();
+        let content = fs::read_to_string(file_path).unwrap();
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).unwrap();
+        let bindings = parsed["bindings"].as_sequence().unwrap();
+        assert!(
+            bindings[0].get("display").is_none(),
+            "display should be absent when module.display is None"
+        );
+    }
+
+    #[test]
+    fn test_display_emitted_when_set() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let mut module = sample_module();
+        module.display = Some(json!({"mcp": {"alias": "users_get"}, "alias": "users.get"}));
+        let modules = vec![module];
+        let results = writer
+            .write(&modules, dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+        let file_path = results[0].path.as_ref().unwrap();
+        let content = fs::read_to_string(file_path).unwrap();
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).unwrap();
+        let bindings = parsed["bindings"].as_sequence().unwrap();
+        let display = bindings[0]
+            .get("display")
+            .expect("display should be present");
+        assert_eq!(
+            display["alias"],
+            serde_yaml_ng::Value::String("users.get".into())
+        );
+        assert_eq!(
+            display["mcp"]["alias"],
+            serde_yaml_ng::Value::String("users_get".into())
+        );
+    }
+
+    #[test]
+    fn test_none_annotations_in_binding() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let mut module = sample_module();
+        module.annotations = None;
+        let modules = vec![module];
+        let results = writer
+            .write(&modules, dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+        let file_path = results[0].path.as_ref().unwrap();
+        let content = fs::read_to_string(file_path).unwrap();
+        // The file should still be valid YAML and contain the annotations key
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).unwrap();
+        let bindings = parsed["bindings"].as_sequence().unwrap();
+        assert_eq!(bindings.len(), 1);
+        // annotations should be present (as null)
+        assert!(bindings[0].get("annotations").is_some());
+    }
+
+    #[test]
+    fn test_overwrite_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+
+        // Write the first version
+        let module_v1 = ScannedModule::new(
+            "overwrite_test".into(),
+            "Version 1".into(),
+            json!({"type": "object"}),
+            json!({"type": "object"}),
+            vec![],
+            "app:v1".into(),
+        );
+        let results_v1 = writer
+            .write(
+                &[module_v1],
+                dir.path().to_str().unwrap(),
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        let file_path = results_v1[0].path.as_ref().unwrap();
+        let content_v1 = fs::read_to_string(file_path).unwrap();
+        assert!(content_v1.contains("Version 1"));
+
+        // Write the second version with the same module_id
+        let module_v2 = ScannedModule::new(
+            "overwrite_test".into(),
+            "Version 2".into(),
+            json!({"type": "object"}),
+            json!({"type": "object"}),
+            vec![],
+            "app:v2".into(),
+        );
+        let results_v2 = writer
+            .write(
+                &[module_v2],
+                dir.path().to_str().unwrap(),
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        let file_path_v2 = results_v2[0].path.as_ref().unwrap();
+        let content_v2 = fs::read_to_string(file_path_v2).unwrap();
+        assert!(content_v2.contains("Version 2"));
+        assert!(!content_v2.contains("Version 1"));
+    }
+
+    #[test]
+    fn test_suggested_alias_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let mut module = sample_module();
+        module.suggested_alias = Some("users.get".into());
+        let results = writer
+            .write(&[module], dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+        let file_path = results[0].path.as_ref().unwrap();
+        let content = fs::read_to_string(file_path).unwrap();
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).unwrap();
+        let bindings = parsed["bindings"].as_sequence().unwrap();
+        assert_eq!(
+            bindings[0]["suggested_alias"]
+                .as_str()
+                .expect("suggested_alias should be a string"),
+            "users.get"
+        );
+    }
+
+    #[test]
+    fn test_suggested_alias_absent_when_none() {
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let module = sample_module();
+        let results = writer
+            .write(&[module], dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+        let file_path = results[0].path.as_ref().unwrap();
+        let content = fs::read_to_string(file_path).unwrap();
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).unwrap();
+        let bindings = parsed["bindings"].as_sequence().unwrap();
+        assert!(
+            bindings[0].get("suggested_alias").is_none(),
+            "suggested_alias should be absent when module.suggested_alias is None"
+        );
+    }
+
+    #[test]
+    fn test_filename_collision_produces_distinct_files() {
+        // D11-010: two modules whose module_ids both sanitize to the same filename
+        // must produce two distinct files in a single write() call.
+        // The second module receives a numeric suffix (e.g. `foo_1.binding.yaml`).
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+
+        // Both module_ids sanitize to "a_b" (slash → underscore)
+        let mod1 = ScannedModule::new(
+            "a/b".into(),
+            "Module slash".into(),
+            json!({"type": "object"}),
+            json!({"type": "object"}),
+            vec![],
+            "app:slash".into(),
+        );
+        let mod2 = ScannedModule::new(
+            "a_b".into(),
+            "Module underscore".into(),
+            json!({"type": "object"}),
+            json!({"type": "object"}),
+            vec![],
+            "app:underscore".into(),
+        );
+
+        let results = writer
+            .write(
+                &[mod1, mod2],
+                dir.path().to_str().unwrap(),
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2, "should produce two results");
+
+        let path1 = results[0]
+            .path
+            .as_ref()
+            .expect("first result must have path");
+        let path2 = results[1]
+            .path
+            .as_ref()
+            .expect("second result must have path");
+        assert_ne!(path1, path2, "collision must produce distinct file paths");
+        assert!(Path::new(path1).exists(), "first file must exist: {path1}");
+        assert!(Path::new(path2).exists(), "second file must exist: {path2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_refuses_to_overwrite_symlink_at_target_path() {
+        // A-D-015 parity: when a symlink occupies the target file path, the
+        // writer must refuse to overwrite it (matches Python's is_symlink and
+        // TypeScript's lstatSync guards). The result must be marked unverified
+        // with the canonical "Security skip" wording.
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let module = sample_module(); // module_id = "users.get_user"
+
+        // Plant a symlink at the target file path BEFORE writing. The symlink
+        // points to a sibling decoy file so we can verify the writer did not
+        // dereference it.
+        let target_file = dir.path().join("users.get_user.binding.yaml");
+        let decoy = dir.path().join("decoy.yaml");
+        fs::write(&decoy, "original decoy content\n").unwrap();
+        symlink(&decoy, &target_file).unwrap();
+
+        let results = writer
+            .write(&[module], dir.path().to_str().unwrap(), false, false, None)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].verified,
+            "symlinked target must NOT be verified"
+        );
+        let err = results[0].verification_error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("symlink"),
+            "verification_error should mention symlink, got: {err}"
+        );
+
+        // The decoy file behind the symlink must be untouched.
+        let decoy_content = fs::read_to_string(&decoy).unwrap();
+        assert_eq!(decoy_content, "original decoy content\n");
+    }
+
+    #[test]
+    fn test_custom_verifier_failure_produces_failed_result() {
+        use crate::output::types::{Verifier, VerifyResult};
+
+        struct AlwaysFail;
+        impl Verifier for AlwaysFail {
+            fn verify(&self, _path: &str, _module_id: &str) -> VerifyResult {
+                VerifyResult::fail("intentional failure".into())
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let writer = YAMLWriter;
+        let module = sample_module();
+        let verifier = AlwaysFail;
+        let verifiers: &[&dyn Verifier] = &[&verifier];
+        let results = writer
+            .write(
+                &[module],
+                dir.path().to_str().unwrap(),
+                false,
+                true,
+                Some(verifiers),
+            )
+            .unwrap();
+        assert!(!results[0].verified, "result should be marked not verified");
+        assert!(results[0]
+            .verification_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("intentional failure"));
+    }
+}

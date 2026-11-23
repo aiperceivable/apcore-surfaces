@@ -1,0 +1,91 @@
+[package]
+name = "apcore-toolkit"
+version = "0.15.0"
+edition = "2021"
+description = "Shared scanner, schema extraction, and output toolkit for apcore framework adapters"
+license = "Apache-2.0"
+readme = "README.md"
+authors = ["aiperceivable <tercel.yi@gmail.com>"]
+homepage = "https://aiperceivable.com"
+repository = "https://github.com/aiperceivable/apcore-toolkit-rust"
+documentation = "https://github.com/aiperceivable/apcore-toolkit-rust#readme"
+keywords = ["apcore", "mcp", "scanner", "schema", "toolkit"]
+categories = [
+    "api-bindings",
+    "development-tools",
+    "web-programming",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+apcore = ">=0.33.0"
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` is required for the toolkit's byte-equivalent tabular
+# formatters (csv / jsonl): object key order MUST match insertion order to
+# stay byte-identical with Python (dict order) and JavaScript (object key
+# order per ES2015+). Without this feature serde_json sorts keys alphabetically.
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+regex = "1"
+syn = { version = "2", features = ["parsing", "full"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+thiserror = "2"
+indexmap = "2"
+percent-encoding = "2"
+async-trait = "0.1"
+walkdir = "2"
+# Runtime-independent, cancellable HTTP deadline watchdog for injected auth
+# transports. Poll interval SleepFn remains exclusively for protocol delays.
+futures-timer = { version = "3", optional = true }
+
+# Used by ai_enhancer for synchronous SLM API calls (always included).
+ureq = { version = "3", features = ["json"] }
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["json"]
+optional = true
+
+# HTTP features use the async timer for cooperative proxy cancellation and
+# the default RFC 8628 polling sleep. Only `time` is needed; reqwest already
+# requires Tokio for HTTP I/O.
+[dependencies.tokio]
+version = "1"
+features = ["time"]
+optional = true
+default-features = false
+
+[features]
+# `http-proxy` is enabled by default so a vanilla `cargo add apcore-toolkit`
+# exposes the same public API surface (`HTTPProxyRegistryWriter`) as the
+# Python and TypeScript SDKs. Consumers who want a lean default build that
+# omits the `reqwest` dependency can opt out with `default-features = false`.
+#
+# `device-auth` follows the same rule for the same reason: the Python and
+# TypeScript SDKs export `DeviceAuthClient` unconditionally, so a vanilla
+# `cargo add apcore-toolkit` must too. `default-features = false` still yields
+# a build with neither `reqwest` nor `tokio`.
+default = ["http-proxy", "device-auth"]
+http-proxy = ["dep:reqwest", "dep:tokio"]
+device-auth = ["dep:reqwest", "dep:tokio", "dep:futures-timer"]
+
+[lints.clippy]
+# Match the project's pre-commit gate (Makefile + hooks/) — block warnings
+# at the lint pass rather than relying solely on `cargo clippy -- -D warnings`
+# in CI. Using `priority = -1` on `all` lets specific allow-list overrides
+# layer on top without losing the deny-all baseline.
+all = { level = "deny", priority = -1 }
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"
+# Test-only: driving `reqwest`'s async client against a real (loopback)
+# HTTP server in the W2 regression test (HEAD/OPTIONS/TRACE support in
+# HTTPProxyRegistryWriter) requires a real async I/O reactor — `futures`'
+# bare `block_on` executor has none. Not a runtime dependency of the
+# crate itself.
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }

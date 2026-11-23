@@ -1,0 +1,1019 @@
+// HTTP proxy registry writer.
+//
+// Registers scanned modules as HTTP proxy implementations that forward
+// requests to a running web API. Feature-gated behind `http-proxy`.
+
+use std::collections::{HashMap, HashSet};
+use std::future::{poll_fn, Future};
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use thiserror::Error;
+use tracing::{debug, warn};
+
+use apcore::cancel::CancelToken;
+use apcore::context::Context;
+use apcore::errors::ModuleError;
+use apcore::module::Module;
+use apcore::Registry;
+
+use crate::http_verb_map::{
+    extract_openapi_path_param_names, extract_path_param_names, is_openapi_proxy_path,
+    substitute_openapi_path_params, substitute_path_params,
+};
+use crate::openapi_parameters::OpenApiProxyInputs;
+use crate::output::types::WriteResult;
+use crate::types::ScannedModule;
+
+/// Errors returned by [`HTTPProxyRegistryWriter::new`].
+#[derive(Debug, Error)]
+pub enum HTTPProxyRegistryWriterError {
+    /// `base_url` is not a valid URL or uses a non-http(s) scheme.
+    #[error("invalid base_url: {0}")]
+    InvalidBaseUrl(String),
+    /// `timeout_secs` is not a valid positive finite number.
+    #[error("invalid timeout_secs: {0}")]
+    InvalidTimeout(String),
+}
+
+/// Register scanned modules as HTTP proxy modules in the registry.
+///
+/// Each module's `execute()` sends an HTTP request to the target API
+/// instead of calling the handler directly.
+pub struct HTTPProxyRegistryWriter {
+    base_url: String,
+    auth_header_factory: Option<Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>>,
+    client: reqwest::Client,
+}
+
+impl std::fmt::Debug for HTTPProxyRegistryWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HTTPProxyRegistryWriter")
+            .field("base_url", &self.base_url)
+            .field(
+                "auth_header_factory",
+                &self.auth_header_factory.as_ref().map(|_| "<factory>"),
+            )
+            .field("client", &self.client)
+            .finish()
+    }
+}
+
+impl HTTPProxyRegistryWriter {
+    /// Create a new HTTP proxy writer.
+    ///
+    /// - `base_url`: Base URL of the target API (must be `http://` or `https://`).
+    /// - `auth_header_factory`: Optional callable returning HTTP headers for auth.
+    /// - `timeout_secs`: HTTP request timeout in seconds (must be a positive finite number).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HTTPProxyRegistryWriterError::InvalidBaseUrl`] if `base_url` is not a valid URL
+    /// or its scheme is not `http` or `https` (SSRF prevention).
+    /// Returns [`HTTPProxyRegistryWriterError::InvalidTimeout`] if `timeout_secs` is not a
+    /// positive finite number.
+    pub fn new(
+        base_url: String,
+        auth_header_factory: Option<Box<dyn Fn() -> HashMap<String, String> + Send + Sync>>,
+        timeout_secs: f64,
+    ) -> Result<Self, HTTPProxyRegistryWriterError> {
+        let parsed = reqwest::Url::parse(&base_url).map_err(|e| {
+            HTTPProxyRegistryWriterError::InvalidBaseUrl(format!("'{}': {e}", base_url))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(HTTPProxyRegistryWriterError::InvalidBaseUrl(format!(
+                "scheme '{}' is not allowed — only http and https are permitted",
+                parsed.scheme()
+            )));
+        }
+
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(HTTPProxyRegistryWriterError::InvalidTimeout(format!(
+                "must be a positive finite number, got {timeout_secs}"
+            )));
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs_f64(timeout_secs))
+            .build()
+            .map_err(|e| {
+                HTTPProxyRegistryWriterError::InvalidBaseUrl(format!(
+                    "failed to build HTTP client: {e}"
+                ))
+            })?;
+
+        Ok(Self {
+            base_url,
+            auth_header_factory: auth_header_factory.map(Arc::from),
+            client,
+        })
+    }
+
+    /// Register each ScannedModule as an HTTP proxy module.
+    pub fn write(&self, modules: &[ScannedModule], registry: &Registry) -> Vec<WriteResult> {
+        let mut results: Vec<WriteResult> = Vec::new();
+
+        for module in modules {
+            let proxy = match self.proxy_module(module) {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    results.push(WriteResult::failed(module.module_id.clone(), None, error));
+                    continue;
+                }
+            };
+
+            let descriptor = apcore::registry::registry::ModuleDescriptor {
+                module_id: module.module_id.clone(),
+                name: Some(module.module_id.clone()),
+                description: module.description.clone(),
+                documentation: module.documentation.clone(),
+                input_schema: module.input_schema.clone(),
+                output_schema: module.output_schema.clone(),
+                version: module.version.clone(),
+                tags: module.tags.clone(),
+                annotations: module.annotations.clone(),
+                examples: module.examples.clone(),
+                metadata: module.metadata.clone(),
+                display: module.display.clone(),
+                sunset_date: None,
+                dependencies: vec![],
+                enabled: true,
+            };
+
+            match registry.register(&module.module_id, Box::new(proxy), descriptor) {
+                Ok(()) => {
+                    debug!("Registered HTTP proxy: {}", module.module_id);
+                    results.push(WriteResult::new(module.module_id.clone()));
+                }
+                Err(e) => {
+                    warn!(module_id = %module.module_id, error = %e, "HTTPProxyRegistryWriter registration failed");
+                    results.push(WriteResult::failed(
+                        module.module_id.clone(),
+                        None,
+                        e.to_string(),
+                    ));
+                }
+            }
+        }
+
+        results
+    }
+
+    fn proxy_module(&self, module: &ScannedModule) -> Result<ProxyModule, String> {
+        let inputs = OpenApiProxyInputs::from_module(module)
+            .map_err(|error| format!("effective input metadata is invalid: {error}"))?;
+        let effective_route = inputs.is_some();
+        let (http_method, url_path) = http_proxy_route_metadata(module);
+        if effective_route && !url_path.is_some_and(is_openapi_proxy_path) {
+            return Err("routing metadata is missing or invalid: 'url_path'".to_string());
+        }
+        let url_path = url_path.unwrap_or("/");
+        let path_params = if effective_route {
+            extract_openapi_path_param_names(url_path)
+        } else {
+            extract_path_param_names(url_path)
+        };
+        let effective_query_names = inputs
+            .map(|inputs| inputs.query.into_iter().collect())
+            .unwrap_or_default();
+        Ok(ProxyModule {
+            base_url: self.base_url.clone(),
+            http_method: http_method.unwrap_or("GET").to_string(),
+            url_path: url_path.to_string(),
+            path_params,
+            effective_route,
+            effective_query_names,
+            required_json_body: effective_route && OpenApiProxyInputs::requires_json_body(module),
+            input_schema: module.input_schema.clone(),
+            output_schema: module.output_schema.clone(),
+            description: module.description.clone(),
+            auth_header_factory: self.auth_header_factory.clone(),
+            client: self.client.clone(),
+        })
+    }
+}
+
+/// Read the explicit HTTP method and URL path used by the proxy writer.
+///
+/// Missing or non-string fields are returned as `None` so callers can check
+/// the route before registration. The writer applies its defaults separately.
+#[must_use]
+pub fn http_proxy_route_metadata(module: &ScannedModule) -> (Option<&str>, Option<&str>) {
+    let http_method = module
+        .metadata
+        .get("http_method")
+        .and_then(|value| value.as_str());
+    let url_path = module
+        .metadata
+        .get("url_path")
+        .and_then(|value| value.as_str());
+    (http_method, url_path)
+}
+
+/// Whether the proxy writer can send this exact, case-sensitive HTTP method.
+#[must_use]
+pub fn proxy_supports_http_method(http_method: &str) -> bool {
+    proxy_http_method(http_method).is_some()
+}
+
+fn proxy_http_method(http_method: &str) -> Option<reqwest::Method> {
+    Some(match http_method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "PATCH" => reqwest::Method::PATCH,
+        "DELETE" => reqwest::Method::DELETE,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        "TRACE" => reqwest::Method::TRACE,
+        _ => return None,
+    })
+}
+
+/// HTTP methods that conventionally carry a JSON request body. Other
+/// methods (`GET`, `HEAD`, `DELETE`, `OPTIONS`) forward non-path inputs
+/// via the query string so they are not silently dropped, matching the
+/// Python and TypeScript SDKs.
+#[must_use]
+pub fn proxy_uses_json_body(http_method: &str) -> bool {
+    ["POST", "PUT", "PATCH"]
+        .iter()
+        .any(|method| method.eq_ignore_ascii_case(http_method))
+}
+
+/// Validate that all `{param}` placeholders in `actual_path` were substituted.
+///
+/// Returns `Err` with the list of still-unfilled parameter names if any remain.
+///
+/// # Defect W1 fix
+///
+/// This previously used a narrow `\{(\w+)\}` (word-characters-only) regex,
+/// distinct from the broad `\{[^}]+\}` pattern [`extract_path_param_names`]
+/// uses for extraction/substitution. Path-parameter extraction and
+/// substitution were already correct for OpenAPI-style hyphenated names
+/// like `{item-id}` (both go through [`extract_path_param_names`]); only
+/// this *unfilled-placeholder* check had narrower breadth than the
+/// extraction path, so a hyphenated param left unfilled by the caller
+/// would not have been flagged here. Reusing
+/// [`extract_path_param_names`] — the same function that already governs
+/// extraction and substitution — closes that gap and removes the second,
+/// divergent regex literal entirely.
+fn validate_path_params_filled(actual_path: &str, effective_route: bool) -> Result<(), String> {
+    let unfilled = if effective_route {
+        extract_openapi_path_param_names(actual_path)
+    } else {
+        extract_path_param_names(actual_path)
+    };
+    if unfilled.is_empty() {
+        Ok(())
+    } else {
+        let mut names: Vec<&str> = unfilled.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        Err(format!(
+            "Missing required path parameters {:?} — inputs must supply values for all path params in '{actual_path}'",
+            names
+        ))
+    }
+}
+
+/// Percent-encode a single path segment value (RFC 3986 §2.3 unreserved chars pass through).
+///
+/// This is intentionally a private helper — it encodes exactly the characters
+/// that are unsafe in a URL path segment. Unreserved characters (`A-Z a-z 0-9 - . _ ~`)
+/// are passed through unchanged; all other bytes are percent-encoded as `%XX`.
+fn percent_encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// Extract a human-readable error message from an HTTP error response body.
+///
+/// Private helper — tries to parse the body as JSON and looks for common error fields
+/// (`error_message`, `detail`, `error`, `message`) in that priority order, before
+/// falling back to a safely-truncated version of the raw text (max 200 characters).
+fn extract_error_message(body: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+        for key in &["error_message", "detail", "error", "message"] {
+            if let Some(val) = parsed.get(key) {
+                let msg = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if !msg.is_empty() {
+                    return msg;
+                }
+            }
+        }
+    }
+
+    safe_truncate(body, 200)
+}
+
+/// Truncate a string to at most `max_chars` characters without panicking
+/// on multi-byte UTF-8 boundaries.
+///
+/// Private helper — counts Unicode scalar values (chars), not bytes, so that
+/// multi-byte sequences (e.g. emoji) are each counted as one character.
+fn safe_truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
+/// A module that proxies requests to an HTTP API.
+struct ProxyModule {
+    base_url: String,
+    http_method: String,
+    url_path: String,
+    path_params: HashSet<String>,
+    effective_route: bool,
+    effective_query_names: HashSet<String>,
+    required_json_body: bool,
+    input_schema: serde_json::Value,
+    output_schema: serde_json::Value,
+    description: String,
+    auth_header_factory: Option<Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>>,
+    // Shared HTTP client — cloned from HTTPProxyRegistryWriter to reuse connection pool.
+    client: reqwest::Client,
+}
+
+#[allow(clippy::result_large_err)] // Preserve the shared ModuleError boundary.
+fn append_query_value<'a>(
+    query: &mut Vec<(&'a str, String)>,
+    name: &'a str,
+    value: &serde_json::Value,
+    prefer_repeated_keys: bool,
+) -> Result<(), ModuleError> {
+    if prefer_repeated_keys && value.is_object() {
+        return Err(ModuleError::new(
+            apcore::errors::ErrorCode::ModuleExecuteError,
+            format!("Query parameter '{name}' cannot forward an object"),
+        ));
+    }
+    if let Some(items) = value.as_array().filter(|_| prefer_repeated_keys) {
+        for item in items {
+            if item.is_array() || item.is_object() || item.is_null() {
+                return Err(ModuleError::new(
+                    apcore::errors::ErrorCode::ModuleExecuteError,
+                    format!("Query array '{name}' requires string, number, or boolean values"),
+                ));
+            }
+            query.push((name, query_value(item)));
+        }
+    } else {
+        query.push((name, query_value(value)));
+    }
+    Ok(())
+}
+
+fn query_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[async_trait]
+impl Module for ProxyModule {
+    fn input_schema(&self) -> serde_json::Value {
+        self.input_schema.clone()
+    }
+
+    fn output_schema(&self) -> serde_json::Value {
+        self.output_schema.clone()
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    async fn execute(
+        &self,
+        inputs: serde_json::Value,
+        ctx: &Context<serde_json::Value>,
+    ) -> Result<serde_json::Value, ModuleError> {
+        match ctx.cancel_token.as_ref() {
+            Some(token) => execute_cancellable(self.forward(inputs, Some(token)), token).await,
+            None => self.forward(inputs, None).await,
+        }
+    }
+}
+
+impl ProxyModule {
+    #[allow(clippy::result_large_err)] // Preserve the shared ModuleError boundary.
+    async fn forward(
+        &self,
+        inputs: serde_json::Value,
+        token: Option<&CancelToken>,
+    ) -> Result<serde_json::Value, ModuleError> {
+        let mut path_param_values: HashMap<&str, String> = HashMap::new();
+        let mut query = Vec::new();
+        let mut body: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+        let uses_body = proxy_uses_json_body(&self.http_method);
+        if let Some(obj) = inputs.as_object() {
+            for (key, value) in obj {
+                if self.path_params.contains(key) {
+                    if self.effective_route
+                        && (value.is_array() || value.is_object() || value.is_null())
+                    {
+                        return Err(ModuleError::new(
+                            apcore::errors::ErrorCode::ModuleExecuteError,
+                            format!("Path parameter '{key}' requires a string, number, or boolean"),
+                        ));
+                    }
+                    let val_str = match value {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    path_param_values.insert(key.as_str(), percent_encode_path_segment(&val_str));
+                } else if uses_body {
+                    body.insert(key.clone(), value.clone());
+                } else {
+                    append_query_value(
+                        &mut query,
+                        key,
+                        value,
+                        self.effective_query_names.contains(key),
+                    )?;
+                }
+            }
+        }
+
+        let actual_path = if self.effective_route {
+            substitute_openapi_path_params(&self.url_path, &path_param_values)
+        } else {
+            substitute_path_params(&self.url_path, &path_param_values)
+        };
+
+        if let Err(msg) = validate_path_params_filled(&actual_path, self.effective_route) {
+            return Err(ModuleError::new(
+                apcore::errors::ErrorCode::ModuleExecuteError,
+                msg,
+            ));
+        }
+
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), actual_path);
+
+        let method = proxy_http_method(&self.http_method).ok_or_else(|| {
+            ModuleError::new(
+                apcore::errors::ErrorCode::ModuleExecuteError,
+                format!("Unsupported HTTP method: {}", self.http_method),
+            )
+        })?;
+        let mut request = self.client.request(method, &url);
+
+        // Apply auth headers from the factory, if configured
+        if let Some(ref factory) = self.auth_header_factory {
+            for (header_name, header_value) in factory() {
+                request = request.header(&header_name, &header_value);
+            }
+        }
+
+        if !query.is_empty() {
+            request = request.query(&query);
+        }
+        if uses_body && (!body.is_empty() || self.required_json_body) {
+            request = request.json(&body);
+        }
+
+        // A synchronous auth factory may itself cancel the Context. Check
+        // after it returns so no HTTP work starts for that cancelled request.
+        if let Some(token) = token {
+            token.check()?;
+        }
+        let resp = request
+            .send()
+            .await
+            .map_err(|error| http_error(error, "sending request"))?;
+        let status = resp.status();
+        if status.as_u16() == 204 {
+            return Ok(serde_json::json!({}));
+        }
+        // Both body paths stay inside the cancellable request future and
+        // reqwest's total timeout. Preserve text charset decoding for errors.
+        if status.is_success() {
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|error| http_error(error, "reading response body"))?;
+            serde_json::from_slice(&body).map_err(|error| {
+                ModuleError::new(
+                    apcore::errors::ErrorCode::ModuleExecuteError,
+                    format!("Failed to parse response JSON: {error}"),
+                )
+            })
+        } else {
+            let text = resp
+                .text()
+                .await
+                .map_err(|error| http_error(error, "reading response body"))?;
+            let message = extract_error_message(&text);
+            Err(ModuleError::new(
+                apcore::errors::ErrorCode::ModuleExecuteError,
+                format!("HTTP {}: {}", status.as_u16(), message),
+            ))
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)] // Preserve the shared ModuleError boundary.
+async fn execute_cancellable<F>(
+    request: F,
+    token: &CancelToken,
+) -> Result<serde_json::Value, ModuleError>
+where
+    F: Future<Output = Result<serde_json::Value, ModuleError>>,
+{
+    token.check()?;
+    let mut request = std::pin::pin!(request);
+    // Core tokens expose cooperative checks rather than a wakeable future.
+    // No background task survives: dropping this scope drops the HTTP work
+    // and its polling timer together.
+    let mut tick = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
+    poll_fn(|cx| {
+        if let Err(error) = token.check() {
+            return Poll::Ready(Err(error.into()));
+        }
+        if let Poll::Ready(result) = request.as_mut().poll(cx) {
+            // Synchronous work inside the future can cancel before returning
+            // Ready; cancellation wins over a simultaneous HTTP result.
+            if let Err(error) = token.check() {
+                return Poll::Ready(Err(error.into()));
+            }
+            return Poll::Ready(result);
+        }
+        if tick.as_mut().poll(cx).is_ready() {
+            tick.as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_millis(10));
+            let _ = tick.as_mut().poll(cx);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+fn http_error(error: reqwest::Error, operation: &str) -> ModuleError {
+    let message = if error.is_timeout() {
+        format!("HTTP request timed out while {operation}: {error}")
+    } else {
+        format!("HTTP request failed while {operation}: {error}")
+    };
+    ModuleError::new(apcore::errors::ErrorCode::ModuleExecuteError, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_cancellation_wins_over_a_simultaneously_ready_result() {
+        for succeed in [true, false] {
+            let token = CancelToken::new();
+            let future = async {
+                token.cancel();
+                if succeed {
+                    Ok(json!({}))
+                } else {
+                    Err(ModuleError::new(
+                        apcore::errors::ErrorCode::ModuleExecuteError,
+                        "HTTP failure",
+                    ))
+                }
+            };
+            let error = execute_cancellable(future, &token).await.unwrap_err();
+            assert_eq!(error.code, apcore::errors::ErrorCode::ExecutionCancelled);
+        }
+    }
+
+    #[test]
+    fn test_new_rejects_non_http_scheme() {
+        let result = HTTPProxyRegistryWriter::new("file:///etc/passwd".into(), None, 30.0);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("scheme 'file' is not allowed"));
+    }
+
+    #[test]
+    fn test_new_rejects_invalid_url() {
+        let result = HTTPProxyRegistryWriter::new("not a url".into(), None, 30.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_rejects_nan_timeout() {
+        let result = HTTPProxyRegistryWriter::new("http://localhost".into(), None, f64::NAN);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn test_new_rejects_negative_timeout() {
+        let result = HTTPProxyRegistryWriter::new("http://localhost".into(), None, -1.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_accepts_https_scheme() {
+        let result = HTTPProxyRegistryWriter::new("https://api.example.com".into(), None, 30.0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_http_fields_defaults() {
+        let module = ScannedModule::new(
+            "test".into(),
+            "test".into(),
+            json!({}),
+            json!({}),
+            vec![],
+            "app:func".into(),
+        );
+        let writer = HTTPProxyRegistryWriter::new("http://localhost".into(), None, 1.0).unwrap();
+        let proxy = writer.proxy_module(&module).unwrap();
+        assert_eq!(proxy.http_method, "GET");
+        assert_eq!(proxy.url_path, "/");
+    }
+
+    #[test]
+    fn test_get_http_fields_from_metadata() {
+        let mut module = ScannedModule::new(
+            "test".into(),
+            "test".into(),
+            json!({}),
+            json!({}),
+            vec![],
+            "app:func".into(),
+        );
+        module.metadata.insert(
+            "http_method".into(),
+            serde_json::Value::String("POST".into()),
+        );
+        module.metadata.insert(
+            "url_path".into(),
+            serde_json::Value::String("/users".into()),
+        );
+        let writer = HTTPProxyRegistryWriter::new("http://localhost".into(), None, 1.0).unwrap();
+        let proxy = writer.proxy_module(&module).unwrap();
+        assert_eq!(proxy.http_method, "POST");
+        assert_eq!(proxy.url_path, "/users");
+    }
+
+    #[test]
+    fn test_extract_path_params() {
+        let params = extract_path_param_names("/users/{user_id}/tasks/{task_id}");
+        assert!(params.contains("user_id"));
+        assert!(params.contains("task_id"));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_path_params_none() {
+        let params = extract_path_param_names("/users");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_extract_path_params_colon_style() {
+        // Regression test: colon-style params must not be silently dropped.
+        // The private PATH_PARAM_RE only handled brace-style; this test
+        // verifies that extract_path_param_names (from http_verb_map) handles
+        // both styles correctly.
+        let params = extract_path_param_names("/users/:id");
+        assert!(
+            params.contains("id"),
+            "colon-style param ':id' should be recognised; got: {params:?}"
+        );
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_path_params_mixed_styles() {
+        let params = extract_path_param_names("/users/:user_id/tasks/{task_id}");
+        assert!(params.contains("user_id"));
+        assert!(params.contains("task_id"));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_error_message_json_error_message() {
+        let body = r#"{"error_message": "not found"}"#;
+        assert_eq!(extract_error_message(body), "not found");
+    }
+
+    #[test]
+    fn test_extract_error_message_json_detail() {
+        let body = r#"{"detail": "unauthorized"}"#;
+        assert_eq!(extract_error_message(body), "unauthorized");
+    }
+
+    #[test]
+    fn test_extract_error_message_json_error() {
+        let body = r#"{"error": "bad request"}"#;
+        assert_eq!(extract_error_message(body), "bad request");
+    }
+
+    #[test]
+    fn test_extract_error_message_json_message() {
+        let body = r#"{"message": "server error"}"#;
+        assert_eq!(extract_error_message(body), "server error");
+    }
+
+    #[test]
+    fn test_extract_error_message_json_priority() {
+        // error_message takes priority over message
+        let body = r#"{"error_message": "first", "message": "second"}"#;
+        assert_eq!(extract_error_message(body), "first");
+    }
+
+    #[test]
+    fn test_extract_error_message_plain_text_short() {
+        let body = "plain text error";
+        assert_eq!(extract_error_message(body), "plain text error");
+    }
+
+    #[test]
+    fn test_extract_error_message_plain_text_truncated() {
+        let body = "x".repeat(300);
+        let result = extract_error_message(&body);
+        assert_eq!(result.len(), 200);
+    }
+
+    #[test]
+    fn test_validate_path_params_filled_no_placeholders() {
+        assert!(validate_path_params_filled("/users/123/tasks/456", false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_params_filled_static_path() {
+        assert!(validate_path_params_filled("/health", false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_params_filled_unfilled_placeholder() {
+        let result = validate_path_params_filled("/users/{user_id}/tasks", false);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("user_id"),
+            "error should name the unfilled param: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_params_filled_multiple_unfilled() {
+        let result = validate_path_params_filled("/users/{user_id}/tasks/{task_id}", false);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("user_id") || msg.contains("task_id"), "{msg}");
+    }
+
+    // W1 regression: the narrow `\{(\w+)\}` validator regex could not
+    // match a hyphenated OpenAPI-style path parameter like `{item-id}`,
+    // so an unfilled hyphenated param was silently NOT flagged (the
+    // literal `{item-id}` was left in the URL with no error). Now that
+    // `validate_path_params_filled` reuses `extract_path_param_names`
+    // (the same broad `\{[^}]+\}` extraction already used for
+    // substitution), the hyphenated param is correctly recognised and
+    // flagged as unfilled.
+    #[test]
+    fn test_validate_path_params_filled_hyphenated_param_now_flagged() {
+        let result = validate_path_params_filled("/items/{item-id}", false);
+        assert!(
+            result.is_err(),
+            "a hyphenated unfilled path param must now be flagged (W1 fix)"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("item-id"),
+            "error should name the unfilled hyphenated param: {msg}"
+        );
+    }
+
+    // W2 regression: HTTPProxyRegistryWriter's method-match block
+    // previously handled only GET/POST/PUT/PATCH/DELETE and rejected
+    // HEAD/OPTIONS/TRACE with "Unsupported HTTP method: <verb>" *before*
+    // any network call was attempted — even though OpenAPI (and the
+    // Python/TypeScript writers) recognise all eight HTTP verbs. This
+    // drives `ProxyModule::execute` against a real loopback HTTP server
+    // to prove the request is now actually built and sent for each of
+    // the three previously-unsupported methods.
+    fn spawn_mock_server(
+        response: &'static str,
+        connections: usize,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..connections {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_execute_head_options_trace_now_supported() {
+        // 204 No Content sidesteps response-body parsing entirely (the
+        // handler short-circuits to `Ok(json!({}))` for status 204), so
+        // this test isolates exactly what W2 fixes — request construction
+        // and dispatch for a method that was previously rejected outright
+        // — without depending on HTTP body-framing behaviour for HEAD
+        // responses (which real HTTP clients suppress regardless of any
+        // `Content-Length` a test server claims).
+        const RESPONSE: &str = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+        let (addr, handle) = spawn_mock_server(RESPONSE, 3);
+
+        for method in ["HEAD", "OPTIONS", "TRACE"] {
+            let proxy = ProxyModule {
+                base_url: format!("http://{addr}"),
+                http_method: method.to_string(),
+                url_path: "/widgets".to_string(),
+                path_params: HashSet::new(),
+                effective_route: false,
+                effective_query_names: HashSet::new(),
+                required_json_body: false,
+                input_schema: json!({}),
+                output_schema: json!({}),
+                description: "test".to_string(),
+                auth_header_factory: None,
+                client: reqwest::Client::new(),
+            };
+            let ctx = Context::create(None, None, None, None, json!({}), None);
+            let result = proxy.execute(json!({}), &ctx).await;
+            assert!(
+                result.is_ok(),
+                "{method} should now be supported (previously errored with \
+                 'Unsupported HTTP method: {method}'): {result:?}"
+            );
+        }
+
+        handle.join().expect("mock server thread panicked");
+    }
+
+    // Regression test: `extract_path_param_names` correctly recognises
+    // colon-style placeholders (`:id`), so `id`'s value is pulled out of
+    // `inputs` and excluded from the query/body — but the URL
+    // substitution step previously did a manual, brace-only
+    // `actual_path.replace(&format!("{{{key}}}"), ...)`, which never
+    // matches `:id`. That left the literal `:id` in the URL and tripped
+    // `validate_path_params_filled`'s "Missing required path parameters"
+    // check on every request against a colon-style route. The fix
+    // routes substitution through the shared `substitute_path_params`
+    // helper, which handles both `{id}` and `:id` styles.
+    #[tokio::test]
+    async fn test_execute_colon_style_path_param_substituted() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+        let addr = listener.local_addr().expect("local_addr");
+        // Non-blocking with a bounded retry loop: if the fix regresses and
+        // the request is never sent (e.g. execute() short-circuits on a
+        // still-unfilled path param before touching the network), this
+        // thread must still terminate on its own within a couple of
+        // seconds instead of hanging the test suite on a blocking accept().
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let (tx, rx) = mpsc::channel::<String>();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break Some(stream),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            if let Some(mut stream) = stream {
+                let _ = stream.set_nonblocking(false);
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = request.lines().next().unwrap_or("").to_string();
+                let _ = tx.send(request_line);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        let mut path_params = HashSet::new();
+        path_params.insert("id".to_string());
+        let proxy = ProxyModule {
+            base_url: format!("http://{addr}"),
+            http_method: "GET".to_string(),
+            url_path: "/users/:id".to_string(),
+            path_params,
+            effective_route: false,
+            effective_query_names: HashSet::new(),
+            required_json_body: false,
+            input_schema: json!({}),
+            output_schema: json!({}),
+            description: "test".to_string(),
+            auth_header_factory: None,
+            client: reqwest::Client::new(),
+        };
+        let ctx = Context::create(None, None, None, None, json!({}), None);
+        let result = proxy.execute(json!({"id": "42"}), &ctx).await;
+
+        handle.join().expect("mock server thread panicked");
+
+        assert!(
+            result.is_ok(),
+            "colon-style path param should be substituted, not rejected as missing: {result:?}"
+        );
+        let request_line = rx
+            .recv()
+            .expect("mock server should have received a request");
+        assert!(
+            request_line.contains("/users/42"),
+            "expected substituted path '/users/42' in request line, got: {request_line}"
+        );
+        assert!(
+            !request_line.contains(":id"),
+            "colon-style placeholder must not leak into the request path: {request_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_trace_previously_unsupported_error_gone() {
+        // Without W2, this would fail fast with
+        // `Unsupported HTTP method: TRACE` before ever touching the
+        // network — assert the specific old error string is gone, using
+        // a closed port so the test doesn't depend on a live server.
+        let proxy = ProxyModule {
+            base_url: "http://127.0.0.1:1".to_string(), // reserved, always refused
+            http_method: "TRACE".to_string(),
+            url_path: "/widgets".to_string(),
+            path_params: HashSet::new(),
+            effective_route: false,
+            effective_query_names: HashSet::new(),
+            required_json_body: false,
+            input_schema: json!({}),
+            output_schema: json!({}),
+            description: "test".to_string(),
+            auth_header_factory: None,
+            client: reqwest::Client::new(),
+        };
+        let ctx = Context::create(None, None, None, None, json!({}), None);
+        let result = proxy.execute(json!({}), &ctx).await;
+        assert!(result.is_err(), "connection to a closed port must fail");
+        let message = result.unwrap_err().to_string();
+        assert!(
+            !message.contains("Unsupported HTTP method"),
+            "TRACE must be recognised by the method-match block: {message}"
+        );
+    }
+
+    #[test]
+    fn test_safe_truncate_multibyte() {
+        // Each emoji is multiple bytes but one char
+        let body = "\u{1F600}".repeat(300);
+        let result = safe_truncate(&body, 200);
+        assert_eq!(result.chars().count(), 200);
+    }
+
+    // D11-1 regression: only POST, PUT and PATCH use a JSON body. All other methods
+    // (GET, HEAD, DELETE, OPTIONS) MUST forward non-path inputs as the query
+    // string, mirroring Python and TypeScript. Previously Rust routed any
+    // non-GET method into the JSON body — DELETE proxies were emitting bodies
+    // that most servers ignore or reject (RFC 9110 §9.3.5).
+    #[test]
+    fn test_body_methods_set_contents() {
+        assert!(proxy_uses_json_body("POST"));
+        assert!(proxy_uses_json_body("put"));
+        assert!(proxy_uses_json_body("PaTcH"));
+        assert!(!proxy_uses_json_body("GET"));
+        assert!(!proxy_uses_json_body("DELETE"));
+        assert!(!proxy_uses_json_body("HEAD"));
+        assert!(!proxy_uses_json_body("OPTIONS"));
+    }
+}
