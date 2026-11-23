@@ -973,8 +973,8 @@ mod tests {
     /// The candidate fixture directories, in resolution order. Mirrors
     /// `router.rs`'s `conformance_candidates` / `tests/common::candidates`.
     fn conformance_candidates() -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
         let mut dir: std::path::PathBuf = env!("CARGO_MANIFEST_DIR").into();
+        let mut out = vec![dir.join("../conformance/fixtures")];
         for _ in 0..=4 {
             out.push(dir.join("apcore-mcp").join("conformance").join("fixtures"));
             if !dir.pop() {
@@ -1015,8 +1015,7 @@ mod tests {
         assert!(
             std::env::var_os("CI").is_none(),
             "conformance fixture {name:?} not found; in CI this is a failure \
-             rather than a skip. The workflow must check out \
-             aiperceivable/apcore-mcp to the `apcore-mcp` path."
+             rather than a skip. The checkout must include `mcp/conformance/fixtures`."
         );
         eprintln!("skipping: conformance fixture {name:?} not found locally");
         None

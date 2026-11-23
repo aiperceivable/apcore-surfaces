@@ -51,12 +51,20 @@ jobs:
             throw new Error('Consumer did not resolve the toolkit from this checkout');
           }
           JS
+      - name: Run the toolkit source checks
+        if: matrix.component == 'toolkit'
+        run: |
+          pnpm exec apdev-js check-chars src/ tests/
+          pnpm exec apdev-js check-imports --package apcore-js
       - run: pnpm lint
+        if: matrix.component != 'toolkit'
       - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm test
       - uses: oven-sh/setup-bun@v2
         if: matrix.component == 'toolkit'
+        with:
+          bun-version: 1.3.x
       - run: pnpm test:packaging
         if: matrix.component == 'toolkit'
 

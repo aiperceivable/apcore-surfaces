@@ -4800,17 +4800,15 @@ mod tests {
 
     /// Locate the shared conformance fixtures, mirroring `tests/common`.
     ///
-    /// Honours `APCORE_CONFORMANCE_FIXTURES`, otherwise walks up looking for
-    /// `apcore-mcp/conformance/fixtures`, which covers both the sibling
-    /// checkout developers use and the CI layout where the spec repo is
-    /// checked out inside the workspace.
+    /// Honours `APCORE_CONFORMANCE_FIXTURES`, then checks the shared fixtures
+    /// next to the crate, followed by legacy spec checkout locations.
     /// The candidate fixture directories, in resolution order.
     ///
     /// Shared by the lookup and by `conformance_search_report` so the two
     /// cannot drift.
     fn conformance_candidates() -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
         let mut dir: std::path::PathBuf = env!("CARGO_MANIFEST_DIR").into();
+        let mut out = vec![dir.join("../conformance/fixtures")];
         for _ in 0..=4 {
             out.push(dir.join("apcore-mcp").join("conformance").join("fixtures"));
             if !dir.pop() {
@@ -4843,7 +4841,7 @@ mod tests {
             Err(_) => out.push_str("  $APCORE_CONFORMANCE_FIXTURES: unset\n"),
         }
         out.push_str(&format!(
-            "  ancestors of {} searched for apcore-mcp/conformance/fixtures:\n",
+            "  fixture directories relative to {}:\n",
             env!("CARGO_MANIFEST_DIR"),
         ));
         for candidate in conformance_candidates() {
@@ -4901,8 +4899,7 @@ mod tests {
             "{detail}In CI this is a failure rather than a skip: the \
              cross-language conformance suite exists to catch divergence between \
              the three bridges, and skipping it silently reports success while \
-             proving nothing. The workflow must check out \
-             aiperceivable/apcore-mcp to the `apcore-mcp` path."
+             proving nothing. The checkout must include `mcp/conformance/fixtures`."
         );
         eprintln!("skipping: {detail}");
         None
