@@ -1,0 +1,478 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [0.15.0] - Unreleased
+
+### Added
+
+- Shared OpenAPI proxy diagnostics and preflight over selected effective modules via
+  `detect_effective_proxy_hazards()` and `validate_effective_proxy_modules()`.
+
+- `OpenAPIScanner.scan_with_effective_parameters()` resolves inherited Path Item
+  parameters and same-document Parameter Object references. Operation-level
+  declarations override matching `(name, in)` pairs. The scanner exposes the
+  inputs used for schema generation in `metadata.openapi.proxy_inputs` for
+  selected-operation proxy checks. `scan()` retains its existing behavior.
+
+## [0.14.2] - 2026-11-19
+
+Toolkit update for apcore 0.33.0. 
+
+## [0.14.1] - 2026-10-25
+
+### Fixed
+
+- HTTP proxy execution now observes `Context.cancel_token`, interrupts in-flight
+  HTTP I/O, and joins request cleanup before reporting cancellation.
+- Proxy requests, URL-based OpenAPI loading, and the default authentication
+  transport enforce configured HTTP timeouts across the complete response body,
+  including responses that continuously send small chunks.
+- Device authorization polling clamps sleeps and outbound requests to the
+  remaining flow deadline, counts user-code callbacks against device-code
+  expiry, and rejects results that arrive after expiry.
+  `PreparedRequest.timeout_seconds` passes this budget to custom transports;
+  injected synchronous clients retain ownership and must bound their own I/O.
+  The optional `http_timeout=None` default is unchanged.
+- Ctrl-C during synchronous HTTP calls from a running event loop now cancels
+  actual HTTP work and joins cleanup, including startup and repeated-interrupt
+  windows. Context variables and previously recovered task cancellation state
+  are preserved across the bridge.
+- Slow OS DNS no longer delays configured HTTP deadlines during loop shutdown.
+  A process-wide resolver bounds running/queued lookups, discards late results,
+  and resets safely after fork; HTTP workers are still fully joined.
+
+## [0.14.0] - 2026-10-09
+
+Toolkit update for apcore 0.32.0. Public loader signatures and error types
+are unchanged, but binding-file validation is stricter.
+
+### Changed
+
+- Required `apcore` dependency floor raised to `0.32.0`.
+
+### Breaking
+
+- Binding documents reject unknown top-level or entry keys and one-sided
+  inline schema pairs in both loose and strict modes, aligned with apcore
+  0.32.0. Runtime-only `auto_schema` and `schema_ref` remain unsupported by
+  this pure-data loader. Public method signatures and error types are unchanged.
+  **Migration:** remove unsupported keys, move application-specific entry
+  data into `metadata`, and provide both `input_schema` and `output_schema`
+  (or neither in loose mode). Use apcore's runtime loader for runtime schema sources.
+
+### Fixed
+
+- Non-string `spec_version` values warn and continue instead of raising an
+  unhashable-value `TypeError` for lists or mappings.
+
+### Added
+
+- Shared binding-structure conformance tests: 18 cases in both strict and
+  loose modes through in-memory parsing and YAML file loading.
+- CI checks out canonical fixtures from `apcore-toolkit`'s `main` and fails
+  with publication-order guidance if the binding-structure corpus is missing.
+  Publish the corpus before merging the SDK changes.
+
+## [0.13.0] - 2026-09-28
+
+A breaking release: `OpenAPIScanner` module IDs are normalised into apcore's Canonical ID alphabet (read the Migration note before upgrading — IDs derived from camelCase names change). The apcore floor is unchanged.
+
+### Changed — BREAKING
+
+- **`OpenAPIScanner` emits module IDs in apcore's Canonical ID alphabet.** V1 used `operationId` verbatim with case preserved and sanitised to `[A-Za-z0-9_.-]`, an alphabet no apcore registry accepts (PROTOCOL_SPEC §2.7 admits only `[a-z0-9_.]`). The canonical Swagger Petstore (`listPets`, `createPets`, `showPetById`) scanned cleanly and registered **nothing**; so did any path containing a hyphen. The `apcore-mcp` and `apcore-a2a` OpenAPI backends, in all three languages, each shipped a private projection to compensate. The rule now lives in the toolkit, once: `derive_module_id` converts to snake_case with two pinned word-boundary regexes (`getUserById` → `get_user_by_id`, `getHTTPResponse` → `get_http_response`) — the camelCase → snake_case conversion apcore's PROTOCOL_SPEC §2.2 (Algorithm A02) already requires for Canonical IDs, which V1's verbatim choice contradicted; the word boundaries match what apcore's own SDKs produce — and `OpenAPIScanner.scan` applies the same normalisation to the **final** ID, after `base_path_prefix` and both ID-affecting hooks (the `transform_module` hook therefore still sees the un-normalised ID). **The normalisation never rewrites an ID apcore already accepts**, so FastAPI's generated `read_item_items__item_id__get`, utoipa function names and any other snake_case `operationId` are used as they are: runs of `_` are kept, because no registry enforces §2.7's no-`__` clause and collapsing them would rename every FastAPI ID that registers today, and a trailing `_` is stripped only from an `operationId` (`getUser_` → `get_user`, as V1 did), never from a legal ID a hook returns. Path segments are normalised one at a time, and a path with no surviving segment (`/`, `/-`, `/{}`) derives `root.<method>`. A segment that still begins with a digit (`/v1/2fa`) is not repaired, since that would invent a name: after `filter_modules` and `deduplicate_ids` the module carries a pinned legality warning in `ScannedModule.warnings` naming the ID actually emitted (`3ds_2`, after the deduplication warning), and the consumer decides. The raw `operationId` stays in `metadata["openapi"]["operation_id"]`; the scanner deliberately sets no `suggested_alias` (the reasoning is recorded in the spec). The normalisation helper is private; `derive_module_id` remains the public entry point. See [`docs/features/openapi-scanner.md`](https://github.com/aiperceivable/apcore-toolkit/blob/main/docs/features/openapi-scanner.md#module_id-derivation).
+  - **Migration:** only names containing uppercase letters change meaning: they are split into words (`getUserById` → `get_user_by_id`, `/userProfiles` → `user_profiles`). Names apcore rejected before (hyphens, a leading `_`, other punctuation) now register (`/user-profiles` → `user_profiles`). Measured against the IDs the `apcore-mcp` / `apcore-a2a` backends register today — V1 plus their lowercase projection — every lowercase `operationId` and path whose ID was legal derives the **identical** ID, except an `operationId` ending in a hyphen (`list-`: `list_` → `list`) and a path with no segment that survives normalisation (`/-`: `get` → `root.get`). Those backends' projections lowercased without splitting words (`listPets` → `listpets`); because their dependency on the toolkit is open-ended (`>=0.12.0`), their users get `list_pets` as soon as they pick up this release, even before the backends change. ACL rules, bindings and `include`/`exclude` patterns written against the old camelCase-derived IDs need updating — filters match the emitted, normalised ID. `include`/`exclude` patterns passed to `scan` match the normalised ID.
+- **Conformance: `openapi_scan.json` 2.0.0** (24 → 33 cases). Cases 003 and 015 are re-pinned to the normalised IDs. Nine new cases: 025 pins the word-boundary regexes (acronyms, digits, hyphens), that a legal FastAPI ID with `__` runs passes through unchanged, the operationId-branch trailing-`_` strip, and one `_` per astral code point; 026 path-branch normalisation; 027 the legality warning from both derivation branches; 028 `base_path_prefix` normalisation; 029 hook-output normalisation; 030 that the legality warning follows deduplication and names the emitted ID; 031 the `root.<method>` fallback for a path with no surviving segment; 032 that the final pass keeps a legal ID a hook returns (`pre_.abc_`); 033 one `_` per replaced character, never collapsed (`list--pets` → `list__pets`), a path segment's trailing `_` kept, and lowercasing after replacement (KELVIN SIGN). The driver adds the named hooks `always_returns_mixed_case_id` (a `derive_module_id` hook returning `"Custom-Space.GetThing"`, case 029) and `always_returns_legal_trailing_underscore_id` (returning `"abc_"`, case 032), and now asserts that each named hook is installed under the hook kind it was written for.
+
+
+## [0.12.0] - 2026-09-23
+
+The first release since 0.11.1. Adds the **RFC 8628 Device Authorization Flow client** ([apcore-toolkit#17](https://github.com/aiperceivable/apcore-toolkit/issues/17)) — the protocol half only, writing nothing to a terminal — plus `BindingLoader.load`'s `pattern` argument ([#18](https://github.com/aiperceivable/apcore-toolkit/issues/18)), a `$ref` resolution security fix, and the apcore 0.31.0 floor.
+
+### Added
+
+- **`DeviceAuthClient`, `DeviceAuthConfig`, `TokenSet`, `TokenStore`, `FileTokenStore`, `Grant` / `DeviceCodeGrant`**, and the four extension hooks. See [`docs/features/device-auth.md`](https://github.com/aiperceivable/apcore-toolkit/blob/main/docs/features/device-auth.md). `httpx` is an optional `auth` extra, imported lazily.
+- Asserted against the shared **65-case** corpus (`conformance/fixtures/device_auth.json`). **No HTTP mocking is required**: the state machine is pure over an injected monotonic clock and a scripted response sequence.
+- **V1 is device flow only**, with the `Grant` interface in place so a second grant is one implementation against a stable seam rather than a rewrite. A deliberate scope-down from the proposal's own recommendation — PKCE widens the exact surface whose risk mitigation depends on being narrow, and no consumer has yet named a provider lacking device-flow support.
+
+- **`BindingLoader.load` honours a caller-supplied `pattern`.** apcore 0.30 made `bindings.pattern` a canonical configuration default, but this loader hardcoded the value and had no parameter through which a caller could pass a configured one — so a consumer that needs the loader's *return value*, rather than apcore's registration side effect, silently dropped the key. `apexe` is exactly that consumer: it loads `.binding.yaml` into `ScannedModule`, converts each into its own `CliModule`, and could not call apcore's config-aware loader without bypassing every control `CliModule` exists to apply. Signature is now `load(path, *, strict=False, recursive=False, pattern="*.binding.yaml")` — keyword-only and defaulted, so no existing call changes.
+- The loader takes the resolved value and does **not** read `Config` itself, keeping the pure-data layer dependency-free and leaving the environment > file > default precedence chain with the caller that actually holds a `Config`.
+- **`conformance/fixtures/binding_pattern.json`** (43 shared cases) pins the matcher, the rejected patterns, and how `pattern` composes with `recursive`. The spec carries the matching **algorithm** in pseudocode, not just the syntax — three independent implementations converge only if the algorithm is fixed.
+
+### Changed
+
+- **Directories are never candidates**, at every depth. A directory whose *name* matched was previously handed to the YAML reader. The file-type check **follows symlinks**, so a symlinked binding file is still selected while a symlinked directory is neither selected nor descended into, and a dangling link is skipped rather than aborting the load. Selection is also now sorted with an explicit `key=str`: `sorted()` over `Path` compares `_str_normcase`, which case-folds on Windows, so ordering there disagreed with the TypeScript and Rust SDKs.
+
+### Changed — dependency floor
+
+- **Required apcore floor raised to 0.31.0.** apcore 0.31.0 is two joined audit cycles (`PROTOCOL_SPEC` v1.37.0 → v1.59.0): a configuration-surface audit and a deep-chain call-graph audit settling 54 cross-language divergences, five of them security defects. **No code change was needed here** — the toolkit's apcore surface is `Registry`, `Module`/`FunctionModule`, `ModuleAnnotations`, `ModuleExample`, `ModuleDescriptor`, `Context`, `ModuleError`/`ErrorCode`, and none of it moved. All three suites passed unmodified against 0.31.0 — the upgrade itself required no code change (the counts below are the release's final totals, which the two fixes in this release raised further).
+- **Notable for this toolkit specifically:** apcore 0.31.0 adds **Algorithm A25 (`match_glob`)**, which replaces the three disagreeing glob dialects this project reported as [apcore#116](https://github.com/aiperceivable/apcore/issues/116) and [apcore#117](https://github.com/aiperceivable/apcore/issues/117). `BindingLoader.load`'s matcher was specified independently of apcore precisely because there was no single upstream behaviour to inherit; there now is. The two algorithms were compared exhaustively over 85,995 pattern/value pairs and **agree on every one** — no behaviour change is required. The remaining difference is validation, not matching: see the note in [`docs/features/binding-loader.md`](https://github.com/aiperceivable/apcore-toolkit/blob/main/docs/features/binding-loader.md#pattern-matching).
+
+### Changed — `bindings.pattern` is never rejected
+
+- **`load` no longer raises on `pattern` for syntactic reasons.** An earlier draft of this work rejected an empty pattern and any pattern containing `/` or `\`; that validation was removed before release, so `pattern` ships with none. Every string is a valid pattern — `a[b`, `{x,y}`, `**`, `/` and `\` are literals — and one matching no file yields no modules, which is not an error. This adopts apcore 0.31.0's Algorithm A25 requirement 2 (`PROTOCOL_SPEC` §9.2.3) and §5.12.6 clause 6 verbatim.
+- **The reason, recorded because it gives up a better error message.** `**/*.binding.yaml` — the shape a caller reaches for first when they want recursion — was a clear error pointing at `recursive=True`, and is now a silently empty result. That diagnostic was surrendered because the entire purpose of this parameter is to let a caller honour apcore's `bindings.pattern`: a caller resolving the key from `Config` and handing the same string to both components must get the same answer from both, and under 0.12.0 apcore matched nothing while the toolkit raised. Two components reading one configuration key and disagreeing is exactly what [#18](https://github.com/aiperceivable/apcore-toolkit/issues/18) was filed to close. The diagnostic now lives in the docs: *if a pattern selects nothing and contains `/`, you probably wanted `recursive=True`.*
+- **`\` is a literal, not a separator** (A25 requirement 4), so on a filesystem permitting it, `sub\*.binding.yaml` genuinely matches `sub\x.binding.yaml`. Verified identical across all three SDKs end-to-end.
+- Removed with it: Rust's `BindingLoadError::InvalidPattern` variant (back to 7) and `validate_binding_pattern`; TypeScript's `validateBindingPattern`. All were introduced in the unreleased 0.12.0 and were never published. The corpus loses its `validate` case kind; its five cases became `match` cases asserting what those patterns now do, plus a `select` case pinning that the loader surfaces an empty result rather than an error — 44 cases, 0 skipped, in all three SDKs.
+
+### Fixed — security
+
+- **`$ref` sibling keys were discarded during schema resolution, dropping `x-sensitive`.** `deep_resolve_refs` resolved a node like `{"$ref": "…", "x-sensitive": true}` to the referenced schema **alone**, silently losing every key written beside the reference. This is a credential-disclosure path, not a fidelity nicety: apcore reads `x-sensitive` off the **resolved** schema to decide what to redact, and this toolkit's `OpenAPIScanner` produces the `input_schema` / `output_schema` that the output writers register into an apcore `Registry`. A field whose OpenAPI document marked it sensitive beside a `$ref` therefore reached apcore with nothing to redact on, and was logged in plaintext. apcore closed the same hole in its own resolver in 0.31.0 (decision D-98); fixing it there and not here would have left the leak intact for every schema this toolkit produces, because the marking is already gone by the time apcore sees it. All three SDKs were affected identically — so this was not a cross-SDK divergence, and the existing corpus could not have caught it.
+- The resolved target is now shallow-merged with its siblings, **sibling winning** on conflict, at every depth. The merge is deliberately **not** restricted to `x-` extension keys: limiting it to the one symptom that was noticed would leave `description`, `title` and `deprecated` silently dropped. A `$ref` that fails to resolve still contributes its siblings. New shared corpus `conformance/fixtures/ref_resolution.json` (9 cases); normative text in [`docs/features/openapi.md`](docs/features/openapi.md#ref-sibling-keys-are-preserved).
+
+### Notes
+
+Tokens persist to `~/.config/apcore/credentials.json` (`%APPDATA%\apcore\` on Windows), `0600`, written by atomic replace, keyed by issuer and client id. The path is normative rather than per-SDK precisely so that tools maintaining credential baselines can protect it — `apexe` has added it to its own.
+
+`pattern` matches the **file name** only. `*` and `?` are the only metacharacters; `[`, `]`, `{`, `}` are literals, because character classes and brace expansion are where language glob implementations diverge. A pattern containing `/` or `\` is rejected before any filesystem access — which makes `**/*.binding.yaml` a diagnostic rather than a mystery, since traversal depth is `recursive`'s job.
+
+**1031 tests pass** (798 at 0.11.1). `ruff check` and `ruff format --check` clean; `mypy` reports 0 errors in `auth/`.
+
+## [0.11.1] - 2026-09-06
+
+Patch release. Bumps the required `apcore` floor to `0.30.0`. apcore 0.30.0 is confined to the `Config`/`BindingLoader` layer (the §9.2.2 deprecation-warning cadence fix, the missing-binding-directory error message, discarding a set-but-empty path-typed `APCORE_*` override, and `bindings.dir`/`bindings.pattern` becoming canonical defaults) — none of it touches `Registry`, `FunctionModule`, `ModuleAnnotations`, `ModuleExample`, `DEFAULT_ANNOTATIONS`, `ErrorCodes`, or `apcore.errors.ModuleError`, which is the complete set this toolkit imports (confirmed via grep: no `Config`, `BindingLoader`, `ACL`, `ApprovalRequest`, `CancelToken`, `ExecutionPolicy` or `Executor` reference exists in `src/`). No code or API changes; all 798 tests pass unmodified against apcore 0.30.0. `ruff check` clean.
+
+## [0.11.0] - 2026-09-05
+
+Feature release: ships `OpenAPIScanner` and `TuiViewModel`, version-aligned with the TypeScript and Rust SDKs.
+
+### Added
+
+- **`OpenAPIScanner`, `derive_module_id`, `load_spec`** (`apcore_toolkit.openapi_scanner`) — turn an OpenAPI 3.0/3.1 document into a `ScannedModule` list, one module per operation. `load_spec` accepts a local path or `http(s)://` URL (the latter requires the `http-proxy` extra); YAML parsing uses the already-required `PyYAML` dependency. See `docs/features/openapi-scanner.md` in `apcore-toolkit`.
+- **`TuiViewModel`, `Column`, `Row`, `Cell`, `Sort`, `Filter`, `TonePalette`, `ToneRule`, `Group`, `modules_to_view_model`, `format_view_model`** (`apcore_toolkit.tui_view_model`) — byte-equivalent module-list view-model builder and canonical JSON encoder. See `docs/features/tui-view-model.md`.
+- 35 new conformance tests (`tests/test_openapi_scan_conformance.py`, `tests/test_view_model_conformance.py`) against the shared corpus in `apcore-toolkit/conformance/fixtures/`, plus 6 hand-written malformed-input regression tests (`tests/test_openapi_scanner_malformed_input.py`).
+
+### Changed
+
+- **Required `apcore` floor raised to `0.29.0`.** apcore-python 0.29.0's SDK-visible surface is confined to the approval and ACL governance layer: `ApprovalRequest.caller_id` / `.action` (additive, both with safe defaults, so no existing keyword construction breaks), `CancelToken.raise_if_cancelled()` (additive alias for `check()`, which is unchanged and not deprecated), and `ACL.__init__` now re-validating every rule it is handed — breaking only for a caller that constructs a well-formed rule, mutates its `callers` / `targets` into an empty or malformed pattern array, and then passes it to `ACL(rules=[...])` for the first time. None of that touches the surface this toolkit imports: `Registry`, `FunctionModule`, `ModuleAnnotations`, `DEFAULT_ANNOTATIONS`, `ModuleExample`, `ErrorCodes` and `apcore.errors.ModuleError` are the complete set (confirmed by grepping every `from apcore` / `import apcore` in `src/`; no `ACL`, `ApprovalRequest`, `CancelToken`, `ExecutionPolicy` or `Executor` reference exists outside doc prose). No code or API changes, and all 760 tests pass unmodified against apcore 0.29.0.
+
+### Fixed
+
+- **`OpenAPIScanner` mis-parsed a non-array `tags` field.** `list(operation.get("tags") or [])` silently character-split a string value instead of degrading to `[]`. Found by a cross-SDK audit against the TypeScript/Rust ports, which already required an array. Fixed; regression test added.
+- Tightened several other malformed-input type checks (`deprecated` now requires a literal boolean rather than truthy-coercing; `operationId`/`info.version`/`summary` now require `str`; the "no 2xx response" check now matches ASCII digits only, not any Unicode decimal digit) to match TypeScript/Rust behaviour. None affect a valid OpenAPI document.
+
+All 760 tests pass (was 719 at 0.10.2). `mypy --strict` and `ruff` clean.
+
+## [0.10.2] - 2026-09-01
+
+Patch release. Bumps the required `apcore` floor to `0.28.0` to align the ecosystem on the 0.27.0/0.28.0 governance layer (argument-scoped approval, `ACLRule.approval`, `ExecutionPolicy.resolve()` call-site parameters, `Executor.governance_state()`, ACL effect/condition hardening) — none of it touches a surface this toolkit uses (confirmed via grep: no `ACL`, `ExecutionPolicy`, `Executor`, or `SchemaValidator` usage anywhere in `src/`). No code or API changes; all 719 tests pass unmodified against apcore 0.28.0.
+
+Note: apcore 0.28.0 also makes dict-declared `input_schema`/`output_schema` validation actually enforce (previously a no-op). `HTTPProxyRegistryWriter` registers such modules but this toolkit never routes one through a live apcore `Executor`, so nothing here changes — but a framework adapter that executes a dict-schema module built by this writer through apcore 0.28.0 will now see real validation where it previously saw none.
+
+## [0.10.1] - 2026-07-14
+
+Patch release. Bumps the required `apcore` floor to `0.26.0` to align the ecosystem on the 0.26.0 governance layer (Execution Policy §7.9, governance events, no-handler fail-loud — additive, no breaking changes). No code or API changes; all 719 tests pass unmodified against apcore 0.26.0.
+
+## [0.10.0] - 2026-07-07
+
+Centralize `ScannedModule` -> `FunctionModule` field mapping so subclass writers can no longer silently drop fields, and ship a reusable conformance verifier adapters run in their own suites. Addresses aiperceivable/apcore-toolkit-python#7 (items 1 & 2). All 719 tests pass (6 new).
+
+### Changed
+
+- **`RegistryWriter._to_function_module` no longer builds `FunctionModule` inline; field mapping is centralized in a new `_build_function_module`.** Adapters previously overrode the whole `_to_function_module` (for framework-specific target/func adaptation) and hand-copied the field list — which repeatedly dropped `annotations`, silently disabling approval/ACL gating that keys on `requires_approval`. Subclasses should now override only the narrow hooks:
+  - `_adapt_func(func, mod)` — framework-specific callable adaptation before Pydantic flattening (e.g. stripping a leading `request` param); default is identity.
+  - `_build_input_schema(mod)` / `_build_output_schema(mod)` — explicit Pydantic models from an authoritative scanned schema; default `None` (function introspection).
+  The centralized builder forwards **all** carried fields, including `annotations` and (newly) `display`, so no override can drop them. Existing behavior is unchanged for callers that do not override the hooks.
+
+### Added
+
+- **`apcore_toolkit.conformance.assert_annotations_preserved(writer, scanned_module, registry)`** — a reusable, framework-agnostic verifier (raises `AssertionError`; no pytest dependency) that registers a module and asserts its behavioral annotations survive `get_definition`. Adapters import it into their own test suites so a dropped-annotations regression fails loudly everywhere (item 2 of #7). Exported from the package root.
+- Round-trip regression tests using a real `Registry` (not a mock): the base writer preserves `annotations` through `scan -> register -> get_definition`, and a hook-only subclass cannot drop them; plus tests for the conformance verifier itself.
+
+
+## [0.9.0] - 2026-06-23
+
+Minor release. Hardens the OpenAPI parser against real-world framework output that the previous version assumed away. No public API changes; all 713 tests pass (7 new regression tests added).
+
+### Fixed
+
+- **`extract_output_schema` crashed on integer status-code keys** — django-ninja (and other generators that build the OpenAPI doc as an in-memory dict) emit response keys as integers (`{200: ...}`) rather than strings. `re.match(r"^2\d\d$", k)` raised `TypeError` on a non-`str` key, and `sorted()` raised `TypeError` on a mixed int/str keyset. Response keys are now normalized to strings before matching, mirroring the always-string keys the TypeScript/Rust SDKs receive from JSON parsing. (`openapi.py`)
+- **`extract_output_schema` / `extract_input_schema` crashed on explicit `null`** — a `null` response, `content`, `requestBody`, `schema`, `properties`, or `required` (legitimately emitted for empty/204-style responses and bodyless operations) raised `AttributeError`/`TypeError`. All such accesses now fall back to an empty container via `or {}` / `or []`. (`openapi.py`)
+
+
+## [0.8.1] - 2026-06-12
+
+Patch release. Bumps the required apcore runtime floor to 0.24.0. Toolkit API surface and code unchanged; all 701 tests pass without modification against 0.24.0.
+
+### Changed
+
+- Required runtime bumped to `apcore>=0.24.0` — bumped from `>=0.22.0`. Toolkit's stable surface is unaffected by the 0.22 → 0.24 delta.
+
+  Key 0.23.0–0.24.0 changes visible to toolkit users (indirect runtime effects):
+  - `Registry.register()` behaviour is unchanged for `RegistryWriter` (sequential registration path). The 0.24.0 per-instance `ToggleState` scoping means disabling a module via one `APCore` no longer bleeds into the registry under test — improves isolation in test suites that construct multiple `APCore` instances in one process.
+  - AI error-recovery metadata (`user_fixable`, `ai_guidance`) is now auto-populated on `ModuleError` at the apcore framework level (0.23.0), so errors surfaced through `RegistryWriter` carry this metadata automatically with no toolkit changes required.
+  - `CircuitBreakerMiddleware` constructor is breaking in 0.23.0 (old `failure_threshold`/`success_threshold` removed). Toolkit does not use this middleware; no toolkit changes required.
+
+## [0.8.0] - 2026-05-28
+
+Aligned release across Python, TypeScript, and Rust. Bumps the required apcore runtime to 0.22.0.
+
+### Changed
+
+- Required runtime bumped to `apcore 0.22.0` — bumped from `>=0.21.0`. The prior constraint excluded 0.22.0 due to caret semantics; this fixes installs on the latest apcore runtime. Toolkit API surface unchanged; all 701 tests pass without code changes against 0.22.0.
+
+  Key 0.22.0 changes visible to toolkit users:
+  - `Registry.register()` now rejects the second concurrent caller with `InvalidInputError(code=DUPLICATE_MODULE_ID)` immediately. `RegistryWriter.write()` registers sequentially and is unaffected under normal usage.
+  - Registration Ordering Invariants: modules are now guaranteed fully visible to `registry.get()` / `registry.list()` immediately on return from `write()`.
+  - `StreamingModule` promoted from duck-typed to explicit Protocol — `RegistryWriter._to_function_module` creates a `_StreamingFunctionModule` adapter for targets with an async `stream()` method.
+
+## [0.7.0] - 2026-05-12
+
+### Added
+
+- New conformance test `tests/test_display_resolve_conformance.py` wired to the shared fixture `apcore-toolkit/conformance/fixtures/display_resolve.json` (14 cases). Previously orphaned across all three SDKs (D9-W1).
+- **`format_csv(rows, *, bom=False)` and `format_jsonl(rows)`** — byte-equivalent tabular data formatters. Lives in `apcore_toolkit.formatting.tabular`; re-exported at the top-level package. Cross-SDK byte-identity contract: every SDK (Python / TypeScript / Rust) emits identical bytes for the same input. Canonical contract:
+    - **CSV**: header = union of keys across all rows (insertion-order, first occurrence); fixes the prior single-row-keys data-loss bug in apcore-cli SDK implementations. Non-scalar cells = canonical compact JSON. RFC 4180 CRLF terminator. Embedded `,` / `"` / `\n` / `\r` quote-wrapped. Optional UTF-8 BOM for Excel-locale users.
+    - **JSONL**: each row = canonical compact JSON (no inter-token whitespace, insertion-order preserved, whole-number floats drop `.0` matching JS `JSON.stringify`, NaN/Inf → null). LF terminator, no trailing blank.
+- **Conformance corpus** at `apcore-toolkit/conformance/fixtures/format_csv.json` (15 cases) and `format_jsonl.json` (8 cases) — shared across all 3 SDKs.
+- **Tabular Formats** section added to `docs/features/formatting.md` documenting contract, conformance flow, number-portability constraints (`Number.MAX_SAFE_INTEGER`), and YAML deferral.
+
+### Why
+
+Per-SDK reimplementations of csv/jsonl had accumulated divergence (Python repr vs JSON, heterogeneous-keys silent data loss in TS, `\n` vs CRLF in Rust). The spec MUST language couldn't enforce conformance on downstream consumers (e.g. aisee-cli) that reimplemented their own emission. Lifting csv/jsonl into the toolkit replaces those independent failure modes with a single conformance-tested reference. See `apcore-cli/docs/tech-design.md` ADR-09 for the tier-split rationale.
+
+### Changed
+
+- `RegistryWriter._to_function_module` no longer coerces an empty `examples` list to `None`. Empty collections now round-trip as `[]` to match the canonical Rust/TS behavior (D11-007).
+
+### Notes
+
+- D3-W1 (apcore runtime floor mismatch): the TS SDK's `apcore-js >= 0.21.1` floor was lowered to `>=0.21.0` for alignment with Python and Rust, which target the apcore 0.21 line on PyPI / crates.io. Python's floor is unchanged at `>=0.21.0`.
+- YAML byte-equivalence is deferred — each idiomatic YAML library has different quoting/indent heuristics. Tracked as a follow-up.
+- Integers above `Number.MAX_SAFE_INTEGER` (2^53-1) are not cross-SDK portable; callers should serialize them as JSON strings.
+
+### Fixed (post-audit cross-SDK reconciliation)
+
+The 2026-05-12 cross-SDK audit (`/apcore-skills:audit --scope toolkit`) flagged contract-parity divergences between Python and the TypeScript / Rust SDKs. The following Python-side adjustments bring behaviour in line with the spec and the other two SDKs.
+
+- **`BindingLoader._parse_entry` loose-mode wrong-type policy** (D10-001) — when `strict=False` (the default), wrong-type non-required optional fields (`input_schema`, `output_schema`, `tags`) now log a `WARNING` (logger `apcore_toolkit`) and coerce to the empty default (`{}` / `[]`) instead of raising `BindingLoadError`. Mirrors the warn-and-coerce behaviour of `apcore-toolkit-rust` and `apcore-toolkit-typescript`. Strict mode (`strict=True`) is unchanged: wrong-type optional fields still raise `BindingLoadError`. Spec: `apcore-toolkit/docs/features/binding-loader.md` § Loose-mode wrong-type policy. **Behaviour change** for callers running with `strict=False` (the default) that previously caught `BindingLoadError` for malformed optional fields — those callers will now see warning logs instead of an exception, and the binding entry will load with empty optional-field values.
+- **`get_writer` HTTP-proxy aliases** (D10-003) — `get_writer("http_proxy", base_url=...)` and `get_writer("httpproxy", base_url=...)` now return an `HTTPProxyRegistryWriter`. Previously only the canonical `"http-proxy"` was accepted; the new aliases match the cross-SDK guarantee already honoured by `apcore-toolkit-typescript` and `apcore-toolkit-rust`. Canonical formats (`"yaml"`, `"python"`, `"registry"`, `"http-proxy"`) remain case-sensitive. Spec: `apcore-toolkit/docs/features/output-writers.md` § Contract: get_writer.
+- **Dead re-export `_module_path_matches_prefix` removed from `apcore_toolkit.pydantic_utils`** (D9-002) — the alias was never imported by any caller in `src/` or `tests/`. Removed from the module body and from `__all__`. Single-underscore symbols are not part of the public re-export surface; consumers that still need the helper should import it directly from `apcore_toolkit.resolve_target`.
+- **Docstring** — `get_writer` docstring corrected to refer to Rust's renamed `InvalidFormatError::Unknown` (was `OutputFormatError::Unknown`); see `apcore-toolkit-rust` 0.7.0 entry for the rename.
+
+### Test suite
+
+- 684 tests pass (was 683); +1 regression test `test_loose_mode_warns_and_coerces_wrong_type_optional_fields` covering the new D10-001 behaviour. Existing strict-mode tests in `TestMalformedFieldTypes` were updated to pass `strict=True` explicitly so the strict-mode rejection contract continues to be exercised.
+
+
+## [0.6.0] - 2026-05-07
+
+### Changed
+
+- **`apcore` minimum version bumped from 0.20.0 to 0.21.0** — `pyproject.toml` `dependencies` now requires `apcore>=0.21.0`. Toolkit only imports stable apcore surface (`ModuleAnnotations`, `DEFAULT_ANNOTATIONS`, `ModuleExample`, `Registry`, `ErrorCodes`, `parse_docstring`, `errors.ModuleError`); the 0.21.0 additions (`discoverable` field on `ModuleAnnotations`, `PreviewResult`, `Change`, `ephemeral.*` namespace) are automatically handled — `ModuleAnnotations.from_dict()` picks up `discoverable` transparently, and `dataclasses.asdict()` / `dataclasses.replace()` propagate the new field without code changes. `AIEnhancer` derives its field set from `dataclasses.fields(ModuleAnnotations)` at import time, so it also picks up `discoverable` automatically. Full pytest suite verified against apcore 0.21.0.
+- **`apcore` minimum version bumped from 0.19.0 to 0.20.0** — `pyproject.toml` `dependencies` now requires `apcore>=0.20.0`. Toolkit only imports stable apcore surface (`ModuleAnnotations`, `DEFAULT_ANNOTATIONS`, `ModuleExample`, `Registry`, `ErrorCodes`, `parse_docstring`, `errors.ModuleError`); none of these were affected by 0.20.0 changes. Full pytest suite (585 passed) verified against apcore 0.20.0.
+
+### Added
+
+- **Surface-aware formatters** (refs aiperceivable/apcore-toolkit#13) — `format_module`, `format_schema`, `format_modules` for rendering `ScannedModule` and JSON Schema for specific consumer surfaces. Four styles for `format_module`: `markdown` (LLM context), `skill` (drop-in `.claude/skills/<id>/SKILL.md` or `.gemini/skills/<id>/SKILL.md` body with minimal `name` + `description` frontmatter — no vendor-specific extensions), `table-row` (CLI listing), `json` (programmatic). `format_schema` styles: `prose`, `table`, `json`. `format_modules` adds optional `group_by="tag" | "prefix"`. `display=True` (default) prefers the `ScannedModule.display` overlay over raw fields. Lives in `apcore_toolkit.formatting.surface`; re-exported at the top-level package.
+- **Annotation-table cross-SDK alignment** — `format_module(style="markdown" | "skill")` `## Behavior` table now emits only fields that differ from `ModuleAnnotations()` defaults, sorts rows alphabetically by snake_case key, and renders bool values as lowercase `true`/`false`. The section is omitted entirely when every annotation field matches its default. Closes the byte-equality gap with the TypeScript and Rust SDKs.
+
+### Changed
+
+- **`infer_annotations_from_method` canonical mapping** (refs aiperceivable/apcore-toolkit#11) — `HEAD` and `OPTIONS` now map to `readonly=true` (without `cacheable=true`), matching the canonical mapping declared in `apcore-toolkit/docs/features/scanning.md` and aligning with the existing Rust SDK. Previously these methods returned default annotations.
+
+## [0.5.0] - 2026-04-21
+
+### Added
+
+- **`BindingLoader`** (`apcore_toolkit.binding_loader`) — parses `.binding.yaml` files back into `ScannedModule` objects, the inverse of `YAMLWriter`. Unlike `apcore.BindingLoader`, this is pure data: no target import, no Registry mutation. Enables verification, merging, diffing, and round-trip workflows.
+  - `load(path, *, strict=False)` — single file or directory of `*.binding.yaml`.
+  - `load_data(data, *, strict=False)` — pre-parsed YAML dict.
+  - Loose mode (default): only `module_id + target` required; missing fields use defaults.
+  - Strict mode: additionally requires `input_schema + output_schema`.
+  - `spec_version` validated; missing/unsupported versions WARN but do not fail.
+  - `annotations` parsed via `ModuleAnnotations.from_dict`; malformed values degrade to `None` with WARN.
+  - `examples` entries validated individually; malformed ones skipped with WARN.
+  - `BindingLoadError` exception carries `file_path`, `module_id`, `missing_fields`, `reason`.
+- **`ScannedModule.display`** — new top-level optional field (`dict | None`) holding the sparse display overlay for binding YAML persistence. Distinct from `metadata["display"]` (resolved form produced by `DisplayResolver`).
+- **New feature doc**: `docs/features/binding-loader.md`; `display-overlay.md` and `output-writers.md` updated.
+
+### Changed
+
+- **`YAMLWriter._build_binding`** — emits top-level `display:` key only when `ScannedModule.display is not None` (skip when None keeps output clean).
+- **`serializers.module_to_dict`** — includes `display` key in output.
+- **`AIEnhancer._build_prompt`** — confidence template is now built dynamically from `gaps`. When `annotations` is in gaps, the prompt requests per-field confidence for every `_ANNOTATION_FIELD_VALIDATORS` field (`annotations.readonly`, `annotations.streaming`, `annotations.cache_ttl`, ...). Previously the template hard-coded `{"description": 0.0, "documentation": 0.0}` only, causing all annotation-field confidence lookups to fall back to `0.0` and fail the threshold check — annotation enhancement silently never took effect. Fixes symmetry with `_enhance_module`'s `ann_conf.get(f"annotations.{field_name}", ...)` read path.
+
+### Dependencies
+
+- **`apcore >= 0.19.0`** — picks up the expanded `ModuleAnnotations` (12 fields incl. `streaming`, `cacheable`, `cache_ttl`, `cache_key_fields`, `paginated`, `pagination_style`, `extra`). No toolkit code changes were needed for the type itself — `_build_annotation_field_validators` reflects the updated dataclass automatically.
+
+### Tests
+
+- +34 new tests: 24 for `BindingLoader` (parsing, strict/loose modes, spec_version, file & directory loading, round-trip with `YAMLWriter`), 5 for the prompt confidence block, and 5 hardening tests (display deep-copy, malformed-shape warn, recursive glob, UTF-8 encoding, null-field error wording).
+- Updated `test_field_count` (13 → 14) and `test_all_expected_keys` for the new `display` field.
+- Total suite: 440 tests.
+
+### Hardening (post-review)
+
+- **`BindingLoader`**: warns (rather than silently drops) malformed `display` values that are not a mapping; `load()` gained a `recursive: bool = False` kwarg for nested binding layouts; `read_text` now forces UTF-8 decoding so non-ASCII aliases round-trip on non-UTF-8 locales; required-field validation now rejects wrong-type scalars (e.g. `module_id: 42`, `target: true`) and empty strings in addition to absent/null, matching the Rust loader's contract — error wording is "missing or invalid required fields"; nested `input_schema`/`output_schema`/`metadata` are now deep-copied via `copy.deepcopy` so caller mutation does not leak back into the parsed YAML source graph.
+- **`YAMLWriter`**: `display` is now deep-copied into the emitted binding (defensive parity with the TypeScript/Rust writers) so post-write mutation of `ScannedModule.display` cannot leak into the file. File writes are now atomic: the payload is written to `<name>.<pid>.tmp`, `fsync`ed, then `os.replace`d onto the final path (matches the TypeScript `tmp + rename` and Rust `tmp + sync_all + rename` writers). A process crash mid-write no longer leaves a partial YAML file that `BindingLoader` would fail to parse. A pre-write check refuses to overwrite a symlink at the target path (defence-in-depth against TOCTOU).
+- **`BaseScanner.deduplicate_ids`**: pre-scans all input `module_id`s so generated `_N` suffixes never collide with an ID already present in the input. Input `[a, a, a_2]` now yields `[a, a_3, a_2]` instead of the previous buggy `[a, a_2, a_2]`. Matches the TypeScript and Rust implementations.
+- **`resolve_target` / `RegistryWriter.write`**: new `allowed_prefixes: list[str] | None` kwarg (forwarded from `RegistryWriter.write` through `_to_function_module` to `resolve_target`). When set, `resolve_target` rejects any module path outside the listed prefixes **before** calling `importlib.import_module`, raising `PermissionError`. Mitigates arbitrary-code-execution via forged binding files (e.g. a malicious `target: "os:system"` injected into untrusted YAML). Parity with the TypeScript SDK's `allowedPrefixes` option, adapted to Python's module-name import model. Boundary-aware: `"myapp"` permits `myapp.views` but NOT `myappx.foo`. Rust does not need this because `resolve_target` is parse-only and the `HandlerFactory` is the security boundary.
+- **`ScannedModule.display`**: moved to the END of the dataclass so existing positional `ScannedModule(...)` callers are not broken by the new field.
+
+## [0.4.1] - 2026-03-25
+
+### Added
+
+- **`deep_resolve_refs()`** — public API for recursive `$ref` resolution in OpenAPI schemas (previously internal `_deep_resolve_refs`). Resolves nested `allOf`/`anyOf`/`oneOf`, `items`, and `properties`. Depth-limited to 16 levels.
+
+### Fixed
+
+- README: apcore dependency version updated from `>= 0.13.1` to `>= 0.14.0` (matches pyproject.toml).
+- README: Core Modules table now lists all public API functions (added 10 missing entries).
+
+## [0.4.0] - 2026-03-23
+
+### Added
+
+- **`DisplayResolver`** (`apcore_toolkit.display`) — sparse binding.yaml display overlay (§5.13). Merges per-surface presentation fields (alias, description, guidance, tags, documentation) into `ScannedModule.metadata["display"]` for downstream CLI/MCP/A2A surfaces.
+  - Resolution chain per field: surface-specific override > `display` default > binding-level field > scanner value.
+  - `resolve(modules, *, binding_path=..., binding_data=...)` — accepts pre-parsed dict or a path to a `.binding.yaml` file / directory of `*.binding.yaml` files. `binding_data` takes precedence over `binding_path`.
+  - MCP alias auto-sanitization: replaces characters outside `[a-zA-Z0-9_-]` with `_`; prepends `_` if result starts with a digit.
+  - MCP alias hard limit: raises `ValueError` if sanitized alias exceeds 64 characters.
+  - CLI alias validation: warns and falls back to `display.alias` when user-explicitly-set alias does not match `^[a-z][a-z0-9_-]*$` (module_id fallback always accepted without warning).
+  - `suggested_alias` in `ScannedModule.metadata` (emitted by `simplify_ids=True` scanner) used as fallback when no `display.alias` is set.
+  - Match-count logging: `INFO` for match count, `WARNING` when binding map loaded but zero modules matched.
+- **`DisplayResolver` public export** — available as `from apcore_toolkit.display import DisplayResolver` and `from apcore_toolkit import DisplayResolver`.
+
+### Tests
+
+- 30 new tests in `tests/test_display_resolver.py` covering: no-binding fallthrough, alias-only overlay, surface-specific overrides, MCP sanitization, MCP 64-char limit, `suggested_alias` fallback, sparse overlay (10 modules / 1 binding), tags resolution, `binding_path` file and directory loading, guidance chain, CLI invalid alias warning and fallback, `binding_data` vs `binding_path` precedence.
+
+### Added (Convention Module Discovery — §5.14)
+
+- **`ConventionScanner`** — scans a `commands/` directory of plain Python files for public functions and converts them to `ScannedModule` instances with schema inferred from type annotations.
+  - Module ID: `{file_prefix}.{function_name}` with `MODULE_PREFIX` override.
+  - Description from first line of docstring (`"(no description)"` fallback).
+  - `input_schema` / `output_schema` inferred from PEP 484 type hints.
+  - `CLI_GROUP` and `TAGS` module-level constants stored in metadata.
+  - `include` / `exclude` regex filters on module IDs.
+- **`ConventionScanner` public export** — available as `from apcore_toolkit import ConventionScanner`.
+
+### Tests (Convention Module Discovery)
+
+- 15 new tests in `tests/test_convention_scanner.py`.
+
+---
+## [0.3.1] - 2026-03-22
+
+### Changed
+- Rebrand: aipartnerup → aiperceivable
+
+## [0.3.0] - 2026-03-19
+
+### Added
+
+- `_deep_resolve_refs()` — recursive `$ref` resolution for nested OpenAPI schemas,
+  handling `allOf`/`anyOf`/`oneOf`, `items`, and `properties`. Depth-limited to 16
+  levels to prevent infinite recursion on circular references.
+- `Enhancer` protocol — pluggable interface for metadata enhancement, allowing
+  custom enhancers beyond the built-in `AIEnhancer`.
+- `HTTPProxyRegistryWriter` — registers scanned modules as HTTP proxy classes
+  that forward requests to a running web API. Supports path parameter substitution,
+  pluggable auth headers, and `2xx` success range (with `204` returning `{}`).
+  Requires optional `httpx` dependency (`pip install apcore-toolkit[http-proxy]`).
+- `get_writer("http-proxy", base_url=...)` — factory support for the new
+  HTTP proxy writer with `**kwargs` forwarding.
+- Expanded `__init__.py` public API: exports `Enhancer`, `HTTPProxyRegistryWriter`,
+  `WriteError`, `Verifier`, `VerifyResult`, verifier classes, serializer functions,
+  `resolve_ref`, `resolve_schema`, `extract_input_schema`, `extract_output_schema`,
+  and `run_verifier_chain`.
+
+### Fixed
+
+- `extract_output_schema()` — now recursively resolves all nested `$ref` pointers
+  (previously only handled the shallow case of array items with `$ref`).
+- `extract_input_schema()` — now recursively resolves `$ref` inside individual
+  properties after assembly.
+- `get_writer()` return type annotation now includes `HTTPProxyRegistryWriter`.
+
+### Tests
+
+- 272 tests (up from 260), all passing
+- Added `TestDeepResolveRefs` (8 tests): top-level ref, nested properties,
+  allOf/anyOf, array items, deeply nested refs, circular ref depth limit,
+  immutability guarantee
+- Added nested `$ref` tests for `extract_input_schema` and `extract_output_schema`
+- Added `test_http_proxy` for `get_writer("http-proxy")` factory
+
+---
+
+## [0.2.0] - 2026-03-11
+
+### Added
+
+- `WriteResult` dataclass — structured result type for all writer operations,
+  with optional output verification support
+- `AIEnhancer` — SLM-based metadata enhancement using local OpenAI-compatible
+  APIs (Ollama, vLLM, LM Studio). Fills missing descriptions, infers behavioral
+  annotations, and generates input schemas for untyped functions. All AI-generated
+  fields are tagged with `x-generated-by: slm` for auditability.
+  Annotation inference prompt and acceptance logic extended to handle all 11
+  annotation fields (5 new: `cacheable`, `cache_ttl`, `cache_key_fields`,
+  `paginated`, `pagination_style`)
+- Output verification via `verify=True` parameter on all writers:
+  - `YAMLWriter`: validates YAML parsability and required binding fields
+  - `PythonWriter`: validates Python syntax via `ast.parse()`
+  - `RegistryWriter`: validates module is retrievable after registration
+- CI matrix expanded to Python 3.11 + 3.12, added mypy and coverage reporting
+
+### Changed
+
+- **apcore >= 0.13.0** — Upgraded minimum dependency to support new
+  `ModuleAnnotations` caching and pagination fields:
+  `cacheable`, `cache_ttl`, `cache_key_fields`, `paginated`, `pagination_style`
+- `infer_annotations_from_method()` — `GET` now also infers `cacheable=True`
+- **BREAKING**: All writers now return `list[WriteResult]` instead of
+  `list[dict]` (YAMLWriter) or `list[str]` (PythonWriter, RegistryWriter).
+  Downstream adapters (`django-apcore`, `flask-apcore`) must update code that
+  accesses writer return values as dicts or strings. Migration:
+  - `result[0]["bindings"]` → use `writer._build_binding(module)` for dict access
+  - `result == ["module.id"]` → `[r.module_id for r in result] == ["module.id"]`
+  - `f"wrote: {item}"` → `f"wrote: {item.module_id}"`
+  - Downstream packages should pin `apcore-toolkit<0.2.0` until updated
+
+### Fixed
+
+- README — added 5 concrete verifier classes (`YAMLVerifier`, `SyntaxVerifier`,
+  `RegistryVerifier`, `MagicBytesVerifier`, `JSONVerifier`) to Core Modules table
+  for documentation completeness
+
+### Tests
+
+- 197 tests (up from 150), all passing
+
+---
+
+## [0.1.0] - 2026-03-06
+
+Initial release. Extracts shared framework-agnostic logic from `django-apcore`
+and `flask-apcore` into a standalone toolkit package.
+
+### Added
+
+- `ScannedModule` dataclass — canonical representation of a scanned endpoint
+- `BaseScanner` ABC with `filter_modules()`, `deduplicate_ids()`,
+  `infer_annotations_from_method()`, and `extract_docstring()` utilities
+- `YAMLWriter` — generates `.binding.yaml` files for `apcore.BindingLoader`
+- `PythonWriter` — generates `@module`-decorated Python wrapper files
+- `RegistryWriter` — registers modules directly into `apcore.Registry`
+- `to_markdown()` — generic dict-to-Markdown conversion with depth control
+  and table heuristics
+- `flatten_pydantic_params()` — flattens Pydantic model parameters into
+  scalar kwargs for MCP tool invocation
+- `resolve_target()` — resolves `module.path:qualname` target strings
+- `enrich_schema_descriptions()` — merges docstring parameter descriptions
+  into JSON Schema properties
+- `annotations_to_dict()` / `module_to_dict()` — serialization utilities
+- OpenAPI utilities: `resolve_ref()`, `resolve_schema()`,
+  `extract_input_schema()`, `extract_output_schema()`
+- Output format factory via `get_writer()`
+- 150 tests with 94% code coverage
+
+### Dependencies
+
+- apcore >= 0.9.0
+- pydantic >= 2.0
+- PyYAML >= 6.0

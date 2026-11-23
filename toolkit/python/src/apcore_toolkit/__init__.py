@@ -1,0 +1,197 @@
+"""apcore-toolkit — Shared scanner, schema extraction, and output toolkit.
+
+Public API re-exports for convenient access to core types and utilities.
+"""
+
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _get_version
+
+from apcore_toolkit.ai_enhancer import AIEnhancer, Enhancer
+from apcore_toolkit.auth import (
+    AuthError,
+    AuthorizationDeniedError,
+    AuthorizationExpiredError,
+    AuthorizationProtocolError,
+    CredentialPermissionError,
+    DeviceAuthClient,
+    DeviceAuthConfig,
+    DeviceAuthError,
+    DeviceCodeGrant,
+    DiscoveryError,
+    FileTokenStore,
+    Grant,
+    NoCredentialError,
+    RefreshFailedError,
+    TokenSet,
+    TokenStore,
+)
+from apcore_toolkit.binding_loader import BindingLoader, BindingLoadError
+from apcore_toolkit.conformance import assert_annotations_preserved
+from apcore_toolkit.display import DisplayResolver
+from apcore_toolkit.formatting import (
+    format_csv,
+    format_jsonl,
+    format_module,
+    format_modules,
+    format_schema,
+    to_markdown,
+)
+from apcore_toolkit.openapi import (
+    deep_resolve_refs,
+    extract_input_schema,
+    extract_output_schema,
+    resolve_ref,
+    resolve_schema,
+)
+from apcore_toolkit.output import get_writer
+from apcore_toolkit.output.errors import InvalidFormatError, WriteError
+from apcore_toolkit.output.python_writer import PythonWriter
+from apcore_toolkit.output.http_proxy_writer import HTTPProxyRegistryWriter, proxy_uses_json_body, read_proxy_route
+from apcore_toolkit.output.registry_writer import RegistryWriter
+from apcore_toolkit.output.types import Verifier, VerifyResult, WriteResult
+from apcore_toolkit.output.verifiers import (
+    JSONVerifier,
+    MagicBytesVerifier,
+    RegistryVerifier,
+    SyntaxVerifier,
+    YAMLVerifier,
+    run_verifier_chain,
+)
+from apcore_toolkit.output.yaml_writer import YAMLWriter
+from apcore_toolkit.openapi_scanner import OpenAPIScanner, derive_module_id, load_spec
+from apcore_toolkit.openapi_parameters import OpenApiParameterProblem, OpenApiProxyInputs
+from apcore_toolkit.openapi_proxy import (
+    EffectiveProxyHazard,
+    detect_effective_proxy_hazards,
+    validate_effective_proxy_modules,
+)
+from apcore_toolkit.tui_view_model import (
+    Cell,
+    Column,
+    Filter,
+    Group,
+    Row,
+    Sort,
+    ToneRule,
+    TonePalette,
+    TuiViewModel,
+    format_view_model,
+    modules_to_view_model,
+)
+from apcore_toolkit.pydantic_utils import flatten_pydantic_params, resolve_target
+from apcore_toolkit.convention_scanner import ConventionScanner
+from apcore_toolkit.http_verb_map import (
+    SCANNER_VERB_MAP,
+    extract_path_param_names,
+    generate_suggested_alias,
+    has_path_params,
+    resolve_http_verb,
+    substitute_path_params,
+)
+from apcore_toolkit.scanner import (
+    BaseScanner,
+    deduplicate_ids,
+    filter_modules,
+    infer_annotations_from_method,
+)
+from apcore_toolkit.schema_utils import enrich_schema_descriptions
+from apcore_toolkit.serializers import annotations_to_dict, module_to_dict, modules_to_dicts
+from apcore_toolkit.types import ScannedModule, clone_module, create_scanned_module
+
+try:
+    __version__ = _get_version("apcore-toolkit")
+except PackageNotFoundError:
+    __version__ = "unknown"
+
+__all__ = [
+    "AIEnhancer",
+    "AuthError",
+    "AuthorizationDeniedError",
+    "AuthorizationExpiredError",
+    "AuthorizationProtocolError",
+    "BindingLoadError",
+    "BindingLoader",
+    "assert_annotations_preserved",
+    "Cell",
+    "Column",
+    "DisplayResolver",
+    "BaseScanner",
+    "ConventionScanner",
+    "CredentialPermissionError",
+    "DeviceAuthClient",
+    "DeviceAuthConfig",
+    "DeviceAuthError",
+    "DeviceCodeGrant",
+    "DiscoveryError",
+    "FileTokenStore",
+    "Filter",
+    "Grant",
+    "Group",
+    "HTTPProxyRegistryWriter",
+    "EffectiveProxyHazard",
+    "detect_effective_proxy_hazards",
+    "validate_effective_proxy_modules",
+    "Enhancer",
+    "InvalidFormatError",
+    "JSONVerifier",
+    "MagicBytesVerifier",
+    "NoCredentialError",
+    "OpenAPIScanner",
+    "OpenApiParameterProblem",
+    "OpenApiProxyInputs",
+    "PythonWriter",
+    "RefreshFailedError",
+    "RegistryVerifier",
+    "RegistryWriter",
+    "Row",
+    "SCANNER_VERB_MAP",
+    "ScannedModule",
+    "Sort",
+    "SyntaxVerifier",
+    "TokenSet",
+    "TokenStore",
+    "ToneRule",
+    "TonePalette",
+    "TuiViewModel",
+    "Verifier",
+    "VerifyResult",
+    "WriteError",
+    "WriteResult",
+    "YAMLVerifier",
+    "YAMLWriter",
+    "annotations_to_dict",
+    "clone_module",
+    "create_scanned_module",
+    "deduplicate_ids",
+    "deep_resolve_refs",
+    "derive_module_id",
+    "enrich_schema_descriptions",
+    "extract_input_schema",
+    "extract_output_schema",
+    "extract_path_param_names",
+    "filter_modules",
+    "flatten_pydantic_params",
+    "format_csv",
+    "format_jsonl",
+    "format_module",
+    "format_modules",
+    "format_schema",
+    "format_view_model",
+    "generate_suggested_alias",
+    "get_writer",
+    "has_path_params",
+    "infer_annotations_from_method",
+    "load_spec",
+    "module_to_dict",
+    "modules_to_dicts",
+    "modules_to_view_model",
+    "proxy_uses_json_body",
+    "read_proxy_route",
+    "resolve_http_verb",
+    "resolve_ref",
+    "resolve_schema",
+    "resolve_target",
+    "run_verifier_chain",
+    "substitute_path_params",
+    "to_markdown",
+]

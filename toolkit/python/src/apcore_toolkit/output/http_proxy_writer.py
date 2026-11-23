@@ -1,0 +1,388 @@
+"""HTTP proxy registry writer.
+
+Registers scanned modules as HTTP proxy classes that forward requests
+to a running web API. This enables CLI execution without invoking
+route handlers directly (which depend on framework DI systems).
+
+Requires the ``httpx`` optional dependency::
+
+    pip install apcore-toolkit[http-proxy]
+
+Usage::
+
+    from apcore_toolkit.output.http_proxy_writer import HTTPProxyRegistryWriter
+
+    writer = HTTPProxyRegistryWriter(
+        base_url="http://localhost:8000",
+        auth_header_factory=lambda: {"Authorization": "Bearer xxx"},
+    )
+    results = writer.write(modules, registry)
+
+The writer reads ``http_method`` and ``url_path`` from each
+``ScannedModule.metadata`` dict (the framework-agnostic convention).
+Framework-specific ``ScannedModule`` subclasses with top-level
+``http_method`` / ``url_path`` attributes are also supported.
+"""
+
+import asyncio
+import logging
+import math
+import re
+from collections.abc import Callable, Mapping
+from typing import Any
+from urllib.parse import quote, urlparse
+
+from apcore import DEFAULT_ANNOTATIONS, ErrorCodes, Registry
+from apcore.errors import ModuleError
+from apcore_toolkit.http_verb_map import (
+    _effective_openapi_path,
+    _openapi_path_param_names,
+    _substitute_openapi_path_params,
+    extract_path_param_names,
+    substitute_path_params,
+)
+from apcore_toolkit.openapi_parameters import OpenApiProxyInputs
+from apcore_toolkit.output.types import WriteResult
+from apcore_toolkit.types import ScannedModule
+
+logger = logging.getLogger("apcore_toolkit")
+
+# Methods that conventionally carry a JSON body. Other methods (GET,
+# HEAD, DELETE, OPTIONS) forward non-path inputs via the query string
+# so they are not silently dropped.
+_BODY_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH"})
+
+
+def proxy_uses_json_body(http_method: str) -> bool:
+    """Whether the HTTP proxy sends inputs outside the path as a JSON body."""
+    return http_method in _BODY_METHODS
+
+
+# Matches any unfilled placeholder ({name} or :name) left after substitution.
+_UNFILLED_PARAM_RE: re.Pattern[str] = re.compile(r"\{[^}]+\}|:[a-zA-Z_]\w*")
+
+
+def _percent_encode_path_segment(value: str) -> str:
+    """Percent-encode a path-parameter value per RFC 3986 unreserved set.
+
+    Mirrors Rust's ``percent_encode_path_segment`` so a path-param value
+    containing ``/``, ``?``, ``#``, ``%``, or whitespace cannot break the
+    request URL. ``safe=""`` keeps only ALPHA / DIGIT / ``-`` / ``.`` /
+    ``_`` / ``~`` literal — the unreserved set.
+    """
+    return quote(value, safe="")
+
+
+def _format_path_value(name: str, value: Any, *, effective: bool) -> str:
+    if effective and not isinstance(value, (str, bool, int, float)):
+        raise ModuleError(
+            code=ErrorCodes.MODULE_EXECUTE_ERROR,
+            message=f"Path parameter {name!r} must be a scalar value",
+            details={},
+        )
+    return str(value).lower() if effective and isinstance(value, bool) else str(value)
+
+
+def _unfilled_path_parameter(path: str, *, effective: bool) -> str | None:
+    if effective:
+        missing = min(_openapi_path_param_names(path), default=None)
+        return "{" + missing + "}" if missing is not None else None
+    match = _UNFILLED_PARAM_RE.search(path)
+    return match[0] if match is not None else None
+
+
+def read_proxy_route(mod: Any, *, default_method: str | None = None) -> tuple[Any, Any]:
+    """Read raw proxy route values, preferring framework attributes over metadata.
+
+    The optional method default applies only when the metadata key is absent.
+    Strict callers can omit it to diagnose missing values.
+    """
+    metadata = getattr(mod, "metadata", None) or {}
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    http_method = getattr(mod, "http_method", None) or metadata.get("http_method", default_method)
+    url_path = getattr(mod, "url_path", None) or metadata.get("url_path")
+    return http_method, url_path
+
+
+def _get_http_fields(mod: Any, *, effective: bool = False) -> tuple[str, str]:
+    http_method, url_path = read_proxy_route(mod, default_method="GET")
+    if effective:
+        effective_path = _effective_openapi_path(url_path)
+        if effective_path is None:
+            raise ValueError(f"valid 'url_path' is required (module: {mod.module_id!r})")
+        return str(http_method), effective_path
+    url_path = str(url_path or "/")
+    if url_path.startswith(("http://", "https://", "file://", "ftp://")):
+        raise ValueError(
+            f"url_path must be a relative path, not an absolute URL: {url_path!r} (module: {mod.module_id!r})"
+        )
+    return str(http_method), url_path
+
+
+class HTTPProxyRegistryWriter:
+    """Register scanned modules as HTTP proxy classes in the registry.
+
+    Each module's ``execute()`` sends an HTTP request to the target API
+    instead of calling the route handler directly.
+
+    Args:
+        base_url: Base URL of the target API (e.g. ``http://localhost:8000``).
+        auth_header_factory: Optional callable returning HTTP headers for
+            authentication (e.g. ``{"Authorization": "Bearer xxx"}``).
+            Called once per request.
+        timeout: HTTP request timeout in seconds.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        auth_header_factory: Callable[[], dict[str, str]] | None = None,
+        timeout: float = 60.0,
+    ) -> None:
+        # Reject non-http(s) schemes up-front so a misconfigured base_url
+        # (e.g. ``file:///x`` or ``ftp://...``) cannot reach the HTTP client.
+        # Mirrors the Rust ``HTTPProxyRegistryWriter::new`` ``InvalidBaseUrl``
+        # check so the three SDKs stay behaviourally aligned.
+        parsed = urlparse(base_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"Invalid base_url scheme {parsed.scheme!r} — must be 'http' or 'https'")
+        # Reject a non-finite or non-positive timeout up-front (0, negative,
+        # NaN, +/-inf) rather than deferring to undefined `httpx` client
+        # behaviour. Mirrors the Rust `HTTPProxyRegistryWriter::new` check
+        # (`timeout_secs.is_finite() && timeout_secs > 0.0`) so the two SDKs
+        # stay behaviourally aligned.
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError(f"Invalid timeout {timeout!r} — must be a finite number greater than 0")
+        self._base_url = base_url
+        self._auth_header_factory = auth_header_factory
+        self._timeout = timeout
+
+    def write(
+        self,
+        modules: list[ScannedModule],
+        registry: Registry,
+    ) -> list[WriteResult]:
+        """Register each ScannedModule as an HTTP proxy module."""
+        results: list[WriteResult] = []
+        for mod in modules:
+            try:
+                module_instance = self._build_module_class(mod)()
+                registry.register(mod.module_id, module_instance)
+                results.append(WriteResult(module_id=mod.module_id, path=None, verified=True))
+            except Exception as exc:
+                logger.warning(
+                    "HTTPProxyRegistryWriter: failed to register %s",
+                    mod.module_id,
+                    exc_info=True,
+                )
+                results.append(
+                    WriteResult(
+                        module_id=mod.module_id,
+                        path=None,
+                        verified=False,
+                        verification_error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+        return results
+
+    def _build_module_class(self, mod: ScannedModule) -> type:
+        """Build a module class with HTTP proxy execute method."""
+        effective_inputs = OpenApiProxyInputs.from_module(mod)
+        effective = effective_inputs is not None
+        http_method, url_path = _get_http_fields(mod, effective=effective)
+        path_names = _openapi_path_param_names if effective else extract_path_param_names
+        substitute_path = _substitute_openapi_path_params if effective else substitute_path_params
+        path_params = path_names(url_path)
+        base_url = self._base_url
+        auth_factory = self._auth_header_factory
+        timeout = self._timeout
+        required_json_body = effective_inputs is not None and effective_inputs.required_json_body
+        effective_query = frozenset(effective_inputs.query) if effective_inputs is not None else frozenset()
+
+        annotations = mod.annotations or DEFAULT_ANNOTATIONS
+
+        # Raw dict schemas are auto-wrapped by Registry._ensure_schema_adapter
+        # (apcore >= 0.13.1) during register(), so no manual wrapping needed.
+        raw_input = dict(mod.input_schema or {})
+        raw_output = dict(mod.output_schema or {})
+
+        class ProxyModule:
+            input_schema = raw_input
+            output_schema = raw_output
+            description = mod.description
+            documentation = mod.documentation
+            # Shared client — created lazily on first execute(), reused across calls
+            # for connection pooling. Each ProxyModule class has its own client
+            # bound to its base_url/timeout.
+            _client: Any = None
+
+            async def execute(self, inputs: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
+                import httpx as _httpx
+
+                token = getattr(ctx, "cancel_token", None)
+                if token is not None:
+                    token.check()
+
+                if ProxyModule._client is None:
+                    ProxyModule._client = _httpx.AsyncClient(base_url=base_url, timeout=timeout)
+
+                headers: dict[str, str] = {}
+                if auth_factory is not None:
+                    auth_result = auth_factory()
+                    if not isinstance(auth_result, dict):
+                        raise TypeError(
+                            f"auth_header_factory must return dict[str, str], got {type(auth_result).__name__}"
+                        )
+                    headers.update(auth_result)
+
+                # Separate path params from the rest; percent-encode each
+                # path-param value (RFC 3986 unreserved set) BEFORE
+                # substitution so values containing "/", "?", "#", "%", or
+                # whitespace cannot corrupt the URL. Mirrors the Rust
+                # implementation's percent_encode_path_segment.
+                path_values = {
+                    name: _percent_encode_path_segment(_format_path_value(name, value, effective=effective))
+                    for name, value in inputs.items()
+                    if name in path_params
+                }
+                actual_path = substitute_path(url_path, path_values)
+                # Reject the request if any placeholder went unfilled —
+                # otherwise a forgotten input would silently leak `{name}`
+                # into the request URL.
+                missing = _unfilled_path_parameter(actual_path, effective=effective)
+                if missing is not None:
+                    raise ModuleError(
+                        code=ErrorCodes.MODULE_EXECUTE_ERROR,
+                        message=(f"path parameter not provided: {missing!r} in url_path {url_path!r}"),
+                        details={"url_path": url_path, "missing": missing},
+                    )
+                non_path = {k: v for k, v in inputs.items() if k not in path_params}
+
+                # Body for POST/PUT/PATCH; query for everything else
+                # (GET/DELETE/HEAD/OPTIONS) so non-path inputs are never
+                # silently dropped.
+                kwargs: dict[str, Any] = {}
+                if proxy_uses_json_body(http_method) and (non_path or required_json_body):
+                    kwargs["json"] = non_path
+                elif non_path:
+                    for name, values in non_path.items():
+                        if name not in effective_query:
+                            continue
+                        if isinstance(values, dict):
+                            raise ModuleError(
+                                code=ErrorCodes.MODULE_EXECUTE_ERROR,
+                                message=f"Query parameter {name!r} cannot contain an object",
+                                details={},
+                            )
+                        if isinstance(values, list) and any(
+                            not isinstance(value, (str, bool, int, float)) for value in values
+                        ):
+                            raise ModuleError(
+                                code=ErrorCodes.MODULE_EXECUTE_ERROR,
+                                message=f"Query array {name!r} must contain only scalar values",
+                                details={},
+                            )
+                    if any(isinstance(v, (dict, list)) and k not in effective_query for k, v in non_path.items()):
+                        logger.warning(
+                            "HTTPProxyRegistryWriter: %s %s has nested dict/list params "
+                            "that will be str()-serialized in the query string",
+                            http_method,
+                            url_path,
+                        )
+                    kwargs["params"] = non_path
+
+                try:
+                    # HTTPX's read timeout resets for every chunk. Keep a total
+                    # deadline around the buffered request, including its body.
+                    async with asyncio.timeout(timeout):
+                        if token is None:
+                            resp = await ProxyModule._client.request(
+                                http_method, actual_path, headers=headers, **kwargs
+                            )
+                        else:
+                            token.check()
+                            request_task = asyncio.create_task(
+                                ProxyModule._client.request(http_method, actual_path, headers=headers, **kwargs)
+                            )
+                            try:
+                                # CancelToken is a synchronous cooperative flag;
+                                # polling also observes cancellation of a parent.
+                                while not request_task.done():
+                                    token.check()
+                                    await asyncio.wait({request_task}, timeout=0.01)
+                                token.check()
+                                resp = await request_task
+                            finally:
+                                if not request_task.done():
+                                    request_task.cancel()
+                                # Join HTTP cleanup before returning to the caller.
+                                # Task cancellation remains CancelledError.
+                                await asyncio.gather(request_task, return_exceptions=True)
+                except TimeoutError as exc:
+                    if token is not None:
+                        token.check()
+                    raise ModuleError(
+                        code=ErrorCodes.MODULE_EXECUTE_ERROR,
+                        message=f"HTTP request timed out after {timeout:g}s",
+                        details={},
+                    ) from exc
+                except _httpx.HTTPError as exc:
+                    raise ModuleError(
+                        code=ErrorCodes.MODULE_EXECUTE_ERROR,
+                        message=f"HTTP transport error: {exc}",
+                        details={},
+                    ) from exc
+
+                if 200 <= resp.status_code < 300:
+                    if resp.status_code == 204:
+                        return {}
+                    try:
+                        body = resp.json()
+                    except ValueError as exc:
+                        raise ModuleError(
+                            code=ErrorCodes.MODULE_EXECUTE_ERROR,
+                            message=f"HTTP {resp.status_code}: invalid JSON in response body",
+                            details={"http_status": resp.status_code},
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ModuleError(
+                            code=ErrorCodes.MODULE_EXECUTE_ERROR,
+                            message=f"HTTP {resp.status_code}: expected JSON object, got {type(body).__name__}",
+                            details={"http_status": resp.status_code},
+                        )
+                    return body
+
+                error_msg = _extract_error_message(resp)
+                raise ModuleError(
+                    code=ErrorCodes.MODULE_EXECUTE_ERROR,
+                    message=f"HTTP {resp.status_code}: {error_msg}",
+                    details={"http_status": resp.status_code},
+                )
+
+        ProxyModule.__name__ = re.sub(r"\W", "_", mod.module_id)
+        ProxyModule.__qualname__ = ProxyModule.__name__
+        ProxyModule.annotations = annotations  # type: ignore[assignment]
+        ProxyModule.tags = list(mod.tags if isinstance(mod.tags, list) else [])  # type: ignore[attr-defined]
+
+        return ProxyModule
+
+
+def _extract_error_message(resp: Any) -> str:
+    """Extract a human-readable error message from an HTTP error response."""
+    content_type = resp.headers.get("content-type", "")
+    if content_type.startswith("application/json"):
+        try:
+            body = resp.json()
+            return (
+                body.get("error_message")
+                or body.get("detail")
+                or body.get("error")
+                or body.get("message")
+                or resp.text[:200]
+            )
+        except (ValueError, AttributeError):
+            # ValueError: JSONDecodeError (bad body despite content-type header)
+            # AttributeError: resp.json() returned a non-dict
+            logger.debug("_extract_error_message: could not parse JSON body — falling back to text")
+    return resp.text[:200]

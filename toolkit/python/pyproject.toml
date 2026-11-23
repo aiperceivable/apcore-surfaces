@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apcore-toolkit"
+version = "0.15.0"
+description = "Shared scanner, schema extraction, and output toolkit for apcore framework adapters"
+requires-python = ">=3.11"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    { name = "aiperceivable", email = "tercel.yi@gmail.com" },
+]
+keywords = [
+    "apcore",
+    "mcp",
+    "scanner",
+    "schema",
+    "yaml",
+    "pydantic",
+    "openapi",
+    "toolkit",
+]
+dependencies = [
+    "apcore>=0.33.0",
+    "pydantic>=2.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+http-proxy = ["httpx>=0.24"]
+auth = ["httpx>=0.24"]
+json-schema = ["jsonschema>=4.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.9",
+    "mypy>=1.0",
+    "apdev[dev]>=0.2.1",
+    "httpx>=0.24",
+]
+
+[project.urls]
+Homepage = "https://aiperceivable.com"
+Repository = "https://github.com/aiperceivable/apcore-toolkit-python"
+Documentation = "https://github.com/aiperceivable/apcore-toolkit-python#readme"
+Issues = "https://github.com/aiperceivable/apcore-toolkit-python/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/apcore_toolkit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+src = ["src"]
+target-version = "py311"
+line-length = 120
+
+# Pinned explicitly (matches ruff's pre-0.16 default) because ruff 0.16 widened its
+# implicit default selection (adds SIM/UP/RUF/BLE/TRY/PLC/G/C4/I and more), which made
+# CI fail on a fresh `pip install` (unpinned ruff floor) while a locally uv-pinned
+# ruff 0.15.x still reported zero issues on the same code. Without an explicit
+# `select`, the enforced rule set silently depends on whichever ruff version happens
+# to be installed.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.apdev]
+base_package = "apcore_toolkit"
+src_dir = "src"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+# Resolve `apcore_toolkit` from the working tree rather than from whatever copy
+# happens to be installed in site-packages. Without this, type checkers fall
+# back to the installed distribution, which can be an older release that lacks
+# symbols the tests import — reported as bogus "unknown import symbol" errors
+# against correct source. pytest is unaffected because `pythonpath` above
+# already prepends `src`; type checkers do not read that setting.
+mypy_path = "src"
+
+[tool.pyright]
+extraPaths = ["src"]

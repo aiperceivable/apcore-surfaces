@@ -1,0 +1,221 @@
+"""YAML binding file generator.
+
+Writes ScannedModule instances as .binding.yaml files compatible with
+apcore.BindingLoader. Merged from django-apcore and flask-apcore versions,
+using Flask's richer _build_binding (annotations, documentation, metadata).
+"""
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import yaml
+
+from apcore_toolkit.output.errors import WriteError
+from apcore_toolkit.output.types import Verifier, WriteResult
+from apcore_toolkit.output.verifiers import YAMLVerifier, run_verifier_chain
+from apcore_toolkit.serializers import annotations_to_dict
+
+if TYPE_CHECKING:
+    from apcore_toolkit.types import ScannedModule
+
+logger = logging.getLogger("apcore_toolkit")
+
+
+class YAMLWriter:
+    """Generates .binding.yaml files from ScannedModule instances."""
+
+    def write(
+        self,
+        modules: list[ScannedModule],
+        output_dir: str,
+        dry_run: bool = False,
+        verify: bool = False,
+        verifiers: list[Verifier] | None = None,
+    ) -> list[WriteResult]:
+        """Write YAML binding files for each ScannedModule.
+
+        Args:
+            modules: List of ScannedModule instances to write.
+            output_dir: Directory path to write files to.
+            dry_run: If True, return results without writing to disk.
+            verify: If True, verify written files are valid YAML with required fields.
+            verifiers: Optional list of custom Verifier instances. When provided,
+                these run after the built-in check (if verify=True). First failure
+                stops the chain.
+
+        Returns:
+            List of WriteResult instances.
+        """
+        if not modules:
+            return []
+
+        output_path = Path(output_dir).resolve()
+        if not dry_run:
+            try:
+                output_path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise WriteError(str(output_path), exc) from exc
+
+        results: list[WriteResult] = []
+        timestamp = datetime.now(timezone.utc).isoformat()
+        written_names: dict[str, str] = {}  # sanitized_filename -> original module_id
+
+        for module in modules:
+            binding_data = self._build_binding(module)
+
+            if dry_run:
+                results.append(WriteResult(module_id=module.module_id))
+                continue
+
+            # Sanitize module_id for safe filename construction
+            safe_id = re.sub(r"[^a-zA-Z0-9._-]", "_", module.module_id)
+            # Collapse consecutive dots to prevent path traversal
+            safe_id = re.sub(r"\.{2,}", "_", safe_id)
+            filename = f"{safe_id}.binding.yaml"
+            # Collision tracking: append _N suffix when sanitized name collides
+            counter = 0
+            while filename in written_names:
+                counter += 1
+                filename = f"{safe_id}_{counter}.binding.yaml"
+            written_names[filename] = module.module_id
+            # Keep file_path unresolved so the symlink check below detects
+            # a symlink AT the target path instead of silently following it.
+            # (``Path.resolve()`` dereferences the final symlink component.)
+            file_path = output_path / filename
+
+            # Path traversal protection: after filename sanitization the path
+            # has no slashes, so parent must equal the already-canonical
+            # output_path. Guards against future refactors of the sanitizer.
+            if file_path.parent != output_path:
+                logger.warning(
+                    "Skipping file outside output directory: %s",
+                    file_path,
+                )
+                continue
+
+            # Pre-write symlink check (TOCTOU mitigation — matches the
+            # TypeScript writer's ``lstatSync`` guard). A symlink at the
+            # target path could redirect the write outside ``output_path``
+            # even though the resolved parent passed the is_relative_to check.
+            try:
+                if file_path.is_symlink():
+                    logger.warning("Skipping symlink escape at: %s", file_path)
+                    results.append(
+                        WriteResult(
+                            module_id=module.module_id,
+                            path=str(file_path),
+                            verified=False,
+                            verification_error="Security skip: symlink at target path",
+                        )
+                    )
+                    continue
+            except OSError:
+                # Target does not exist yet — safe to write.
+                pass
+
+            if file_path.exists():
+                logger.warning("Overwriting existing file: %s", file_path)
+
+            header = (
+                f"# Auto-generated by apcore-toolkit scanner\n"
+                f"# Generated: {timestamp}\n"
+                "# Do not edit manually unless you intend"
+                " to customize schemas.\n\n"
+            )
+            yaml_content = yaml.safe_dump(binding_data, default_flow_style=False, sort_keys=False)
+
+            # Atomic write: write to a tmp file in the same directory, fsync,
+            # then os.replace() onto the final path. Matches the TypeScript
+            # (tmp + renameSync) and Rust (tmp + sync_all + rename) writers.
+            # Without this, a crash mid-write leaves a partial YAML file that
+            # BindingLoader later fails to parse.
+            tmp_path = file_path.parent / f"{file_path.name}.{os.getpid()}.tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(header + yaml_content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, file_path)
+                # Post-rename defence-in-depth: warn if the result is a
+                # symlink (would indicate a TOCTOU race).
+                try:
+                    if file_path.is_symlink():
+                        logger.warning(
+                            "YAMLWriter: post-rename symlink detected at %s — possible race",
+                            file_path,
+                        )
+                except OSError:
+                    pass
+            except OSError as exc:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise WriteError(str(file_path), exc) from exc
+            logger.debug("Written: %s", file_path)
+
+            result = WriteResult(module_id=module.module_id, path=str(file_path))
+            if verify:
+                result = self._verify(result, file_path)
+            if result.verified and verifiers:
+                chain_result = run_verifier_chain(verifiers, str(file_path), module.module_id)
+                if not chain_result.ok:
+                    result = WriteResult(
+                        module_id=result.module_id,
+                        path=result.path,
+                        verified=False,
+                        verification_error=chain_result.error,
+                    )
+            results.append(result)
+
+        return results
+
+    def _build_binding(self, module: ScannedModule) -> dict[str, Any]:
+        """Build the YAML-serializable dict for a ScannedModule.
+
+        Includes annotations, documentation, examples, and metadata fields.
+        """
+        binding: dict[str, Any] = {
+            "module_id": module.module_id,
+            "target": module.target,
+            "description": module.description,
+            "documentation": module.documentation,
+            "tags": module.tags,
+            "version": module.version,
+            "annotations": annotations_to_dict(module.annotations),
+            "examples": [dataclasses.asdict(e) for e in module.examples] if module.examples else [],
+            "metadata": module.metadata,
+            "input_schema": module.input_schema,
+            "output_schema": module.output_schema,
+        }
+        if module.suggested_alias is not None:
+            # Emit only when set so omitting the field in YAML round-trips back
+            # to None (see BindingLoader._parse_entry: entry.get("suggested_alias")).
+            binding["suggested_alias"] = module.suggested_alias
+        if module.display is not None:
+            # Deep-copy so later mutation of module.display does not leak
+            # through into the serialized YAML, and to match the defensive
+            # copying performed by the TypeScript/Rust writers.
+            binding["display"] = copy.deepcopy(module.display)
+        return {"spec_version": "1.0", "bindings": [binding]}
+
+    @staticmethod
+    def _verify(result: WriteResult, file_path: Path) -> WriteResult:
+        """Verify that a written YAML file is well-formed and contains required fields."""
+        vr = YAMLVerifier().verify(str(file_path), result.module_id)
+        if not vr.ok:
+            return WriteResult(
+                module_id=result.module_id,
+                path=result.path,
+                verified=False,
+                verification_error=vr.error,
+            )
+        return result
