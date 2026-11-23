@@ -1,8 +1,9 @@
 site_name: apcore-cli
 site_description: The CLI Adapter for apcore — Expose modules as high-performance, AI-perceivable command-line tools.
-site_url: https://aiperceivable.github.io/apcore-cli/
-repo_url: https://github.com/aiperceivable/apcore-cli
-repo_name: aiperceivable/apcore-cli
+site_url: https://aiperceivable.github.io/apcore-surfaces/cli/
+repo_url: https://github.com/aiperceivable/apcore-surfaces
+repo_name: aiperceivable/apcore-surfaces
+edit_uri: edit/main/cli/docs/
 theme:
   name: material
   logo: assets/apcore-cli-logo.svg

@@ -1,7 +1,9 @@
 site_name: apcore-a2a
 site_description: Automatic A2A protocol adapter for the apcore ecosystem
-repo_url: https://github.com/aiperceivable/apcore-a2a
-repo_name: aiperceivable/apcore-a2a
+site_url: https://aiperceivable.github.io/apcore-surfaces/a2a/
+repo_url: https://github.com/aiperceivable/apcore-surfaces
+repo_name: aiperceivable/apcore-surfaces
+edit_uri: edit/main/a2a/docs/
 
 theme:
   name: material
