@@ -22,11 +22,8 @@ import pytest
 
 from apcore_toolkit import deep_resolve_refs
 
-_CONFORMANCE_DIR = Path(__file__).resolve().parent.parent.parent / "apcore-toolkit" / "conformance" / "fixtures"
+_CONFORMANCE_DIR = Path(__file__).resolve().parent.parent.parent / "conformance" / "fixtures"
 _FIXTURE = _CONFORMANCE_DIR / "ref_resolution.json"
-
-if not _FIXTURE.exists():  # pragma: no cover - the corpus repo is a sibling checkout
-    pytest.skip(f"shared conformance corpus not found at {_FIXTURE}", allow_module_level=True)
 
 _CASES: list[dict[str, Any]] = json.loads(_FIXTURE.read_text(encoding="utf-8"))["test_cases"]
 

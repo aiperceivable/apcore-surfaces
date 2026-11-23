@@ -1,0 +1,96 @@
+name: TypeScript surfaces
+
+on:
+  push:
+    branches: [main]
+    paths: &typescript-paths
+      - '*/typescript/**'
+      - '*/conformance/**'
+      - '.github/workflows/typescript.yml'
+  pull_request:
+    paths: *typescript-paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: TypeScript (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [toolkit, mcp, a2a, cli]
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}/typescript
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.30.1'
+      - name: Install pinned dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build and link the toolkit from this checkout
+        if: matrix.component != 'toolkit'
+        run: |
+          toolkit="$GITHUB_WORKSPACE/toolkit/typescript"
+          pnpm --dir "$toolkit" install --frozen-lockfile
+          pnpm --dir "$toolkit" build
+          pnpm link "$toolkit"
+          node --input-type=module <<'JS'
+          import { realpathSync } from 'node:fs';
+          import { resolve } from 'node:path';
+          import { fileURLToPath } from 'node:url';
+          const expected = resolve(process.env.GITHUB_WORKSPACE, 'toolkit/typescript/dist/index.js');
+          if (realpathSync(fileURLToPath(import.meta.resolve('apcore-toolkit'))) !== expected) {
+            throw new Error('Consumer did not resolve the toolkit from this checkout');
+          }
+          JS
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm test
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.component == 'toolkit'
+      - run: pnpm test:packaging
+        if: matrix.component == 'toolkit'
+
+  package:
+    name: npm distribution (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [toolkit, mcp, a2a, cli]
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}/typescript
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.30.1'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Pack and install as an external consumer
+        shell: bash
+        run: |
+          temporary=$(mktemp -d)
+          pnpm pack --pack-destination "$temporary"
+          archive=( "$temporary"/*.tgz )
+          cd "$temporary"
+          npm init -y
+          npm install "${archive[0]}"
+          node --input-type=module - 'apcore-${{ matrix.component }}' <<'JS'
+          const name = process.argv[2];
+          await import(name);
+          if (name === 'apcore-toolkit') await import(name + '/browser');
+          JS

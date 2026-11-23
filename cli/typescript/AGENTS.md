@@ -20,8 +20,8 @@
 
 ## Project Conventions
 
-- Spec repo (single source of truth): `../apcore-cli/docs/`
-- Python reference implementation: `../apcore-cli-python/`
+- Spec repo (single source of truth): `../docs/`
+- Python reference implementation: `../python/`
 - ESM module (`"type": "module"` in package.json).
 - Public API exported from `src/index.ts`.
 - CLI framework: Commander.js (not Click or clap).

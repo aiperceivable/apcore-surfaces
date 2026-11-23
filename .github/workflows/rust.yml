@@ -1,20 +1,16 @@
-name: Rust toolkit and CLI
+name: Rust surfaces
 
 on:
   push:
     branches: [main]
     paths:
-      - 'toolkit/rust/**'
-      - 'toolkit/conformance/**'
-      - 'cli/rust/**'
-      - 'cli/conformance/**'
+      - '*/rust/**'
+      - '*/conformance/**'
       - '.github/workflows/rust.yml'
   pull_request:
     paths:
-      - 'toolkit/rust/**'
-      - 'toolkit/conformance/**'
-      - 'cli/rust/**'
-      - 'cli/conformance/**'
+      - '*/rust/**'
+      - '*/conformance/**'
       - '.github/workflows/rust.yml'
   workflow_dispatch:
 
@@ -24,16 +20,23 @@ permissions:
 jobs:
   source:
     name: Rust source tests (${{ matrix.component }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        component: [toolkit, cli]
+        component: [toolkit, mcp, a2a, cli]
+        os: [ubuntu-latest]
+        include:
+          - component: mcp
+            os: windows-latest
     defaults:
       run:
         working-directory: ${{ matrix.component }}/rust
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -43,7 +46,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ${{ matrix.component }}/rust/target
-          key: ${{ runner.os }}-cargo-${{ matrix.component }}-${{ hashFiles('toolkit/rust/Cargo.lock', 'cli/rust/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.component }}-${{ hashFiles('*/rust/Cargo.lock') }}
       - run: cargo fmt --all -- --check
       - name: Check and test toolkit
         if: matrix.component == 'toolkit'
@@ -51,21 +54,25 @@ jobs:
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-features
           cargo check --locked --no-default-features
-      - name: Check and test CLI against this checkout's toolkit
-        if: matrix.component == 'cli'
+      - name: Check and test the surface against this checkout's toolkit
+        if: matrix.component != 'toolkit'
+        shell: bash
         run: |
           patch="patch.crates-io.apcore-toolkit.path='$GITHUB_WORKSPACE/toolkit/rust'"
-          cargo --config "$patch" metadata --format-version 1 | python3 -c '
+          cargo --config "$patch" metadata --format-version 1 | python -c '
           import json, sys
           from pathlib import Path
           expected = (Path(sys.argv[1]) / "toolkit/rust/Cargo.toml").resolve()
           packages = [p for p in json.load(sys.stdin)["packages"] if p["name"] == "apcore-toolkit"]
           if len(packages) != 1 or Path(packages[0]["manifest_path"]).resolve() != expected:
-              raise SystemExit("CLI did not resolve the toolkit from this checkout")
+              raise SystemExit("Consumer did not resolve the toolkit from this checkout")
           ' "$GITHUB_WORKSPACE"
           cargo --config "$patch" clippy --all-targets --all-features -- -D warnings
           cargo --config "$patch" test --all-features
           cargo --config "$patch" build --examples
+          if [[ "${{ matrix.component }}" == a2a ]]; then
+            cargo --config "$patch" check --no-default-features
+          fi
 
   package:
     name: Rust crate verification (${{ matrix.component }})
@@ -73,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [toolkit, cli]
+        component: [toolkit, mcp, a2a, cli]
     defaults:
       run:
         working-directory: ${{ matrix.component }}/rust

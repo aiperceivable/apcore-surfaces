@@ -43,13 +43,11 @@ from apcore_toolkit.binding_loader import (
 #: would otherwise be parametrized into no test at all and pass vacuously.
 _DISPATCHED_KINDS = frozenset({"match", "select"})
 
-_CONFORMANCE_DIR = Path(__file__).resolve().parent.parent.parent / "apcore-toolkit" / "conformance" / "fixtures"
+_CONFORMANCE_DIR = Path(__file__).resolve().parent.parent.parent / "conformance" / "fixtures"
 
 
 def _load_fixture() -> list[dict[str, Any]]:
     path = _CONFORMANCE_DIR / "binding_pattern.json"
-    if not path.exists():
-        pytest.skip(f"conformance fixture not found at {path}", allow_module_level=True)
     data = json.loads(path.read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["test_cases"]
     return cases

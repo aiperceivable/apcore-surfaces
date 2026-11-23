@@ -80,10 +80,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/aiperceivable/apcore-mcp-typescript.git"
+    "url": "https://github.com/aiperceivable/apcore-surfaces.git",
+    "directory": "mcp/typescript"
   },
   "homepage": "https://github.com/aiperceivable",
   "bugs": {
-    "url": "https://github.com/aiperceivable/apcore-mcp-typescript/issues"
+    "url": "https://github.com/aiperceivable/apcore-surfaces/issues"
   }
 }

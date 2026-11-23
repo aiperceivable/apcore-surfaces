@@ -12,13 +12,16 @@ import { fileURLToPath } from "node:url";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 export const SPEC_REPO_ROOT =
-  process.env.APCORE_A2A_SPEC_REPO ?? path.resolve(dir, "../../../apcore-a2a");
+  process.env.APCORE_A2A_SPEC_REPO ?? path.resolve(dir, "../../..");
 const FIXTURES_DIR = path.join(SPEC_REPO_ROOT, "conformance", "fixtures");
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function loadFixture(name: string): any | null {
   const p = path.join(FIXTURES_DIR, name);
-  if (!fs.existsSync(p)) return null;
+  if (!fs.existsSync(p)) {
+    if (process.env.CI) throw new Error(`required conformance fixture missing: ${p}`);
+    return null;
+  }
   return JSON.parse(fs.readFileSync(p, "utf-8"));
 }
 

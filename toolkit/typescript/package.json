@@ -32,11 +32,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/aiperceivable/apcore-toolkit-typescript"
+    "url": "https://github.com/aiperceivable/apcore-surfaces.git",
+    "directory": "toolkit/typescript"
   },
   "homepage": "https://aiperceivable.com",
   "bugs": {
-    "url": "https://github.com/aiperceivable/apcore-toolkit-typescript/issues"
+    "url": "https://github.com/aiperceivable/apcore-surfaces/issues"
   },
   "files": [
     "dist",

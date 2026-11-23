@@ -51,7 +51,7 @@ pub fn fixtures_dir() -> Option<PathBuf> {
 /// report that describes a different search than the one that ran is worse
 /// than no report.
 fn candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
+    let mut out = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/fixtures")];
     let mut dir: PathBuf = env!("CARGO_MANIFEST_DIR").into();
     for _ in 0..=MAX_ASCENT {
         out.push(

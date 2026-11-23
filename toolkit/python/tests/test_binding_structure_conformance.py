@@ -9,7 +9,7 @@ import yaml
 
 from apcore_toolkit import BindingLoadError, BindingLoader
 
-_FIXTURE = Path(__file__).resolve().parents[2] / "apcore-toolkit/conformance/fixtures/binding_structure.json"
+_FIXTURE = Path(__file__).resolve().parents[2] / "conformance/fixtures/binding_structure.json"
 _CASES = json.loads(_FIXTURE.read_text())["test_cases"]
 
 

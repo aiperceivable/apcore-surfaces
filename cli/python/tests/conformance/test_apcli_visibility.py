@@ -38,7 +38,7 @@ from apcore_cli.factory import create_cli
 # Fixture location — matches the TS test's APCORE_CLI_SPEC_REPO convention.
 # ---------------------------------------------------------------------------
 
-_DEFAULT_SPEC_REPO = Path(__file__).resolve().parents[3] / "apcore-cli"
+_DEFAULT_SPEC_REPO = Path(__file__).resolve().parents[3]
 SPEC_REPO_ROOT = Path(os.environ.get("APCORE_CLI_SPEC_REPO", str(_DEFAULT_SPEC_REPO)))
 FIXTURE_ROOT = SPEC_REPO_ROOT / "conformance" / "fixtures" / "apcli-visibility"
 

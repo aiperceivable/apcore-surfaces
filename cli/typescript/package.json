@@ -66,10 +66,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/aiperceivable/apcore-cli-typescript.git"
+    "url": "https://github.com/aiperceivable/apcore-surfaces.git",
+    "directory": "cli/typescript"
   },
   "homepage": "https://github.com/aiperceivable",
   "bugs": {
-    "url": "https://github.com/aiperceivable/apcore-cli-typescript/issues"
+    "url": "https://github.com/aiperceivable/apcore-surfaces/issues"
   }
 }

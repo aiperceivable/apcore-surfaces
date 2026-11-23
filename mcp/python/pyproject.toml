@@ -69,9 +69,9 @@ apcore-mcp = "apcore_mcp.__main__:main"
 
 [project.urls]
 Homepage = "https://aiperceivable.com"
-Repository = "https://github.com/aiperceivable/apcore-mcp-python"
+Repository = "https://github.com/aiperceivable/apcore-surfaces/tree/main/mcp/python"
 Documentation = "https://github.com/aiperceivable/apcore-mcp-python#readme"
-Issues = "https://github.com/aiperceivable/apcore-mcp-python/issues"
+Issues = "https://github.com/aiperceivable/apcore-surfaces/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apcore_mcp"]

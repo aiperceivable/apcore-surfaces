@@ -23,7 +23,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SPEC_REPO_ROOT =
   process.env.APCORE_CLI_SPEC_REPO ??
-  path.resolve(__dirname, "../../../apcore-cli");
+  path.resolve(__dirname, "../../..");
 const FIXTURE_PATH = path.join(
   SPEC_REPO_ROOT,
   "conformance/fixtures/snake-case-kwargs/cases.json",

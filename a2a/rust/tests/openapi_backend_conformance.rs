@@ -52,15 +52,17 @@ fn spec_root() -> PathBuf {
     if let Ok(p) = std::env::var("APCORE_A2A_SPEC_REPO") {
         return PathBuf::from(p);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate dir has a parent")
-        .join("apcore-a2a")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
 fn fixture() -> Option<Value> {
     let path = spec_root().join("conformance/fixtures/openapi_backend.json");
     if !path.is_file() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "required conformance fixture missing: {}",
+            path.display()
+        );
         eprintln!(
             "conformance fixture not found, skipping: {}",
             path.display()

@@ -47,7 +47,6 @@ const FIXTURE_PATH = resolve(
   __dirname,
   '..',
   '..',
-  'apcore-toolkit',
   'conformance',
   'fixtures',
   'binding_pattern.json',
@@ -80,7 +79,6 @@ interface SelectCase {
 type Case = MatchCase | SelectCase;
 
 function loadCases(): Case[] {
-  if (!existsSync(FIXTURE_PATH)) return [];
   const data = JSON.parse(readFileSync(FIXTURE_PATH, 'utf8')) as { test_cases: Case[] };
   return data.test_cases;
 }
@@ -149,8 +147,9 @@ function detectSymlinkSupport(): boolean {
 const SYMLINKS_SUPPORTED = detectSymlinkSupport();
 
 const cases = loadCases();
+if (cases.length === 0) throw new Error("the shared fixture must contain cases");
 
-describe.skipIf(cases.length === 0)('BindingLoader pattern — cross-SDK conformance', () => {
+describe('BindingLoader pattern — cross-SDK conformance', () => {
   const tmpDirs: string[] = [];
 
   afterEach(() => {

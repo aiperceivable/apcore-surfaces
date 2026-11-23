@@ -14,7 +14,7 @@ interface Case {
   fields?: Record<string, unknown>;
 }
 
-const fixture = new URL('../../apcore-toolkit/conformance/fixtures/binding_structure.json', import.meta.url);
+const fixture = new URL('../../conformance/fixtures/binding_structure.json', import.meta.url);
 const cases = (JSON.parse(readFileSync(fixture, 'utf8')) as { test_cases: Case[] }).test_cases;
 const fields: Record<string, keyof ScannedModule> = {
   input_schema: 'inputSchema', output_schema: 'outputSchema', suggested_alias: 'suggestedAlias',

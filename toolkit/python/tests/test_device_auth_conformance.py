@@ -68,7 +68,7 @@ from apcore_toolkit.auth.errors import (
     ConfigurationError,
 )
 
-_CONFORMANCE_DIR = Path(__file__).resolve().parent.parent.parent / "apcore-toolkit" / "conformance" / "fixtures"
+_CONFORMANCE_DIR = Path(__file__).resolve().parent.parent.parent / "conformance" / "fixtures"
 
 #: Case kinds this harness dispatches on. A fixture case carrying anything else
 #: would be parametrized into no test at all and pass vacuously.
@@ -97,8 +97,6 @@ _TOKEN_ENDPOINT = "https://e.example/token"
 
 def _load_fixture() -> list[dict[str, Any]]:
     path = _CONFORMANCE_DIR / "device_auth.json"
-    if not path.exists():
-        pytest.skip(f"conformance fixture not found at {path}", allow_module_level=True)
     data = json.loads(path.read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["test_cases"]
     return cases

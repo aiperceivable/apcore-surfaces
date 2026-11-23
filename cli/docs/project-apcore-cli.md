@@ -35,7 +35,7 @@ description: "Project manifest for apcore-cli: the FE-01 through FE-15 feature t
 
 ## Requirement Traceability
 
-Maps high-level requirements (from [ideas/draft.md](../ideas/draft.md)) to feature-level requirements.
+Maps high-level requirements (from [ideas/draft.md](https://github.com/aiperceivable/apcore-surfaces/blob/main/cli/ideas/draft.md)) to feature-level requirements.
 
 | Idea Req | Description | Feature Specs |
 |----------|-------------|---------------|

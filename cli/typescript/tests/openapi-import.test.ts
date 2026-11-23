@@ -855,7 +855,7 @@ describe("registration (FE-15a §4.7)", () => {
 
 
 it("OpenAPI commands expose effective diagnostics while retaining legacy JSON and bindings", async () => {
-  const specRoot = process.env.APCORE_CLI_SPEC_REPO ?? path.resolve("..", "apcore-cli");
+  const specRoot = process.env.APCORE_CLI_SPEC_REPO ?? path.resolve("..");
   const shared = JSON.parse(fs.readFileSync(
     path.join(specRoot, "conformance/fixtures/openapi_effective_documents.json"), "utf8",
   ));

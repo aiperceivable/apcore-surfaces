@@ -7,7 +7,7 @@
 // proposal (see apcore-toolkit/docs/features/tui-view-model.md).
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAnnotations } from 'apcore-js';
@@ -34,7 +34,6 @@ const FIXTURE_PATH = resolve(
   __dirname,
   '..',
   '..',
-  'apcore-toolkit',
   'conformance',
   'fixtures',
   'view_model.json',
@@ -93,7 +92,6 @@ interface Case {
 }
 
 function loadCases(): Case[] {
-  if (!existsSync(FIXTURE_PATH)) return [];
   const data = JSON.parse(readFileSync(FIXTURE_PATH, 'utf8')) as { test_cases: Case[] };
   return data.test_cases;
 }
@@ -146,8 +144,9 @@ function buildTonePalettes(raw: RawTonePalette[] | undefined): TonePalette[] {
 }
 
 const cases = loadCases();
+if (cases.length === 0) throw new Error("the shared fixture must contain cases");
 
-describe.skipIf(cases.length === 0)('TuiViewModel — cross-SDK conformance', () => {
+describe('TuiViewModel — cross-SDK conformance', () => {
   for (const tc of cases) {
     it(`${tc.id}: ${tc.description}`, () => {
       const options = tc.input.options ?? {};

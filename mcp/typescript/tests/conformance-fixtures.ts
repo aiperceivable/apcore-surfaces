@@ -47,6 +47,7 @@ function candidateDirs(): string[] {
   // (`…/aipartnerup/apcore-mcp`) and CI, where the spec repo is checked out
   // *inside* the workspace (`$GITHUB_WORKSPACE/apcore-mcp`) because
   // `actions/checkout` refuses to place a repository outside it.
+  candidates.push(resolve(__dirname, "../../conformance/fixtures"));
   let dir = __dirname;
   for (let i = 0; i <= MAX_ASCENT; i += 1) {
     candidates.push(resolve(dir, ...FIXTURE_SUBPATH));

@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-_DEFAULT_SPEC_REPO = Path(__file__).resolve().parents[3] / "apcore-a2a"
+_DEFAULT_SPEC_REPO = Path(__file__).resolve().parents[3]
 SPEC_REPO_ROOT = Path(os.environ.get("APCORE_A2A_SPEC_REPO", str(_DEFAULT_SPEC_REPO)))
 FIXTURES_DIR = SPEC_REPO_ROOT / "conformance" / "fixtures"
 

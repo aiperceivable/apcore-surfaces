@@ -14,7 +14,7 @@
 // its own resolver as D-98 in 0.31.0.
 
 import { describe, it, expect } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,7 +25,6 @@ const FIXTURE_PATH = resolve(
   __dirname,
   '..',
   '..',
-  'apcore-toolkit',
   'conformance',
   'fixtures',
   'ref_resolution.json',
@@ -42,13 +41,13 @@ interface Case {
 }
 
 function loadCases(): Case[] {
-  if (!existsSync(FIXTURE_PATH)) return [];
   return (JSON.parse(readFileSync(FIXTURE_PATH, 'utf8')) as { test_cases: Case[] }).test_cases;
 }
 
 const CASES = loadCases();
+if (CASES.length === 0) throw new Error("the shared fixture must contain cases");
 
-describe.skipIf(CASES.length === 0)('deepResolveRefs — shared conformance corpus', () => {
+describe('deepResolveRefs — shared conformance corpus', () => {
   it('the corpus is non-empty and its ids are unique', () => {
     expect(CASES.length).toBeGreaterThan(0);
     expect(new Set(CASES.map((c) => c.id)).size).toBe(CASES.length);

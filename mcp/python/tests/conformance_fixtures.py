@@ -47,6 +47,9 @@ def fixtures_dir() -> Path | None:
         return candidate if candidate.is_dir() else None
 
     here = Path(__file__).resolve().parent
+    in_tree = here.parent.parent / "conformance" / "fixtures"
+    if in_tree.is_dir():
+        return in_tree
     for directory in [here, *here.parents][: _MAX_ASCENT + 1]:
         candidate = directory / _FIXTURE_SUBPATH
         if candidate.is_dir():

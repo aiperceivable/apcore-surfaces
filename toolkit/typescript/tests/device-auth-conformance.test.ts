@@ -27,7 +27,7 @@
 // clock and a scripted `AuthTransport`; only the discovery cases, which are
 // about fetching well-known documents, script a `fetch`.
 
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inspect } from 'node:util';
@@ -69,7 +69,6 @@ const FIXTURE_PATH = resolve(
   __dirname,
   '..',
   '..',
-  'apcore-toolkit',
   'conformance',
   'fixtures',
   'device_auth.json',
@@ -88,7 +87,6 @@ interface FixtureCase {
 }
 
 function loadCases(): FixtureCase[] {
-  if (!existsSync(FIXTURE_PATH)) return [];
   const data = JSON.parse(readFileSync(FIXTURE_PATH, 'utf8')) as { test_cases: FixtureCase[] };
   return data.test_cases;
 }
@@ -981,8 +979,9 @@ async function runHookCase(tc: FixtureCase, allCases: FixtureCase[]): Promise<vo
 // ---------------------------------------------------------------------------
 
 const cases = loadCases();
+if (cases.length === 0) throw new Error("the shared fixture must contain cases");
 
-describe.skipIf(cases.length === 0)('device authorization flow — cross-SDK conformance', () => {
+describe('device authorization flow — cross-SDK conformance', () => {
   it('loads the whole corpus', () => {
     expect(cases.length, 'the corpus ships 65 cases').toBe(65);
   });
@@ -1032,7 +1031,7 @@ describe.skipIf(cases.length === 0)('device authorization flow — cross-SDK con
   }
 });
 
-describe.skipIf(cases.length === 0)('corpus coverage', () => {
+describe('corpus coverage', () => {
   it('every case kind has a runner', () => {
     const kinds = [...new Set(cases.map((c) => c.kind))].sort();
     expect(kinds).toEqual([

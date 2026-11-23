@@ -20,7 +20,7 @@
 // ignored option would let a case pass against default behaviour.
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -33,7 +33,6 @@ const FIXTURE_PATH = resolve(
   __dirname,
   '..',
   '..',
-  'apcore-toolkit',
   'conformance',
   'fixtures',
   'openapi_scan.json',
@@ -54,7 +53,6 @@ interface Case {
 }
 
 function loadCases(): Case[] {
-  if (!existsSync(FIXTURE_PATH)) return [];
   const data = JSON.parse(readFileSync(FIXTURE_PATH, 'utf8')) as { test_cases: Case[] };
   return data.test_cases;
 }
@@ -139,8 +137,9 @@ function moduleRepr(m: ScannedModule): Record<string, unknown> {
 }
 
 const cases = loadCases();
+if (cases.length === 0) throw new Error("the shared fixture must contain cases");
 
-describe.skipIf(cases.length === 0)('OpenAPIScanner — cross-SDK conformance', () => {
+describe('OpenAPIScanner — cross-SDK conformance', () => {
   for (const tc of cases) {
     it(`${tc.id}: ${tc.description}`, () => {
       const spec = tc.input.spec;

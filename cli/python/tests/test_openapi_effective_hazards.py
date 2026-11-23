@@ -111,7 +111,7 @@ def test_diagnostic_follows_framework_route_overrides():
 
 
 def _load_shared_fixture(name):
-    default_spec_repo = Path(__file__).resolve().parents[2] / "apcore-cli"
+    default_spec_repo = Path(__file__).resolve().parents[2]
     explicit_spec_repo = os.environ.get("APCORE_CLI_SPEC_REPO")
     spec_repo = Path(explicit_spec_repo) if explicit_spec_repo is not None else default_spec_repo
     fixture = spec_repo / "conformance" / "fixtures" / name

@@ -61,11 +61,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aiperceivable/apcore-a2a-typescript.git"
+    "url": "https://github.com/aiperceivable/apcore-surfaces.git",
+    "directory": "a2a/typescript"
   },
   "homepage": "https://aiperceivable.com",
   "bugs": {
-    "url": "https://github.com/aiperceivable/apcore-a2a-typescript/issues"
+    "url": "https://github.com/aiperceivable/apcore-surfaces/issues"
   },
   "keywords": [
     "apcore",

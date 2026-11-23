@@ -32,7 +32,7 @@ interface DocumentCase {
 }
 
 const repoRoot = process.env.APCORE_CLI_SPEC_REPO
-  ?? fileURLToPath(new URL("../../../apcore-cli", import.meta.url));
+  ?? fileURLToPath(new URL("../../../", import.meta.url));
 const fixturePath = path.join(repoRoot, "conformance/fixtures/openapi_effective_hazards.json");
 const fixture = JSON.parse(readFileSync(fixturePath, "utf8")) as { version: number; cases: FixtureCase[] };
 

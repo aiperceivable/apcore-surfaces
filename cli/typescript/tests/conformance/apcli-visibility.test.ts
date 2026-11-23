@@ -32,7 +32,7 @@ const __dirname = path.dirname(__filename);
 // layout (aipartnerup/apcore-cli alongside this repo).
 const SPEC_REPO_ROOT =
   process.env.APCORE_CLI_SPEC_REPO ??
-  path.resolve(__dirname, "../../../apcore-cli");
+  path.resolve(__dirname, "../../..");
 const FIXTURE_ROOT = path.join(
   SPEC_REPO_ROOT,
   "conformance/fixtures/apcli-visibility",
