@@ -1,0 +1,765 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+Follows apcore-toolkit 0.13.0, whose `OpenAPIScanner` now emits every `module_id` in apcore's
+Canonical ID alphabet itself. The OpenAPI Backend's own module-ID projection (FR-OAS-002) is
+retired across all three SDKs, and `conformance/fixtures/openapi_backend.json` moves to
+contract 2.0.
+
+### Changed — BREAKING
+
+- **OpenAPI-derived module IDs — and therefore A2A skill IDs — change for every camelCase or
+  hyphenated `operationId` and path.** apcore-toolkit 0.13.0 splits camelCase into snake_case
+  words where the backend's projection only lowercased. Exact migration:
+  - `operationId: listPets` → `list_pets` (was `listpets`); under `prefix: petstore`,
+    `petstore.list_pets` (was `petstore.listpets`).
+  - camelCase path parameters likewise: `GET /pets/{petId}` → `pets.pet_id.get` (was
+    `pets.petid.get`).
+  - A `prefix` is normalised with the rest of the ID: `Pet-Store` → `pet_store.…`.
+  - A segment with a leading `_`, which the projection had to drop, now registers
+    (`/v1/_debug/` → `v1.debug.get`).
+  - IDs that were already lowercase and legal are unchanged (apart from the two edge cases
+    apcore-toolkit's 0.13.0 CHANGELOG records: an `operationId` ending in a hyphen, and a path
+    with no surviving segment).
+  - **ACL rules (`targets`), bindings, and `include` / `exclude` patterns keyed on old IDs must be
+    updated.** The scanner's filters match the emitted, normalised ID (`^read_audit_log$`, not
+    `readAuditLog`). The recommended prefixed catch-all deny rule (`petstore.*`) keeps holding;
+    an allow-list of old operation names fails closed until it is updated. A2A clients that call
+    skills by ID must use the new IDs.
+  - **The apcore-toolkit floor is now 0.13.0** in all three SDKs (was 0.12.0). Because the floor
+    was open-ended, a 0.8.0 install that resolves toolkit 0.13 already registers the new IDs.
+- **FR-OAS-002 is rewritten: "Registry-legal module IDs"** (feature spec, SRS, tech design, test
+  plan, PRD FR-020). The backend registers exactly the ID the scanner emitted and no longer
+  rewrites it. It still skips, with the same WARNING, a module whose emitted ID apcore's registry
+  would reject — the one case the toolkit deliberately leaves unrepaired: a segment beginning with
+  a digit (`/v1/2fa` → `v1.2fa.get`), or an empty ID from a hook. The check now runs on the IDs
+  `scan` returns, never inside `transform_module`, so a hook returning `MyThing` registers as
+  `my_thing` rather than being skipped (or, as the old in-hook projection did, becoming
+  `mything`). Collisions the naming rule creates (`listPets` + `list-pets`) are resolved by the
+  scanner's own deduplication (`list_pets`, `list_pets_2`).
+- **FR-OAS-003 criteria 5–6 reworded**, behaviour unchanged except for the fix below: the repair
+  runs on the modules `scan` returns, and its INFO line names the IDs as emitted — after
+  normalisation and deduplication (`list_pets_2`, never a second `list_pets`).
+- **`conformance/fixtures/openapi_backend.json` contract 2.0** (was 1.0), measured against
+  apcore-toolkit 0.13.0 / apcore 0.31.0. Every expected ID re-pinned; case ids kept. Inputs
+  changed in two cases to keep their intent: `projection_runs_before_deduplication` now collides
+  `listPets` + `list-pets` (`listPets` + `listpets` no longer collide), and
+  `projection_prefix_applied_before_projection` uses prefix `Pet-Store` to show the prefix
+  normalised with the ID. Three new cases — `projection_hook_output_normalised_not_skipped`,
+  `description_synthesis_report_names_the_emitted_id`,
+  `description_not_synthesized_for_excluded_operation` — and three new driver-read fields:
+  `hooks` (named, driver-implemented hooks; an unknown name must fail the case),
+  `expected_no_error_logs`, and `expected_synthesis_report`. 24 → 27 cases.
+
+### Deprecated
+
+- **`project_module_id` / `projectModuleId`** in all three SDKs (Python `DeprecationWarning`,
+  TypeScript `@deprecated`, Rust `#[deprecated]`). The projection is no longer needed and nothing
+  in the backend calls it; it keeps its behaviour and will be removed in a later minor release.
+
+### Fixed
+
+- **FR-OAS-003 reported operations that `include` / `exclude` had removed.** The repair ran inside
+  the scanner's `transform_module` hook, which runs before the scanner's own filters, so the INFO
+  line named operations that never registered and counted them against a denominator that
+  excluded them (measured on 0.8.0: `2 of 1 scanned operations … Affected: listpets, secret`). The
+  feature spec already said the opposite; all three SDKs now run the repair on `scan`'s output.
+- **`conformance/README.md` listed no `openapi_backend.json`** in its fixture inventory; added.
+- **The feature spec's ACL-stability example matched nothing.** It showed a deny rule keyed on the
+  `operationId` (`targets: ["deleteUser"]`), which no version of the backend ever registered; it
+  now uses the emitted ID (`delete_user`), and the section notes that a toolkit upgrade can move
+  IDs as surely as an upstream rename.
+
+## [0.8.0] - 2026-09-24
+
+Minor release across all three SDKs. Raises the runtime floor to **apcore 0.31.0 / apcore-toolkit
+0.12.0** and fixes three cross-language divergences the floor raise would otherwise have
+reopened or created — none of them a change to this binding's own wire contract, all of them
+found by reviewing what the two upstream releases changed rather than by anything failing first.
+
+### Fixed
+
+- **Rust: the Agent Card ACL filter stopped agreeing with the real enforcement path for an
+  anonymous caller.** `ApCoreAgentExecutor::acl_context` exists specifically to reproduce, out of
+  pipeline, what apcore's own `BuiltinContextCreation` does before `BuiltinACLCheck` reads it, so
+  the Agent Card filter and `Executor::call()` agree about what an anonymous caller can see.
+  Through apcore 0.30, apcore-rust's own `BuiltinContextCreation` manufactured a synthetic
+  `Identity{id:"@external", type:"external"}` for a null identity — a Rust-only bug; apcore-python
+  and apcore-typescript never did this — and `acl_context` mirrored it for the same reason it
+  mirrors everything else that step does. apcore 0.31.0 fixes apcore-rust to match its siblings
+  (`PROTOCOL_SPEC` decision D-103: a null `identity` stays null, no synthetic `@external`
+  principal; `caller_id` alone still defaults to the ACL's own sentinel). Left unmirrored past the
+  floor raise, `acl_context` would have kept synthesizing an `Identity` the real pipeline no
+  longer does, so an `identity_types` / `roles` conditional ACL rule would evaluate against a
+  fabricated principal on the discovery path and against `None` on the call path — silently
+  reopening the exact divergence this method was written to prevent.
+
+- **Python and TypeScript: `global_deadline` reached apcore through a workaround for a bug in
+  apcore/apcore-js itself, and apcore 0.31.0 fixes that bug in a way that breaks the workaround.**
+  Both bindings map A2A's `execution_timeout` onto apcore's `global_deadline` so the pipeline can
+  stop cooperatively between streaming chunks — the same shape as 0.7.0's OpenAPI Backend finding
+  (`apcore-a2a.openapi.spec`, "The runtime floor" section below): the floor becoming load-bearing
+  for a code path that has nothing to do with the feature that motivated raising it.
+
+  - **Python** passed `time.monotonic() + execution_timeout`, deliberately, because
+    apcore-python's own deadline enforcement compared the value against `time.monotonic()`
+    instead of the documented `time.time()` contract — a bug this binding worked around rather
+    than reported. apcore 0.31.0 (D-99) fixes that internal comparison to match its own documented
+    contract, which **flips the failure mode**: a monotonic value (~1e5–1e6) now reads as
+    already-expired against `time.time()` (~1.8e9), so every module call through the executor
+    would have failed immediately, with the defect latent for as long as the manifest still said
+    `apcore>=0.30.0`.
+  - **TypeScript** seeded `data[CTX_GLOBAL_DEADLINE]` (ms-since-epoch) because apcore-js's
+    `BuiltinContextCreation` ignored its own first-class `Context.globalDeadline` field and only
+    ever consulted that data key. apcore 0.31.0 (D-99–D-101) makes `globalDeadline` — epoch
+    **seconds**, not milliseconds — the pipeline's only source and stops reading the data key
+    entirely, so the old workaround would have gone silently inert: task-timeout enforcement
+    disabled with no error, not a failure this binding's own test suite could have caught without
+    a dedicated assertion (added: `executor.test.ts`, spies on `Context.create`'s call arguments).
+
+  Both fixes restore identical externally-observed behaviour (timeouts enforced at the configured
+  budget) rather than changing it — an operator upgrading `apcore-a2a` alongside the floor sees no
+  difference. The risk was entirely in upgrading the floor *without* the code change, which is
+  exactly why this is a spec-repo entry and not just three SDK changelog footnotes: the same class
+  of "a workaround for the other side's bug breaks when the other side fixes it" is worth watching
+  for on every future floor raise, in either direction.
+
+### Changed — the runtime floor
+
+- **Runtime floor raised to apcore 0.31.0 / apcore-toolkit 0.12.0** in all three SDKs. apcore
+  0.31.0 is two joined audit cycles (`PROTOCOL_SPEC` v1.37.0 → v1.59.0) settling 54 cross-language
+  divergences, five of them security defects; apcore-toolkit 0.12.0 adds the Device Authorization
+  Flow (RFC 8628, unused here), threads a `pattern` parameter through `BindingLoader.load` (not
+  used by any of the three SDKs), and fixes a `$ref` sibling-key credential-disclosure defect in
+  its own schema resolver.
+- **The `$ref` sibling-key fix reaches all three SDKs with no code change of their own.** All
+  three delegate schema `$ref` resolution entirely to `apcore(-js)(-toolkit)`'s own
+  `deep_resolve_refs` / `deepResolveRefs` — none carries an independent resolver the way
+  `apcore-mcp` did (which had the identical latent bug in its own hand-rolled `_inline_refs` /
+  `inlineRefs`, fixed independently in its own 0.22.0). Worth stating plainly: a binding is only as
+  safe from this bug class as its choice not to duplicate the resolver.
+- **`sys_modules` per-group enforcement (apcore 0.31.0) does not change what any SDK registers.**
+  The four per-group `sys_modules.*.enabled` flags go from declared-but-ignored to actually
+  enforced, but their defaults were already `true`, and all three bindings only ever set the
+  top-level `sys_modules.enabled` flag, relying on those defaults — so registered-module counts
+  are unaffected.
+- Every other apcore/apcore-toolkit surface this binding's three SDKs import (`Registry`,
+  `Executor`, `Context`, `ACL.check_access`/`checkAccess`, `governance_state()`,
+  `ErrorFormatterRegistry`, `Config.register_namespace`) was checked against both changelogs'
+  breaking-change sections and needs no further change.
+
+## [0.7.0] - 2026-09-07
+
+Minor release across all three SDKs. Two things ship together: the **OpenAPI Backend**
+(feature F-12), and the runtime floor moving to **apcore 0.30.0 / apcore-toolkit 0.11.1**
+— which is not a coincidence, because the OpenAPI Scanner the feature is built on is
+what apcore-toolkit 0.11.0 added.
+
+### Added
+
+- **F-12 OpenAPI Backend** (`docs/features/openapi-backend.md`, SRS §3.16 `FR-OAS-001`…`006`,
+  PRD `FR-020`, Tech Design §4.10). Point apcore-a2a at an OpenAPI 3.0/3.1 document and
+  every operation becomes an A2A Skill on the Agent Card, proxied over HTTP to the API that
+  published it — with no apcore project on the other end. apcore-cli shipped the same
+  scanner as FE-15a in its 0.12.0 and apcore-mcp as its OpenAPI Backend in 0.20.0; this
+  makes apcore-a2a the third and last consumer in the ecosystem.
+
+  The pipeline is `load_spec → OpenAPIScanner.scan → HTTPProxyRegistryWriter.write →
+  Registry`, all of it already-shipped apcore-toolkit code. Everything downstream — skill
+  mapping, schema conversion, card visibility, ACL, approval, execution — is the code that
+  already serves an extensions directory, unmodified. New `apcore-a2a.openapi` Config Bus
+  section, `--from-openapi` and six `--openapi-*` CLI flags, and a new
+  `BackendSource::OpenApi` variant in Rust.
+
+  **Two repairs make it work, and neither is cosmetic.** `FR-OAS-002`: apcore-toolkit
+  derives module IDs into `[A-Za-z0-9_.-]` while apcore's `Registry` accepts only
+  `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$` — measured against apcore 0.30.0 /
+  apcore-toolkit 0.11.1, **only two of nine realistic operation shapes register unrepaired,
+  and the canonical Swagger Petstore is entirely in the rejected set**: it scans cleanly,
+  registers nothing, and the server serves an Agent Card with zero skills without raising
+  anywhere. `FR-OAS-003`: an operation with no `summary` or `description` yields `""`, and
+  the Agent Card builder skips empty-description modules — so 80 operations with 30
+  undocumented silently became 50 skills. A `{METHOD} {path}` description is synthesized
+  instead, and the affected operations are named at INFO.
+
+- **`FR-OAS-005`, a startup warning that names the public Agent Card.** The toolkit never
+  infers `requires_approval` for any HTTP method — a `POST /charges` that moves money is
+  annotated exactly like a `POST /echo` — and the 0.6.0 public-card filter subtracts only
+  ACL-denied and approval-gated skills. So a scanned write operation is advertised on
+  `/.well-known/agent-card.json`, a route that is auth-exempt by design and that A2A
+  clients are built to crawl. apcore-mcp's equivalent exposure is a tool list behind a
+  session; A2A's is a public discovery document, which is why this binding states a
+  requirement its siblings do not.
+
+  They are **not** withheld as a class. That is a deliberate departure from the `system.*`
+  rule: `system.*` is apcore's own reserved management surface, while an OpenAPI-derived
+  module is the operator's own API, and withholding it would reproduce the silent-loss
+  failure `FR-OAS-003` exists to close. The warning is suppressed only by having nothing to
+  warn about, by every such module declaring `requires_approval` itself, or by an explicit
+  `acknowledge_unapproved_writes: true` — and **never** by the presence of an attached ACL,
+  following apcore's own rule that a governance accessor reports the absence of a gate and
+  never the presence of protection.
+
+### The runtime floor
+
+The floor spans two apcore minors. **0.29.0** is ACL and approval work: the pattern
+array (`callers` / `targets`) has its shape closed at every entry point, `ApprovalRequest`
+gains `caller_id` and `action`, and — in Rust only — `ACLRule` becomes `#[non_exhaustive]`
+while `APCore::on`/`off` return `Result`. **0.30.0** is confined to the `Config` /
+`BindingLoader` layer: `Config` gains a `project_root` accessor and a declared set of
+path-typed configuration keys, a set-but-empty `APCORE_*` path override is discarded
+rather than silently resolving to the working directory, and `bindings.dir` /
+`bindings.pattern` become canonical defaults.
+
+**The floor reaches this binding's pre-existing surface nowhere.** The apcore surface it
+imports — `Registry`, `Executor`, `Context`, `Identity`, `CancelToken`, `ACL`,
+`ErrorCodes` / `ModuleError`, `ErrorFormatterRegistry`, `Config.register_namespace` — is
+untouched by both minors, and the extensions directory arrives in all three SDKs as an
+explicit CLI argument handed straight to `Registry`, which is the "explicit wins" tier of
+§5.12.6's precedence chain.
+
+**The OpenAPI Backend is where 0.30.0 does become load-bearing**, in a way worth stating
+plainly because it inverts what was true one release ago. Through 0.6.x the `apcore-a2a`
+namespace held five scalar keys and no path-valued one, so §9.2.1 and §9.2.2 had nothing
+to say about it. `apcore-a2a.openapi.spec` is the namespace's first path-typed key — and
+apcore 0.30.0's protections for such keys **do not reach it**. Verified empirically against
+apcore 0.30.0, not inferred from the specification: `Config.path_typed_keys()` returns a
+fixed tuple of apcore's own five keys and does not change after a namespace carrying a
+path-valued default is registered, and the §9.2.1 requirement-5 empty-value discard is
+gated on that same fixed set. So `APCORE_A2A_OPENAPI_SPEC=` would be an ordinary override
+to `""` — a legal relative path to every filesystem API and never the one an operator
+meant, which is precisely the failure apcore closed for `APCORE_ACL_ROOT=` in a namespace
+the fix does not cover. `FR-OAS-004` makes the binding own the three rules instead. The
+same finding is recorded independently in apcore-mcp.
+
+### Changed
+
+- **Runtime floor raised to apcore 0.30.0 / apcore-toolkit 0.11.1** in all three SDKs
+  (`apcore>=0.30.0` / `apcore-js >=0.30.0` / `apcore = ">=0.30"`, and
+  `apcore-toolkit>=0.11.1` throughout). apcore-toolkit 0.11.0 is what makes F-12 possible
+  at all; the apcore floor is separate and carries no behaviour change for this binding.
+
+- **The Rust `apcore` upper bound is dropped** (`>=0.28, <0.29` → `>=0.30`). The bound
+  existed because two consecutive apcore minors had shipped unannounced source breaks
+  into `ACLRule` struct literals; apcore 0.29.0 closes that route by making `ACLRule`
+  `#[non_exhaustive]`, which is what the bound was buying. `docs/spec/tech-design.md`
+  §13.2 records the reasoning rather than leaving the removed bound unexplained.
+
+- **`apcore-a2a-rust`'s six `ACLRule` struct literals in `tests/integration.rs` now go
+  through `ACLRule::new`.** Test-only: `#[non_exhaustive]` makes struct-expression
+  construction a compile error for a downstream crate, `..Default::default()` included.
+  The optional `approval` and `conditions` fields are assigned after construction.
+
+### Upgrade notes
+
+An operator carrying an ACL rule whose `callers` or `targets` is `[]`, `["$or"]`,
+`["$not"]`, or a multi-operand `["$not", p1, p2]` will find it **refused at load** by
+apcore 0.29.0 rather than silently matching nothing. That is an apcore-level break, not
+one this binding introduces, but it reaches an apcore-a2a deployment through the ACL the
+Agent Card filters read: such a rule had been contributing nothing to the decision, so
+under `default_effect: allow` it was permitting the very call it named — and the public
+card was advertising the skill accordingly. See apcore's own 0.29.0 changelog for the
+per-shape migration; `["$not", p1, p2]` is the one with no mechanical rewrite.
+
+## [0.6.0] - 2026-09-01
+
+Minor release across all three SDKs, resolving `aiperceivable/apcore-a2a` issues #2,
+#3, #4 and #5 and `apcore-a2a-rust` #2. One principle runs through all five: **apcore
+already draws these distinctions, and a transport binding's job is to convey them,
+not to flatten them.** Three governance refusals apcore names separately were being
+collapsed onto two codes that mean something else; four behavioral annotations apcore
+models were reaching no A2A caller at all; and the ACL's verdict on who may see what
+was honoured in one binding, ignored in two.
+
+The runtime floor moves to **apcore 0.28.0 / apcore-toolkit 0.10.2**, and the same
+principle covers what apcore 0.28.0 changed underneath: it split one ACL verdict into
+two independent results, and this release reads them apart rather than folding them
+back together.
+
+**Breaking** for callers that matched `-32001` or the literal `"Task not found"` to
+detect an authorization failure, and for Python/TypeScript deployments that relied on
+the public Agent Card as a full catalogue.
+
+### Changed
+
+- **A governance refusal is reported as itself** (srs FR-ERR-003, FR-ERR-009,
+  FR-ERR-010, FR-ERR-012). `ACL_DENIED` moves from `-32001 "Task not found"` to
+  `-32040 "Access denied"`; `APPROVAL_DENIED` and `APPROVAL_TIMEOUT` leave the
+  `-32603` catch-all for `-32041 "Approval denied"` and `-32042 "Approval timed
+  out"`. All three now reach `TASK_STATE_REJECTED` instead of `TASK_STATE_FAILED`,
+  which matters most on `message/send`, where the response is a JSON-RPC `result`
+  and the error code never reaches the caller at all.
+
+  The old mapping told an agent a *different* failure had happened, one whose correct
+  response was the opposite of the real one: `"Task not found"` sends a caller back to
+  re-fetch or re-send the one thing that was fine, and `"Internal server error"` is
+  the canonical *retryable* failure — for a call a human had explicitly refused. A2A
+  §13.2 requires a server to return an authorization error (MUST) and to say what was
+  refused (SHOULD); its MUST NOT forbids revealing *the existence of a resource*, not
+  the *class* of failure, so a fixed `"Access denied"` naming no caller, target or rule
+  satisfies all three. `-32040`–`-32042` sit above A2A 1.0's reserved `-32001`–`-32009`
+  in the JSON-RPC implementation-defined range, which is the "JSON-RPC custom error"
+  §13.2 names for this binding.
+
+  `-32001` now means only "unknown task id, or a task owned by another principal" —
+  still deliberately indistinguishable from each other, no longer conflated with
+  authorization. `APPROVAL_PENDING` is untouched: it remains a resumable
+  `TASK_STATE_INPUT_REQUIRED` carrying its message verbatim, which is how a caller
+  learns the `approval_id` it resumes with.
+
+- **The public Agent Card shows what an anonymous caller could actually invoke**
+  (srs FR-AGC-003). Every registered skill, minus those the ACL denies to the
+  anonymous principal, minus those annotated `requires_approval`. The three bindings
+  previously gave three different answers: Rust filtered per caller, Python and
+  TypeScript filtered nothing — publishing every restricted skill's id, name,
+  description and full input schema to any anonymous caller, since `/.well-known/`
+  is auth-exempt by design. None matched the static split the spec described.
+
+  The filter resolves one identity, so it runs once at build time. Per-caller
+  filtering moves to the extended card, where the caller is authenticated — which is
+  what makes it affordable: on the auth-exempt public route it let any anonymous
+  client drive one governance audit write per skill per request.
+
+- **The extended Agent Card carries what the authenticated caller may invoke**
+  (srs FR-AGC-004), including `requires_approval` skills. Python previously returned
+  `CopyFrom(base_card)`, a verbatim copy; Rust and TypeScript advertised
+  `capabilities.extendedAgentCard` and never routed the endpoint at all.
+
+- **`capabilities.extendedAgentCard` is no longer derived from `auth is not None`**
+  (srs FR-AGC-002, FR-AGC-006). A binding advertises a capability only when it serves
+  it. A2A §3.2.x entitles a client to read the flag and call the method.
+
+- **Card visibility reads apcore's two governance axes apart** (srs FR-AGC-003 "The
+  two axes", criterion 11; FR-AGC-004 criteria 2 and 10). apcore 0.28.0
+  (`PROTOCOL_SPEC` §6.1.6) gave an ACL rule an `approval: required` field orthogonal
+  to `effect`, so one check now resolves two independent results — may this caller
+  reach this target, and must this call be put to a human — and made the legacy
+  boolean `ACL.check` **fail closed** on the second. All three bindings filtered
+  their cards on that boolean. Left alone, a skill the ACL *allows* the caller but
+  gates behind a human would have silently vanished from the **extended** card too:
+  a refusal the ACL never issued, and the caller left unable to learn that a
+  capability it holds exists at all.
+
+  Every card filter now reads the structured accessor (`check_access` /
+  `checkAccess`) and filters on `access` alone. `approval_required` decides only
+  *which surface*: it joins the module's `requires_approval` annotation as the second
+  source the public card subtracts, composed by union exactly as apcore §6.9 composes
+  them. Reading the annotation alone would have left on the public card a skill an
+  anonymous caller cannot in fact just call — since 0.28.0 the annotation describes
+  the *module*, not the call (apcore#110).
+
+  The ACL is consulted with no arguments projection, because a card is discovery and
+  there is no call site. An `arguments` condition (§6.1.7) is therefore unevaluable,
+  which leaves an `allow` rule's requirement *pending* and composing (§6.1.1 rule 5)
+  — so a skill gated only for some argument shapes reports a requirement here and
+  stays off the public card. That is the honest discovery-time answer.
+
+### Added
+
+- **apcore's behavioral annotations reach the wire** (srs FR-SKL-004). `readonly`,
+  `destructive`, `idempotent` and `requires_approval` are emitted as namespaced
+  entries in the standard `tags` field — `apcore:readonly`, `apcore:destructive`,
+  `apcore:idempotent`, `apcore:requires-approval` — in that fixed order, appended
+  after the module's own tags and de-duplicated against them. Only `true` flags are
+  emitted, matching how the apcore MCP binding maps the same annotations onto
+  optional `readOnlyHint` / `destructiveHint` / `idempotentHint`.
+
+  A2A 1.0 `AgentSkill` is `{id, name, description, tags, examples, inputModes,
+  outputModes, securityRequirements}` — no `extensions`, no `metadata`, and in the
+  Python binding the type is generated from the A2A protobuf schema, so a vendor
+  member cannot be added at all. `tags` is the only carrier that exists; the
+  `apcore:` prefix keeps it out of the module's own flat tag namespace.
+
+  This is also what makes retry semantics usable. `retryable` is a property of the
+  *error*; whether a retry is safe is a property of the *operation*. A timeout is
+  retryable for a read and dangerous for a non-idempotent mutation. apcore resolves
+  that internally with exactly this two-factor rule; before this change an A2A caller
+  had the error half and not the operation half.
+
+- **`disclose_refusal_reason` configuration flag, default off** (srs FR-ERR-011).
+  When enabled, forwards apcore's own sanitized message for the three governance
+  codes instead of the fixed per-class string. The *class* of refusal is always
+  conveyed; the *detail* is a deployment choice. A server whose callers are its own
+  agents wants the reason — which is what the apcore MCP binding reports today, so an
+  operator comparing the two transports otherwise sees it on one and not the other.
+
+- **`FR-AGC-006`**: a binding SHALL advertise no capability it does not serve, with a
+  conformance fixture asserting each advertised capability has a served counterpart.
+
+- **apcore's `system.*` management namespace never reaches the public Agent Card**
+  (srs FR-AGC-003 criteria 12 and 13, FR-AGC-004 criterion 11; `apcore-a2a#5`).
+  Skills whose module id is in apcore's reserved namespace (`PROTOCOL_SPEC` §6.7)
+  are removed from the public card **unconditionally** — independent of ACL state,
+  of the `requires_approval` annotation, and of how `sys_modules` is configured.
+  They stay on the extended card, filtered per identity like any other skill.
+
+  Every other subtraction the public card makes is governance-shaped, and with no
+  ACL configured they all collapse: the ACL predicates are empty, and the
+  annotation covers only the three `system.control.*` write modules — leaving the
+  six read modules, which enumerate the deployment's module inventory
+  (`system.manifest.*`), its health and its usage, published by id, name,
+  description and full input schema to any anonymous caller on the auth-exempt
+  `/.well-known/` route. `ACL.discover()` yields nothing for a missing root by
+  design, so "no ACL at all" is the default rather than an edge case, and the rule
+  that has to hold there cannot be shaped like a governance verdict. Rust made
+  this explicit — `let Some(acl) = executor.acl() else { return card.clone() }` —
+  and Python and TypeScript reached the same place by filtering nothing.
+
+  Keying on the namespace conveys apcore's own boundary rather than inventing one:
+  apcore identifies the surface by that prefix itself, in
+  `Executor.governance_state()`, and its registries reject a user module that
+  tries to claim the namespace (`InvalidModuleId: Module ID contains reserved
+  word: 'system'`), so the prefix cannot collide.
+
+  Refusing to build such a card was the alternative and is deliberately **not**
+  taken: it would break a running deployment on upgrade, and a binding cannot know
+  the operator's intent. FR-AGC-007 carries the signal instead.
+
+- **`FR-AGC-007`**: at server construction the binding reads apcore's
+  `Executor.governance_state()` and warns when `unprotected_control_surface` is
+  true. It never refuses to start and never alters a card.
+
+  Withholding `system.*` from the public card removes the surface from *discovery*,
+  not from *dispatch*. `system.control.*` declares `requires_approval`, but
+  apcore's approval gate warns once and continues when no `ApprovalHandler` is
+  configured, failing closed only under `ExecutionPolicy(strict=True)` — so the
+  write modules stay callable, and the card rule must not be mistaken for a fix to
+  that. `governance_state()` (apcore 0.28.0, `PROTOCOL_SPEC` §6.6.5) is the right
+  question to ask: it answers "is a gate *engaging*", not "is an ACL *attached*",
+  and the ACL and approval gates are pipeline *steps* that the `internal`,
+  `testing` and `minimal` strategies remove — so an executor can hold an ACL that
+  no step ever consults. apcore made it a pure read and named "a serve-time adapter
+  may warn or refuse" as the two reactions; this is the warn.
+
+### Runtime floor
+
+The floor moves to **apcore 0.28.0 / apcore-toolkit 0.10.2**. apcore-toolkit 0.10.2
+is a floor bump only — no API change. apcore 0.28.0 required one code change in this
+project (the card-visibility axes, above) and one source fix in the Rust test suite
+(`apcore::acl::ACLRule` gained a required `approval` field, which a struct literal
+cannot skip). Three further apcore changes alter what an A2A caller observes without
+any code change here, and are called out so an operator upgrading is not surprised:
+
+- **Python only — a module declaring `input_schema` / `output_schema` as a raw dict
+  is now actually validated.** `_DictSchemaAdapter.model_validate` was a
+  pass-through, so every constraint such a schema declared (`required`, `enum`,
+  `type`, …) was inert. Calls that previously reached the handler with junk now fail
+  as `SCHEMA_VALIDATION_ERROR`, which this binding already maps to `-32602`. Modules
+  using Pydantic models are unaffected.
+- **An ACL `deny` rule whose condition cannot be evaluated now denies** instead of
+  going inert. That changes both what the Agent Card advertises and what a call
+  returns, in the safe direction.
+- **An ACL rule carrying an `effect` outside `allow` / `deny` now fails at
+  construction** rather than being read as `deny`. A deployment whose ACL file
+  carried `effect: "Allow"` will fail to start rather than silently deny.
+
+### Fixed
+
+- **`sys_modules` / `sysModules` registered nothing, in all three bindings**
+  (`apcore-a2a#5`). apcore reads `sys_modules.enabled` — a **top-level** config
+  section — while Python and TypeScript built the registration `Config` as
+  `{apcore: {sys_modules: {enabled: true}}}`, so the lookup missed,
+  `register_sys_modules` returned at its first line, and Python logged
+  `"Registered apcore system modules"` anyway. Rust never even tried: it passed
+  `Config::default()` and discarded the `Result` with `let _ =`. The flag was a
+  silent no-op in every deployment since it was introduced.
+
+  Fixed together with the namespace rule above, deliberately in that order:
+  repairing the config path on its own is precisely what would have opened the
+  hole that rule closes. Rust now inspects the `Result` and reports a failure;
+  Python and TypeScript carry through operator settings found under either
+  spelling, top-level winning; all three log the module ids they actually
+  registered rather than asserting success.
+
+- **Rust: `async_serve` no longer derives its bind address from `config.url`**
+  (`apcore-a2a-rust#2`). `APCoreA2AConfig` gains `host` and `port`; `url` is now used
+  only for the Agent Card, defaulting to `http://{host}:{port}` exactly as the Python
+  and TypeScript bindings have always done. The old code string-split `url` on `://`
+  and fell back to `0.0.0.0:8000` when the split failed, so a scheme-less loopback
+  value like `127.0.0.1:18999` silently published every skill on every interface, on
+  a port the operator never chose — with nothing logged. A path, a trailing slash or a
+  missing port failed to bind with an address-parse error naming neither the URL nor
+  the cause. Rust also gains the unauthenticated-public-bind warning Python and
+  TypeScript already emit.
+
+### Conformance
+
+- `fixtures/error_mapping.json`: `acl_denied_sanitized` re-pinned to `-32040`;
+  `approval_denied_sanitized`, `approval_timeout_sanitized`,
+  `approval_pending_is_not_a_refusal` and `task_not_found_keeps_minus_32001` added.
+  The last two exist so the remap cannot silently take `APPROVAL_PENDING` or `-32001`
+  with it.
+- `fixtures/agent_card.json`: `annotation_tags_namespaced`,
+  `annotation_tags_absent_when_false`, `public_card_hides_requires_approval`,
+  `public_card_hides_acl_denied_to_anonymous`,
+  `extended_card_is_not_a_copy_of_the_public_card`,
+  `public_card_hides_acl_approval_gated` and `extended_card_keeps_acl_approval_gated`
+  added — the card-visibility coverage whose absence let the three bindings diverge
+  unnoticed, and the pair that pins both directions of the authorization/approval
+  split. The last two carry `card_variant`, so builder-level runners skip them and
+  each SDK's card-visibility test asserts them.
+- `fixtures/agent_card.json`: `public_card_excludes_system_namespace_with_no_acl`
+  and `extended_card_keeps_system_namespace` added — the "system modules enabled,
+  no ACL" case `apcore-a2a#5` identified as the gap, asserted identically across
+  the three bindings.
+
+## [0.5.0] - 2026-08-17
+
+Minor release across all three SDKs. Task-addressed methods are now scoped to the
+authenticated principal, and failed tasks no longer collapse every error to a fixed
+string — from `aiperceivable/apexe` issues #33, #34 and #35. The runtime floor moves
+to apcore 0.27.
+
+**Rust carries a breaking change**: task ownership moved inside the `TaskStore`, so
+it survives a restart. Python and TypeScript needed no code change for that — both
+re-export their upstream SDK's `TaskStore`, which already took a `ServerCallContext`
+and already bucketed by owner. Suites: Rust 161, Python 350, TypeScript 328.
+
+### Changed
+
+- **Task-addressed methods are scoped to the authenticated principal** in all three
+  SDKs — `tasks/get`, `tasks/cancel`, `tasks/list` and the three
+  `tasks/pushNotificationConfig/*`. Previously `tasks/list` returned every caller's
+  tasks including their output, and any task could be read, cancelled or
+  re-pointed at a webhook by whoever knew its id; only the unguessability of a
+  UUIDv4 stood in the way. Cross-principal access is masked as `-32001` so ids
+  cannot be probed, consistent with how ACL denials are already reported
+  (srs FR-ERR-003). Callers with no identity share one owner bucket, matching
+  upstream's `UnauthenticatedUser`.
+
+- **Failed tasks classify their errors instead of collapsing them.** Caller-fixable
+  failures — schema validation, invalid input, unknown module — now reach the caller
+  with their code, message and `ai_guidance`, which is what lets an agent on the
+  other end correct itself. Internal and unrecognized errors keep the fixed
+  `"Internal server error"` string and ACL denials stay masked, per the existing
+  `error_mapping.json` contract, which is unchanged.
+
+- **`features/storage.md`: owner scoping is now part of the `TaskStore` contract.**
+  Every method must be scoped by the call context; `get` and `delete` on another
+  owner's task must behave exactly as they do for a task that does not exist — never
+  a distinguishable error, or task ids become probeable — and `list` must return only
+  the caller's tasks. Bucketing on `(owner, task_id)` satisfies all of it at once.
+  No language can enforce this: upstream `a2a-python` states it as a SHOULD, and a
+  store that ignores its context disables isolation entirely. Recorded alongside is
+  the split of push-notification configs into their own pluggable store, so a
+  persistent deployment restores tasks and their webhook targets together.
+
+  Rust is the only SDK that defines these traits itself (there is no Rust a2a-sdk),
+  so it is where the contract is implemented; its `TaskStore` and `PushConfigStore`
+  signatures in this doc were updated to match.
+
+- **Runtime floor raised to apcore 0.27** in all three SDKs. Note for future
+  upgrades: 0.27's own breaking-change list is incomplete — `Registry::describe`
+  changed both its signature *and* its return value (a module's one-line description
+  became a whole Markdown document), which would have published the full document
+  into every `AgentSkill.description` on the Agent Card.
+
+- **`tasks/list` renamed to `ListTasks` throughout (srs, prd, tech-design,
+  test-plan, features).** The spec had required a method name that exists in no
+  A2A version: 1.0 calls task listing `ListTasks`, and 0.3 had no listing method
+  at all. Both SDK-backed implementations therefore could not serve it, while
+  the Rust server implemented the invented name and nothing else could reach it.
+  `srs.md` now also records the `A2A-Version: 1.0` header requirement, and why
+  the remaining method names stay in their 0.3 spellings.
+
+  FR-TSK-006's pagination fields were wrong in the same way: it specified
+  `cursor` / `limit` / `nextCursor`, while `ListTasksRequest` declares
+  `pageToken` / `pageSize` and answers with `nextPageToken` / `totalSize`. The
+  `pageSize <= 200` clamp it required is recorded as not implemented — no
+  upstream SDK enforces a ceiling, and the Rust server ignores list parameters
+  altogether (no `contextId` filter, no pagination).
+
+### Fixed
+
+- **`features/storage.md` corrected against the implementations.** Four statements
+  did not match any SDK: the Rust `TaskStore` signature predated the owner-carrying
+  call context; the "actual implementation" snippet re-exported from a `self::memory`
+  module that does not exist (the types are defined in `storage/mod.rs`); the a2a-sdk
+  interface was described as `save`/`get`/`delete` only, while 1.0 also has `list`
+  and passes a `ServerCallContext` to each; and `isinstance(store, TaskStore)` was
+  presented as a cross-language requirement when it is Python-only.
+
+- **Rust API surface brought back in sync** across `features/public-api.md`,
+  `features/server-core.md` and `spec/tech-design.md`: `A2AServerFactory::create`
+  takes a `CreateOptions` struct (was ten positional arguments); the crate-root
+  re-exports now list the `storage` types and `CreateOptions`; and `VERSION` is
+  derived from `CARGO_PKG_VERSION` rather than the hand-written `"0.4.0"` literal
+  the docs still showed — that literal had already drifted twice, which is why the
+  constant became derived in the first place.
+
+- **`features/push-notifications.md` no longer describes one implementation for
+  three languages.** Python and TypeScript delegate config storage, delivery and
+  retry to their upstream SDK and cannot inject a store; Rust defines its own
+  pluggable `PushConfigStore` and delivers itself. The note previously described
+  only the Python path.
+
+- **`spec/tech-design.md` §13.2 (Package Manifest) rebuilt from the shipped
+  manifests.** All three samples had drifted far past their version headings: the
+  Python one still read `version = "0.1.0"` with `apcore>=0.22.0` and
+  `a2a-sdk>=0.3.0`, and omitted `apcore-toolkit` entirely; the TypeScript one listed
+  `@a2a-js/sdk: ^0.3.0` against a shipped floor of `1.0.1`, plus `express ^4.19`
+  against `^5.1.0`, and omitted `apcore-js`; the Rust one listed `apcore = "0.22"`
+  and eight of its twenty-three dependencies. All 53 dependency lines across the
+  three samples are now verified equal to the manifests, and the section states that
+  the repo manifests are authoritative. Added the reasoning behind two pins that
+  look arbitrary otherwise: why `@a2a-js/sdk` is floored at `>=1.0.1` rather than
+  `^1.0.0`, and why `apcore` is the one dependency carrying an upper bound.
+
+- **The SSE wire format is documented as the one all three SDKs actually emit.**
+  `features/streaming.md`, `spec/srs.md` and both example blocks in
+  `spec/tech-design.md` showed a bare `data: {"statusUpdate":…}` payload preceded
+  by a monotonically increasing SSE `id:` line. No SDK produces either. Every
+  frame is a complete JSON-RPC response whose `result` holds the event, with `id`
+  echoing the `message/stream` request, and no `id:` line at all — upstream
+  `a2a-python`'s SSE generator sets only `data` (plus `event: error` on the error
+  frame), and the Rust `sse_event` never calls `.id()`. A client written against
+  the old text could not have parsed a real stream.
+
+- **The `oneof` wrapper key for a standalone message is `message`, not `msg`.**
+  Corrected in `features/streaming.md` and `spec/srs.md` (prose and the
+  wrapper-key table). Verified against the upstream proto descriptor:
+  `StreamResponse` maps `task -> task`, `message -> message`,
+  `status_update -> statusUpdate`, `artifact_update -> artifactUpdate`.
+
+- **`spec/tech-design.md` §13.3 (Docker) — two samples that could not have worked.**
+  The TypeScript Dockerfile ran `npm ci` against a `package-lock.json`; the repo
+  uses pnpm and ships only `pnpm-lock.yaml`. The Python one ran `pip install .`
+  before `COPY src/ src/`, which hatchling cannot satisfy — its wheel target is
+  `packages = ["src/apcore_a2a"]`.
+
+## [0.4.2] - 2026-06-25
+
+Patch release. Bumps the required apcore runtime floor to 0.25.0 and apcore-toolkit to 0.9.1 across all three SDKs. No code, API, or wire-protocol changes — the A2A 1.0 contract is unchanged. All suites pass unmodified: Python 332, TypeScript 306, Rust 106.
+
+### Changed
+
+- **Runtime floor bumped** — `apcore >= 0.25.0` (from `>=0.24.0`) and `apcore-toolkit >= 0.9.1` (from `>=0.8.1`) in all SDKs (Rust: `apcore = "0.25"`). The adapter surface is unaffected by the 0.24 → 0.25 delta.
+
+  apcore 0.25.0 and apcore-toolkit 0.9.0–0.9.1 changes reviewed for adapter impact — none required a change:
+  - **Config-driven ACL discovery (0.25.0, apcore #74)** — `ACL.discover(config)` is auto-wired during `APCore` construction, but is skipped when the caller supplies its own `Executor` (as all three SDK adapters do), so an explicitly configured ACL is never clobbered.
+  - **Registry module-id constants promoted to the public surface (0.25.0, apcore #30)** — export-surface-only addition; no behavior change.
+  - **apcore-toolkit OpenAPI parser hardening (0.9.0–0.9.1)** — robustness fixes (integer status-code keys, explicit-`null` fields) with no public API change; the adapters use only `deep_resolve_refs` / `deepResolveRefs`, which is unaffected.
+
+
+## [0.4.1] - 2026-06-15
+
+Patch release. Bumps the required apcore runtime floor to 0.24.0 and apcore-toolkit to 0.8.1 across all three SDKs. No code, API, or wire-protocol changes — the A2A 1.0 contract is unchanged. All suites pass unmodified: Python 332, TypeScript 306, Rust 106.
+
+### Changed
+
+- **Runtime floor bumped** — `apcore >= 0.24.0` (from `>=0.22.0`) and `apcore-toolkit >= 0.8.1` (from `>=0.8.0`) in all SDKs (Rust: `apcore = "0.24"`, whose previous `"0.22"` caret hard-capped below 0.23 and required the bump). The adapter surface is unaffected by the 0.22 → 0.24 delta.
+
+  apcore 0.23.0–0.24.0 changes reviewed for adapter impact — none required a change:
+  - **Per-instance `ToggleState` (0.24.0, apcore #71)** — `Executor` / `register_sys_modules` gained an optional per-instance toggle state; all SDK call sites use the back-compat form and fall back to the process-global toggle state, behaviorally identical for a single-registry server.
+  - **`CircuitBreakerMiddleware` constructor rewrite (0.23.0, breaking)** — not used by the adapter.
+  - **AI error-recovery metadata auto-populated on `ModuleError` (0.23.0)** — `user_fixable` / `ai_guidance` now surface through serialized errors automatically; the adapter never backfilled them.
+  - **`A2ASubscriber` 4xx no-retry (0.23.0)** — applies to apcore's own event-system subscriber, not this adapter.
+
+
+## [0.4.0] - 2026-06-01
+
+### Changed
+
+- **A2A protocol upgraded 0.3 → 1.0 (BREAKING).** All language SDKs now target the protobuf-derived A2A 1.0 wire format:
+  - **Events** are a `oneof` discriminated by wrapper key (`task` / `statusUpdate` / `artifactUpdate` / `msg`) — the 0.3 `type`/`kind` discriminator and the `final` flag are removed. The stream now ends on a terminal `TaskState` (`TASK_STATE_COMPLETED` / `TASK_STATE_FAILED` / `TASK_STATE_CANCELED` / `TASK_STATE_REJECTED`).
+  - **`TaskState`** serializes as its full enum name (`TASK_STATE_SUBMITTED`, …); `Role` is an enum (`ROLE_USER` / `ROLE_AGENT`).
+  - **`Part`** is a flattened `oneof`: text → `{"text": …}`, data → `{"data": …}`, file → `{"raw": …}` / `{"url": …}` (no `type` discriminator).
+  - **`AgentCard`**: 0.3 top-level `url` → `supportedInterfaces` (`[{url, protocolBinding:"JSONRPC", protocolVersion:"1.0", tenant:""}]`); `supportsAuthenticatedExtendedCard` → `capabilities.extendedAgentCard`; `capabilities` gains `extensions`, drops `stateTransitionHistory`; `AgentSkill` gains `securityRequirements`; new required `provider`, `securityRequirements`, `signatures`.
+  - **Agent Card endpoint** is `/.well-known/agent-card.json` (1.0), with `/.well-known/agent.json` served as a 0.3 compatibility alias.
+- **apcore runtime bumped to 0.22** across all SDKs; `apcore-toolkit >= 0.8.0` added as a dependency (schema `$ref` resolution now delegates to the shared `deep_resolve_refs`).
+- **New apcore 0.22 capabilities wired:** real streaming via `Executor.stream()` (`StreamingModule`), cooperative cancellation via `CancelToken`, `global_deadline` (mapped from `execution_timeout`, now bounding the streaming path), `ObsLoggingMiddleware`, and `register_sys_modules` (new `sys_modules` option on `serve()` / `async_serve()`).
+- **Env prefix simplified** — `APCORE__A2A` (double underscore) → `APCORE_A2A` (single underscore).
+
+### Added
+
+- **Rust implementation** (`apcore-a2a-rust`) — a working A2A 1.0 server on axum 0.8 over apcore 0.22, at full feature parity with the Python and TypeScript SDKs (hand-rolled A2A 1.0 wire types; there is no Rust A2A SDK).
+- **Error Formatter Registry** (§8.8) — all SDKs register their `ErrorMapper` with `ErrorFormatterRegistry.register("a2a", ...)` so the ecosystem has a discoverable A2A error formatter.
+- **Config Bus namespace** (§9.13) — all SDKs register the `apcore-a2a` namespace with env prefix `APCORE_A2A` and defaults for `execution_timeout`, `cors_origins`, `explorer`, `metrics`, `push_notifications`.
+- **New error codes** — `MODULE_DISABLED`, `CONFIG_NAMESPACE_DUPLICATE`, `CONFIG_MOUNT_ERROR`, `CONFIG_BIND_ERROR` handled in ErrorMapper across all languages.
+- **Cross-language conformance fixtures** (`conformance/`) — shared golden cases for agent card shape, error mapping, JWT claim coercion, part conversion, skill resolution, and streaming events, consumed by the Python/Rust/TypeScript conformance suites to lock A2A 1.0 behavior across languages.
+- **`LICENSE`** (Apache-2.0) and a repo `.gitignore`.
+
+### Fixed (Cross-Language Sync)
+
+- **TypeScript top-level exports** — `index.ts` now exports all 16 symbols specified in F-08 (was 6). Added `VERSION`, `createAuthMiddleware`, `authIdentityStore`, `getAuthIdentity`, `AgentCardBuilder`, `SkillMapper`, `SchemaConverter`, `ErrorMapper`, `PartConverter`, `A2AServerFactory`, `ApCoreAgentExecutor`.
+- **TypeScript `pushNotifications` parameter** — added to `A2AServerCreateOptions` and wired into capabilities.
+- **TypeScript `A2AClient.agentCard`** getter — equivalent to Python's `agent_card` async property.
+- **TypeScript `ErrorMapper.sanitizeMessage`** — changed from public to private, matching Python and spec.
+
+### Notes
+
+- All three implementations are upgraded to this spec and passing: Python (`a2a-sdk >= 1.0.0`, 282 tests), TypeScript (`@a2a-js/sdk >= 1.0.0-alpha.0`, 257 tests), and Rust (`apcore-a2a-rust`, 37 tests). The Rust server reaches full feature parity: JSON-RPC (message/send, message/stream SSE, tasks/get|cancel|list, pushNotificationConfig/set|get|delete), CancelToken, global_deadline, JWT auth, ObsLogging, sys_modules, CORS, Explorer UI, and webhook push delivery.
+
+---
+
+## [0.3.0] - 2026-03-27
+
+### Added
+
+- **Display overlay in `SkillMapper`** (§5.13) — both Python and TypeScript SDKs now read `metadata["display"]["a2a"]` for skill name, description, tags, and guidance.
+  - Skill name: `a2a.alias` → `display.alias` → humanized `module_id`.
+  - Description: `a2a.description` → `display.description` → `module.description`. Guidance appended if present.
+  - Tags: `display.tags` → `module.tags`.
+
+### Changed
+
+- **Cross-language sync** — aligned Python and TypeScript SDKs on endpoint, env vars, CLI interface, and documentation.
+- **Well-known endpoint** unified to `/.well-known/agent.json` across both SDKs (TypeScript was using `agent-card.json`).
+- **Environment variables** renamed with `APCORE_` prefix: `JWT_SECRET` → `APCORE_JWT_SECRET`, `A2A_EXECUTION_TIMEOUT` → `APCORE_A2A_EXECUTION_TIMEOUT`.
+- **CLI `--execution-timeout`** now accepts seconds in both SDKs (TypeScript was using milliseconds).
+- **`apcore` dependency** bumped from `0.9.0+` to `0.14.0+` in both SDKs.
+- Updated feature spec `docs/features/adapters.md` — SkillMapper field mapping table corrected (`id`→`module_id`, `name`→alias chain).
+
+### Removed
+
+- **`_build_extensions()` dead code** (Python) — `AgentSkill` has no `extensions` field in the A2A SDK; deleted along with 3 tests.
+
+---
+
+## [0.2.1] - 2026-03-22
+
+### Changed
+- Rebrand: aipartnerup → aiperceivable
+
+## [0.2.0] - 2026-03-10
+
+### Changed
+
+- Updated Python requirement from 3.10+ to 3.11+ to match pyproject.toml.
+- Updated apcore dependency requirement from 0.6.0+ to 0.9.0+.
+- Delegated TaskStore and InMemoryTaskStore to a2a-sdk (replaces custom protocol).
+- Replaced ExecutionRouter, TaskManager, and TransportManager with a2a-sdk components (ApCoreAgentExecutor, DefaultRequestHandler, A2AStarletteApplication).
+- CLI `--host` default changed from `0.0.0.0` to `127.0.0.1` for safer defaults.
+- Default agent name fallback changed from `"apcore-agent"` to `"Apcore Agent"`.
+- Auth 401 response body now returns `{"error": "Unauthorized", "detail": "Missing or invalid Bearer token"}`.
+- AgentCard `defaultOutputModes` now includes both `"text/plain"` and `"application/json"`.
+
+### Added
+
+- Expanded public API exports: auth classes, adapter classes, and server factory now re-exported from top-level `__init__.py`.
+- Documented that SkillMapper `_build_extensions()` cannot wire annotations into AgentSkill (a2a-sdk lacks `extensions` field); annotations available via Explorer UI instead.
+- ErrorMapper `_sanitize_message()` now strips traceback lines in addition to file paths.
+- Explorer `create_explorer_mount()` accepts optional `registry` parameter to enrich agent card with input schemas.
+- Path-based registry resolution: `serve()` and `async_serve()` accept `str`/`Path` for auto-discovery.
+
+### Fixed
+
+- Feature specs updated to match actual implementation (F-01 through F-11).
+- Documentation version references corrected (Python 3.11+, apcore 0.9.0+).
+
+## [0.1.0] - 2026-03-07
+
+### Added
+
+- Product Requirements Document (PRD), Software Requirements Specification (SRS), Technical Design Document, and Test Plan.
+- 11 feature specifications: adapters, storage, server-core, streaming, push-notifications, auth, client, public-api, cli, explorer, ops.
+- Getting Started guide with Python and TypeScript examples.
+- README with project overview, quick start, and architecture summary.
+- MkDocs Material documentation site with GitHub Pages deployment.
+- Project logo (`apcore-a2a-logo.svg`).

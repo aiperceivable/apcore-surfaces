@@ -1,0 +1,299 @@
+---
+description: "Explorer module spec: browser-based UI for testing an A2A agent, mounted as a Starlette sub-app at a configurable prefix and served as a single self-contained HTML file."
+---
+
+# Feature: Explorer UI
+
+| Field | Value |
+|-------|-------|
+| Feature ID | F-10 |
+| Name | explorer |
+| Priority | P2 |
+| SRS Refs | FR-EXP-001 |
+| Tech Design | §4.8 Explorer Module |
+| Depends On | F-03 (server-core — ExecutionRouter, agent_card) |
+| Blocks | None |
+
+## Purpose
+
+Browser-based interactive UI for exploring and testing an A2A agent. Mounted as a Starlette sub-application at a configurable URL prefix (default: `/explorer`). Delivered as a single self-contained HTML file — no external CDN dependencies.
+
+## Component: Explorer mount/router — `explorer/__init__.py`
+
+=== "Python"
+
+    ```python
+    def create_explorer_mount(
+        agent_card: AgentCard | dict,
+        router: object,  # duck-typed: DefaultRequestHandler or ExecutionRouter
+        *,
+        explorer_prefix: str = "/explorer",
+        authenticator: object | None = None,
+        registry: object | None = None,    # optional: enriches agent card with input schemas
+    ) -> Mount:
+        """Create a Starlette Mount for the Explorer UI.
+
+        Args:
+            agent_card: Pre-computed Agent Card dict (served to Explorer JS).
+            router: Request handler for proxying test requests (duck-typed).
+            explorer_prefix: URL prefix at which the Explorer is mounted.
+            authenticator: Optional Authenticator for Explorer POST routes.
+
+        Returns:
+            A Starlette Mount that can be added to the parent app's routes.
+        """
+    ```
+
+=== "TypeScript"
+
+    ```typescript
+    // src/explorer/handler.ts — returns an Express Router.
+    function createExplorerRouter(
+      agentCard: Record<string, unknown>,
+      opts?: { registry?: unknown },   // optional: enriches agent card with input schemas
+    ): Router;
+    // GET /         → serves the SPA html
+    // GET /agent-card → returns the card + _inputSchemas
+    // Mounted at `explorerPrefix` (default "/explorer") when `explorer: true`.
+    ```
+
+=== "Rust"
+
+    ```rust
+    // src/explorer/mod.rs — UI HTML is compiled in via include_str!;
+    // routes are wired by A2AServerFactory::create when config.explorer = true.
+    // GET /explorer              → serves embedded HTML (include_str!)
+    // GET /explorer/agent-card   → serves the card + _inputSchemas
+    // NOTE: the prefix is fixed at "/explorer" (no explorer_prefix config field).
+    ```
+
+**Mount routes:**
+
+| Method | Path | Handler | Auth Required |
+|--------|------|---------|---------------|
+| `GET` | `{explorer_prefix}/` | Serve `index.html` | No |
+| `GET` | `{explorer_prefix}/agent-card` | Return agent card JSON | No |
+
+Explorer GET endpoints are **exempt** from JWT authentication even when `auth` is configured. This is enforced by adding `explorer_prefix` to `AuthMiddleware.exempt_prefixes`.
+
+---
+
+## Explorer UI Features (`index.html`)
+
+The single-file UI provides:
+
+### Agent Card Panel
+- Agent name, description, version, URL
+- Capabilities: streaming, push notifications
+- Security schemes listing
+
+### Skills Browser
+- List all skills with: ID, name, description, tags
+- Expand each skill to view:
+  - Input/output MIME modes
+  - Examples (up to 10)
+  - apcore annotations (`readonly`, `destructive`, `idempotent`, `requires_approval`)
+  - Input schema (formatted JSON)
+
+### Message Composer
+- Skill selector dropdown (populated from agent card)
+- Message editor (text input or JSON DataPart)
+- Context ID field (optional, pre-filled with generated UUID)
+- **Send** button → `message/send` JSON-RPC call → display Task result
+- **Stream** button → `message/stream` → live SSE event log
+
+### SSE Stream Viewer
+- Live-rendered event list
+- Event type badges (status / artifact)
+- State transitions highlighted
+- Artifact parts displayed inline (text rendered, JSON pretty-printed)
+
+### Task State Viewer
+- Input task ID → fetch via `tasks/get`
+- Display current state, timestamp, history timeline
+- Cancel button → `tasks/cancel`
+
+---
+
+## Implementation Notes
+
+### Single HTML File
+
+=== "Python"
+
+    ```
+    src/apcore_a2a/explorer/index.html
+    ```
+
+=== "TypeScript"
+
+    ```
+    src/explorer/index.html   # served by createExplorerRouter()
+    ```
+
+=== "Rust"
+
+    ```
+    src/explorer/index.html   # compiled into the binary via include_str!
+    ```
+
+- No external CDN (fonts, JS libs) — fully self-contained.
+- Agent Card fetched from `GET {explorer_prefix}/agent-card` on page load.
+- JSON-RPC calls made via `fetch()` to the parent server's `POST /`.
+- SSE stream via `EventSource` API pointed at parent server's `POST /`.
+- Auth token (if configured) stored in sessionStorage, sent as `Authorization: Bearer` header.
+
+### Explorer routes
+
+=== "Python"
+
+    ```python
+    from starlette.routing import Mount, Route
+    from starlette.responses import HTMLResponse
+    from starlette.staticfiles import StaticFiles
+
+    def create_explorer_mount(agent_card, router, *, explorer_prefix="/explorer",
+                              authenticator=None, registry=None):
+        html_path = Path(__file__).parent / "index.html"
+
+        async def serve_index(request):
+            return HTMLResponse(html_path.read_text())
+
+        async def serve_agent_card(request):
+            # If agent_card is a Pydantic model, serialize to dict via model_dump()
+            card_data = agent_card.model_dump() if hasattr(agent_card, "model_dump") else agent_card
+            # If registry provided, enrich skills with _inputSchemas
+            if registry is not None:
+                for skill in card_data.get("skills", []):
+                    defn = registry.get_definition(skill.get("id"))
+                    if defn and getattr(defn, "input_schema", None):
+                        skill["_inputSchemas"] = defn.input_schema
+            return JSONResponse(card_data)
+
+        return Mount(explorer_prefix, routes=[
+            Route("/", endpoint=serve_index),
+            Route("/agent-card", endpoint=serve_agent_card),
+        ])
+    ```
+
+=== "TypeScript"
+
+    ```typescript
+    import { Router } from "express";
+    import { readFileSync } from "node:fs";
+
+    // src/explorer/handler.ts
+    export function createExplorerRouter(
+      agentCard: Record<string, unknown>,
+      opts?: { registry?: unknown },
+    ): Router {
+      const router = Router();
+      const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+
+      router.get("/", (_req, res) => res.type("html").send(html));
+
+      router.get("/agent-card", (_req, res) => {
+        // If a registry was provided, enrich skills with _inputSchemas.
+        res.json(agentCard);
+      });
+
+      return router;
+    }
+    // Mounted at `explorerPrefix` (default "/explorer") when `explorer: true`.
+    ```
+
+=== "Rust"
+
+    ```rust
+    use axum::{response::Html, routing::get, Json, Router};
+
+    // src/explorer/mod.rs — wired by A2AServerFactory::create when config.explorer = true.
+    // The HTML is compiled into the binary; the prefix is fixed at "/explorer".
+    const EXPLORER_HTML: &str = include_str!("index.html");
+
+    pub fn explorer_router(card: serde_json::Value) -> Router {
+        Router::new()
+            .route("/explorer", get(|| async { Html(EXPLORER_HTML) }))
+            // Card enriched with _inputSchemas is served here.
+            .route("/explorer/agent-card", get(move || async move { Json(card) }))
+    }
+    ```
+
+---
+
+## Auth Exemption
+
+When `A2AServerFactory` mounts the Explorer, it passes `explorer_prefix` to `AuthMiddleware`:
+
+=== "Python"
+
+    ```python
+    # In A2AServerFactory.create():
+    if explorer:
+        explorer_mount = create_explorer_mount(agent_card, router, explorer_prefix=explorer_prefix)
+        routes.append(explorer_mount)
+        exempt_prefixes.add(explorer_prefix)
+    ```
+
+=== "TypeScript"
+
+    ```typescript
+    // In A2AServerFactory.create():
+    if (opts.explorer) {
+      const prefix = opts.explorerPrefix ?? "/explorer";
+      app.use(prefix, createExplorerRouter(agentCard, { registry }));
+      exemptPrefixes.add(prefix);
+    }
+    ```
+
+=== "Rust"
+
+    ```rust
+    // In A2AServerFactory::create(): the prefix is fixed at "/explorer".
+    if explorer {
+        router = router.merge(explorer_router(card.clone()));
+        exempt_paths.push("/explorer".to_string());
+    }
+    ```
+
+This means any `GET {explorer_prefix}/*` request bypasses JWT validation.
+
+---
+
+## File Structure
+
+=== "Python"
+
+    ```
+    src/apcore_a2a/explorer/
+        __init__.py    # create_explorer_mount()
+        index.html     # Self-contained Explorer UI
+    ```
+
+=== "TypeScript"
+
+    ```
+    src/explorer/
+        handler.ts     # createExplorerRouter()
+        index.html     # Self-contained Explorer UI
+    ```
+
+=== "Rust"
+
+    ```
+    src/explorer/
+        mod.rs         # explorer routes; wired by A2AServerFactory::create
+        index.html     # Self-contained Explorer UI (include_str!)
+    ```
+
+## Key Invariants
+
+- Explorer is mounted only when `explorer=True` in `serve()` / `A2AServerFactory.create()`
+- All Explorer routes are exempt from JWT authentication (public dev tool)
+- `index.html` is self-contained — no external network requests from the UI
+- Agent Card data served at `{explorer_prefix}/agent-card` (not re-fetching `/.well-known/agent-card.json` to avoid CORS)
+- `create_explorer_mount()` has no dependency on auth or storage modules
+
+## Test Module
+
+`tests/explorer/test_explorer.py`
