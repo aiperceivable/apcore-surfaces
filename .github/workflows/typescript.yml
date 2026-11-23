@@ -46,7 +46,7 @@ jobs:
           import { realpathSync } from 'node:fs';
           import { resolve } from 'node:path';
           import { fileURLToPath } from 'node:url';
-          const expected = resolve(process.env.GITHUB_WORKSPACE, 'toolkit/typescript/dist/index.js');
+          const expected = realpathSync(resolve(process.env.GITHUB_WORKSPACE, 'toolkit/typescript/dist/index.js'));
           if (realpathSync(fileURLToPath(import.meta.resolve('apcore-toolkit'))) !== expected) {
             throw new Error('Consumer did not resolve the toolkit from this checkout');
           }
