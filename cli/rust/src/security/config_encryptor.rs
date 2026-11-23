@@ -1,0 +1,658 @@
+// apcore-cli — Encrypted config storage.
+// Protocol spec: SEC-03 (ConfigEncryptor, ConfigDecryptionError)
+
+use aes_gcm::{
+    aead::{rand_core::RngCore, Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use gethostname::gethostname;
+use pbkdf2::pbkdf2_hmac;
+use sha2::Sha256;
+use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const SERVICE_NAME: &str = "apcore-cli";
+/// Legacy static salt used by `enc:` (v1) tokens — kept for decryption
+/// backward compatibility only.  New encryptions use `enc:v2:` with a
+/// per-encryption random salt embedded in the wire bytes.
+const PBKDF2_SALT_V1: &[u8] = b"apcore-cli-config-v1";
+/// OWASP 2026 minimum for PBKDF2-HMAC-SHA256.
+const PBKDF2_ITERATIONS: u32 = 600_000;
+/// Minimum v1 wire-format length: 12-byte nonce + 16-byte tag.
+const MIN_WIRE_LEN_V1: usize = 28;
+/// Random salt length prepended to v2 wire bytes.
+const PBKDF2_SALT_LEN_V2: usize = 16;
+/// Minimum v2 wire-format length: 16-byte salt + 12-byte nonce + 16-byte tag.
+const MIN_WIRE_LEN_V2: usize = PBKDF2_SALT_LEN_V2 + 28;
+
+// ---------------------------------------------------------------------------
+// ConfigDecryptionError
+// ---------------------------------------------------------------------------
+
+/// Errors produced by decryption or key-derivation operations.
+#[derive(Debug, Error)]
+pub enum ConfigDecryptionError {
+    /// The ciphertext is malformed or has been tampered with. Used by the
+    /// internal `_aes_decrypt_*` helpers, which do not know the originating
+    /// config key. Public callers go through [`ConfigEncryptor::retrieve`],
+    /// which wraps this into [`Self::DecryptFailed`] with the user-facing
+    /// `{key}` context per spec (`docs/features/security.md` §
+    /// `Contract: ConfigEncryptor.retrieve`).
+    #[error("decryption failed: authentication tag mismatch or corrupt data")]
+    AuthTagMismatch,
+
+    /// Decryption of a stored config value failed. Carries the originating
+    /// config key so the user-facing message can name it and direct the
+    /// caller to remediate via `apcli config set {key}`. Cross-language
+    /// parity with Python `ConfigDecryptionError(f"Failed to decrypt
+    /// configuration value '{key}'. ...")` and TS equivalent — audit
+    /// D11-006 (2026-05-12) canonicalized the CLI brand to `apcli` per FE-13.
+    #[error(
+        "Failed to decrypt configuration value '{key}'. \
+         Re-store with 'apcli config set {key}'."
+    )]
+    DecryptFailed { key: String },
+
+    /// The stored data was not valid UTF-8 after decryption.
+    #[error("decrypted data is not valid UTF-8")]
+    InvalidUtf8,
+
+    /// Keyring access failed.
+    #[error("keyring error: {0}")]
+    KeyringError(String),
+
+    /// Key-derivation failed.
+    #[error("key derivation error: {0}")]
+    KdfError(String),
+}
+
+// ---------------------------------------------------------------------------
+// ConfigEncryptor
+// ---------------------------------------------------------------------------
+
+/// AES-GCM encrypted config store backed by the system keyring.
+///
+/// Uses PBKDF2-HMAC-SHA256 for key derivation from a machine-specific
+/// `hostname:username` material, and AES-256-GCM for authenticated encryption.
+///
+/// Wire format for AES-encrypted values:
+///   `enc:<base64(nonce[12] || tag[16] || ciphertext)>`
+///
+/// Keyring-stored values are referenced as:
+///   `keyring:<key>`
+#[derive(Default)]
+pub struct ConfigEncryptor {
+    /// When `true`, skip the OS keyring probe and always use AES encryption.
+    /// Intended for unit tests running in headless/CI environments.
+    _force_aes: bool,
+}
+
+impl ConfigEncryptor {
+    /// Create a new `ConfigEncryptor` using the OS keyring when available.
+    pub fn new() -> Result<Self, ConfigDecryptionError> {
+        Ok(Self::default())
+    }
+
+    /// Create a `ConfigEncryptor` that always uses AES encryption, bypassing
+    /// the OS keyring. Intended for use in tests running in headless/CI environments.
+    /// Gated behind the `test-support` feature so it is excluded from production builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_forced_aes() -> Self {
+        Self { _force_aes: true }
+    }
+
+    /// Wrapper for `_keyring_available()` for use in integration tests.
+    #[allow(dead_code)]
+    pub(crate) fn keyring_available(&self) -> bool {
+        self._keyring_available()
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+
+    /// Persist `value` for `key`.
+    ///
+    /// Tries the OS keyring first. On failure (headless / CI) falls back to
+    /// AES-256-GCM file encryption.
+    ///
+    /// Returns a config-file token:
+    /// - `"keyring:<key>"` when stored in the OS keyring.
+    /// - `"enc:<base64>"` when stored as an encrypted blob.
+    ///
+    /// # Security note
+    ///
+    /// The `enc:` fallback path derives its encryption key from the machine's
+    /// hostname and the current username. This protects against casual file
+    /// browsing but **not** against targeted attacks by co-tenants on shared
+    /// systems who know both values. For sensitive credentials (API keys,
+    /// tokens), prefer the `keyring:` path (OS keyring) when available, or
+    /// use environment variables instead of config file storage.
+    pub fn store(&self, key: &str, value: &str) -> Result<String, ConfigDecryptionError> {
+        if self._keyring_available() {
+            let entry = keyring::Entry::new(SERVICE_NAME, key)
+                .map_err(|e| ConfigDecryptionError::KeyringError(e.to_string()))?;
+            entry
+                .set_password(value)
+                .map_err(|e| ConfigDecryptionError::KeyringError(e.to_string()))?;
+            Ok(format!("keyring:{key}"))
+        } else {
+            tracing::warn!("OS keyring unavailable. Using file-based encryption.");
+            let ciphertext = self._aes_encrypt_v2(value)?;
+            Ok(format!("enc:v2:{}", B64.encode(&ciphertext)))
+        }
+    }
+
+    /// Retrieve the plaintext for a config value token.
+    ///
+    /// Handles four formats:
+    /// - `"keyring:<ref>"` — fetch from OS keyring.
+    /// - `"enc:v2:<base64>"` — v2: per-encryption random salt (PBKDF2 600k rounds).
+    /// - `"enc:<base64>"` — v1 legacy: static PBKDF2 salt (100k rounds, read-only).
+    /// - anything else — return as-is (plain passthrough).
+    pub fn retrieve(&self, config_value: &str, key: &str) -> Result<String, ConfigDecryptionError> {
+        if let Some(ref_key) = config_value.strip_prefix("keyring:") {
+            let entry = keyring::Entry::new(SERVICE_NAME, ref_key)
+                .map_err(|e| ConfigDecryptionError::KeyringError(e.to_string()))?;
+            entry.get_password().map_err(|e| match e {
+                keyring::Error::NoEntry => ConfigDecryptionError::KeyringError(format!(
+                    "Keyring entry not found for '{ref_key}'."
+                )),
+                other => ConfigDecryptionError::KeyringError(other.to_string()),
+            })
+        } else if let Some(b64_data) = config_value.strip_prefix("enc:v2:") {
+            let data = B64
+                .decode(b64_data)
+                .map_err(|_| ConfigDecryptionError::DecryptFailed {
+                    key: key.to_string(),
+                })?;
+            self._aes_decrypt_v2(&data)
+                .map_err(|_| ConfigDecryptionError::DecryptFailed {
+                    key: key.to_string(),
+                })
+        } else if let Some(b64_data) = config_value.strip_prefix("enc:") {
+            let data = B64
+                .decode(b64_data)
+                .map_err(|_| ConfigDecryptionError::DecryptFailed {
+                    key: key.to_string(),
+                })?;
+            self._aes_decrypt_v1(&data)
+                .map_err(|_| ConfigDecryptionError::DecryptFailed {
+                    key: key.to_string(),
+                })
+        } else {
+            Ok(config_value.to_string())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Returns `true` when the OS keyring is accessible.
+    fn _keyring_available(&self) -> bool {
+        if self._force_aes {
+            return false;
+        }
+        let entry = match keyring::Entry::new(SERVICE_NAME, "__apcore_probe__") {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        matches!(entry.get_password(), Ok(_) | Err(keyring::Error::NoEntry))
+    }
+
+    /// Derive a 32-byte AES key via PBKDF2-HMAC-SHA256.
+    ///
+    /// Key material precedence (matching Python/TS parity):
+    /// 1. `APCORE_CLI_CONFIG_PASSPHRASE` env var if set and non-empty.
+    /// 2. `hostname:username` fallback.
+    fn _derive_key_with_salt(&self, salt: &[u8]) -> Result<[u8; 32], ConfigDecryptionError> {
+        self._derive_key_with_salt_iter(salt, PBKDF2_ITERATIONS)
+    }
+
+    /// Like [`_derive_key_with_salt`] but with a configurable iteration count.
+    /// Used by [`_aes_decrypt_v1`] to support the 600k → 100k retry that
+    /// Python and TypeScript SDKs perform for early-version v1 ciphertexts
+    /// (D10-001).
+    fn _derive_key_with_salt_iter(
+        &self,
+        salt: &[u8],
+        iterations: u32,
+    ) -> Result<[u8; 32], ConfigDecryptionError> {
+        let material = if let Ok(passphrase) = std::env::var("APCORE_CLI_CONFIG_PASSPHRASE") {
+            if !passphrase.is_empty() {
+                passphrase
+            } else {
+                let hostname = gethostname()
+                    .into_string()
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let username = Self::resolve_username_from_env();
+                format!("{hostname}:{username}")
+            }
+        } else {
+            let hostname = gethostname()
+                .into_string()
+                .unwrap_or_else(|_| "unknown".to_string());
+            let username = Self::resolve_username_from_env();
+            format!("{hostname}:{username}")
+        };
+        let mut key = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(material.as_bytes(), salt, iterations, &mut key);
+        Ok(key)
+    }
+
+    /// Resolve the username for key-derivation material.
+    ///
+    /// Audit D11-W1 (2026-05-08): the chain is `USER → LOGNAME → USERNAME →
+    /// "unknown"`. The previous Rust implementation stopped at LOGNAME,
+    /// breaking Windows hosts where only `USERNAME` is set (Python and TS
+    /// reference implementations include `USERNAME` in the chain).
+    fn resolve_username_from_env() -> String {
+        Self::resolve_username_from_env_with(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure variant of [`Self::resolve_username_from_env`] that takes an
+    /// injectable env lookup. Exposed for unit testing the priority chain
+    /// without process-wide env mutation.
+    fn resolve_username_from_env_with<F>(env_lookup: &F) -> String
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        for key in ["USER", "LOGNAME", "USERNAME"] {
+            if let Some(v) = env_lookup(key) {
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+        "unknown".to_string()
+    }
+
+    /// Encrypt `plaintext` and return v2 wire bytes.
+    ///
+    /// Wire format: `salt[16] || nonce[12] || tag[16] || ciphertext`.
+    /// A 16-byte random salt is generated per encryption; it is embedded in
+    /// the output so no external state is required for decryption.
+    pub(crate) fn _aes_encrypt_v2(
+        &self,
+        plaintext: &str,
+    ) -> Result<Vec<u8>, ConfigDecryptionError> {
+        let mut salt_bytes = [0u8; PBKDF2_SALT_LEN_V2];
+        OsRng.fill_bytes(&mut salt_bytes);
+        let raw_key = self._derive_key_with_salt(&salt_bytes)?;
+        let cipher = Aes256Gcm::new_from_slice(&raw_key)
+            .map_err(|e| ConfigDecryptionError::KdfError(e.to_string()))?;
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let encrypted = cipher
+            .encrypt(&nonce, plaintext.as_bytes())
+            .map_err(|_| ConfigDecryptionError::AuthTagMismatch)?;
+        let ct_len = encrypted.len() - 16;
+        let ciphertext = &encrypted[..ct_len];
+        let tag = &encrypted[ct_len..];
+        let mut out = Vec::with_capacity(PBKDF2_SALT_LEN_V2 + 12 + 16 + ct_len);
+        out.extend_from_slice(&salt_bytes);
+        out.extend_from_slice(nonce.as_slice());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(ciphertext);
+        Ok(out)
+    }
+
+    /// Decrypt v2 wire bytes back to a UTF-8 string.
+    ///
+    /// Expected wire format: `salt[16] || nonce[12] || tag[16] || ciphertext`.
+    pub(crate) fn _aes_decrypt_v2(&self, data: &[u8]) -> Result<String, ConfigDecryptionError> {
+        if data.len() < MIN_WIRE_LEN_V2 {
+            return Err(ConfigDecryptionError::AuthTagMismatch);
+        }
+        let salt = &data[..PBKDF2_SALT_LEN_V2];
+        let rest = &data[PBKDF2_SALT_LEN_V2..];
+        let raw_key = self._derive_key_with_salt(salt)?;
+        let cipher = Aes256Gcm::new_from_slice(&raw_key)
+            .map_err(|e| ConfigDecryptionError::KdfError(e.to_string()))?;
+        let nonce = Nonce::from_slice(&rest[..12]);
+        let tag = &rest[12..28];
+        let ciphertext = &rest[28..];
+        let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + 16);
+        ct_with_tag.extend_from_slice(ciphertext);
+        ct_with_tag.extend_from_slice(tag);
+        let plaintext = cipher
+            .decrypt(nonce, ct_with_tag.as_slice())
+            .map_err(|_| ConfigDecryptionError::AuthTagMismatch)?;
+        String::from_utf8(plaintext).map_err(|_| ConfigDecryptionError::InvalidUtf8)
+    }
+
+    /// Decrypt v1 (legacy) wire bytes back to a UTF-8 string.
+    ///
+    /// Expected wire format: `nonce[12] || tag[16] || ciphertext` with the
+    /// static `PBKDF2_SALT_V1` salt. Read-only — new encryptions use
+    /// `_aes_encrypt_v2` / `enc:v2:` tokens instead.
+    ///
+    /// Iteration retry per the cross-SDK contract (D10-001): tries 600k
+    /// (current Rust-written v1) first, then 100k (early Python/TS-written
+    /// v1). Mirrors apcore-cli-python/src/apcore_cli/security/config_encryptor.py:139
+    /// and apcore-cli-typescript/src/security/config-encryptor.ts:197.
+    pub(crate) fn _aes_decrypt_v1(&self, data: &[u8]) -> Result<String, ConfigDecryptionError> {
+        if data.len() < MIN_WIRE_LEN_V1 {
+            return Err(ConfigDecryptionError::AuthTagMismatch);
+        }
+        let nonce = Nonce::from_slice(&data[..12]);
+        let tag = &data[12..28];
+        let ciphertext = &data[28..];
+
+        let mut last_err: Option<ConfigDecryptionError> = None;
+        for iterations in [PBKDF2_ITERATIONS, 100_000_u32] {
+            let raw_key = match self._derive_key_with_salt_iter(PBKDF2_SALT_V1, iterations) {
+                Ok(k) => k,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let cipher = match Aes256Gcm::new_from_slice(&raw_key) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = Some(ConfigDecryptionError::KdfError(e.to_string()));
+                    continue;
+                }
+            };
+            let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + 16);
+            ct_with_tag.extend_from_slice(ciphertext);
+            ct_with_tag.extend_from_slice(tag);
+            match cipher.decrypt(nonce, ct_with_tag.as_slice()) {
+                Ok(plaintext) => {
+                    return String::from_utf8(plaintext)
+                        .map_err(|_| ConfigDecryptionError::InvalidUtf8);
+                }
+                Err(_) => {
+                    last_err = Some(ConfigDecryptionError::AuthTagMismatch);
+                    continue;
+                }
+            }
+        }
+        Err(last_err.unwrap_or(ConfigDecryptionError::AuthTagMismatch))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an encryptor that always uses the AES path (keyring skipped).
+    fn aes_encryptor() -> ConfigEncryptor {
+        ConfigEncryptor { _force_aes: true }
+    }
+
+    /// D11-W1 (2026-05-08): the username fallback chain must walk
+    /// `USER → LOGNAME → USERNAME → "unknown"`. The previous chain stopped
+    /// at LOGNAME, so Windows hosts (which expose only `USERNAME`) silently
+    /// derived their key from "unknown" instead of the real account, making
+    /// previously-encrypted v1/v2 payloads undecryptable across hosts.
+    #[test]
+    fn test_resolve_username_walks_user_logname_username_chain() {
+        // USER wins over LOGNAME and USERNAME.
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "USER" => Some("user_val".to_string()),
+                "LOGNAME" => Some("logname_val".to_string()),
+                "USERNAME" => Some("username_val".to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            ConfigEncryptor::resolve_username_from_env_with(&env),
+            "user_val"
+        );
+
+        // LOGNAME wins when USER is unset.
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "LOGNAME" => Some("logname_val".to_string()),
+                "USERNAME" => Some("username_val".to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            ConfigEncryptor::resolve_username_from_env_with(&env),
+            "logname_val"
+        );
+
+        // USERNAME wins when both USER and LOGNAME are unset (Windows).
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "USERNAME" => Some("username_val".to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            ConfigEncryptor::resolve_username_from_env_with(&env),
+            "username_val"
+        );
+
+        // All unset → "unknown".
+        let env = |_: &str| -> Option<String> { None };
+        assert_eq!(
+            ConfigEncryptor::resolve_username_from_env_with(&env),
+            "unknown"
+        );
+
+        // Empty values are skipped (non-Windows env where USER is exported as "").
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "USER" => Some(String::new()),
+                "LOGNAME" => Some(String::new()),
+                "USERNAME" => Some("windows_account".to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            ConfigEncryptor::resolve_username_from_env_with(&env),
+            "windows_account"
+        );
+    }
+
+    #[test]
+    fn test_aes_v2_roundtrip() {
+        let enc = aes_encryptor();
+        let ciphertext = enc._aes_encrypt_v2("hello-secret").expect("encrypt");
+        let plaintext = enc._aes_decrypt_v2(&ciphertext).expect("decrypt");
+        assert_eq!(plaintext, "hello-secret");
+    }
+
+    /// Helper: encrypt v1 wire bytes with an explicit iteration count so we
+    /// can test the 600k → 100k decrypt fallback (D10-001) without exposing
+    /// the legacy 100k path as a public encryption API.
+    fn _v1_encrypt_with_iterations(
+        enc: &ConfigEncryptor,
+        plaintext: &str,
+        iterations: u32,
+    ) -> Vec<u8> {
+        use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+        let raw_key = enc
+            ._derive_key_with_salt_iter(PBKDF2_SALT_V1, iterations)
+            .expect("derive");
+        let cipher = Aes256Gcm::new_from_slice(&raw_key).expect("cipher");
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ct_with_tag = cipher
+            .encrypt(&nonce, plaintext.as_bytes())
+            .expect("encrypt");
+        // Wire format: nonce[12] || tag[16] || ciphertext.
+        // aes-gcm appends the 16-byte tag to the end of the ciphertext, so we
+        // need to splice it into the middle slot.
+        assert!(ct_with_tag.len() >= 16);
+        let split = ct_with_tag.len() - 16;
+        let (ct, tag) = ct_with_tag.split_at(split);
+        let mut wire = Vec::with_capacity(12 + 16 + ct.len());
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(tag);
+        wire.extend_from_slice(ct);
+        wire
+    }
+
+    #[test]
+    fn test_aes_v1_decrypts_600k_ciphertext() {
+        // Sanity: the current iteration count round-trips.
+        let enc = aes_encryptor();
+        let wire = _v1_encrypt_with_iterations(&enc, "current-secret", PBKDF2_ITERATIONS);
+        let plaintext = enc._aes_decrypt_v1(&wire).expect("decrypt");
+        assert_eq!(plaintext, "current-secret");
+    }
+
+    #[test]
+    fn test_aes_v1_decrypts_100k_legacy_ciphertext() {
+        // D10-001: very early SDK builds wrote v1 ciphertexts with 100k
+        // PBKDF2 iterations. Python and TS retry with 100k after 600k fails;
+        // Rust must do the same so legacy values remain readable.
+        let enc = aes_encryptor();
+        let wire = _v1_encrypt_with_iterations(&enc, "legacy-secret", 100_000);
+        let plaintext = enc
+            ._aes_decrypt_v1(&wire)
+            .expect("v1 decrypt must retry at 100k iterations");
+        assert_eq!(plaintext, "legacy-secret");
+    }
+
+    #[test]
+    fn test_aes_v1_rejects_wrong_iterations() {
+        // Ciphertext encrypted with 200k (neither 600k nor 100k) must fail
+        // — proves the retry list is bounded, not "try anything".
+        let enc = aes_encryptor();
+        let wire = _v1_encrypt_with_iterations(&enc, "weird", 200_000);
+        let result = enc._aes_decrypt_v1(&wire);
+        assert!(result.is_err(), "200k ciphertext must not decrypt");
+    }
+
+    #[test]
+    fn test_store_without_keyring_returns_enc_v2_prefix() {
+        let enc = aes_encryptor();
+        let token = enc.store("auth.api_key", "secret123").expect("store");
+        assert!(
+            token.starts_with("enc:v2:"),
+            "expected enc:v2: prefix, got {token}"
+        );
+    }
+
+    #[test]
+    fn test_retrieve_enc_v2_value() {
+        let enc = aes_encryptor();
+        let token = enc.store("auth.api_key", "secret123").expect("store");
+        let result = enc.retrieve(&token, "auth.api_key").expect("retrieve");
+        assert_eq!(result, "secret123");
+    }
+
+    #[test]
+    fn test_retrieve_plaintext_passthrough() {
+        let enc = aes_encryptor();
+        let result = enc.retrieve("plain-value", "some.key").expect("retrieve");
+        assert_eq!(result, "plain-value");
+    }
+
+    #[test]
+    fn test_retrieve_corrupted_v1_ciphertext_returns_error() {
+        let enc = aes_encryptor();
+        let mut bad = vec![0u8; 40];
+        bad[12] ^= 0xFF;
+        let config_value = format!("enc:{}", B64.encode(&bad));
+        let result = enc.retrieve(&config_value, "some.key");
+        assert!(matches!(
+            result,
+            Err(ConfigDecryptionError::DecryptFailed { ref key }) if key == "some.key"
+        ));
+    }
+
+    #[test]
+    fn test_retrieve_corrupted_v2_ciphertext_returns_error() {
+        let enc = aes_encryptor();
+        // v2 wire: 16 salt + 40 (12 nonce + 16 tag + 12 ct), corrupt tag.
+        let mut bad = vec![0u8; 56];
+        bad[16 + 12] ^= 0xFF;
+        let config_value = format!("enc:v2:{}", B64.encode(&bad));
+        let result = enc.retrieve(&config_value, "some.key");
+        assert!(matches!(
+            result,
+            Err(ConfigDecryptionError::DecryptFailed { ref key }) if key == "some.key"
+        ));
+    }
+
+    #[test]
+    fn test_retrieve_short_v1_ciphertext_returns_error() {
+        let enc = aes_encryptor();
+        let config_value = format!("enc:{}", B64.encode([0u8; 10]));
+        let result = enc.retrieve(&config_value, "some.key");
+        assert!(matches!(
+            result,
+            Err(ConfigDecryptionError::DecryptFailed { ref key }) if key == "some.key"
+        ));
+    }
+
+    #[test]
+    fn test_retrieve_short_v2_ciphertext_returns_error() {
+        let enc = aes_encryptor();
+        let config_value = format!("enc:v2:{}", B64.encode([0u8; 10]));
+        let result = enc.retrieve(&config_value, "some.key");
+        assert!(matches!(
+            result,
+            Err(ConfigDecryptionError::DecryptFailed { ref key }) if key == "some.key"
+        ));
+    }
+
+    /// Audit D10-truncated #1 regression: the user-facing error message must
+    /// name the originating config key and direct the caller to remediate.
+    /// Cross-language parity with Python `config_encryptor.py:62-64,70-72`
+    /// and TS `config-encryptor.ts:136-149`.
+    #[test]
+    fn test_retrieve_decrypt_error_message_includes_key_and_remediation() {
+        let enc = aes_encryptor();
+        // Corrupted v2 ciphertext.
+        let mut bad = vec![0u8; 56];
+        bad[16 + 12] ^= 0xFF;
+        let config_value = format!("enc:v2:{}", B64.encode(&bad));
+        let err = enc
+            .retrieve(&config_value, "auth.api_key")
+            .expect_err("corrupt ciphertext should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auth.api_key"),
+            "error message must name the config key, got: {msg}"
+        );
+        assert!(
+            msg.contains("apcli config set auth.api_key"),
+            "error message must include remediation guidance, got: {msg}"
+        );
+    }
+
+    /// Audit D10-truncated #1: an invalid base64 payload behind `enc:v2:`
+    /// should also surface as `DecryptFailed { key }` so the user gets the
+    /// same actionable message as a tag-mismatch failure.
+    #[test]
+    fn test_retrieve_invalid_b64_returns_decrypt_failed_with_key() {
+        let enc = aes_encryptor();
+        let result = enc.retrieve("enc:v2:!!!not-base64!!!", "auth.api_key");
+        assert!(matches!(
+            result,
+            Err(ConfigDecryptionError::DecryptFailed { ref key }) if key == "auth.api_key"
+        ));
+    }
+
+    #[test]
+    fn test_derive_key_is_32_bytes() {
+        let enc = aes_encryptor();
+        let key = enc._derive_key_with_salt(PBKDF2_SALT_V1).expect("derive");
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn test_v2_ciphertexts_differ_for_same_plaintext() {
+        // Random per-encryption salt means same plaintext produces different tokens.
+        let enc = aes_encryptor();
+        let ct1 = enc._aes_encrypt_v2("same").expect("e1");
+        let ct2 = enc._aes_encrypt_v2("same").expect("e2");
+        assert_ne!(ct1, ct2, "v2 ciphertexts must differ (random salt)");
+    }
+}

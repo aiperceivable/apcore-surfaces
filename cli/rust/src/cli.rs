@@ -1,0 +1,2601 @@
+// apcore-cli — Core CLI dispatcher.
+// Protocol spec: FE-01 (build_module_command, collect_input,
+//                        validate_module_id, set_audit_logger, dispatch_module)
+
+use std::collections::HashMap;
+use std::io::{IsTerminal, Read};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::security::AuditLogger;
+
+// NOTE: LazyModuleGroup, GroupedModuleGroup, ModuleExecutor trait, and
+// ApCoreExecutorAdapter were deleted per audit findings D9-001..004. They
+// were Python Click-hierarchy ports that did not fit clap's model. Actual
+// dispatch is handled directly by dispatch_module() below; the dispatcher
+// calls the concrete `apcore::Executor` without a trait-object indirection.
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Errors produced by CLI dispatch operations.
+#[derive(Debug, Error)]
+pub enum CliError {
+    #[error("invalid module id: {0}")]
+    InvalidModuleId(String),
+
+    #[error("reserved module id: '{0}' conflicts with a built-in command name")]
+    ReservedModuleId(String),
+
+    #[error("stdin read error: {0}")]
+    StdinRead(String),
+
+    #[error("json parse error: {0}")]
+    JsonParse(String),
+
+    #[error("input too large (limit {limit} bytes, got {actual} bytes)")]
+    InputTooLarge { limit: usize, actual: usize },
+
+    #[error("expected JSON object, got a different type")]
+    NotAnObject,
+
+    /// Schema $ref resolution failed (circular, missing target, max depth).
+    /// Routed to `EXIT_SCHEMA_CIRCULAR_REF` (48) by `cli_error_exit_code`.
+    #[error("schema $ref resolution failed for module '{module_id}': {source}")]
+    SchemaRefResolution {
+        module_id: String,
+        source: crate::ref_resolver::RefResolverError,
+    },
+
+    /// Schema parsing failed (reserved property name OR flag-name collision).
+    /// Routed to `EXIT_SCHEMA_CIRCULAR_REF` (48) for cross-SDK parity with
+    /// Python `sys.exit(48)` and TS `process.exit(EXIT_CODES.SCHEMA_CIRCULAR_REF)`.
+    /// Audit D11-NEW-005 (2026-05-08).
+    #[error("schema parse error for module '{module_id}': {source}")]
+    SchemaParserFailure {
+        module_id: String,
+        source: crate::schema_parser::SchemaParserError,
+    },
+}
+
+impl CliError {
+    /// Map a `CliError` to the protocol-spec exit code so callers don't have
+    /// to switch on the variant inline.
+    ///
+    /// Schema $ref failures route to two different exit codes per spec
+    /// (audit D10-002, 2026-05-08):
+    ///
+    /// - `Unresolvable` (missing target) → `EXIT_SCHEMA_VALIDATION_ERROR`
+    ///   (45) — the schema itself is invalid because the `$ref` points at
+    ///   nothing.
+    /// - `Circular` / `MaxDepthExceeded` → `EXIT_SCHEMA_CIRCULAR_REF` (48)
+    ///   — the schema is structurally well-formed but cannot be inlined.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            CliError::SchemaRefResolution { source, .. } => match source {
+                crate::ref_resolver::RefResolverError::Unresolvable { .. } => {
+                    crate::EXIT_SCHEMA_VALIDATION_ERROR
+                }
+                crate::ref_resolver::RefResolverError::Circular { .. }
+                | crate::ref_resolver::RefResolverError::MaxDepthExceeded { .. } => {
+                    crate::EXIT_SCHEMA_CIRCULAR_REF
+                }
+            },
+            CliError::SchemaParserFailure { .. } => crate::EXIT_SCHEMA_CIRCULAR_REF,
+            _ => crate::EXIT_INVALID_INPUT,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global all-options help flag (controls built-in option visibility in help)
+// ---------------------------------------------------------------------------
+
+/// Whether --all-options was passed (controls help detail level).
+static ALL_OPTIONS_HELP: AtomicBool = AtomicBool::new(false);
+
+/// Set the all-options help flag. When false, built-in options are hidden
+/// from help.
+///
+/// # Cross-SDK note (D1-W1, 2026-05-12)
+///
+/// Python and TypeScript ship a deprecated `set_verbose_help` /
+/// `setVerboseHelp` alias kept for one MINOR cycle (FE-13 v0.9 rename
+/// `--verbose` -> `--all-options`). Rust intentionally does NOT export
+/// the alias because the Rust SDK shipped its canonical form post-rename
+/// — there are no pre-v0.9 Rust callers to break. Embedders writing
+/// new cross-SDK glue should reference `set_all_options_help` in all
+/// three languages.
+pub fn set_all_options_help(all_options: bool) {
+    ALL_OPTIONS_HELP.store(all_options, Ordering::Relaxed);
+}
+
+/// Check the all-options help flag.
+pub fn is_all_options_help() -> bool {
+    ALL_OPTIONS_HELP.load(Ordering::Relaxed)
+}
+
+/// Whether system modules (`system.health.summary` etc.) are available on the
+/// executor backing this CLI. Gates registration of the six system subcommands
+/// (`health`/`usage`/`enable`/`disable`/`reload`/`config`) so that — matching
+/// apcore-cli-python `_system_modules_available` (factory.py) and the
+/// apcore-cli-typescript probe — either all six appear or none do. Partial
+/// registration is a cross-SDK parity bug (apcore-cli
+/// usability-enhancements.md §register_system_commands).
+///
+/// Defaults to `true` so the building-block composer `register_apcli_subcommands`
+/// keeps registering the full set for callers that have not probed availability
+/// (mirrors how `register_health_command` always registers when called directly
+/// in Python). The standalone binary calls `set_system_modules_available` with
+/// the probed value before building the command tree.
+static SYSTEM_MODULES_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+/// Set whether system modules are available (gates the six system subcommands).
+/// Call before building the CLI command tree. See [`is_system_modules_available`].
+pub fn set_system_modules_available(available: bool) {
+    SYSTEM_MODULES_AVAILABLE.store(available, Ordering::Relaxed);
+}
+
+/// Check whether system modules are available. When false, the six system
+/// subcommands are skipped atomically during registration.
+pub fn is_system_modules_available() -> bool {
+    SYSTEM_MODULES_AVAILABLE.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Global docs URL (shown in help and man pages)
+// ---------------------------------------------------------------------------
+
+/// Base URL for online documentation. `None` means no link shown.
+static DOCS_URL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set the base URL for online documentation links in help and man
+/// pages. Pass `None` to disable. Command-level help appends
+/// `/commands/{name}` automatically.
+///
+/// # Example
+/// ```
+/// apcore_cli::cli::set_docs_url(Some("https://docs.apcore.dev/cli".into()));
+/// ```
+pub fn set_docs_url(url: Option<String>) {
+    if let Ok(mut guard) = DOCS_URL.lock() {
+        // A trailing slash would produce `.../cli//commands/...` in the help
+        // footer; normalize once at the boundary.
+        *guard = url.map(|value| value.trim_end_matches('/').to_string());
+    }
+}
+
+/// Get the current docs URL (if set).
+pub fn get_docs_url() -> Option<String> {
+    match DOCS_URL.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global audit logger (module-level singleton, set once at startup)
+// ---------------------------------------------------------------------------
+
+static AUDIT_LOGGER: Mutex<Option<AuditLogger>> = Mutex::new(None);
+
+// ---------------------------------------------------------------------------
+// Global executable map (module name -> script path, set once at startup)
+// ---------------------------------------------------------------------------
+
+static EXECUTABLES: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+
+/// Store the executable map built during module discovery.
+///
+/// Must be called once before any `dispatch_module` invocation.
+pub fn set_executables(map: HashMap<String, PathBuf>) {
+    let _ = EXECUTABLES.set(map);
+}
+
+/// Set (or clear) the global audit logger used by all module commands.
+///
+/// Pass `None` to disable auditing. Typically called once during CLI
+/// initialisation, before any commands are dispatched.
+pub fn set_audit_logger(audit_logger: Option<AuditLogger>) {
+    match AUDIT_LOGGER.lock() {
+        Ok(mut guard) => {
+            *guard = audit_logger;
+        }
+        Err(_poisoned) => {
+            tracing::warn!("AUDIT_LOGGER mutex poisoned — audit logger not updated");
+        }
+    }
+}
+
+/// Centralised audit-log entry point. Acquires the global lock once, calls
+/// `log_execution`, and silently no-ops when the logger is disabled or the
+/// mutex is poisoned. Both helpers below delegate here so every dispatch_module
+/// exit path goes through the same shape — closes the gap where the standard
+/// Err path called `log_execution` but the stream/trace Err paths did not
+/// (review #7).
+fn audit_log_entry(module_id: &str, input: &Value, status: &str, exit_code: i32, duration_ms: u64) {
+    if let Ok(guard) = AUDIT_LOGGER.lock() {
+        if let Some(logger) = guard.as_ref() {
+            logger.log_execution(module_id, input, status, exit_code, duration_ms);
+        }
+    }
+}
+
+/// Record a successful module execution. Exit code is 0.
+fn audit_success(module_id: &str, input: &Value, duration_ms: u64) {
+    audit_log_entry(module_id, input, "success", 0, duration_ms);
+}
+
+/// Record a failed module execution. `exit_code` is the protocol-spec code
+/// returned to the caller.
+fn audit_error(module_id: &str, input: &Value, exit_code: i32, duration_ms: u64) {
+    audit_log_entry(module_id, input, "error", exit_code, duration_ms);
+}
+
+// ---------------------------------------------------------------------------
+// exec_command — clap subcommand builder for `exec`
+// ---------------------------------------------------------------------------
+
+/// Add the standard dispatch flags (--input, --yes, --large-input, --format,
+/// --sandbox) to a clap Command. Used by both `exec_command()` and the external
+/// subcommand re-parser in main.rs.
+pub fn add_dispatch_flags(cmd: clap::Command) -> clap::Command {
+    use clap::{Arg, ArgAction};
+    let hide = !is_all_options_help();
+    cmd.arg(
+        Arg::new("input")
+            .long("input")
+            .value_name("SOURCE")
+            .help(
+                "Read a JSON object, read it from a file path, \
+                 or use '-' to read from stdin pipe",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("yes")
+            .long("yes")
+            .short('y')
+            .action(ArgAction::SetTrue)
+            .help(
+                "Skip interactive approval prompts \
+                 (for scripts and CI)",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("large-input")
+            .long("large-input")
+            .action(ArgAction::SetTrue)
+            .help(
+                "Allow stdin input larger than 10MB \
+                 (default limit protects against \
+                 accidental pipes)",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("format")
+            .long("format")
+            .value_parser(["table", "json", "csv", "yaml", "jsonl"])
+            .help(
+                "Output format: json, table, csv, \
+                 yaml, jsonl.",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("fields")
+            .long("fields")
+            .value_name("FIELDS")
+            .help(
+                "Comma-separated dot-paths to select \
+                 from the result (e.g., 'status,data.count').",
+            )
+            .hide(hide),
+    )
+    .arg(
+        // --sandbox is always hidden (not yet implemented)
+        Arg::new("sandbox")
+            .long("sandbox")
+            .action(ArgAction::SetTrue)
+            .help(
+                "Run module in an isolated subprocess \
+                 with restricted filesystem and env \
+                 access",
+            )
+            .hide(true),
+    )
+    .arg(
+        Arg::new("dry-run")
+            .long("dry-run")
+            .action(ArgAction::SetTrue)
+            .help(
+                "Run preflight checks without executing \
+                 the module. Shows validation results.",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("trace")
+            .long("trace")
+            .action(ArgAction::SetTrue)
+            .help(
+                "Show execution pipeline trace with \
+                 per-step timing after the result.",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("stream")
+            .long("stream")
+            .action(ArgAction::SetTrue)
+            .help(
+                "Stream module output as JSONL (one JSON \
+                 object per line, flushed immediately).",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("strategy")
+            .long("strategy")
+            .value_parser(["standard", "internal", "testing", "performance", "minimal"])
+            .value_name("STRATEGY")
+            .help(
+                "Execution pipeline strategy: standard \
+                 (default), internal, testing, performance.",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("approval-timeout")
+            .long("approval-timeout")
+            .value_name("SECONDS")
+            .help(
+                "Override approval prompt timeout in \
+                 seconds (default: 60).",
+            )
+            .hide(hide),
+    )
+    .arg(
+        Arg::new("approval-token")
+            .long("approval-token")
+            .value_name("TOKEN")
+            .help(
+                "Resume a pending approval with the \
+                 given token (for async approval flows).",
+            )
+            .hide(hide),
+    )
+}
+
+/// Build the `exec` clap subcommand.
+///
+/// `exec` runs an apcore module by its fully-qualified module ID.
+pub fn exec_command() -> clap::Command {
+    use clap::{Arg, Command};
+
+    let cmd = Command::new("exec").about("Execute a module").arg(
+        Arg::new("module_id")
+            .required(true)
+            .value_name("MODULE_ID")
+            .help("Fully-qualified module ID to execute"),
+    );
+    add_dispatch_flags(cmd)
+}
+
+// ---------------------------------------------------------------------------
+// Reserved root-level names (FE-13)
+// ---------------------------------------------------------------------------
+//
+// Pre-v0.7, apcore-cli maintained a flat list of built-in command names
+// (`BUILTIN_COMMANDS`) that were reserved against business-module collisions.
+// FE-13 collapses every former built-in under the reserved `apcli` group, so
+// the only collision surface at the root is the `apcli` name itself. See
+// `crate::builtin_group::RESERVED_GROUP_NAMES` for the canonical list.
+//
+// BUILTIN_COMMANDS deprecated alias removed in v0.7.x — use RESERVED_GROUP_NAMES.
+
+// LazyModuleGroup / GroupedModuleGroup / ModuleExecutor / ApCoreExecutorAdapter
+// were deleted per audit findings D9-001..004. See the module-level comment at
+// the top of this file. Multi-level grouping now happens at the clap::Command
+// build time in main.rs (via schema_parser + dispatch flags), not via a
+// separate Lazy/Grouped struct hierarchy.
+
+// ---------------------------------------------------------------------------
+// build_module_command
+// ---------------------------------------------------------------------------
+
+/// Built-in flag names added to every generated module command. A schema
+/// property that collides with one of these names will cause
+/// `crate::exit::exit_with(2)`.
+const RESERVED_FLAG_NAMES: &[&str] = &[
+    "all-options",
+    "approval-timeout",
+    "approval-token",
+    "dry-run",
+    "fields",
+    "format",
+    "input",
+    "large-input",
+    "sandbox",
+    "strategy",
+    "stream",
+    "trace",
+    "yes",
+];
+
+/// Build a clap `Command` for a single module definition.
+///
+/// The resulting subcommand has:
+/// * its `name` set to `module_def.name`
+/// * its `about` derived from the module descriptor (empty if unavailable)
+/// * the built-in dispatch flags (`--input`, `--yes`/`-y`, `--large-input`,
+///   `--format`, `--sandbox`, `--dry-run`, `--trace`, `--stream`, `--strategy`,
+///   `--fields`, `--approval-timeout`, `--approval-token`)
+/// * schema-derived flags from `schema_to_clap_args`
+///
+/// The executor is NOT embedded in the `clap::Command` — clap has no
+/// user-data attachment. Dispatch is handled separately by `dispatch_module`
+/// which receives the executor as a parameter.
+///
+/// # Errors
+/// Returns `CliError::ReservedModuleId` when `module_def.name` is one of the
+/// reserved built-in command names.
+///
+/// **Design note (audit D9):** This is a convenience wrapper over
+/// [`build_module_command_with_limit`] that supplies the default
+/// `HELP_TEXT_MAX_LEN`. Audit D9 flagged the pair as bloat, but the wrapper
+/// is consumed by `main.rs:624` and 8+ unit tests as the ergonomic default
+/// form. Migrating those callers to construct an explicit limit at every site
+/// would add ~15 lines of churn for a 1-line save. Retained intentionally.
+pub fn build_module_command(
+    module_def: &apcore::registry::registry::ModuleDescriptor,
+) -> Result<clap::Command, CliError> {
+    build_module_command_with_limit(module_def, crate::schema_parser::HELP_TEXT_MAX_LEN)
+}
+
+/// Build a clap `Command` for a single module definition with a configurable
+/// help text max length.
+pub fn build_module_command_with_limit(
+    module_def: &apcore::registry::registry::ModuleDescriptor,
+    help_text_max_length: usize,
+) -> Result<clap::Command, CliError> {
+    let module_id = &module_def.module_id;
+
+    // Guard: reject reserved command names immediately (FE-13 §4.10).
+    // Use the live reserved-set so a renamed built-in group (set via
+    // `set_reserved_group_names` from the binary entry-point) is honored.
+    if crate::builtin_group::is_reserved_group_name(module_id) {
+        return Err(CliError::ReservedModuleId(module_id.clone()));
+    }
+
+    // Resolve $ref pointers in the input schema before generating clap args.
+    // Failures (circular ref, missing target, max-depth exceeded) propagate
+    // as SchemaRefResolution so the user sees EXIT_SCHEMA_CIRCULAR_REF (48)
+    // — previously the error was swallowed via .unwrap_or_else and the user
+    // got a downstream clap parse error built from un-resolved $refs (review #8).
+    let resolved_schema = crate::ref_resolver::resolve_refs(
+        &module_def.input_schema,
+        crate::ref_resolver::MAX_REF_DEPTH,
+        module_id,
+    )
+    .map_err(|e| CliError::SchemaRefResolution {
+        module_id: module_id.clone(),
+        source: e,
+    })?;
+
+    // Build clap args from JSON Schema properties. Map ReservedPropertyName /
+    // FlagCollision through `SchemaParserFailure` so they share exit-code 48
+    // with Python `sys.exit(48)` and TS `process.exit(SCHEMA_CIRCULAR_REF)`.
+    // Audit D11-NEW-005 (2026-05-08).
+    let schema_args = crate::schema_parser::schema_to_clap_args_with_limit(
+        &resolved_schema,
+        help_text_max_length,
+    )
+    .map_err(|e| CliError::SchemaParserFailure {
+        module_id: module_id.clone(),
+        source: e,
+    })?;
+
+    // Check for schema property names that collide with built-in flags.
+    for arg in &schema_args.args {
+        if let Some(long) = arg.get_long() {
+            if RESERVED_FLAG_NAMES.contains(&long) {
+                return Err(CliError::ReservedModuleId(format!(
+                    "module '{module_id}' schema property '{long}' conflicts \
+                     with a reserved CLI option name"
+                )));
+            }
+        }
+    }
+
+    let hide = !is_all_options_help();
+
+    // Build after_help footer: all-options hint + optional docs link
+    let mut footer_parts = Vec::new();
+    if hide {
+        footer_parts.push(
+            "Use --all-options to show all options \
+             (including built-in options)."
+                .to_string(),
+        );
+    }
+    if let Some(url) = get_docs_url() {
+        footer_parts.push(format!("Docs: {url}/commands/{module_id}"));
+    }
+    let footer = footer_parts.join("\n");
+
+    let mut cmd = add_dispatch_flags(clap::Command::new(module_id.clone()).after_help(footer));
+
+    // Attach schema-derived args.
+    for arg in schema_args.args {
+        cmd = cmd.arg(arg);
+    }
+
+    Ok(cmd)
+}
+
+// ---------------------------------------------------------------------------
+// collect_input
+// ---------------------------------------------------------------------------
+
+const STDIN_SIZE_LIMIT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// Inner implementation: accepts any `Read` source for testability.
+///
+/// # Arguments
+/// * `stdin_flag`  — `Some("-")` to read from `reader`, anything else skips STDIN
+/// * `cli_kwargs`  — map of flag name → value (`Null` values are dropped)
+/// * `large_input` — if `false`, reject payloads exceeding `STDIN_SIZE_LIMIT_BYTES`
+/// * `reader`      — byte source to read from when `stdin_flag == Some("-")`
+///
+/// # Errors
+/// Returns `CliError` on oversized input, invalid JSON, or non-object JSON.
+pub fn collect_input_from_reader<R: Read>(
+    stdin_flag: Option<&str>,
+    cli_kwargs: HashMap<String, Value>,
+    large_input: bool,
+    mut reader: R,
+) -> Result<HashMap<String, Value>, CliError> {
+    // Drop Null values from CLI kwargs.
+    let cli_non_null: HashMap<String, Value> = cli_kwargs
+        .into_iter()
+        .filter(|(_, v)| !v.is_null())
+        .collect();
+
+    if stdin_flag != Some("-") {
+        return Ok(cli_non_null);
+    }
+
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| CliError::StdinRead(e.to_string()))?;
+
+    if !large_input && buf.len() > STDIN_SIZE_LIMIT_BYTES {
+        return Err(CliError::InputTooLarge {
+            limit: STDIN_SIZE_LIMIT_BYTES,
+            actual: buf.len(),
+        });
+    }
+
+    if buf.is_empty() {
+        return Ok(cli_non_null);
+    }
+
+    let stdin_value: Value =
+        serde_json::from_slice(&buf).map_err(|e| CliError::JsonParse(e.to_string()))?;
+
+    let stdin_map = match stdin_value {
+        Value::Object(m) => m,
+        _ => return Err(CliError::NotAnObject),
+    };
+
+    // Merge: STDIN base, CLI kwargs override on collision.
+    let mut merged: HashMap<String, Value> = stdin_map.into_iter().collect();
+    merged.extend(cli_non_null);
+    Ok(merged)
+}
+
+/// Merge CLI keyword arguments with optional JSON input.
+///
+/// Resolution order (highest priority first):
+/// 1. CLI flags (non-`Null` values in `cli_kwargs`)
+/// 2. JSON from `stdin_flag`:
+///    - `Some("-")` → read from stdin
+///    - `Some(path)` → read from file at `path`
+///    - `None` → no JSON input, return CLI kwargs only
+///
+/// # Arguments
+/// * `stdin_flag`  — `Some("-")` for stdin, `Some(path)` for a file, `None` to skip
+/// * `cli_kwargs`  — map of flag name → value (`Null` values are ignored)
+/// * `large_input` — if `false`, reject payloads exceeding 10 MiB
+///
+/// # Errors
+/// Returns `CliError` (exit code 2) on oversized input, invalid JSON, non-object
+/// JSON, or file open failures.
+pub fn collect_input(
+    stdin_flag: Option<&str>,
+    cli_kwargs: HashMap<String, Value>,
+    large_input: bool,
+) -> Result<HashMap<String, Value>, CliError> {
+    match stdin_flag {
+        None | Some("") => {
+            collect_input_from_reader(None, cli_kwargs, large_input, std::io::stdin())
+        }
+        Some("-") => {
+            collect_input_from_reader(Some("-"), cli_kwargs, large_input, std::io::stdin())
+        }
+        Some(path) => {
+            let file = std::fs::File::open(path).map_err(|e| {
+                CliError::StdinRead(format!("cannot open input file '{}': {}", path, e))
+            })?;
+            collect_input_from_reader(Some("-"), cli_kwargs, large_input, file)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// validate_module_id
+// ---------------------------------------------------------------------------
+
+/// Maximum allowed length for a CLI-supplied module ID.
+///
+/// Tracks PROTOCOL_SPEC §2.7 EBNF constraint #1 — bumped from 128 to 192 in
+/// spec 1.6.0-draft to accommodate Java/.NET deep-namespace FQN-derived IDs.
+/// Filesystem-safe: `192 + ".binding.yaml".len() = 205 < 255`-byte filename
+/// limit on ext4/xfs/NTFS/APFS/btrfs.
+const MODULE_ID_MAX_LEN: usize = 192;
+
+/// Validate a module identifier.
+///
+/// # Rules
+/// * Maximum 192 characters (PROTOCOL_SPEC §2.7)
+/// * Matches `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`
+/// * No leading/trailing dots, no consecutive dots
+/// * Must not start with a digit or uppercase letter
+///
+/// # Errors
+/// Returns `CliError::InvalidModuleId` on any violation. Top-level CLI
+/// dispatch maps that to **exit code 2** (`EXIT_INVALID_INPUT`).
+///
+/// Cross-SDK note (D10-004): Python `validate_module_id` calls `sys.exit(2)`
+/// directly; TypeScript calls `process.exit(2)`. Rust keeps the Result form
+/// so callers can compose with other validation (and so this function is
+/// testable). Production code SHOULD prefer
+/// [`validate_module_id_or_exit`] which mirrors the Python/TS observable
+/// behavior — callers that ignore a `Result` here would silently pass
+/// invalid IDs downstream.
+pub fn validate_module_id(module_id: &str) -> Result<(), CliError> {
+    if module_id.len() > MODULE_ID_MAX_LEN {
+        return Err(CliError::InvalidModuleId(format!(
+            "Invalid module ID format: '{module_id}'. Maximum length is {MODULE_ID_MAX_LEN} characters."
+        )));
+    }
+    if !is_valid_module_id(module_id) {
+        return Err(CliError::InvalidModuleId(format!(
+            "Invalid module ID format: '{module_id}'."
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a module identifier, exiting on failure.
+///
+/// On a valid id, returns `()`. On any violation, writes the error message
+/// to stderr and calls `crate::exit::exit_with(2)` — matching Python's
+/// `sys.exit(2)` and TypeScript's `process.exit(2)` observable behavior
+/// (D10-004 cross-SDK parity). Use this from production dispatch paths
+/// where the Result form's only sensible Err handling is the exit pattern;
+/// use the underlying [`validate_module_id`] from tests and from callers
+/// that need to chain the validation with other checks.
+pub fn validate_module_id_or_exit(module_id: &str) {
+    if let Err(CliError::InvalidModuleId(msg)) = validate_module_id(module_id) {
+        eprintln!("Error: {msg}");
+        crate::exit::exit_with(crate::EXIT_INVALID_INPUT);
+    }
+}
+
+/// Hand-written validator matching `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`.
+///
+/// Does not require the `regex` crate.
+#[inline]
+fn is_valid_module_id(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    // Split on '.' and validate each segment individually.
+    for segment in s.split('.') {
+        if segment.is_empty() {
+            // Catches leading dot, trailing dot, and consecutive dots.
+            return false;
+        }
+        let mut chars = segment.chars();
+        // First character must be a lowercase ASCII letter.
+        match chars.next() {
+            Some(c) if c.is_ascii_lowercase() => {}
+            _ => return false,
+        }
+        // Remaining characters: lowercase letter, ASCII digit, or underscore.
+        for c in chars {
+            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_' {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Error code mapping
+// ---------------------------------------------------------------------------
+
+/// Whether this dispatch will reach an execution path that does NOT carry the
+/// executor's attached ACL, and must therefore be gated here in the parent
+/// (FE-14 section 4.10).
+///
+/// * A filesystem script module is spawned as a subprocess and never reaches
+///   `Executor::call`.
+/// * `--sandbox` delegates to `sandbox_runner`, which builds a fresh
+///   `Registry` + `Executor` with no ACL attached.
+///
+/// Both are complete bypasses, and the sandbox one inverts the user's intent:
+/// `--sandbox` is a security flag, so stronger isolation would otherwise mean
+/// weaker access control.
+pub(crate) fn bypasses_executor_acl(has_script_executable: bool, use_sandbox: bool) -> bool {
+    has_script_executable || use_sandbox
+}
+
+/// Map an apcore error code string to the appropriate CLI exit code.
+///
+/// Exit code table:
+/// * `MODULE_NOT_FOUND` / `MODULE_LOAD_ERROR` / `MODULE_DISABLED` → 44
+/// * `SCHEMA_VALIDATION_ERROR`                                     → 45
+/// * `APPROVAL_DENIED` / `APPROVAL_TIMEOUT` / `APPROVAL_PENDING`  → 46
+/// * `CONFIG_NOT_FOUND` / `CONFIG_INVALID` / `ACL_RULE_ERROR`      → 47
+/// * `SCHEMA_CIRCULAR_REF`                                         → 48
+/// * `ACL_DENIED`                                                  → 77
+/// * everything else (including `MODULE_EXECUTE_ERROR` / `MODULE_TIMEOUT`) → 1
+pub(crate) fn map_apcore_error_to_exit_code(error_code: &str) -> i32 {
+    use crate::{
+        EXIT_ACL_DENIED, EXIT_ACL_RULE_ERROR, EXIT_APPROVAL_DENIED, EXIT_CONFIG_BIND_ERROR,
+        EXIT_CONFIG_MOUNT_ERROR, EXIT_CONFIG_NAMESPACE_RESERVED, EXIT_CONFIG_NOT_FOUND,
+        EXIT_DEPENDENCY_NOT_FOUND, EXIT_DEPENDENCY_VERSION_MISMATCH,
+        EXIT_ERROR_FORMATTER_DUPLICATE, EXIT_MODULE_EXECUTE_ERROR, EXIT_MODULE_NOT_FOUND,
+        EXIT_SCHEMA_CIRCULAR_REF, EXIT_SCHEMA_VALIDATION_ERROR,
+    };
+    match error_code {
+        "MODULE_NOT_FOUND" | "MODULE_LOAD_ERROR" | "MODULE_DISABLED" => EXIT_MODULE_NOT_FOUND,
+        // `ErrorCode::DependencyNotFound` / `DependencyVersionMismatch` are real
+        // apcore variants that reached the catch-all arm and exited 1, while
+        // apcore-cli-python and apcore-cli-typescript both mapped them to 44.
+        "DEPENDENCY_NOT_FOUND" => EXIT_DEPENDENCY_NOT_FOUND,
+        "DEPENDENCY_VERSION_MISMATCH" => EXIT_DEPENDENCY_VERSION_MISMATCH,
+        "SCHEMA_VALIDATION_ERROR" => EXIT_SCHEMA_VALIDATION_ERROR,
+        "APPROVAL_DENIED" | "APPROVAL_TIMEOUT" | "APPROVAL_PENDING" => EXIT_APPROVAL_DENIED,
+        "CONFIG_NOT_FOUND" | "CONFIG_INVALID" => EXIT_CONFIG_NOT_FOUND,
+        // FE-14 §6.1: a structurally invalid ACL file is a *configuration*
+        // fault, so it shares 47 with CONFIG_INVALID. 77 stays reserved for an
+        // actual access decision. Cross-SDK map change — all three SDKs add
+        // this key together.
+        "ACL_RULE_ERROR" => EXIT_ACL_RULE_ERROR,
+        "SCHEMA_CIRCULAR_REF" => EXIT_SCHEMA_CIRCULAR_REF,
+        "ACL_DENIED" => EXIT_ACL_DENIED,
+        // Config Bus errors (apcore >= 0.15.0)
+        "CONFIG_NAMESPACE_RESERVED"
+        | "CONFIG_NAMESPACE_DUPLICATE"
+        | "CONFIG_ENV_PREFIX_CONFLICT"
+        | "CONFIG_ENV_MAP_CONFLICT" => EXIT_CONFIG_NAMESPACE_RESERVED,
+        "CONFIG_MOUNT_ERROR" => EXIT_CONFIG_MOUNT_ERROR,
+        "CONFIG_BIND_ERROR" => EXIT_CONFIG_BIND_ERROR,
+        "ERROR_FORMATTER_DUPLICATE" => EXIT_ERROR_FORMATTER_DUPLICATE,
+        _ => EXIT_MODULE_EXECUTE_ERROR,
+    }
+}
+
+/// Map an `apcore::errors::ModuleError` directly to an exit code.
+///
+/// Converts the `ErrorCode` enum variant to its SCREAMING_SNAKE_CASE
+/// representation via serde JSON serialisation and delegates to
+/// `map_apcore_error_to_exit_code`.
+pub(crate) fn map_module_error_to_exit_code(err: &apcore::errors::ModuleError) -> i32 {
+    // Serialise the ErrorCode enum to its SCREAMING_SNAKE_CASE string.
+    let code_str = serde_json::to_value(err.code)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    map_apcore_error_to_exit_code(&code_str)
+}
+
+// ---------------------------------------------------------------------------
+// Schema validation helper
+// ---------------------------------------------------------------------------
+
+/// Validate `input` against a JSON Schema object using the `jsonschema` crate.
+///
+/// Enforces all JSON Schema keywords present in `schema` (type, format, enum,
+/// pattern, minimum, maximum, required, etc.).  Returns the first validation
+/// error message on failure.
+///
+/// clap delivers all flag values as strings.  Before running jsonschema this
+/// function coerces string values to integer/number where the schema declares
+/// those types, so `--port 8080` (string "8080") satisfies `{type: "integer"}`.
+///
+/// # Errors
+/// Returns `Err(String)` with the first schema violation found.
+pub(crate) fn validate_against_schema(
+    input: &HashMap<String, Value>,
+    schema: &Value,
+) -> Result<(), String> {
+    let mut instance =
+        serde_json::to_value(input).map_err(|e| format!("failed to serialize input: {e}"))?;
+
+    // Coerce string values to their schema-declared numeric types.
+    if let (Some(obj), Some(props)) = (
+        instance.as_object_mut(),
+        schema.get("properties").and_then(|p| p.as_object()),
+    ) {
+        for (key, prop) in props {
+            let type_str = match prop.get("type").and_then(|t| t.as_str()) {
+                Some(t) => t,
+                None => continue,
+            };
+            if let Some(Value::String(s)) = obj.get(key) {
+                let coerced = match type_str {
+                    "integer" => s.parse::<i64>().ok().map(Value::from),
+                    "number" => s.parse::<f64>().ok().map(Value::from),
+                    _ => None,
+                };
+                if let Some(v) = coerced {
+                    obj.insert(key.clone(), v);
+                }
+            }
+        }
+    }
+
+    let validator =
+        jsonschema::validator_for(schema).map_err(|e| format!("invalid schema: {e}"))?;
+
+    let errors: Vec<String> = validator
+        .iter_errors(&instance)
+        .map(|e| e.to_string())
+        .collect();
+
+    match errors.first() {
+        Some(msg) => Err(msg.clone()),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_module — full execution pipeline
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// F3: Enhanced Error Output
+// ---------------------------------------------------------------------------
+
+/// Emit structured JSON error to stderr for AI agents / non-TTY consumers.
+///
+/// When `error_data` is provided (from an apcore ModuleError), its fields
+/// (`code`, `details`, `suggestion`, `ai_guidance`, `retryable`,
+/// `user_fixable`) are included in the output per FE-11 spec section 3.3.
+#[cfg(test)]
+fn emit_error_json(
+    module_id: &str,
+    message: &str,
+    exit_code: i32,
+    error_data: Option<&serde_json::Value>,
+) {
+    emit_error_json_to(
+        module_id,
+        message,
+        exit_code,
+        error_data,
+        &ErrorStream::Stderr,
+    );
+}
+
+fn emit_error_json_to(
+    _module_id: &str,
+    message: &str,
+    exit_code: i32,
+    error_data: Option<&serde_json::Value>,
+    stream: &ErrorStream,
+) {
+    let mut payload = serde_json::json!({
+        "error": true,
+        "code": "UNKNOWN",
+        "message": message,
+        "exit_code": exit_code,
+    });
+    // Overlay fields from the structured error if available.
+    if let Some(data) = error_data {
+        if let Some(obj) = data.as_object() {
+            for key in &[
+                "code",
+                "message",
+                "details",
+                "suggestion",
+                "ai_guidance",
+                "retryable",
+                "user_fixable",
+            ] {
+                if let Some(val) = obj.get(*key) {
+                    if !val.is_null() {
+                        payload[*key] = val.clone();
+                    }
+                }
+            }
+        }
+    }
+    stream.write_line(&serde_json::to_string(&payload).unwrap_or_default());
+}
+
+/// Emit human-readable error to stderr with structured guidance fields.
+///
+/// Shows `[CODE]` header, `Details:` block, `Suggestion:`, and `Retryable:`
+/// labels. Hides `ai_guidance` and `user_fixable` (machine-oriented fields).
+#[cfg(test)]
+fn emit_error_tty(
+    module_id: &str,
+    message: &str,
+    exit_code: i32,
+    error_data: Option<&serde_json::Value>,
+) {
+    emit_error_tty_to(
+        module_id,
+        message,
+        exit_code,
+        error_data,
+        &ErrorStream::Stderr,
+    );
+}
+
+fn emit_error_tty_to(
+    _module_id: &str,
+    message: &str,
+    exit_code: i32,
+    error_data: Option<&serde_json::Value>,
+    stream: &ErrorStream,
+) {
+    let mut out = String::new();
+    // Header with error code.
+    if let Some(code) = error_data
+        .and_then(|d| d.get("code"))
+        .and_then(|v| v.as_str())
+    {
+        out.push_str(&format!("Error [{code}]: {message}\n"));
+    } else {
+        out.push_str(&format!("Error: {message}\n"));
+    }
+
+    // Details block.
+    if let Some(details) = error_data
+        .and_then(|d| d.get("details"))
+        .and_then(|v| v.as_object())
+    {
+        out.push_str("\n  Details:\n");
+        for (k, v) in details {
+            out.push_str(&format!("    {k}: {v}\n"));
+        }
+    }
+
+    // Suggestion.
+    if let Some(suggestion) = error_data
+        .and_then(|d| d.get("suggestion"))
+        .and_then(|v| v.as_str())
+    {
+        out.push_str(&format!("\n  Suggestion: {suggestion}\n"));
+    }
+
+    // Retryable.
+    if let Some(retryable) = error_data
+        .and_then(|d| d.get("retryable"))
+        .and_then(|v| v.as_bool())
+    {
+        let label = if retryable {
+            "Yes"
+        } else {
+            "No (same input will fail again)"
+        };
+        out.push_str(&format!("  Retryable: {label}\n"));
+    }
+
+    out.push_str(&format!("\n  Exit code: {exit_code}\n"));
+    stream.write_line(out.trim_end_matches('\n'));
+}
+
+// ---------------------------------------------------------------------------
+// Boolean pair reconciliation
+// ---------------------------------------------------------------------------
+
+/// Reconcile --flag / --no-flag boolean pairs from ArgMatches into bool values.
+///
+/// For each BoolFlagPair:
+/// - If --flag was set  → prop_name = true
+/// - If --no-flag set   → prop_name = false
+/// - If neither         → prop_name = default_val
+pub fn reconcile_bool_pairs(
+    matches: &clap::ArgMatches,
+    bool_pairs: &[crate::schema_parser::BoolFlagPair],
+) -> HashMap<String, Value> {
+    let mut result = HashMap::new();
+    for pair in bool_pairs {
+        // Use try_get_one to avoid panicking when the flag doesn't exist
+        // in ArgMatches (e.g. exec subcommand doesn't have schema-derived flags).
+        let pos_set = matches
+            .try_get_one::<bool>(&pair.prop_name)
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false);
+        let neg_id = format!("no-{}", pair.prop_name);
+        let neg_set = matches
+            .try_get_one::<bool>(&neg_id)
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false);
+        let val = if pos_set {
+            true
+        } else if neg_set {
+            false
+        } else {
+            pair.default_val
+        };
+        result.insert(pair.prop_name.clone(), Value::Bool(val));
+    }
+    result
+}
+
+/// Extract schema-derived CLI kwargs from `ArgMatches` for a given module.
+///
+/// Iterates schema properties and extracts string values from clap matches.
+/// Boolean pairs are handled separately via `reconcile_bool_pairs`.
+fn extract_cli_kwargs(
+    matches: &clap::ArgMatches,
+    module_def: &apcore::registry::registry::ModuleDescriptor,
+) -> HashMap<String, Value> {
+    use crate::schema_parser::schema_to_clap_args;
+
+    let schema_args = match schema_to_clap_args(&module_def.input_schema, None) {
+        Ok(sa) => sa,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut kwargs: HashMap<String, Value> = HashMap::new();
+
+    // Extract non-boolean schema args as strings (or Null if absent).
+    for arg in &schema_args.args {
+        let id = arg.get_id().as_str().to_string();
+        // Skip the no- counterparts of boolean args.
+        if id.starts_with("no-") {
+            continue;
+        }
+        // Use try_get_one to avoid panicking when the arg doesn't exist
+        // in ArgMatches (e.g. exec subcommand doesn't have schema-derived flags).
+        if let Ok(Some(val)) = matches.try_get_one::<String>(&id) {
+            kwargs.insert(id, Value::String(val.clone()));
+        } else if let Ok(Some(val)) = matches.try_get_one::<std::path::PathBuf>(&id) {
+            kwargs.insert(id, Value::String(val.to_string_lossy().to_string()));
+        } else {
+            kwargs.insert(id, Value::Null);
+        }
+    }
+
+    // Reconcile boolean pairs.
+    let bool_vals = reconcile_bool_pairs(matches, &schema_args.bool_pairs);
+    kwargs.extend(bool_vals);
+
+    // Apply enum type reconversion.
+    crate::schema_parser::reconvert_enum_values(kwargs, &schema_args)
+}
+
+/// Execute a script-based module by spawning the executable as a subprocess.
+///
+/// JSON input is written to stdin; JSON output is read from stdout.
+/// Stderr is captured and included in error messages on failure.
+async fn execute_script(executable: &std::path::Path, input: &Value) -> Result<Value, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new(executable)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Ensure the child is killed if this future is dropped (e.g. on
+        // SIGINT via the tokio::select! race at the call site) — tokio's
+        // default is kill_on_drop=false, which would leak the subprocess.
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("failed to spawn {}: {}", executable.display(), e))?;
+
+    // Write JSON input to child stdin then close it.
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload =
+            serde_json::to_vec(input).map_err(|e| format!("failed to serialize input: {e}"))?;
+        stdin
+            .write_all(&payload)
+            .await
+            .map_err(|e| format!("failed to write to stdin: {e}"))?;
+        drop(stdin);
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("failed to read output: {e}"))?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(1);
+        let stderr_hint = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "script exited with code {code}{}",
+            if stderr_hint.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr_hint.trim())
+            }
+        ));
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("script stdout is not valid JSON: {e}"))
+}
+
+fn validate_sandbox_flags(
+    matches: &clap::ArgMatches,
+    standalone: bool,
+) -> Result<(), &'static str> {
+    if !matches.get_flag("sandbox") || matches.get_flag("dry-run") {
+        return Ok(());
+    }
+
+    if matches.get_flag("trace")
+        || matches.get_flag("stream")
+        || matches.get_one::<String>("strategy").is_some()
+    {
+        return Err("--sandbox cannot be combined with --trace, --stream, or --strategy.");
+    }
+
+    if !standalone {
+        return Err("--sandbox requires the standalone apcore-cli executable.");
+    }
+
+    Ok(())
+}
+
+/// Execute a module and exit the process with the corresponding CLI exit code.
+///
+/// Use [`dispatch_module_with_result`] when the caller needs to keep running.
+/// Host-owned sink for failure lines.
+pub type ErrorWriter = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Callback receiving a classified dispatch failure.
+pub type ErrorHandler = Arc<dyn Fn(&DispatchFailure) + Send + Sync>;
+
+/// Where a failure envelope is written.
+#[derive(Clone, Default)]
+pub enum ErrorStream {
+    /// Default: keep stdout clean for results.
+    #[default]
+    Stderr,
+    /// Agent-facing hosts whose contract is "stdout contains exactly one
+    /// document on failure".
+    Stdout,
+    /// Host-owned sink (logger, buffer, protocol writer).
+    Custom(ErrorWriter),
+}
+
+impl ErrorStream {
+    pub(crate) fn write_line(&self, line: &str) {
+        match self {
+            Self::Stderr => eprintln!("{line}"),
+            Self::Stdout => println!("{line}"),
+            Self::Custom(write) => write(line),
+        }
+    }
+}
+
+/// Failure information handed to [`DispatchOptions::on_error`].
+#[derive(Debug, Clone)]
+pub struct DispatchFailure {
+    /// CLI exit code the dispatch is about to return.
+    pub exit_code: i32,
+    /// apcore error code, when the failure carries one.
+    pub code: Option<String>,
+    /// Human-readable message without the `Error: ` prefix.
+    pub message: String,
+    /// Canonical module ID that was invoked.
+    pub module_id: String,
+}
+
+/// Host hooks for [`dispatch_module_with_options`].
+///
+/// The defaults reproduce the standalone CLI: render results, merge no extra
+/// input, write failures to stderr, and report through the returned
+/// `Result<_, i32>`.
+#[derive(Clone)]
+pub struct DispatchOptions {
+    /// Render the successful result. Defaults to `true`.
+    pub print_result: bool,
+    /// Host-injected input merged after stdin/flag collection and before
+    /// validation. Use it for program-level flags that are part of the
+    /// module's input contract.
+    pub extra_input: Option<Value>,
+    /// Destination for failure envelopes. Defaults to stderr.
+    pub error_stream: ErrorStream,
+    /// Called after a failure is classified, before the exit code is returned.
+    pub on_error: Option<ErrorHandler>,
+    /// Translate apcore error codes into host exit codes. Keys are wire codes
+    /// (`MODULE_NOT_FOUND`, `SCHEMA_VALIDATION_ERROR`, ...); unmapped codes
+    /// keep the CLI's own mapping.
+    pub exit_codes: HashMap<String, i32>,
+}
+
+impl Default for DispatchOptions {
+    fn default() -> Self {
+        Self {
+            print_result: true,
+            extra_input: None,
+            error_stream: ErrorStream::default(),
+            on_error: None,
+            exit_codes: HashMap::new(),
+        }
+    }
+}
+
+struct DispatchErrors<'a> {
+    options: &'a DispatchOptions,
+    module_id: &'a str,
+    json: bool,
+}
+
+impl<'a> DispatchErrors<'a> {
+    fn new(options: &'a DispatchOptions, module_id: &'a str, matches: &clap::ArgMatches) -> Self {
+        let json = matches
+            .get_one::<String>("format")
+            .is_some_and(|format| format == "json")
+            || !std::io::stderr().is_terminal();
+        Self {
+            options,
+            module_id,
+            json,
+        }
+    }
+
+    fn fail(&self, exit_code: i32, code: &str, message: impl AsRef<str>) -> i32 {
+        self.report(
+            exit_code,
+            message.as_ref(),
+            Some(&serde_json::json!({ "code": code })),
+            None,
+        )
+    }
+
+    fn invalid_input(&self, message: impl AsRef<str>) -> i32 {
+        self.fail(crate::EXIT_INVALID_INPUT, "GENERAL_INVALID_INPUT", message)
+    }
+
+    fn module_error(&self, error: &apcore::ModuleError, input: &Value, duration_ms: u64) -> i32 {
+        let data = serde_json::to_value(error).ok();
+        self.report(
+            map_module_error_to_exit_code(error),
+            &error.to_string(),
+            data.as_ref(),
+            Some((input, duration_ms)),
+        )
+    }
+
+    fn report(
+        &self,
+        fallback_exit_code: i32,
+        message: &str,
+        error_data: Option<&Value>,
+        audit: Option<(&Value, u64)>,
+    ) -> i32 {
+        let code = error_data
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str);
+        let exit_code = code
+            .and_then(|code| self.options.exit_codes.get(code).copied())
+            .unwrap_or(fallback_exit_code);
+        if let Some((input, duration_ms)) = audit {
+            audit_error(self.module_id, input, exit_code, duration_ms);
+        }
+        if let Some(handler) = &self.options.on_error {
+            handler(&DispatchFailure {
+                exit_code,
+                code: code.map(str::to_string),
+                message: message.to_string(),
+                module_id: self.module_id.to_string(),
+            });
+        }
+        let emit = if self.json {
+            emit_error_json_to
+        } else {
+            emit_error_tty_to
+        };
+        emit(
+            self.module_id,
+            message,
+            exit_code,
+            error_data,
+            &self.options.error_stream,
+        );
+        exit_code
+    }
+}
+
+pub async fn dispatch_module(
+    module_id: &str,
+    matches: &clap::ArgMatches,
+    registry: &Arc<dyn crate::discovery::RegistryProvider>,
+    apcore_executor: &apcore::Executor,
+) -> ! {
+    let options = DispatchOptions::default();
+    let errors = DispatchErrors::new(&options, module_id, matches);
+    if let Err(message) = validate_sandbox_flags(matches, true) {
+        crate::exit::exit_with(errors.invalid_input(message));
+    }
+    let exit_code = Box::pin(run_module_dispatch(
+        module_id,
+        matches,
+        registry.as_ref(),
+        apcore_executor,
+        &errors,
+        true,
+    ))
+    .await
+    .map_or_else(|code| code, |_| crate::EXIT_SUCCESS);
+    crate::exit::exit_with(exit_code);
+}
+
+/// Execute a module and return control to the caller.
+///
+/// Use matches from [`build_module_command`] or [`exec_command`].
+/// Set `print_result` to false to suppress rendering the successful result.
+/// Returns the raw result before CLI field projection or trace decoration.
+/// Dry runs and streaming output return `Ok(None)`. Errors return a CLI exit code.
+/// Sandbox execution requires the standalone executable. The host owns signal handling
+/// and interactive approval. After collecting approval, the host can pass `--yes`.
+/// The host can cancel module dispatch by dropping the future.
+pub async fn dispatch_module_with_result(
+    module_id: &str,
+    matches: &clap::ArgMatches,
+    registry: &dyn crate::discovery::RegistryProvider,
+    apcore_executor: &apcore::Executor,
+    print_result: bool,
+) -> Result<Option<Value>, i32> {
+    dispatch_module_with_options(
+        module_id,
+        matches,
+        registry,
+        apcore_executor,
+        &DispatchOptions {
+            print_result,
+            ..DispatchOptions::default()
+        },
+    )
+    .await
+}
+
+/// Execute a module with host hooks (extra input, failure stream, `on_error`).
+///
+/// Returns the raw result; failures return the CLI exit code, so an embedded
+/// host always keeps control (the standalone binary calls
+/// [`dispatch_module`], which exits).
+pub async fn dispatch_module_with_options(
+    module_id: &str,
+    matches: &clap::ArgMatches,
+    registry: &dyn crate::discovery::RegistryProvider,
+    apcore_executor: &apcore::Executor,
+    options: &DispatchOptions,
+) -> Result<Option<Value>, i32> {
+    let errors = DispatchErrors::new(options, module_id, matches);
+    validate_sandbox_flags(matches, false).map_err(|message| errors.invalid_input(message))?;
+
+    // Box the state machine: the dispatcher is large and an embedded host may
+    // call it from a small thread stack (tests default to 2 MB).
+    Box::pin(run_module_dispatch(
+        module_id,
+        matches,
+        registry,
+        apcore_executor,
+        &errors,
+        false,
+    ))
+    .await
+}
+
+async fn run_module_dispatch(
+    module_id: &str,
+    matches: &clap::ArgMatches,
+    registry: &dyn crate::discovery::RegistryProvider,
+    apcore_executor: &apcore::Executor,
+    errors: &DispatchErrors<'_>,
+    standalone: bool,
+) -> Result<Option<Value>, i32> {
+    let options = errors.options;
+    let print_result = options.print_result;
+    use crate::{
+        EXIT_APPROVAL_DENIED, EXIT_MODULE_NOT_FOUND, EXIT_SCHEMA_VALIDATION_ERROR, EXIT_SIGINT,
+    };
+
+    // 1. Validate module ID format (exit 2 on bad format).
+    if let Err(CliError::InvalidModuleId(msg)) = validate_module_id(module_id) {
+        return Err(errors.invalid_input(msg));
+    }
+
+    // 2. Registry lookup (exit 44 if not found).
+    let module_def = match registry.get_module_descriptor(module_id) {
+        Some(def) => def,
+        None => {
+            return Err(errors.fail(
+                EXIT_MODULE_NOT_FOUND,
+                "MODULE_NOT_FOUND",
+                format!("Module '{module_id}' not found in registry."),
+            ));
+        }
+    };
+
+    // 3. Extract built-in flags from matches.
+    let stdin_flag = matches.get_one::<String>("input").map(|s| s.as_str());
+    let auto_approve = matches.get_flag("yes");
+    let large_input = matches.get_flag("large-input");
+    let format_flag = matches.get_one::<String>("format").cloned();
+    let fields_flag = matches.get_one::<String>("fields").cloned();
+    let dry_run = matches.get_flag("dry-run");
+    let trace_flag = matches.get_flag("trace");
+    let stream_flag = matches.get_flag("stream");
+    let strategy_name = matches.get_one::<String>("strategy").cloned();
+    let approval_timeout_arg = matches.get_one::<String>("approval-timeout").cloned();
+    let approval_token = matches.get_one::<String>("approval-token").cloned();
+
+    // FE-14 §6.2: bypassing a *configured* ACL is a materially different event
+    // from running with no rules at all, so the warning names the strategy and
+    // fires only when an ACL is actually attached.
+    crate::acl_cmd::warn_if_strategy_bypasses_acl(
+        strategy_name.as_deref(),
+        apcore_executor.acl.is_some(),
+    );
+
+    // FE-14 §4.3: `--identity-id` / `--identity-type` / `--role` build the
+    // Context handed to the executor. `None` when no flag was given, so apcore
+    // constructs its own default context exactly as it did pre-FE-14 —
+    // `Context::caller_id` is never set here, and a real execution always
+    // presents `@external`.
+    let cli_ctx = crate::acl_cmd::identity_context();
+
+    // 4. Build CLI kwargs from schema-derived flags (stub: empty map).
+    let cli_kwargs = extract_cli_kwargs(matches, &module_def);
+
+    // 5. Collect and merge input (exit 2 on errors).
+    let input = match stdin_flag {
+        Some(source) if source.trim_start().starts_with(['{', '[']) => {
+            collect_input_from_reader(Some("-"), cli_kwargs, large_input, source.as_bytes())
+        }
+        _ => collect_input(stdin_flag, cli_kwargs, large_input),
+    };
+    let mut merged = match input {
+        Ok(m) => m,
+        Err(CliError::InputTooLarge { .. }) => {
+            return Err(
+                errors.invalid_input("Input exceeds 10MB limit. Use --large-input to override.")
+            );
+        }
+        Err(CliError::JsonParse(detail)) => {
+            return Err(
+                errors.invalid_input(format!("Input does not contain valid JSON: {detail}."))
+            );
+        }
+        Err(CliError::NotAnObject) => {
+            return Err(errors.invalid_input("Input JSON must be an object, got array or scalar."));
+        }
+        Err(e) => {
+            return Err(errors.invalid_input(e.to_string()));
+        }
+    };
+
+    // 5b. Host-injected input (program-level flags, envelope fields). Merged
+    // before validation so the values are validated like any other input.
+    if let Some(extra) = &options.extra_input {
+        let Some(extra_obj) = extra.as_object() else {
+            return Err(errors.invalid_input("extra_input must be a JSON object."));
+        };
+        for (key, value) in extra_obj {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+
+    // -- F1: Dry-run / validate: preflight only, no execution --
+    if dry_run {
+        // D11-011 (2026-05-12): the Rust-only stderr "Pipeline preview"
+        // emitter has been removed for cross-SDK parity — neither Python nor
+        // TypeScript emits a pipeline preview, and the spec does not declare
+        // one. `--trace` now uniformly routes through executor.call_with_trace
+        // in all three SDKs without additional stderr decoration.
+        let _ = trace_flag; // intentionally unused; trace path runs via call_with_trace.
+        let input_value =
+            serde_json::to_value(&merged).unwrap_or(Value::Object(Default::default()));
+
+        // Delegate to the shared preflight builder (D9-004) so the
+        // dry-run path emits the same shape as the standalone `validate`
+        // subcommand. Both call sites share validate::build_preflight_result
+        // — was previously a parallel implementation here.
+        let preflight =
+            crate::validate::build_preflight_result(apcore_executor, &module_def, &input_value)
+                .await;
+        crate::validate::format_preflight_result(&preflight, format_flag.as_deref());
+        let valid = preflight
+            .get("valid")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if valid {
+            return Ok(None);
+        } else {
+            // Honor the granular check-level exit code mapping owned by
+            // validate::first_failed_exit_code so the dry-run path agrees
+            // with the standalone `validate` path on schema-vs-other
+            // failures.
+            let checks = preflight
+                .get("checks")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            return Err(crate::validate::first_failed_exit_code(&checks));
+        }
+    }
+
+    // 6. Schema validation (if module has input_schema with properties).
+    if let Some(schema) = module_def.input_schema.as_object() {
+        if schema.contains_key("properties") {
+            if let Err(detail) = validate_against_schema(&merged, &module_def.input_schema) {
+                return Err(errors.fail(
+                    EXIT_SCHEMA_VALIDATION_ERROR,
+                    "SCHEMA_VALIDATION_ERROR",
+                    format!("Validation failed: {detail}."),
+                ));
+            }
+        }
+    }
+
+    // -- F5: Inject approval token if provided --
+    if let Some(ref token) = approval_token {
+        merged.insert("_approval_token".to_string(), Value::String(token.clone()));
+    }
+
+    // 8. Build merged input as serde_json::Value.
+    //
+    // Built ahead of the approval gate because the ACL gate below reads the
+    // governance projection of these arguments (PROTOCOL_SPEC 6.1.7) and its
+    // approval axis feeds the gate.
+    let input_value = serde_json::to_value(&merged).unwrap_or(Value::Object(Default::default()));
+
+    // Determine sandbox flag.
+    let use_sandbox = matches.get_flag("sandbox");
+
+    // Check if this module has a script-based executable.
+    let script_executable = EXECUTABLES
+        .get()
+        .and_then(|map| map.get(module_id))
+        .cloned();
+
+    // 6.5 FE-14 section 4.10: gate every execution path that does not carry
+    // the attached ACL.
+    //
+    // Attaching an ACL to the executor gates the calls that go *through that
+    // executor*. It gates nothing else, and this CLI has two paths that build
+    // their own:
+    //
+    // * **Sandbox subprocess** (`--sandbox`). `sandbox_runner` constructs a
+    //   fresh `Registry` + `Executor` from `APCORE_EXTENSIONS_ROOT` with no
+    //   ACL attached. This inverts the user's intent outright: `--sandbox` is
+    //   a *security* flag, so switching on stronger isolation would switch off
+    //   access control.
+    // * **Filesystem script modules.** `FsDiscoverer` executables are spawned
+    //   as subprocesses and never reach `Executor::call`, so the pipeline's
+    //   `acl_check` step never sees them.
+    //
+    // The decision is reached HERE, in the parent, which already holds the
+    // ACL, and a denial refuses BEFORE the subprocess is spawned -- one
+    // enforcement point rather than one per execution mechanism. The child
+    // re-loading `acl.root` is explicitly NOT the control: the sandbox
+    // forwards a narrow env allowlist by design, so the child's view is
+    // neither guaranteed nor trustworthy.
+    let mut acl_requires_approval = false;
+    if bypasses_executor_acl(script_executable.is_some(), use_sandbox) {
+        if let Some(acl) = apcore_executor.acl.as_deref() {
+            // The gate MUST supply both a context and the argument projection.
+            // PROTOCOL_SPEC 6.5 makes every conditional rule a non-match
+            // without a context, and apcore's pipeline creates one at Step 1
+            // for every real call -- so passing `None` here would leave
+            // conditional `deny` rules inert on the delegated path while they
+            // fire in-process. `arguments`-scoped rules go inert the same way
+            // without the projection.
+            let gate_ctx = crate::acl_cmd::delegated_gate_context();
+            let projection = apcore::acl::GovernanceProjection::from_arguments(&input_value);
+            // `caller_id` is deliberately not passed: apcore makes it
+            // unsettable by callers, and a top-level CLI call is always
+            // `@external` (FE-14 section 4.3 / section 7 rule 2).
+            let decision = acl.check_access(None, module_id, Some(&gate_ctx), Some(&projection));
+            if decision.access == "deny" {
+                return Err(errors.fail(
+                    crate::EXIT_ACL_DENIED,
+                    "ACL_DENIED",
+                    format!("Permission denied for module '{module_id}'."),
+                ));
+            }
+            acl_requires_approval = decision.approval_required;
+        }
+    }
+
+    if use_sandbox && script_executable.is_some() {
+        return Err(
+            errors.invalid_input("--sandbox is not supported for filesystem script modules.")
+        );
+    }
+
+    // 7. Approval gate (exit 46 on denial/timeout).
+    // Resolve the timeout: --approval-timeout flag > cli.approval_timeout
+    // config default > hardcoded 60s. Non-numeric values fall back to the
+    // next tier rather than failing the dispatch.
+    let approval_timeout_secs = approval_timeout_arg
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            // Tier 2: read cli.approval_timeout from apcore.yaml when the flag
+            // was not supplied, honouring the documented precedence order.
+            let resolver = crate::config::ConfigResolver::new(
+                None,
+                Some(std::path::PathBuf::from("apcore.yaml")),
+            );
+            resolver
+                .resolve("cli.approval_timeout", None, None)
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(crate::approval::DEFAULT_APPROVAL_TIMEOUT_SECS);
+    let mut module_json = serde_json::to_value(&module_def).unwrap_or_default();
+    // Since apcore 0.28.0 the approval gate fires on the UNION of the module
+    // annotation, an ACL rule carrying `approval: required`, and
+    // `gate_destructive`. On the sandbox and script paths this CLI *is* the
+    // gate, so it rewrites the annotation to the effective value the same way
+    // apcore's own gate does before building the request -- otherwise the same
+    // rule would demand a human on one path and not the other (section 4.10).
+    if acl_requires_approval {
+        if let Some(annotations) = module_json
+            .get_mut("annotations")
+            .and_then(Value::as_object_mut)
+        {
+            annotations.insert("requires_approval".to_string(), Value::Bool(true));
+        }
+    }
+    if let Err(e) = crate::approval::check_approval_with_tty_timeout(
+        &module_json,
+        auto_approve,
+        standalone && std::io::stdin().is_terminal(),
+        approval_timeout_secs,
+    )
+    .await
+    {
+        let code = match e {
+            crate::approval::ApprovalError::Timeout { .. } => "APPROVAL_TIMEOUT",
+            _ => "APPROVAL_DENIED",
+        };
+        return Err(errors.fail(EXIT_APPROVAL_DENIED, code, e.to_string()));
+    }
+
+    // Only the process entry point owns the SIGINT handler.
+    let cancel = async {
+        if standalone {
+            let _ = tokio::signal::ctrl_c().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(cancel);
+
+    // -- F6: Streaming execution --
+    let supports_streaming = script_executable.is_none()
+        && module_def
+            .annotations
+            .as_ref()
+            .is_some_and(|annotations| annotations.streaming);
+
+    if stream_flag && !standalone && !supports_streaming {
+        eprintln!(
+            "Warning: Module '{module_id}' does not declare streaming support. Falling back to standard execution."
+        );
+    }
+
+    if stream_flag && (standalone || supports_streaming) {
+        // Streaming always outputs JSONL; --format table is ignored (spec 3.6.2).
+        if format_flag.as_deref() == Some("table") {
+            eprintln!("Warning: Streaming mode always outputs JSONL; --format table is ignored.");
+        }
+        let start = std::time::Instant::now();
+        if supports_streaming {
+            let mut chunks =
+                apcore_executor.stream(module_id, input_value.clone(), cli_ctx.as_ref(), None);
+            loop {
+                let chunk = tokio::select! {
+                    chunk = std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx)) => chunk,
+                    _ = &mut cancel => {
+                        eprintln!("Execution cancelled.");
+                        return Err(EXIT_SIGINT);
+                    }
+                };
+                match chunk {
+                    Some(Ok(value)) => {
+                        println!("{}", serde_json::to_string(&value).unwrap_or_default());
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                    Some(Err(e)) => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        return Err(errors.module_error(&e, &input_value, duration_ms));
+                    }
+                    None => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        audit_success(module_id, &input_value, duration_ms);
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        // The standalone CLI retains its legacy buffered JSONL fallback.
+        if let Some(exec_path) = script_executable.as_ref() {
+            // Script-based: fall back to regular execution, output as JSONL.
+            let res = tokio::select! {
+                res = execute_script(exec_path, &input_value) => res,
+                _ = &mut cancel => {
+                    eprintln!("Execution cancelled.");
+                    return Err(EXIT_SIGINT);
+                }
+            };
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match res {
+                Ok(val) => {
+                    println!("{}", serde_json::to_string(&val).unwrap_or_default());
+                    audit_success(module_id, &input_value, duration_ms);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(errors.report(
+                        crate::EXIT_MODULE_EXECUTE_ERROR,
+                        &e,
+                        Some(&serde_json::json!({ "code": "MODULE_EXECUTE_ERROR" })),
+                        Some((&input_value, duration_ms)),
+                    ));
+                }
+            }
+        }
+        let res = tokio::select! {
+            res = apcore_executor.call(
+                module_id, input_value.clone(), cli_ctx.as_ref(), None,
+            ) => res,
+            _ = &mut cancel => {
+                eprintln!("Execution cancelled.");
+                return Err(EXIT_SIGINT);
+            }
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match res {
+            Ok(val) => {
+                if let Some(arr) = val.as_array() {
+                    for item in arr {
+                        println!("{}", serde_json::to_string(item).unwrap_or_default());
+                    }
+                } else {
+                    println!("{}", serde_json::to_string(&val).unwrap_or_default());
+                }
+                audit_success(module_id, &input_value, duration_ms);
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(errors.module_error(&e, &input_value, duration_ms));
+            }
+        }
+    }
+
+    // -- F4: Traced execution --
+    if trace_flag {
+        let start = std::time::Instant::now();
+        // Use standard call; trace output is simulated from timing data.
+        // Full PipelineTrace requires call_with_trace(), which may not be
+        // available on all executor implementations.
+        let res = tokio::select! {
+            res = apcore_executor.call(
+                module_id,
+                input_value.clone(),
+                cli_ctx.as_ref(),
+                None,
+            ) => res,
+            _ = &mut cancel => {
+                eprintln!("Execution cancelled.");
+                return Err(EXIT_SIGINT);
+            }
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match res {
+            Ok(output) => {
+                // Print result with trace appended (format BEFORE audit — canonical order).
+                let fmt = crate::output::resolve_format(format_flag.as_deref());
+                if fmt == "json" && print_result {
+                    // Merge trace stub into JSON output.
+                    let trace_data = serde_json::json!({
+                        "strategy": strategy_name.as_deref().unwrap_or("standard"),
+                        "total_duration_ms": duration_ms,
+                        "success": true,
+                    });
+                    let combined = if output.is_object() {
+                        let mut obj = output.as_object().unwrap().clone();
+                        obj.insert("_trace".to_string(), trace_data);
+                        Value::Object(obj)
+                    } else {
+                        serde_json::json!({
+                            "result": output,
+                            "_trace": trace_data,
+                        })
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&combined).unwrap_or_default()
+                    );
+                } else if fmt != "json" {
+                    if print_result {
+                        crate::output::print_exec_result(&output, fmt, fields_flag.as_deref());
+                    }
+                    eprintln!(
+                        "\nPipeline Trace (strategy: {}, {duration_ms}ms)",
+                        strategy_name.as_deref().unwrap_or("standard"),
+                    );
+                }
+                // Audit success AFTER format (canonical order: format -> audit).
+                audit_success(module_id, &input_value, duration_ms);
+                return Ok(Some(output));
+            }
+            Err(e) => {
+                return Err(errors.module_error(&e, &input_value, duration_ms));
+            }
+        }
+    }
+
+    // 9. Execute with SIGINT race (exit 130 on Ctrl-C).
+    let start = std::time::Instant::now();
+
+    // Unify the execution paths into Result<Value, (i32, String, Option<Value>)>
+    // where the error tuple is (exit_code, display_message, optional_structured_error).
+    let result: Result<Value, (i32, String, Option<Value>)> =
+        if let Some(exec_path) = script_executable {
+            // Script-based execution: spawn subprocess, pipe JSON via stdin/stdout.
+            tokio::select! {
+                res = execute_script(&exec_path, &input_value) => {
+                    res.map_err(|e| (
+                        crate::EXIT_MODULE_EXECUTE_ERROR, e,
+                        Some(serde_json::json!({ "code": "MODULE_EXECUTE_ERROR" })),
+                    ))
+                }
+                _ = &mut cancel => {
+                    eprintln!("Execution cancelled.");
+                    return Err(EXIT_SIGINT);
+                }
+            }
+        } else if use_sandbox {
+            let sandbox = crate::security::Sandbox::new(true, 0);
+            tokio::select! {
+                res = sandbox.execute(module_id, input_value.clone(), apcore_executor) => {
+                    res.map_err(|e| {
+                        // Preserve protocol exit-code semantics when the
+                        // disabled passthrough surfaces an apcore ModuleError;
+                        // other sandbox failures (NonZeroExit, Timeout,
+                        // OutputParseFailed, OutputSizeExceeded, SpawnFailed)
+                        // map to the generic execute-error code.
+                        match &e {
+                            crate::security::ModuleExecutionError::ModuleError(inner) => {
+                                let code = map_module_error_to_exit_code(inner);
+                                let data = serde_json::to_value(inner).ok();
+                                (code, e.to_string(), data)
+                            }
+                            _ => (
+                                crate::EXIT_MODULE_EXECUTE_ERROR, e.to_string(),
+                                Some(serde_json::json!({ "code": "MODULE_EXECUTE_ERROR" })),
+                            ),
+                        }
+                    })
+                }
+                _ = &mut cancel => {
+                    eprintln!("Execution cancelled.");
+                    return Err(EXIT_SIGINT);
+                }
+            }
+        } else {
+            // Direct in-process executor call.
+            // Note: strategy is configured at Executor construction, not per-call.
+            // The strategy_name flag is available for future use when the Executor
+            // supports per-call strategy overrides.
+            tokio::select! {
+                res = apcore_executor.call(
+                    module_id,
+                    input_value.clone(),
+                    cli_ctx.as_ref(),
+                    None,
+                ) => {
+                    res.map_err(|e| {
+                        let code = map_module_error_to_exit_code(&e);
+                        // Serialize the ModuleError for F3 structured error output.
+                        let data = serde_json::to_value(&e).ok();
+                        (code, e.to_string(), data)
+                    })
+                }
+                _ = &mut cancel => {
+                    eprintln!("Execution cancelled.");
+                    return Err(EXIT_SIGINT);
+                }
+            }
+        };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(output) => {
+            // 10. Format and output first (canonical order: format -> audit).
+            if print_result {
+                let fmt = crate::output::resolve_format(format_flag.as_deref());
+                crate::output::print_exec_result(&output, fmt, fields_flag.as_deref());
+            }
+            // 11. Audit log success AFTER format.
+            audit_success(module_id, &input_value, duration_ms);
+            Ok(Some(output))
+        }
+        Err((exit_code, message, error_data)) => Err(errors.report(
+            exit_code,
+            &message,
+            error_data.as_ref(),
+            Some((&input_value, duration_ms)),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_native_validation_error_json_pointers() {
+        const CHILD_MODE: &str = "APCORE_CLI_TEST_NATIVE_ERROR_MODE";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer"},
+                    "items": {"type": "array", "items": {
+                        "type": "object", "properties": {"count": {"type": "integer"}}
+                    }},
+                    "a/b~c": {"type": "integer"}
+                },
+                "required": ["count"]
+            });
+            let error = apcore::schema::SchemaValidator::new()
+                .validate_input(
+                    &serde_json::json!({"items": [{"count": "bad"}], "a/b~c": "bad"}),
+                    &schema,
+                )
+                .unwrap_err();
+            let data = error.to_dict();
+            let code = data["code"].as_str().unwrap();
+            let exit_code = map_apcore_error_to_exit_code(code);
+            if mode == "json" {
+                emit_error_json("test.validate", &error.to_string(), exit_code, Some(&data));
+            } else {
+                emit_error_tty("test.validate", &error.to_string(), exit_code, Some(&data));
+            }
+            return;
+        }
+        for mode in ["json", "tty"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::tests::test_native_validation_error_json_pointers",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("/items/0/count"), "{stderr}");
+            assert!(stderr.contains("/a~1b~0c"), "{stderr}");
+            assert!(!stderr.contains("unknown"), "{stderr}");
+            if mode == "json" {
+                let payload: Value = serde_json::from_str(&stderr).unwrap();
+                assert_eq!(payload["exit_code"], 45);
+                assert_eq!(payload["code"], "SCHEMA_VALIDATION_ERROR");
+                let errors = payload["details"]["errors"].as_array().unwrap();
+                let paths: std::collections::BTreeSet<_> = errors
+                    .iter()
+                    .map(|entry| entry["path"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    paths,
+                    ["", "/items/0/count", "/a~1b~0c"].into_iter().collect()
+                );
+                for entry in errors {
+                    assert_eq!(entry.as_object().unwrap().len(), 3);
+                    assert!(entry["keyword"].is_string());
+                    assert!(entry["message"].is_string());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_module_id_valid() {
+        // Valid IDs must not return an error.
+        for id in ["math.add", "text.summarize", "a", "a.b.c"] {
+            let result = validate_module_id(id);
+            assert!(result.is_ok(), "expected ok for '{id}': {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_module_id_too_long() {
+        // PROTOCOL_SPEC §2.7 — bumped from 128 to 192 in spec 1.6.0-draft.
+        let long_id = "a".repeat(193);
+        assert!(validate_module_id(&long_id).is_err());
+    }
+
+    #[test]
+    fn test_validate_module_id_invalid_format() {
+        for id in ["INVALID!ID", "123abc", ".leading.dot", "a..b", "a."] {
+            assert!(validate_module_id(id).is_err(), "expected error for '{id}'");
+        }
+    }
+
+    #[test]
+    fn test_validate_module_id_max_length() {
+        // PROTOCOL_SPEC §2.7 — bumped from 128 to 192 in spec 1.6.0-draft.
+        let max_id = "a".repeat(192);
+        assert!(validate_module_id(&max_id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_module_id_over_max_length_message() {
+        let overlong = "a".repeat(193);
+        let err = validate_module_id(&overlong).expect_err("expected length error");
+        assert!(format!("{err:?}").contains("Maximum length"));
+    }
+
+    // collect_input tests (TDD red → green)
+
+    #[test]
+    fn test_collect_input_no_stdin_drops_null_values() {
+        use serde_json::json;
+        let mut kwargs = HashMap::new();
+        kwargs.insert("a".to_string(), json!(5));
+        kwargs.insert("b".to_string(), Value::Null);
+
+        let result = collect_input(None, kwargs, false).unwrap();
+        assert_eq!(result.get("a"), Some(&json!(5)));
+        assert!(!result.contains_key("b"), "Null values must be dropped");
+    }
+
+    #[test]
+    fn test_collect_input_stdin_valid_json() {
+        use serde_json::json;
+        use std::io::Cursor;
+        let stdin_bytes = b"{\"x\": 42}";
+        let reader = Cursor::new(stdin_bytes.to_vec());
+        let result = collect_input_from_reader(Some("-"), HashMap::new(), false, reader).unwrap();
+        assert_eq!(result.get("x"), Some(&json!(42)));
+    }
+
+    #[test]
+    fn test_collect_input_cli_overrides_stdin() {
+        use serde_json::json;
+        use std::io::Cursor;
+        let stdin_bytes = b"{\"a\": 5}";
+        let reader = Cursor::new(stdin_bytes.to_vec());
+        let mut kwargs = HashMap::new();
+        kwargs.insert("a".to_string(), json!(99));
+        let result = collect_input_from_reader(Some("-"), kwargs, false, reader).unwrap();
+        assert_eq!(result.get("a"), Some(&json!(99)), "CLI must override STDIN");
+    }
+
+    #[test]
+    fn test_collect_input_oversized_stdin_rejected() {
+        use std::io::Cursor;
+        let big = vec![b' '; 10 * 1024 * 1024 + 1];
+        let reader = Cursor::new(big);
+        let err = collect_input_from_reader(Some("-"), HashMap::new(), false, reader).unwrap_err();
+        assert!(matches!(err, CliError::InputTooLarge { .. }));
+    }
+
+    #[test]
+    fn test_collect_input_large_input_allowed() {
+        use std::io::Cursor;
+        let mut payload = b"{\"k\": \"".to_vec();
+        payload.extend(vec![b'x'; 11 * 1024 * 1024]);
+        payload.extend(b"\"}");
+        let reader = Cursor::new(payload);
+        let result = collect_input_from_reader(Some("-"), HashMap::new(), true, reader);
+        assert!(
+            result.is_ok(),
+            "large_input=true must accept oversized payload"
+        );
+    }
+
+    #[test]
+    fn test_collect_input_invalid_json_returns_error() {
+        use std::io::Cursor;
+        let reader = Cursor::new(b"not json at all".to_vec());
+        let err = collect_input_from_reader(Some("-"), HashMap::new(), false, reader).unwrap_err();
+        assert!(matches!(err, CliError::JsonParse(_)));
+    }
+
+    #[test]
+    fn test_collect_input_non_object_json_returns_error() {
+        use std::io::Cursor;
+        let reader = Cursor::new(b"[1, 2, 3]".to_vec());
+        let err = collect_input_from_reader(Some("-"), HashMap::new(), false, reader).unwrap_err();
+        assert!(matches!(err, CliError::NotAnObject));
+    }
+
+    #[test]
+    fn test_collect_input_empty_stdin_returns_empty_map() {
+        use std::io::Cursor;
+        let reader = Cursor::new(b"".to_vec());
+        let result = collect_input_from_reader(Some("-"), HashMap::new(), false, reader).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_collect_input_no_stdin_flag_returns_cli_kwargs() {
+        use serde_json::json;
+        let mut kwargs = HashMap::new();
+        kwargs.insert("foo".to_string(), json!("bar"));
+        let result = collect_input(None, kwargs.clone(), false).unwrap();
+        assert_eq!(result.get("foo"), Some(&json!("bar")));
+    }
+
+    #[test]
+    fn test_collect_input_file_path_reads_json() {
+        use serde_json::json;
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, r#"{{"port": 8080}}"#).unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let result = collect_input(Some(&path), HashMap::new(), false).unwrap();
+        assert_eq!(result.get("port"), Some(&json!(8080)));
+    }
+
+    #[test]
+    fn test_collect_input_file_path_cli_overrides_file() {
+        use serde_json::json;
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, r#"{{"a": 1, "b": 2}}"#).unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let mut kwargs = HashMap::new();
+        kwargs.insert("a".to_string(), json!(99));
+        let result = collect_input(Some(&path), kwargs, false).unwrap();
+        assert_eq!(result.get("a"), Some(&json!(99)), "CLI must override file");
+        assert_eq!(result.get("b"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn test_collect_input_file_path_missing_returns_error() {
+        let err =
+            collect_input(Some("/nonexistent/path/data.json"), HashMap::new(), false).unwrap_err();
+        assert!(matches!(err, CliError::StdinRead(_)));
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_module_command tests (TDD — RED written before GREEN)
+    // ---------------------------------------------------------------------------
+
+    /// Construct a minimal `ModuleDescriptor` for use in `build_module_command`
+    /// tests. `input_schema` defaults to a JSON null (no properties) when
+    /// `schema` is `None`.
+    fn make_module_descriptor(
+        name: &str,
+        description: &str,
+        schema: Option<serde_json::Value>,
+    ) -> apcore::registry::registry::ModuleDescriptor {
+        apcore::registry::registry::ModuleDescriptor {
+            module_id: name.to_string(),
+            name: None,
+            description: description.to_string(),
+            documentation: None,
+            input_schema: schema.unwrap_or(serde_json::Value::Null),
+            output_schema: serde_json::Value::Object(Default::default()),
+            version: "1.0.0".to_string(),
+            tags: vec![],
+            annotations: Some(apcore::module::ModuleAnnotations::default()),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn test_build_module_command_name_is_set() {
+        let module = make_module_descriptor("math.add", "Add two numbers", None);
+        let cmd = build_module_command(&module).unwrap();
+        assert_eq!(cmd.get_name(), "math.add");
+    }
+
+    #[test]
+    fn test_build_module_command_has_input_flag() {
+        let module = make_module_descriptor("a.b", "desc", None);
+        let cmd = build_module_command(&module).unwrap();
+        let names: Vec<&str> = cmd.get_opts().filter_map(|a| a.get_long()).collect();
+        assert!(names.contains(&"input"), "must have --input flag");
+    }
+
+    #[test]
+    fn test_build_module_command_has_yes_flag() {
+        let module = make_module_descriptor("a.b", "desc", None);
+        let cmd = build_module_command(&module).unwrap();
+        let names: Vec<&str> = cmd.get_opts().filter_map(|a| a.get_long()).collect();
+        assert!(names.contains(&"yes"), "must have --yes flag");
+    }
+
+    #[test]
+    fn test_build_module_command_has_large_input_flag() {
+        let module = make_module_descriptor("a.b", "desc", None);
+        let cmd = build_module_command(&module).unwrap();
+        let names: Vec<&str> = cmd.get_opts().filter_map(|a| a.get_long()).collect();
+        assert!(
+            names.contains(&"large-input"),
+            "must have --large-input flag"
+        );
+    }
+
+    #[test]
+    fn test_build_module_command_has_format_flag() {
+        let module = make_module_descriptor("a.b", "desc", None);
+        let cmd = build_module_command(&module).unwrap();
+        let names: Vec<&str> = cmd.get_opts().filter_map(|a| a.get_long()).collect();
+        assert!(names.contains(&"format"), "must have --format flag");
+    }
+
+    #[test]
+    fn test_build_module_command_has_sandbox_flag() {
+        let module = make_module_descriptor("a.b", "desc", None);
+        let cmd = build_module_command(&module).unwrap();
+        let names: Vec<&str> = cmd.get_opts().filter_map(|a| a.get_long()).collect();
+        assert!(names.contains(&"sandbox"), "must have --sandbox flag");
+    }
+
+    #[test]
+    fn test_build_module_command_reserved_name_returns_error() {
+        // FE-13: only the `apcli` group name is reserved now. Former built-ins
+        // (`list`, `describe`, etc.) live under the apcli group and no longer
+        // collide at the root.
+        for reserved in crate::builtin_group::RESERVED_GROUP_NAMES {
+            let module = make_module_descriptor(reserved, "desc", None);
+            let result = build_module_command(&module);
+            assert!(
+                matches!(result, Err(CliError::ReservedModuleId(_))),
+                "expected ReservedModuleId for '{reserved}', got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_module_command_former_builtin_names_allowed() {
+        // Regression guard: `list`, `describe`, `health` etc. used to be
+        // reserved; FE-13 retires that list. They must build cleanly now.
+        for name in &["list", "describe", "exec", "init", "health", "config"] {
+            let module = make_module_descriptor(name, "desc", None);
+            let result = build_module_command(&module);
+            assert!(
+                result.is_ok(),
+                "former built-in '{name}' should no longer be reserved; got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_module_command_yes_has_short_flag() {
+        let module = make_module_descriptor("a.b", "desc", None);
+        let cmd = build_module_command(&module).unwrap();
+        let has_short_y = cmd
+            .get_opts()
+            .filter(|a| a.get_long() == Some("yes"))
+            .any(|a| a.get_short() == Some('y'));
+        assert!(has_short_y, "--yes must have short flag -y");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Reserved name invariants (FE-13)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_reserved_group_names_single_entry() {
+        // FE-13: all former built-ins now live under `apcli`, so the only
+        // reserved root-level name is `apcli` itself.
+        assert_eq!(crate::builtin_group::RESERVED_GROUP_NAMES, &["apcli"]);
+    }
+
+    #[test]
+    fn test_apcli_subcommand_names_matches_spec() {
+        // Spec §4.1 subcommand table — 15 entries registered under `apcli`
+        // (13 through v0.11.0, plus FE-14 `acl` and FE-15a `openapi`).
+        let expected: &[&str] = &[
+            "list",
+            "describe",
+            "exec",
+            "validate",
+            "init",
+            "health",
+            "usage",
+            "enable",
+            "disable",
+            "reload",
+            "config",
+            "completion",
+            "describe-pipeline",
+            "acl",
+            "openapi",
+        ];
+        assert_eq!(crate::builtin_group::APCLI_SUBCOMMAND_NAMES, expected);
+    }
+
+    #[test]
+    fn test_sandbox_alone_triggers_the_parent_acl_gate() {
+        // FE-14 section 4.10. `--sandbox` builds a fresh Executor in the child
+        // with no ACL attached, so the parent must reach the decision itself.
+        // Asserted directly because the standalone binary's registry holds
+        // only FsDiscoverer modules, for which the script branch is selected
+        // first -- the sandbox half of the predicate would otherwise never be
+        // exercised by an end-to-end test.
+        assert!(bypasses_executor_acl(
+            /*has_script_executable*/ false, /*use_sandbox*/ true
+        ));
+        assert!(bypasses_executor_acl(true, false));
+        assert!(bypasses_executor_acl(true, true));
+        // An in-process call through the executor gates itself.
+        assert!(!bypasses_executor_acl(false, false));
+    }
+
+    #[test]
+    fn test_map_error_acl_rule_error_is_47() {
+        // FE-14 §6.1: ACL_RULE_ERROR previously fell through to the catch-all
+        // arm and exited 1, indistinguishable from "the module ran and
+        // failed". It is a configuration fault, so 47 — never 77, which stays
+        // reserved for an actual access decision.
+        assert_eq!(map_apcore_error_to_exit_code("ACL_RULE_ERROR"), 47);
+        assert_ne!(map_apcore_error_to_exit_code("ACL_RULE_ERROR"), 77);
+    }
+
+    #[test]
+    fn test_acl_rule_error_maps_from_the_apcore_enum() {
+        // Guard against the enum's serialized name drifting from the string
+        // the map keys on.
+        let err = apcore::errors::ModuleError::new(
+            apcore::errors::ErrorCode::ACLRuleError,
+            "bad rule".to_string(),
+        );
+        assert_eq!(map_module_error_to_exit_code(&err), 47);
+    }
+
+    // ---------------------------------------------------------------------------
+    // map_apcore_error_to_exit_code tests (RED — written before implementation)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_map_error_module_not_found_is_44() {
+        assert_eq!(map_apcore_error_to_exit_code("MODULE_NOT_FOUND"), 44);
+    }
+
+    #[test]
+    fn test_map_error_module_load_error_is_44() {
+        assert_eq!(map_apcore_error_to_exit_code("MODULE_LOAD_ERROR"), 44);
+    }
+
+    #[test]
+    fn test_map_error_module_disabled_is_44() {
+        assert_eq!(map_apcore_error_to_exit_code("MODULE_DISABLED"), 44);
+    }
+
+    #[test]
+    fn test_map_error_dependency_not_found_is_44() {
+        // Cross-SDK parity: apcore-cli-python and apcore-cli-typescript both map
+        // this to 44; here it reached the catch-all arm and exited 1.
+        assert_eq!(map_apcore_error_to_exit_code("DEPENDENCY_NOT_FOUND"), 44);
+    }
+
+    #[test]
+    fn test_map_error_dependency_version_mismatch_is_44() {
+        assert_eq!(
+            map_apcore_error_to_exit_code("DEPENDENCY_VERSION_MISMATCH"),
+            44
+        );
+    }
+
+    #[test]
+    fn test_map_error_schema_validation_error_is_45() {
+        assert_eq!(map_apcore_error_to_exit_code("SCHEMA_VALIDATION_ERROR"), 45);
+    }
+
+    #[test]
+    fn test_map_error_approval_denied_is_46() {
+        assert_eq!(map_apcore_error_to_exit_code("APPROVAL_DENIED"), 46);
+    }
+
+    #[test]
+    fn test_map_error_approval_timeout_is_46() {
+        assert_eq!(map_apcore_error_to_exit_code("APPROVAL_TIMEOUT"), 46);
+    }
+
+    #[test]
+    fn test_map_error_approval_pending_is_46() {
+        assert_eq!(map_apcore_error_to_exit_code("APPROVAL_PENDING"), 46);
+    }
+
+    #[test]
+    fn test_map_error_config_not_found_is_47() {
+        assert_eq!(map_apcore_error_to_exit_code("CONFIG_NOT_FOUND"), 47);
+    }
+
+    #[test]
+    fn test_map_error_config_invalid_is_47() {
+        assert_eq!(map_apcore_error_to_exit_code("CONFIG_INVALID"), 47);
+    }
+
+    #[test]
+    fn test_map_error_schema_circular_ref_is_48() {
+        assert_eq!(map_apcore_error_to_exit_code("SCHEMA_CIRCULAR_REF"), 48);
+    }
+
+    #[test]
+    fn test_map_error_acl_denied_is_77() {
+        assert_eq!(map_apcore_error_to_exit_code("ACL_DENIED"), 77);
+    }
+
+    #[test]
+    fn test_map_error_module_execute_error_is_1() {
+        assert_eq!(map_apcore_error_to_exit_code("MODULE_EXECUTE_ERROR"), 1);
+    }
+
+    #[test]
+    fn test_map_error_module_timeout_is_1() {
+        assert_eq!(map_apcore_error_to_exit_code("MODULE_TIMEOUT"), 1);
+    }
+
+    #[test]
+    fn test_map_error_unknown_is_1() {
+        assert_eq!(map_apcore_error_to_exit_code("SOMETHING_UNEXPECTED"), 1);
+    }
+
+    #[test]
+    fn test_map_error_empty_string_is_1() {
+        assert_eq!(map_apcore_error_to_exit_code(""), 1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // set_audit_logger implementation tests (RED)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_set_audit_logger_none_clears_logger() {
+        // Setting None must not panic and must leave AUDIT_LOGGER as None.
+        set_audit_logger(None);
+        let guard = AUDIT_LOGGER.lock().unwrap();
+        assert!(guard.is_none(), "setting None must clear the audit logger");
+    }
+
+    #[test]
+    fn test_set_audit_logger_some_stores_logger() {
+        use crate::security::AuditLogger;
+        set_audit_logger(Some(AuditLogger::new(None)));
+        let guard = AUDIT_LOGGER.lock().unwrap();
+        assert!(guard.is_some(), "setting Some must store the audit logger");
+        // Clean up.
+        drop(guard);
+        set_audit_logger(None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // validate_against_schema tests (RED)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_against_schema_passes_with_no_properties() {
+        let schema = serde_json::json!({});
+        let input = std::collections::HashMap::new();
+        // Schema without properties must not fail.
+        let result = validate_against_schema(&input, &schema);
+        assert!(result.is_ok(), "empty schema must pass: {result:?}");
+    }
+
+    #[test]
+    fn test_validate_against_schema_required_field_missing_fails() {
+        let schema = serde_json::json!({
+            "properties": {
+                "a": {"type": "integer"}
+            },
+            "required": ["a"]
+        });
+        let input: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        let result = validate_against_schema(&input, &schema);
+        assert!(result.is_err(), "missing required field must fail");
+    }
+
+    #[test]
+    fn test_validate_against_schema_required_field_present_passes() {
+        let schema = serde_json::json!({
+            "properties": {
+                "a": {"type": "integer"}
+            },
+            "required": ["a"]
+        });
+        let mut input = std::collections::HashMap::new();
+        input.insert("a".to_string(), serde_json::json!(42));
+        let result = validate_against_schema(&input, &schema);
+        assert!(
+            result.is_ok(),
+            "present required field must pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_schema_no_required_any_input_passes() {
+        let schema = serde_json::json!({
+            "properties": {
+                "x": {"type": "string"}
+            }
+        });
+        let input: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        let result = validate_against_schema(&input, &schema);
+        assert!(result.is_ok(), "no required fields: empty input must pass");
+    }
+
+    #[test]
+    fn test_validate_against_schema_type_mismatch_fails() {
+        let schema = serde_json::json!({
+            "properties": {
+                "port": {"type": "integer"}
+            },
+            "required": ["port"]
+        });
+        let mut input = std::collections::HashMap::new();
+        input.insert("port".to_string(), serde_json::json!("not_a_number"));
+        let result = validate_against_schema(&input, &schema);
+        assert!(result.is_err(), "type mismatch must fail validation");
+    }
+
+    #[test]
+    fn test_validate_against_schema_enum_violation_fails() {
+        let schema = serde_json::json!({
+            "properties": {
+                "mode": {"type": "string", "enum": ["read", "write"]}
+            },
+            "required": ["mode"]
+        });
+        let mut input = std::collections::HashMap::new();
+        input.insert("mode".to_string(), serde_json::json!("delete"));
+        let result = validate_against_schema(&input, &schema);
+        assert!(result.is_err(), "enum violation must fail validation");
+    }
+
+    // GroupedModuleGroup / is_valid_group_name tests deleted along with the
+    // corresponding implementations per audit findings D9-002 / D9-005.
+}

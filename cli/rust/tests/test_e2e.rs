@@ -1,0 +1,416 @@
+// apcore-cli — End-to-end CLI invocation tests.
+// These tests invoke the binary-level CLI and check exit codes + stdout.
+
+mod common;
+
+/// Helper: invoke the CLI binary with given args and return the full Output.
+fn run_apcore(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_apcore-cli"))
+        .args(args)
+        .output()
+        .expect("failed to spawn apcore-cli")
+}
+
+// ---------------------------------------------------------------------------
+// Original placeholder tests (converted to real tests)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_e2e_help_flag_exits_0() {
+    // `apcore-cli --extensions-dir ./examples/extensions --help` must exit 0.
+    let out = run_apcore(&["--extensions-dir", "./examples/extensions", "--help"]);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn test_e2e_version_flag() {
+    // `apcore-cli --version` must print a version string and exit 0.
+    let out = run_apcore(&["--version"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.is_empty(), "version output must not be empty");
+}
+
+#[test]
+fn test_e2e_list_command() {
+    // `apcore-cli --extensions-dir ... apcli list` must exit 0.
+    // Audit D9-003: root-level `list` shim removed in v0.8.
+    let out = run_apcore(&["--extensions-dir", "./examples/extensions", "apcli", "list"]);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn test_e2e_describe_command() {
+    // Audit D9-003: root-level `describe` shim removed in v0.8.
+    let out = run_apcore(&[
+        "--extensions-dir",
+        "./examples/extensions",
+        "apcli",
+        "describe",
+        "math.add",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "apcli describe math.add must exit 0 with real extensions"
+    );
+}
+
+#[test]
+fn test_e2e_execute_math_add() {
+    // External subcommand "math.add" routes through dispatch_module and
+    // executes via run.sh with real example extensions.
+    let out = run_apcore(&[
+        "--extensions-dir",
+        "./examples/extensions",
+        "math.add",
+        "--a",
+        "3",
+        "--b",
+        "4",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "math.add --a 3 --b 4 must exit 0, got {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"sum\""),
+        "output must contain sum field: {stdout}"
+    );
+}
+
+#[test]
+fn test_e2e_sandbox_rejects_incompatible_flags() {
+    for flags in [
+        &["--trace"][..],
+        &["--stream"][..],
+        &["--strategy", "standard"][..],
+    ] {
+        let args = [
+            "--extensions-dir",
+            "./examples/extensions",
+            "apcli",
+            "exec",
+            "math.add",
+            "--sandbox",
+        ]
+        .into_iter()
+        .chain(flags.iter().copied())
+        .collect::<Vec<_>>();
+        let out = run_apcore(&args);
+        assert_eq!(out.status.code(), Some(apcore_cli::EXIT_INVALID_INPUT));
+        assert!(out.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--sandbox cannot be combined"), "{stderr}");
+    }
+}
+
+#[test]
+fn test_e2e_sandbox_rejects_filesystem_script_modules() {
+    let out = run_apcore(&[
+        "--extensions-dir",
+        "./examples/extensions",
+        "math.add",
+        "--a",
+        "3",
+        "--b",
+        "4",
+        "--sandbox",
+    ]);
+    assert_eq!(out.status.code(), Some(apcore_cli::EXIT_INVALID_INPUT));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--sandbox is not supported for filesystem script modules"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_e2e_stdin_piping() {
+    // Pipe JSON input via stdin to apcli exec math.add.
+    // Audit D9-003: root-level `exec` shim removed in v0.8.
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_apcore-cli"))
+        .args([
+            "--extensions-dir",
+            "./examples/extensions",
+            "apcli",
+            "exec",
+            "math.add",
+            "--input",
+            "-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"a\": 10, \"b\": 20}")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "exec math.add --input - must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"sum\""),
+        "output must contain sum: {stdout}"
+    );
+}
+
+#[test]
+fn test_e2e_unknown_module_exits_44() {
+    let out = run_apcore(&[
+        "--extensions-dir",
+        "./examples/extensions",
+        "nonexistent.module",
+    ]);
+    assert_eq!(out.status.code(), Some(44));
+}
+
+#[test]
+fn test_e2e_exec_subcommand_routes_to_dispatch() {
+    // exec subcommand uses --input - for JSON input (schema flags like --a
+    // are only available via the external subcommand path, not exec).
+    // Audit D9-003: root-level `exec` shim removed in v0.8.
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_apcore-cli"))
+        .args([
+            "--extensions-dir",
+            "./examples/extensions",
+            "apcli",
+            "exec",
+            "math.add",
+            "--input",
+            "-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"a\": 1, \"b\": 2}")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "exec math.add must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"sum\""),
+        "output must contain sum: {stdout}"
+    );
+}
+
+#[test]
+fn test_e2e_exec_invalid_module_id_exits_2() {
+    // An invalid module ID format (no dot separator) should exit 2.
+    // Audit D9-003: root-level `exec` shim removed in v0.8.
+    let out = run_apcore(&[
+        "--extensions-dir",
+        "./examples/extensions",
+        "apcli",
+        "exec",
+        "INVALID",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "exec with invalid module ID format must exit 2, got {:?}",
+        out.status.code()
+    );
+}
+
+#[test]
+fn test_e2e_external_invalid_module_id_exits_2() {
+    // An invalid module ID format via external subcommand should exit 2.
+    let out = run_apcore(&["--extensions-dir", "./examples/extensions", "INVALID"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "external subcommand with invalid module ID must exit 2, got {:?}",
+        out.status.code()
+    );
+}
+
+#[test]
+fn test_e2e_invalid_input_exits_2() {
+    // Missing required positional for `apcli describe` exits 2.
+    // Audit D9-003: root-level `describe` shim removed in v0.8.
+    let out = run_apcore(&[
+        "--extensions-dir",
+        "./examples/extensions",
+        "apcli",
+        "describe",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn test_e2e_completion_bash() {
+    // `apcore-cli --extensions-dir ... apcli completion bash` must exit 0.
+    // Audit D9-003: root-level `completion` shim removed in v0.8.
+    let out = run_apcore(&[
+        "--extensions-dir",
+        "./examples/extensions",
+        "apcli",
+        "completion",
+        "bash",
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// Tests from the task specification (RED phase)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_help_flag_exits_0_contains_builtins() {
+    let out = run_apcore(&["--extensions-dir", "./examples/extensions", "--help"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // FE-13: former root-level built-ins (list, describe, completion, ...)
+    // now live under the `apcli` group. Root --help shows the `apcli` entry
+    // plus root-level meta commands (`man`, `help`).
+    assert!(stdout.contains("apcli"), "help must mention 'apcli' group");
+}
+
+#[test]
+fn test_version_flag_format() {
+    let out = run_apcore(&["--version"]);
+    assert_eq!(out.status.code(), Some(0));
+    let output = String::from_utf8_lossy(&out.stdout);
+    // Must match "apcore-cli, version X.Y.Z" per FR-01-04.
+    assert!(
+        output.contains("apcore-cli") && output.contains("version"),
+        "version output: {output}"
+    );
+}
+
+#[test]
+fn test_extensions_dir_missing_exits_47() {
+    let out = run_apcore(&[
+        "--extensions-dir",
+        "/tmp/definitely_does_not_exist_apcore_test",
+    ]);
+    assert_eq!(out.status.code(), Some(47));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Extensions directory not found") || stderr.contains("not found"));
+}
+
+#[test]
+fn test_extensions_dir_env_var_respected() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_apcore-cli"))
+        .env("APCORE_EXTENSIONS_ROOT", "./examples/extensions")
+        .args(["--help"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn test_extensions_dir_flag_overrides_env() {
+    // --extensions-dir flag takes precedence over APCORE_EXTENSIONS_ROOT.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_apcore-cli"))
+        .env("APCORE_EXTENSIONS_ROOT", "/nonexistent/path")
+        .args(["--extensions-dir", "./examples/extensions", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn test_prog_name_in_version_output() {
+    // When invoked as "apcore-cli", version output must contain "apcore-cli".
+    let out = run_apcore(&["--version"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("apcore-cli"), "stdout: {stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: null exec result must write zero bytes to stdout
+// ---------------------------------------------------------------------------
+
+/// Build a scratch extensions directory holding a single filesystem-script
+/// module (`test.nullresult`) whose `run.sh` always emits the JSON literal
+/// `null`, then return the tempdir (kept alive for the caller's process
+/// invocation) alongside its path.
+fn null_result_extensions_dir() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("test/nullresult");
+    std::fs::create_dir_all(&module_dir).expect("mkdir module dir");
+    std::fs::write(
+        module_dir.join("module.json"),
+        r#"{
+  "name": "test.nullresult",
+  "description": "Always returns a null result (regression fixture)",
+  "input_schema": {
+    "type": "object",
+    "properties": {}
+  },
+  "output_schema": { "type": "null" },
+  "executable": "run.sh"
+}"#,
+    )
+    .expect("write module.json");
+    let script_path = module_dir.join("run.sh");
+    std::fs::write(&script_path, "#!/usr/bin/env bash\necho null\n").expect("write run.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat run.sh")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod +x run.sh");
+    }
+    tmp
+}
+
+#[test]
+fn test_e2e_null_exec_result_writes_zero_bytes_to_stdout() {
+    // `format_exec_result` returns "" for a `Value::Null` result (see
+    // src/output.rs), but a call site that unconditionally does
+    // `println!("{out_str}")` still emits exactly one newline byte for that
+    // case. Python and TypeScript both write zero bytes for a null exec
+    // result, so the documented byte-for-byte stdout equivalence across the
+    // three SDKs requires the same here: this must be an EMPTY stdout, not
+    // "\n".
+    let tmp = null_result_extensions_dir();
+    let out = run_apcore(&[
+        "--extensions-dir",
+        tmp.path().to_str().expect("utf8 tmp path"),
+        "test.nullresult",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "test.nullresult must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a null exec result must write zero bytes to stdout, got {:?} ({} bytes)",
+        String::from_utf8_lossy(&out.stdout),
+        out.stdout.len()
+    );
+}
