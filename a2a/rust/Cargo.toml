@@ -1,0 +1,71 @@
+[package]
+name = "apcore-a2a"
+version = "0.8.6"
+edition = "2021"
+rust-version = "1.86"
+description = "A2A protocol adapter for apcore — expose apcore modules as A2A agents"
+license = "Apache-2.0"
+readme = "README.md"
+authors = ["aiperceivable <tercel.yi@gmail.com>"]
+homepage = "https://aiperceivable.com"
+repository = "https://github.com/aiperceivable/apcore-a2a-rust"
+documentation = "https://apcore.aiperceivable.com/"
+keywords = ["ai", "a2a", "agent", "apcore", "protocol"]
+categories = ["api-bindings", "asynchronous", "web-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+# The OpenAPI backend fetches a spec over http(s) and registers every operation
+# as an HTTP proxy, both of which live behind apcore-toolkit's own `http-proxy`
+# feature. Opt-in, matching the Python package's `openapi` extra
+# (`apcore-toolkit[http-proxy]`) rather than being on by default: an adapter
+# serving an extensions directory should not carry a spec fetcher it never uses.
+openapi = ["apcore-toolkit/http-proxy"]
+
+[dependencies]
+apcore = ">=0.33.0"
+# `default-features = false` so `http-proxy` — a *default* feature of the
+# toolkit — is reached through this crate's `openapi` feature instead of being
+# enabled unconditionally. The unconditional import (`deep_resolve_refs`) is
+# outside that feature.
+apcore-toolkit = { version = ">=0.15.0", default-features = false }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+hyper = { version = "1", features = ["full"] }
+regex = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio-stream = "0.1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+async-stream = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+
+[[bin]]
+name = "apcore-a2a"
+path = "src/bin/apcore-a2a.rs"
+
+[[example]]
+name = "run"
+path = "examples/run/main.rs"
