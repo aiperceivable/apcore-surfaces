@@ -2,7 +2,7 @@
 //
 // All fixtures (`create_cli.json` / `env.json` / `input.yaml` /
 // `expected_help.txt`) live in the spec repo at
-// `../apcore-cli/conformance/fixtures/apcli-visibility/<scenario>/` and
+// `../conformance/fixtures/apcli-visibility/<scenario>/` and
 // are shared across every SDK (TypeScript, Python, Rust). Each SDK is
 // responsible for making its underlying help renderer (Commander.js /
 // Click / clap) emit the canonical clap-style format — see the spec
@@ -34,11 +34,8 @@ fn spec_repo_root() -> PathBuf {
     if let Ok(p) = std::env::var("APCORE_CLI_SPEC_REPO") {
         return PathBuf::from(p);
     }
-    // CARGO_MANIFEST_DIR points at apcore-cli-rust; spec repo sits alongside.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate dir must have a parent")
-        .join("apcore-cli")
+    // CARGO_MANIFEST_DIR points at cli/rust; the component root owns the fixtures.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
 fn fixture_root() -> PathBuf {

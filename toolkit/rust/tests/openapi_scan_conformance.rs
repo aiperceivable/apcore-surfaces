@@ -16,7 +16,7 @@
 // serializing a closure through JSON.
 //
 // The fixture is read from the sibling spec repository
-// (`../apcore-toolkit`), never from a vendored copy, so a spec change is
+// (`../conformance`), never from a vendored copy, so a spec change is
 // exercised here the moment it is written.
 
 use std::path::PathBuf;
@@ -25,23 +25,20 @@ use apcore_toolkit::{OpenAPIScanner, ScanOptions, ScannedModule, ScannerError};
 use serde_json::{json, Value};
 
 fn conformance_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("toolkit-rust dir must have a parent")
-        .join("apcore-toolkit")
-        .join("conformance")
-        .join("fixtures")
+    std::env::var_os("CONFORMANCE_FIXTURES").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/fixtures"),
+        PathBuf::from,
+    )
 }
 
 fn load_cases() -> Vec<Value> {
     let path = conformance_dir().join("openapi_scan.json");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("WARN: conformance fixture not found at {path:?}; skipping");
-            return Vec::new();
-        }
-    };
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read conformance fixture {}: {error}",
+            path.display()
+        )
+    });
     let doc: Value = serde_json::from_str(&content).expect("fixture must be valid JSON");
     let cases = doc["test_cases"].as_array().cloned().unwrap_or_default();
     // A fixture that is present but yields no cases would otherwise pass
@@ -146,9 +143,7 @@ fn module_repr(m: &ScannedModule) -> Value {
 #[test]
 fn openapi_scan_matches_shared_conformance_fixture() {
     let cases = load_cases();
-    if cases.is_empty() {
-        return;
-    }
+    assert!(!cases.is_empty(), "the shared fixture must contain cases");
 
     let mut failures = Vec::new();
 

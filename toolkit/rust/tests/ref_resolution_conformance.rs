@@ -18,25 +18,15 @@ use apcore_toolkit::deep_resolve_refs;
 use serde_json::Value;
 
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("toolkit-rust dir must have a parent")
-        .join("apcore-toolkit")
-        .join("conformance")
-        .join("fixtures")
+    std::env::var_os("CONFORMANCE_FIXTURES").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/fixtures"),
+        PathBuf::from,
+    )
 }
 
 #[test]
 fn ref_resolution_matches_shared_conformance_fixture() {
     let path = fixtures_dir().join("ref_resolution.json");
-    if !path.exists() {
-        eprintln!(
-            "ref_resolution: shared corpus not found at {} — skipping",
-            path.display()
-        );
-        return;
-    }
-
     let doc: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture must be readable"))
             .expect("fixture must be valid JSON");

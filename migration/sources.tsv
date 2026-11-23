@@ -1,0 +1,17 @@
+Path	Source	Imported commit
+toolkit	https://github.com/aiperceivable/apcore-toolkit	54323ba2bc26067856984fa841bc4d5f1c5fa7d7
+toolkit/python	https://github.com/aiperceivable/apcore-toolkit-python	2e069c7c600c9b3c4fb7a19ed38ceef4795694aa
+toolkit/rust	https://github.com/aiperceivable/apcore-toolkit-rust	6ee4b6d2b2bf3c5fef709643181fe522d8b58a1d
+toolkit/typescript	https://github.com/aiperceivable/apcore-toolkit-typescript	f3bc21a434f065c65795318062be8faff82489b0
+mcp	https://github.com/aiperceivable/apcore-mcp	a977436a2bdf0c1db45093a14ed96db05f862b33
+mcp/python	https://github.com/aiperceivable/apcore-mcp-python	288770665351c3dc756037d5c2c7abb83b260035
+mcp/rust	https://github.com/aiperceivable/apcore-mcp-rust	a991ed13af50a8a5052f854294c8798a1a0fd9ee
+mcp/typescript	https://github.com/aiperceivable/apcore-mcp-typescript	850690305f28d3c870bf60332474c6ed3a3439a4
+a2a	https://github.com/aiperceivable/apcore-a2a	8637a6b6e94cec896cb8d96aeb2e4bb81befb872
+a2a/python	https://github.com/aiperceivable/apcore-a2a-python	0485483b431bfb7eb02a365f3ddebde8c5ba8b24
+a2a/rust	https://github.com/aiperceivable/apcore-a2a-rust	53e6fcd3a17b5b72abfbdc5507e379f5d437556b
+a2a/typescript	https://github.com/aiperceivable/apcore-a2a-typescript	153ee63260848f75884e63c40eed82875cad76ad
+cli	https://github.com/aiperceivable/apcore-cli	4f59e0a509ccece34356e12334912a3c7d886e6b
+cli/python	https://github.com/aiperceivable/apcore-cli-python	9080c7e1588d6e2f3110dffd7bba0a636ad68572
+cli/rust	https://github.com/aiperceivable/apcore-cli-rust	64d3f2d659b2517e0db627c6f65caba0d0acee7b
+cli/typescript	https://github.com/aiperceivable/apcore-cli-typescript	f3d9154660fbc87a929852e5b211d7cc93675d3b

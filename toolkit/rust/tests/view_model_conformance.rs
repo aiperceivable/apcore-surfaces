@@ -20,23 +20,20 @@ use apcore_toolkit::{
 use serde_json::Value;
 
 fn conformance_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("toolkit-rust dir must have a parent")
-        .join("apcore-toolkit")
-        .join("conformance")
-        .join("fixtures")
+    std::env::var_os("CONFORMANCE_FIXTURES").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/fixtures"),
+        PathBuf::from,
+    )
 }
 
 fn load_cases() -> Vec<Value> {
     let path = conformance_dir().join("view_model.json");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("WARN: conformance fixture not found at {path:?}; skipping");
-            return Vec::new();
-        }
-    };
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read conformance fixture {}: {error}",
+            path.display()
+        )
+    });
     let doc: Value = serde_json::from_str(&content).expect("fixture must be valid JSON");
     doc["test_cases"].as_array().cloned().unwrap_or_default()
 }
@@ -187,9 +184,7 @@ fn build_tone_palettes(raw: Option<&Value>) -> Vec<TonePalette> {
 #[test]
 fn view_model_matches_shared_conformance_fixture() {
     let cases = load_cases();
-    if cases.is_empty() {
-        return;
-    }
+    assert!(!cases.is_empty(), "the shared fixture must contain cases");
 
     let mut failures = Vec::new();
 

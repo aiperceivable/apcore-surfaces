@@ -70,23 +70,20 @@ const TOKEN_ENDPOINT: &str = "https://e.example/token";
 // ---------------------------------------------------------------- fixture io
 
 fn conformance_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("toolkit-rust dir must have a parent")
-        .join("apcore-toolkit")
-        .join("conformance")
-        .join("fixtures")
+    std::env::var_os("CONFORMANCE_FIXTURES").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/fixtures"),
+        PathBuf::from,
+    )
 }
 
 fn load_cases() -> Vec<Value> {
     let path = conformance_dir().join("device_auth.json");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => {
-            eprintln!("WARN: conformance fixture not found at {path:?}; skipping");
-            return Vec::new();
-        }
-    };
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read conformance fixture {}: {error}",
+            path.display()
+        )
+    });
     let doc: Value = serde_json::from_str(&content).expect("fixture must be valid JSON");
     doc["test_cases"].as_array().cloned().unwrap_or_default()
 }
@@ -1448,9 +1445,7 @@ fn run_hook_case(case: &Value, input: &Value, expected: &Value, all: &[Value]) -
 #[test]
 fn device_auth_matches_shared_conformance_fixture() {
     let cases = load_cases();
-    if cases.is_empty() {
-        return;
-    }
+    assert!(!cases.is_empty(), "the shared fixture must contain cases");
 
     let mut failures: Vec<String> = Vec::new();
     let mut passed: usize = 0;

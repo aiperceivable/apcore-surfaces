@@ -1,0 +1,83 @@
+name: Rust toolkit and CLI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'toolkit/rust/**'
+      - 'toolkit/conformance/**'
+      - 'cli/rust/**'
+      - 'cli/conformance/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'toolkit/rust/**'
+      - 'toolkit/conformance/**'
+      - 'cli/rust/**'
+      - 'cli/conformance/**'
+      - '.github/workflows/rust.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Rust source tests (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [toolkit, cli]
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}/rust
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ matrix.component }}/rust/target
+          key: ${{ runner.os }}-cargo-${{ matrix.component }}-${{ hashFiles('toolkit/rust/Cargo.lock', 'cli/rust/Cargo.lock') }}
+      - run: cargo fmt --all -- --check
+      - name: Check and test toolkit
+        if: matrix.component == 'toolkit'
+        run: |
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+          cargo check --locked --no-default-features
+      - name: Check and test CLI against this checkout's toolkit
+        if: matrix.component == 'cli'
+        run: |
+          patch="patch.crates-io.apcore-toolkit.path='$GITHUB_WORKSPACE/toolkit/rust'"
+          cargo --config "$patch" metadata --format-version 1 | python3 -c '
+          import json, sys
+          from pathlib import Path
+          expected = (Path(sys.argv[1]) / "toolkit/rust/Cargo.toml").resolve()
+          packages = [p for p in json.load(sys.stdin)["packages"] if p["name"] == "apcore-toolkit"]
+          if len(packages) != 1 or Path(packages[0]["manifest_path"]).resolve() != expected:
+              raise SystemExit("CLI did not resolve the toolkit from this checkout")
+          ' "$GITHUB_WORKSPACE"
+          cargo --config "$patch" clippy --all-targets --all-features -- -D warnings
+          cargo --config "$patch" test --all-features
+          cargo --config "$patch" build --examples
+
+  package:
+    name: Rust crate verification (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [toolkit, cli]
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}/rust
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked

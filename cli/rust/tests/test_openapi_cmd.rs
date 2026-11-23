@@ -1305,7 +1305,7 @@ async fn load_openapi_source_takes_the_source_verbatim() {
 #[test]
 fn test_effective_openapi_commands_match_shared_document_selection() {
     let spec_root = std::env::var_os("APCORE_CLI_SPEC_REPO").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../apcore-cli"),
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join(".."),
         PathBuf::from,
     );
     let fixture: Value = serde_json::from_slice(

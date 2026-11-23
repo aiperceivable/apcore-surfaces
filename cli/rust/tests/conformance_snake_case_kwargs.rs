@@ -1,7 +1,7 @@
 // Conformance — Algorithm C-SNAKE: snake_case multi-word kwargs flow.
 //
 // Cross-language fixture lives at
-// `../apcore-cli/conformance/fixtures/snake-case-kwargs/cases.json` and is
+// `../conformance/fixtures/snake-case-kwargs/cases.json` and is
 // shared verbatim with the TypeScript and Python SDK runners.
 //
 // Targets the schema → clap → kwargs path used by `extract_cli_kwargs` in
@@ -21,10 +21,7 @@ fn spec_repo_root() -> PathBuf {
     if let Ok(p) = std::env::var("APCORE_CLI_SPEC_REPO") {
         return PathBuf::from(p);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate dir must have a parent")
-        .join("apcore-cli")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
 fn fixture_path() -> PathBuf {

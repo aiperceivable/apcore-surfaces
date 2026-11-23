@@ -29,7 +29,7 @@ struct FixtureModule {
 fn fixture_path(filename: &str) -> PathBuf {
     let root = std::env::var_os("APCORE_CLI_SPEC_REPO")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../apcore-cli"));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
     root.join("conformance/fixtures").join(filename)
 }
 

@@ -5,11 +5,18 @@ use serde_json::Value;
 
 #[test]
 fn binding_structure_conformance() {
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("apcore-toolkit/conformance/fixtures/binding_structure.json");
-    let document: Value = serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+    let directory = std::env::var_os("CONFORMANCE_FIXTURES").map_or_else(
+        || std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../conformance/fixtures"),
+        std::path::PathBuf::from,
+    );
+    let fixture = directory.join("binding_structure.json");
+    let content = std::fs::read_to_string(&fixture).unwrap_or_else(|error| {
+        panic!(
+            "cannot read conformance fixture {}: {error}",
+            fixture.display()
+        )
+    });
+    let document: Value = serde_json::from_str(&content).unwrap();
     let cases = document["test_cases"].as_array().unwrap();
     assert!(!cases.is_empty());
     for case in cases {
