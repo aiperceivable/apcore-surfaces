@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-toolkit/main/apcore-toolkit-logo.svg" alt="apcore-toolkit logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-surfaces/main/toolkit/apcore-toolkit-logo.svg" alt="apcore-toolkit logo" width="200"/>
 </div>
 
 # apcore-toolkit
@@ -275,7 +275,7 @@ The **Browser** column marks whether a symbol is also re-exported from
 
 ## Documentation
 
-See the [apcore-toolkit documentation](https://github.com/aiperceivable/apcore-toolkit) for full API reference and guides.
+See the [apcore-toolkit documentation](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit) for full API reference and guides.
 
 ## License
 

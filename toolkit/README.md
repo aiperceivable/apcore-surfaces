@@ -11,9 +11,9 @@
 [![TypeScript SDK](https://img.shields.io/badge/typescript_sdk-0.14.0-green)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/typescript)
 [![Rust Version](https://img.shields.io/badge/rust-1.70%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/rust)
 [![Rust SDK](https://img.shields.io/badge/rust_sdk-0.14.0-green)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/rust)
-[![apcore](https://img.shields.io/badge/apcore-0.32.0%2B-orange)](https://github.com/aiperceivable/apcore-python)
+[![apcore](https://img.shields.io/badge/apcore-0.32.0%2B-orange)](https://github.com/aiperceivable/apcore)
 
-**apcore-toolkit** is a cross-language metadata pipeline for the [apcore](https://github.com/aiperceivable/apcore-python) ecosystem. It turns framework routes, convention-based functions, or complete OpenAPI 3.0/3.1 documents into portable `ScannedModule` values, then refines, presents, exports, or registers them for downstream surfaces.
+**apcore-toolkit** is a cross-language metadata pipeline for the [apcore](https://github.com/aiperceivable/apcore) ecosystem. It turns framework routes, convention-based functions, or complete OpenAPI 3.0/3.1 documents into portable `ScannedModule` values, then refines, presents, exports, or registers them for downstream surfaces.
 
 Available in:
 - [🐍 Python](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/python)

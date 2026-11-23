@@ -5,9 +5,9 @@
 # apcore-cli
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/aiperceivable/apcore-cli-python)
-[![TypeScript](https://img.shields.io/badge/typescript-node%2018%2B-blue)](https://github.com/aiperceivable/apcore-cli-typescript)
-[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange)](https://github.com/aiperceivable/apcore-cli-rust)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/python)
+[![TypeScript](https://img.shields.io/badge/typescript-node%2018%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/typescript)
+[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange)](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/rust)
 
 **The CLI Adapter for apcore — Expose modules as high-performance, AI-perceivable command-line tools.**
 
@@ -16,10 +16,10 @@
 
 | | |
 |---|---|
-| **Spec repo** | [github.com/aiperceivable/apcore-cli](https://github.com/aiperceivable/apcore-cli) |
-| **Python SDK** | [github.com/aiperceivable/apcore-cli-python](https://github.com/aiperceivable/apcore-cli-python) |
-| **TypeScript SDK** | [github.com/aiperceivable/apcore-cli-typescript](https://github.com/aiperceivable/apcore-cli-typescript) |
-| **Rust SDK** | [github.com/aiperceivable/apcore-cli-rust](https://github.com/aiperceivable/apcore-cli-rust) |
+| **Spec repo** | [github.com/aiperceivable/apcore-cli](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli) |
+| **Python SDK** | [github.com/aiperceivable/apcore-cli-python](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/python) |
+| **TypeScript SDK** | [github.com/aiperceivable/apcore-cli-typescript](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/typescript) |
+| **Rust SDK** | [github.com/aiperceivable/apcore-cli-rust](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/rust) |
 | **apcore core** | [github.com/aiperceivable/apcore](https://github.com/aiperceivable/apcore) |
 
 ---
@@ -589,9 +589,9 @@ apcore Registry + Executor (your modules, unchanged)
 
 | Language | Repository | Status |
 |----------|-----------|--------|
-| **Python** | [apcore-cli-python](https://github.com/aiperceivable/apcore-cli-python) | v0.12.3 |
-| **TypeScript** | [apcore-cli-typescript](https://github.com/aiperceivable/apcore-cli-typescript) | v0.12.3 |
-| **Rust** | [apcore-cli-rust](https://github.com/aiperceivable/apcore-cli-rust) | v0.12.3 |
+| **Python** | [apcore-cli-python](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/python) | v0.12.3 |
+| **TypeScript** | [apcore-cli-typescript](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/typescript) | v0.12.3 |
+| **Rust** | [apcore-cli-rust](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/rust) | v0.12.3 |
 
 ## Version Compatibility
 
@@ -709,8 +709,8 @@ For the **implementation**, see the SDKs:
 | Project | Description |
 |---------|-------------|
 | [apcore](https://github.com/aiperceivable/apcore) | Core protocol and framework for AI-Perceivable modules |
-| [apcore-mcp](https://github.com/aiperceivable/apcore-mcp) | Model Context Protocol adapter |
-| [apcore-a2a](https://github.com/aiperceivable/apcore-a2a) | Agent-to-Agent adapter |
+| [apcore-mcp](https://github.com/aiperceivable/apcore-surfaces/tree/main/mcp) | Model Context Protocol adapter |
+| [apcore-a2a](https://github.com/aiperceivable/apcore-surfaces/tree/main/a2a) | Agent-to-Agent adapter |
 | [django-apcore](https://github.com/aiperceivable/django-apcore) | Django integration |
 | [flask-apcore](https://github.com/aiperceivable/flask-apcore) | Flask integration |
 

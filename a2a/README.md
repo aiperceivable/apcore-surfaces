@@ -7,8 +7,8 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![A2A Protocol](https://img.shields.io/badge/A2A-1.0-blue.svg)](https://google.github.io/A2A/)
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-Node_18%2B-blue)](https://github.com/aiperceivable/apcore-a2a-typescript)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://github.com/aiperceivable/apcore-a2a-rust)
+[![TypeScript](https://img.shields.io/badge/TypeScript-Node_18%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/a2a/typescript)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://github.com/aiperceivable/apcore-surfaces/tree/main/a2a/rust)
 
 > **Build once, invoke by Code or AI.**
 > Every call validated, authorized, and evidenced.
@@ -21,9 +21,9 @@ It solves a common problem: **you've built AI capabilities with apcore modules, 
 
 All three SDKs implement the same A2A 1.0 contract defined in this repository's [specs](docs/).
 
-- **Python SDK**: [aiperceivable/apcore-a2a-python](https://github.com/aiperceivable/apcore-a2a-python)
-- **TypeScript SDK**: [aiperceivable/apcore-a2a-typescript](https://github.com/aiperceivable/apcore-a2a-typescript)
-- **Rust SDK**: [aiperceivable/apcore-a2a-rust](https://github.com/aiperceivable/apcore-a2a-rust)
+- **Python SDK**: [aiperceivable/apcore-a2a-python](https://github.com/aiperceivable/apcore-surfaces/tree/main/a2a/python)
+- **TypeScript SDK**: [aiperceivable/apcore-a2a-typescript](https://github.com/aiperceivable/apcore-surfaces/tree/main/a2a/typescript)
+- **Rust SDK**: [aiperceivable/apcore-a2a-rust](https://github.com/aiperceivable/apcore-surfaces/tree/main/a2a/rust)
 
 ---
 

@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-cli/main/apcore-cli-logo.svg" alt="apcore-cli logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-surfaces/main/cli/apcore-cli-logo.svg" alt="apcore-cli logo" width="200"/>
 </div>
 
 # apcore-cli
@@ -12,8 +12,8 @@ Terminal adapter for apcore. Execute AI-Perceivable modules from the command lin
 
 | | |
 |---|---|
-| **Python SDK** | [github.com/aiperceivable/apcore-cli-python](https://github.com/aiperceivable/apcore-cli-python) |
-| **Spec repo** | [github.com/aiperceivable/apcore-cli](https://github.com/aiperceivable/apcore-cli) |
+| **Python SDK** | [github.com/aiperceivable/apcore-cli-python](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli/python) |
+| **Spec repo** | [github.com/aiperceivable/apcore-cli](https://github.com/aiperceivable/apcore-surfaces/tree/main/cli) |
 | **apcore core** | [github.com/aiperceivable/apcore](https://github.com/aiperceivable/apcore) |
 
 **apcore-cli** turns any [apcore](https://github.com/aiperceivable/apcore)-based project into a fully featured CLI tool — with **zero code changes** to your existing modules.

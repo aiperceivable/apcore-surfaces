@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-toolkit/main/apcore-toolkit-logo.svg" alt="apcore-toolkit logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-surfaces/main/toolkit/apcore-toolkit-logo.svg" alt="apcore-toolkit logo" width="200"/>
 </div>
 
 # apcore-toolkit
@@ -333,7 +333,7 @@ See `apcore-toolkit/docs/features/formatting.md` § Tabular Formats for the full
 
 ## Documentation
 
-Full documentation is available at [https://github.com/aiperceivable/apcore-toolkit](https://github.com/aiperceivable/apcore-toolkit).
+Full documentation is available at [https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit).
 
 ## License
 

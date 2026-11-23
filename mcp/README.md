@@ -5,9 +5,9 @@
 # apcore-mcp
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/aiperceivable/apcore-mcp-python)
-[![TypeScript Version](https://img.shields.io/badge/TypeScript-Node_20%2B-blue)](https://github.com/aiperceivable/apcore-mcp-typescript)
-[![Rust Version](https://img.shields.io/badge/Rust-1.75%2B-blue)](https://github.com/aiperceivable/apcore-mcp-rust)
+[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/mcp/python)
+[![TypeScript Version](https://img.shields.io/badge/TypeScript-Node_20%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/mcp/typescript)
+[![Rust Version](https://img.shields.io/badge/Rust-1.75%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/mcp/rust)
 
 > **Build once, invoke by Code or AI.**
 > Same modules, same pipeline — an AI caller gets no shortcut.
@@ -249,9 +249,9 @@ The project is architected as a set of modular features, each with its own speci
 
 | Language | Repository | Package | Status |
 |----------|-----------|---------|--------|
-| Python | [apcore-mcp-python](https://github.com/aiperceivable/apcore-mcp-python) | `pip install apcore-mcp` | ✅ Available |
-| TypeScript | [apcore-mcp-typescript](https://github.com/aiperceivable/apcore-mcp-typescript) | `npm install apcore-mcp` | ✅ Available |
-| Rust | [apcore-mcp-rust](https://github.com/aiperceivable/apcore-mcp-rust) | `cargo add apcore-mcp` | ✅ Available |
+| Python | [apcore-mcp-python](https://github.com/aiperceivable/apcore-surfaces/tree/main/mcp/python) | `pip install apcore-mcp` | ✅ Available |
+| TypeScript | [apcore-mcp-typescript](https://github.com/aiperceivable/apcore-surfaces/tree/main/mcp/typescript) | `npm install apcore-mcp` | ✅ Available |
+| Rust | [apcore-mcp-rust](https://github.com/aiperceivable/apcore-surfaces/tree/main/mcp/rust) | `cargo add apcore-mcp` | ✅ Available |
 | Go | apcore-mcp-go | — | Planned |
 
 ## License

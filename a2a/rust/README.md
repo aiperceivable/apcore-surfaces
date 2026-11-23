@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-a2a/main/apcore-a2a-logo.svg" alt="apcore-a2a logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-surfaces/main/a2a/apcore-a2a-logo.svg" alt="apcore-a2a logo" width="200"/>
 </div>
 
 # apcore-a2a (Rust)
@@ -9,7 +9,7 @@
 
 ## What is apcore-a2a?
 
-**apcore-a2a** is the [A2A (Agent-to-Agent)](https://google.github.io/A2A/) protocol adapter for the [apcore](https://github.com/aiperceivable/apcore-rust) ecosystem.
+**apcore-a2a** is the [A2A (Agent-to-Agent)](https://google.github.io/A2A/) protocol adapter for the [apcore](https://github.com/aiperceivable/apcore) ecosystem.
 
 It solves a common problem: **you've built AI capabilities with apcore modules, but you need them to talk to other AI agents over a standard protocol.** apcore-a2a bridges that gap — it reads your existing module metadata (schemas, descriptions, examples) and automatically exposes them as a standards-compliant A2A server. No hand-written Agent Cards, no JSON-RPC boilerplate, no manual task lifecycle management.
 
@@ -17,7 +17,7 @@ It solves a common problem: **you've built AI capabilities with apcore modules, 
 
 Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/).
 
-> **Also available in:** [Python](https://github.com/aiperceivable/apcore-a2a-python) | [TypeScript](https://github.com/aiperceivable/apcore-a2a-typescript)
+> **Also available in:** [Python](https://github.com/aiperceivable/apcore-surfaces/tree/main/a2a/python) | [TypeScript](https://github.com/aiperceivable/apcore-surfaces/tree/main/a2a/typescript)
 
 ## Features
 

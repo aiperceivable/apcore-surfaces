@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-mcp/main/apcore-mcp-logo.svg" alt="apcore-mcp logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-surfaces/main/mcp/apcore-mcp-logo.svg" alt="apcore-mcp logo" width="200"/>
 </div>
 
 # apcore-mcp

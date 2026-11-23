@@ -1,10 +1,10 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-toolkit/main/apcore-toolkit-logo.svg" alt="apcore-toolkit logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/aiperceivable/apcore-surfaces/main/toolkit/apcore-toolkit-logo.svg" alt="apcore-toolkit logo" width="200"/>
 </div>
 
 # apcore-toolkit-python
 
-Python implementation of the [apcore-toolkit](https://github.com/aiperceivable/apcore-toolkit).
+Python implementation of the [apcore-toolkit](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit).
 
 Extracts ~1,400 lines of duplicated framework-agnostic logic from `django-apcore` and `flask-apcore` into a standalone Python package.
 
@@ -399,7 +399,7 @@ is an OS keychain -- a consumer concern, reached by implementing `TokenStore`.
 
 ## Documentation
 
-Full documentation is available at [https://github.com/aiperceivable/apcore-toolkit](https://github.com/aiperceivable/apcore-toolkit).
+Full documentation is available at [https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit).
 
 ## License
 
