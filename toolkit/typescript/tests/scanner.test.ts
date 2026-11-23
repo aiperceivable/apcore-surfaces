@@ -1,0 +1,311 @@
+import { describe, it, expect } from 'vitest';
+import { DEFAULT_ANNOTATIONS } from 'apcore-js';
+import { BaseScanner } from '../src/scanner.js';
+import { generateSuggestedAlias } from '../src/http-verb-map.js';
+import { createScannedModule } from '../src/types.js';
+import type { ScannedModule } from '../src/types.js';
+
+// Concrete test subclass
+class TestScanner extends BaseScanner {
+  private modules: ScannedModule[];
+
+  constructor(modules: ScannedModule[] = []) {
+    super();
+    this.modules = modules;
+  }
+
+  scan(): ScannedModule[] {
+    return this.modules;
+  }
+
+  getSourceName(): string {
+    return 'test-source';
+  }
+}
+
+function makeModule(id: string): ScannedModule {
+  return createScannedModule({
+    moduleId: id,
+    description: `Module ${id}`,
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    tags: ['test'],
+    target: `http://localhost/${id}`,
+  });
+}
+
+describe('BaseScanner', () => {
+  describe('concrete subclass', () => {
+    it('can be instantiated and returns scan results', () => {
+      const modules = [makeModule('mod-a'), makeModule('mod-b')];
+      const scanner = new TestScanner(modules);
+
+      expect(scanner.getSourceName()).toBe('test-source');
+      expect(scanner.scan()).toEqual(modules);
+    });
+  });
+
+  describe('filterModules', () => {
+    const scanner = new TestScanner();
+    const modules = [
+      makeModule('users.list'),
+      makeModule('users.create'),
+      makeModule('orders.list'),
+      makeModule('orders.delete'),
+    ];
+
+    it('returns all modules when no options provided', () => {
+      const result = scanner.filterModules(modules);
+      expect(result).toEqual(modules);
+    });
+
+    it('filters with include pattern — only matching modules returned', () => {
+      const result = scanner.filterModules(modules, 'users');
+      expect(result).toHaveLength(2);
+      expect(result.map((m) => m.moduleId)).toEqual([
+        'users.list',
+        'users.create',
+      ]);
+    });
+
+    it('filters with exclude pattern — matching modules removed', () => {
+      const result = scanner.filterModules(modules, undefined, 'delete');
+      expect(result).toHaveLength(3);
+      expect(result.map((m) => m.moduleId)).toEqual([
+        'users.list',
+        'users.create',
+        'orders.list',
+      ]);
+    });
+
+    it('filters with both include and exclude', () => {
+      const result = scanner.filterModules(modules, 'orders', 'delete');
+      expect(result).toHaveLength(1);
+      expect(result[0].moduleId).toBe('orders.list');
+    });
+
+    it('supports regex patterns like Python — ^users matches prefix', () => {
+      const result = scanner.filterModules(modules, '^users');
+      expect(result).toHaveLength(2);
+      expect(result.map((m) => m.moduleId)).toEqual([
+        'users.list',
+        'users.create',
+      ]);
+    });
+
+    it('throws SyntaxError for invalid regex patterns', () => {
+      const mods = [makeModule('foo.bar'), makeModule('foo(bar)')];
+      // "foo(" is invalid regex — now throws instead of silently falling back
+      expect(() => scanner.filterModules(mods, 'foo(')).toThrow(SyntaxError);
+    });
+
+    it('dots work as regex wildcards (spec-compatible)', () => {
+      const mods = [makeModule('users.list'), makeModule('usersXlist')];
+      const result = scanner.filterModules(mods, 'users.list');
+      expect(result).toHaveLength(2); // dot matches any char in regex
+    });
+
+    // Issue #7 [D1-002] regression: flat params signature
+    it('flat params: filterModules(modules, "^user_", undefined) — include only', () => {
+      const mods = [makeModule('user_profile'), makeModule('user_settings'), makeModule('orders.list')];
+      const result = scanner.filterModules(mods, '^user_', undefined);
+      expect(result).toHaveLength(2);
+      expect(result.map((m) => m.moduleId)).toEqual(['user_profile', 'user_settings']);
+    });
+
+    it('flat params: filterModules(modules, undefined, "test$") — exclude only', () => {
+      const mods = [makeModule('users.list'), makeModule('users.test'), makeModule('orders.test')];
+      const result = scanner.filterModules(mods, undefined, 'test$');
+      expect(result).toHaveLength(1);
+      expect(result[0].moduleId).toBe('users.list');
+    });
+  });
+
+  describe('inferAnnotationsFromMethod', () => {
+    it('GET → readonly=true, cacheable=true, rest defaults', () => {
+      const ann = BaseScanner.inferAnnotationsFromMethod('GET');
+      expect(ann).toEqual({
+        ...DEFAULT_ANNOTATIONS,
+        readonly: true,
+        cacheable: true,
+      });
+    });
+
+    it('DELETE → destructive=true', () => {
+      const ann = BaseScanner.inferAnnotationsFromMethod('DELETE');
+      expect(ann).toEqual({
+        ...DEFAULT_ANNOTATIONS,
+        destructive: true,
+      });
+    });
+
+    it('PUT → idempotent=true', () => {
+      const ann = BaseScanner.inferAnnotationsFromMethod('PUT');
+      expect(ann).toEqual({
+        ...DEFAULT_ANNOTATIONS,
+        idempotent: true,
+      });
+    });
+
+    it('post (lowercase) → all defaults (case insensitive)', () => {
+      const ann = BaseScanner.inferAnnotationsFromMethod('post');
+      expect(ann).toEqual({ ...DEFAULT_ANNOTATIONS });
+    });
+
+    it('get (lowercase) → readonly=true, cacheable=true (case insensitive)', () => {
+      const ann = BaseScanner.inferAnnotationsFromMethod('get');
+      expect(ann).toEqual({
+        ...DEFAULT_ANNOTATIONS,
+        readonly: true,
+        cacheable: true,
+      });
+    });
+
+    it('HEAD → readonly=true (without cacheable)', () => {
+      const ann = BaseScanner.inferAnnotationsFromMethod('HEAD');
+      expect(ann).toEqual({
+        ...DEFAULT_ANNOTATIONS,
+        readonly: true,
+      });
+      expect(ann.cacheable).toBe(false);
+    });
+
+    it('OPTIONS → readonly=true (without cacheable)', () => {
+      const ann = BaseScanner.inferAnnotationsFromMethod('OPTIONS');
+      expect(ann).toEqual({
+        ...DEFAULT_ANNOTATIONS,
+        readonly: true,
+      });
+      expect(ann.cacheable).toBe(false);
+    });
+
+    it('head (lowercase) → readonly=true (case insensitive)', () => {
+      const ann = BaseScanner.inferAnnotationsFromMethod('head');
+      expect(ann.readonly).toBe(true);
+    });
+  });
+
+  describe('extractDocstring', () => {
+    const scanner = new TestScanner();
+
+    it('returns nulls for non-function input', () => {
+      const result = scanner.extractDocstring(null);
+      expect(result.description).toBeNull();
+      expect(result.documentation).toBeNull();
+      expect(result.params).toEqual({});
+    });
+
+    it('returns nulls for function without JSDoc', () => {
+      const fn = () => 42;
+      const result = scanner.extractDocstring(fn);
+      expect(result.description).toBeNull();
+    });
+
+    it('ignores JSDoc buried inside the function body (D1-7 regression)', () => {
+      // esbuild strips comments at transform time, so we simulate via toString override
+      const fn = () => 42;
+      Object.defineProperty(fn, 'toString', {
+        value: () => 'function fn() {\n  /** buried doc */\n  return 42;\n}',
+      });
+      const result = scanner.extractDocstring(fn);
+      expect(result.description).toBeNull();
+    });
+  });
+
+  describe('deduplicateIds', () => {
+    const scanner = new TestScanner();
+
+    it('returns same modules when no duplicates', () => {
+      const modules = [makeModule('mod-a'), makeModule('mod-b')];
+      const result = scanner.deduplicateIds(modules);
+      expect(result).toEqual(modules);
+      expect(result).toHaveLength(2);
+    });
+
+    it('appends _2, _3 for duplicates and adds warnings', () => {
+      const modules = [
+        makeModule('mod-a'),
+        makeModule('mod-a'),
+        makeModule('mod-a'),
+      ];
+      const result = scanner.deduplicateIds(modules);
+
+      expect(result).toHaveLength(3);
+      expect(result[0].moduleId).toBe('mod-a');
+      expect(result[0].warnings).toEqual([]);
+
+      expect(result[1].moduleId).toBe('mod-a_2');
+      expect(result[1].warnings).toContain(
+        "Module ID renamed from 'mod-a' to 'mod-a_2' to avoid collision",
+      );
+
+      expect(result[2].moduleId).toBe('mod-a_3');
+      expect(result[2].warnings).toContain(
+        "Module ID renamed from 'mod-a' to 'mod-a_3' to avoid collision",
+      );
+    });
+
+    it('does not collide with pre-existing suffixed ID (W14-parity regression)', () => {
+      const modules = [
+        makeModule('mod-a'),
+        makeModule('mod-a_2'), // pre-existing — must not be overwritten by rename
+        makeModule('mod-a'),   // duplicate that would naively become mod-a_2
+      ];
+      const result = scanner.deduplicateIds(modules);
+      expect(result).toHaveLength(3);
+      expect(result[0].moduleId).toBe('mod-a');
+      expect(result[1].moduleId).toBe('mod-a_2');
+      expect(result[2].moduleId).toBe('mod-a_3'); // skip taken _2, use _3
+    });
+
+    it('preserves original modules (returns new instances for renamed)', () => {
+      const original = makeModule('mod-a');
+      const duplicate = makeModule('mod-a');
+      const modules = [original, duplicate];
+
+      const result = scanner.deduplicateIds(modules);
+
+      // First one is unchanged
+      expect(result[0]).toBe(original);
+
+      // Second one is a new instance (renamed)
+      expect(result[1]).not.toBe(duplicate);
+      expect(result[1].moduleId).toBe('mod-a_2');
+
+      // Original duplicate is untouched
+      expect(duplicate.moduleId).toBe('mod-a');
+    });
+  });
+
+  describe('generateSuggestedAlias (top-level function)', () => {
+    it('POST collection', () => {
+      expect(generateSuggestedAlias('/tasks/user_data', 'POST')).toBe(
+        'tasks.user_data.create',
+      );
+    });
+    it('GET collection', () => {
+      expect(generateSuggestedAlias('/tasks/user_data', 'GET')).toBe(
+        'tasks.user_data.list',
+      );
+    });
+    it('GET single resource', () => {
+      expect(generateSuggestedAlias('/tasks/user_data/{id}', 'GET')).toBe(
+        'tasks.user_data.get',
+      );
+    });
+    it('DELETE single resource', () => {
+      expect(generateSuggestedAlias('/tasks/user_data/{id}', 'DELETE')).toBe(
+        'tasks.user_data.delete',
+      );
+    });
+    it('case insensitive method', () => {
+      expect(generateSuggestedAlias('/tasks', 'post')).toBe('tasks.create');
+    });
+    it('root path returns only verb', () => {
+      expect(generateSuggestedAlias('/', 'GET')).toBe('list');
+    });
+    it('callable via top-level import', () => {
+      expect(generateSuggestedAlias('/users', 'POST')).toBe('users.create');
+    });
+  });
+});

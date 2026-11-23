@@ -1,0 +1,425 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import { Registry } from 'apcore-js';
+import type { Context } from 'apcore-js';
+
+import {
+  HTTPProxyRegistryWriter,
+  HTTPProxyRegistryWriterError,
+} from '../src/output/http-proxy-writer.js';
+import type { ScannedModule } from '../src/types.js';
+import { createScannedModule } from '../src/types.js';
+
+function mkModule(overrides: Partial<ScannedModule> = {}): ScannedModule {
+  return {
+    ...createScannedModule({
+      moduleId: 'tasks.create',
+      description: 'create task',
+      target: 'my_app.handlers.tasks:create_task',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+      outputSchema: { type: 'object', properties: {}, additionalProperties: true },
+      tags: [],
+      metadata: { httpMethod: 'POST', urlPath: '/tasks' },
+    }),
+    ...overrides,
+  };
+}
+
+type FetchCall = {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: string | undefined;
+};
+
+function recordingFetch(
+  responder: (call: FetchCall) => Response | Promise<Response>,
+): { fetchImpl: typeof fetch; calls: FetchCall[] } {
+  const calls: FetchCall[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
+    const headers: Record<string, string> = {};
+    const rawHeaders = init?.headers;
+    if (rawHeaders) {
+      for (const [k, v] of Object.entries(rawHeaders as Record<string, string>)) {
+        headers[k] = v;
+      }
+    }
+    const call: FetchCall = {
+      url,
+      method: (init?.method ?? 'GET').toUpperCase(),
+      headers,
+      body: typeof init?.body === 'string' ? init.body : undefined,
+    };
+    calls.push(call);
+    return responder(call);
+  };
+  return { fetchImpl, calls };
+}
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+interface Executable {
+  execute(inputs: Record<string, unknown>, ctx: Context): Promise<Record<string, unknown>>;
+}
+
+function getRegistered(registry: Registry, id: string): Executable {
+  const mod = registry.get(id);
+  if (!mod) throw new Error(`module ${id} not registered`);
+  return mod as unknown as Executable;
+}
+
+describe('HTTPProxyRegistryWriter', () => {
+  let registry: Registry;
+
+  beforeEach(() => {
+    registry = new Registry();
+  });
+
+  it('registers each module with WriteResult verified=true', async () => {
+    const { fetchImpl } = recordingFetch(() => jsonResponse(200, { ok: true }));
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      fetchImpl,
+    });
+    const results = await writer.write([mkModule()], registry);
+    expect(results).toHaveLength(1);
+    expect(results[0].verified).toBe(true);
+    expect(results[0].moduleId).toBe('tasks.create');
+  });
+
+  it('POSTs non-path inputs as JSON body to the resolved URL', async () => {
+    const { fetchImpl, calls } = recordingFetch(() => jsonResponse(200, { id: 1 }));
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      fetchImpl,
+    });
+    await writer.write([mkModule()], registry);
+    const mod = getRegistered(registry, 'tasks.create');
+    const result = await mod.execute({ title: 'a' }, {} as Context);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe('POST');
+    expect(calls[0].url).toBe('http://localhost:8000/tasks');
+    expect(calls[0].body).toBe(JSON.stringify({ title: 'a' }));
+    expect(result).toEqual({ id: 1 });
+  });
+
+  it('substitutes brace path params and puts remaining inputs in the body', async () => {
+    const { fetchImpl, calls } = recordingFetch(() => jsonResponse(200, { ok: true }));
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      fetchImpl,
+    });
+    await writer.write(
+      [
+        mkModule({
+          moduleId: 'tasks.update',
+          metadata: { httpMethod: 'PUT', urlPath: '/tasks/{id}' },
+        }),
+      ],
+      registry,
+    );
+    const mod = getRegistered(registry, 'tasks.update');
+    await mod.execute({ id: 42, title: 'b' }, {} as Context);
+    expect(calls[0].url).toBe('http://localhost:8000/tasks/42');
+    expect(calls[0].method).toBe('PUT');
+    expect(calls[0].body).toBe(JSON.stringify({ title: 'b' }));
+  });
+
+  // D11-3b regression: path-param values must be RFC 3986 percent-encoded
+  // BEFORE substitution so reserved chars cannot corrupt the URL.
+  it('percent-encodes path-param values', async () => {
+    const { fetchImpl, calls } = recordingFetch(() => jsonResponse(200, { ok: true }));
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      fetchImpl,
+    });
+    await writer.write(
+      [
+        mkModule({
+          moduleId: 'tasks.fetch',
+          metadata: { httpMethod: 'GET', urlPath: '/items/{item_id}' },
+        }),
+      ],
+      registry,
+    );
+    const mod = getRegistered(registry, 'tasks.fetch');
+    await mod.execute({ item_id: 'a/b#c' }, {} as Context);
+    // ``/`` -> ``%2F``, ``#`` -> ``%23``
+    expect(calls[0].url).toBe('http://localhost:8000/items/a%2Fb%23c');
+  });
+
+  // D11-3b regression: a missing path-parameter input must NOT leak ``{name}``
+  // into the request URL — it must throw ``ModuleError`` and skip fetch.
+  it('throws ModuleError when a path placeholder is unfilled', async () => {
+    const { fetchImpl, calls } = recordingFetch(() => jsonResponse(200, {}));
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      fetchImpl,
+    });
+    await writer.write(
+      [
+        mkModule({
+          moduleId: 'tasks.miss',
+          metadata: { httpMethod: 'GET', urlPath: '/items/{item_id}' },
+        }),
+      ],
+      registry,
+    );
+    const mod = getRegistered(registry, 'tasks.miss');
+    await expect(mod.execute({}, {} as Context)).rejects.toThrow(/item_id/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('puts non-path inputs into the query string for GET', async () => {
+    const { fetchImpl, calls } = recordingFetch(() => jsonResponse(200, { list: [] }));
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      fetchImpl,
+    });
+    await writer.write(
+      [
+        mkModule({
+          moduleId: 'tasks.list',
+          metadata: { httpMethod: 'GET', urlPath: '/tasks' },
+        }),
+      ],
+      registry,
+    );
+    const mod = getRegistered(registry, 'tasks.list');
+    await mod.execute({ status: 'open', limit: 10 }, {} as Context);
+    expect(calls[0].method).toBe('GET');
+    expect(calls[0].url).toMatch(/^http:\/\/localhost:8000\/tasks\?/);
+    expect(calls[0].url).toContain('status=open');
+    expect(calls[0].url).toContain('limit=10');
+    expect(calls[0].body).toBeUndefined();
+  });
+
+  it('applies authHeaderFactory on each call', async () => {
+    const { fetchImpl, calls } = recordingFetch(() => jsonResponse(200, { ok: true }));
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      authHeaderFactory: () => ({ Authorization: 'Bearer xxx' }),
+      fetchImpl,
+    });
+    await writer.write([mkModule()], registry);
+    await getRegistered(registry, 'tasks.create').execute({}, {} as Context);
+    expect(calls[0].headers['Authorization']).toBe('Bearer xxx');
+  });
+
+  it('raises on 4xx with the extracted error message', async () => {
+    const { fetchImpl } = recordingFetch(() =>
+      jsonResponse(400, { error_message: 'invalid input' }),
+    );
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      fetchImpl,
+    });
+    await writer.write([mkModule()], registry);
+    await expect(
+      getRegistered(registry, 'tasks.create').execute({}, {} as Context),
+    ).rejects.toThrow(/HTTP 400: invalid input/);
+  });
+
+  it('reports verified=false when url_path is an absolute URL', async () => {
+    const writer = new HTTPProxyRegistryWriter({
+      baseUrl: 'http://localhost:8000',
+      fetchImpl: recordingFetch(() => jsonResponse(200, {})).fetchImpl,
+    });
+    const results = await writer.write(
+      [
+        mkModule({
+          moduleId: 'tasks.bad',
+          metadata: { httpMethod: 'POST', urlPath: 'http://evil/tasks' },
+        }),
+      ],
+      registry,
+    );
+    expect(results[0].verified).toBe(false);
+    expect(results[0].verificationError ?? '').toContain('HTTPProxyRegistryWriterError');
+  });
+
+  it('exposes HTTPProxyRegistryWriterError as a named class', () => {
+    expect(new HTTPProxyRegistryWriterError('m', 'x').name).toBe('HTTPProxyRegistryWriterError');
+  });
+
+  it('can be imported from the package entry', async () => {
+    const pkg = await import('../src/index.js');
+    expect(typeof pkg.HTTPProxyRegistryWriter).toBe('function');
+    expect(typeof pkg.HTTPProxyRegistryWriterError).toBe('function');
+  });
+
+  // A-D-009 — base_url scheme validation at construction time. Mirrors Rust's
+  // `InvalidBaseUrl` check; prevents `file://` / `data://` / etc. exfiltration
+  // vectors at request time by failing the writer up-front.
+  describe('base_url scheme validation (A-D-009)', () => {
+    const dummyFetch: typeof fetch = async () => new Response('{}');
+
+    it('rejects file:// scheme at construction', () => {
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'file:///etc/passwd',
+            fetchImpl: dummyFetch,
+          }),
+      ).toThrow(HTTPProxyRegistryWriterError);
+    });
+
+    it('rejects data: scheme at construction', () => {
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'data:text/plain;base64,SGVsbG8=',
+            fetchImpl: dummyFetch,
+          }),
+      ).toThrow(HTTPProxyRegistryWriterError);
+    });
+
+    it('rejects malformed URL strings at construction', () => {
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'not a url',
+            fetchImpl: dummyFetch,
+          }),
+      ).toThrow(HTTPProxyRegistryWriterError);
+    });
+
+    it('accepts http:// and https:// base URLs', () => {
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'http://localhost:8000',
+            fetchImpl: dummyFetch,
+          }),
+      ).not.toThrow();
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'https://api.example.com',
+            fetchImpl: dummyFetch,
+          }),
+      ).not.toThrow();
+    });
+  });
+
+  // Regression: `timeoutMs` was accepted with no validation and fed straight
+  // into `setTimeout(() => controller.abort(), timeoutMs)`, so a non-positive
+  // value silently aborted every proxied request almost immediately with no
+  // diagnostic. Mirrors Rust's `timeout_secs.is_finite() && timeout_secs > 0.0`
+  // check in `HTTPProxyRegistryWriter::new`.
+  describe('timeoutMs validation', () => {
+    const dummyFetch: typeof fetch = async () => new Response('{}');
+
+    it('rejects a zero timeoutMs at construction', () => {
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'http://x',
+            timeoutMs: 0,
+            fetchImpl: dummyFetch,
+          }),
+      ).toThrow(HTTPProxyRegistryWriterError);
+    });
+
+    it('rejects a negative timeoutMs at construction', () => {
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'http://x',
+            timeoutMs: -1000,
+            fetchImpl: dummyFetch,
+          }),
+      ).toThrow(HTTPProxyRegistryWriterError);
+    });
+
+    it('rejects a non-finite timeoutMs at construction', () => {
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'http://x',
+            timeoutMs: Infinity,
+            fetchImpl: dummyFetch,
+          }),
+      ).toThrow(HTTPProxyRegistryWriterError);
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'http://x',
+            timeoutMs: NaN,
+            fetchImpl: dummyFetch,
+          }),
+      ).toThrow(HTTPProxyRegistryWriterError);
+    });
+
+    it('accepts a positive finite timeoutMs and the default (unset)', () => {
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'http://x',
+            timeoutMs: 5000,
+            fetchImpl: dummyFetch,
+          }),
+      ).not.toThrow();
+      expect(
+        () =>
+          new HTTPProxyRegistryWriter({
+            baseUrl: 'http://x',
+            fetchImpl: dummyFetch,
+          }),
+      ).not.toThrow();
+    });
+  });
+
+  // Issue 2 (BLOCKER): HTTPProxyRegistryWriter must read snake_case metadata keys
+  // Python and Rust scanners produce http_method / url_path (snake_case).
+  describe('snake_case metadata key parity', () => {
+    it('reads snake_case http_method and url_path metadata keys', async () => {
+      const { fetchImpl, calls } = recordingFetch(() => jsonResponse(200, { ok: true }));
+      const writer = new HTTPProxyRegistryWriter({
+        baseUrl: 'http://localhost:8000',
+        fetchImpl,
+      });
+      const mod = createScannedModule({
+        moduleId: 'snake.module',
+        target: 'test:handler',
+        metadata: { http_method: 'POST', url_path: '/api/test' },
+        inputSchema: { type: 'object', additionalProperties: true },
+        outputSchema: { type: 'object', additionalProperties: true },
+        tags: [],
+      });
+      await writer.write([mod], registry);
+      const registered = getRegistered(registry, 'snake.module');
+      await registered.execute({ data: 'x' }, {} as Context);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].method).toBe('POST');
+      expect(calls[0].url).toBe('http://localhost:8000/api/test');
+    });
+
+    it('falls back to camelCase httpMethod/urlPath when snake_case is absent', async () => {
+      const { fetchImpl, calls } = recordingFetch(() => jsonResponse(200, { ok: true }));
+      const writer = new HTTPProxyRegistryWriter({
+        baseUrl: 'http://localhost:8000',
+        fetchImpl,
+      });
+      const mod = createScannedModule({
+        moduleId: 'camel.module',
+        target: 'test:handler',
+        metadata: { httpMethod: 'DELETE', urlPath: '/api/items/1' },
+        inputSchema: { type: 'object', additionalProperties: true },
+        outputSchema: { type: 'object', additionalProperties: true },
+        tags: [],
+      });
+      await writer.write([mod], registry);
+      const registered = getRegistered(registry, 'camel.module');
+      await registered.execute({}, {} as Context);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].method).toBe('DELETE');
+      expect(calls[0].url).toBe('http://localhost:8000/api/items/1');
+    });
+  });
+});

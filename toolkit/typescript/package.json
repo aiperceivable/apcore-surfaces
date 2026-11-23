@@ -1,0 +1,81 @@
+{
+  "name": "apcore-toolkit",
+  "version": "0.15.0",
+  "description": "Shared scanner, schema extraction, and output toolkit for apcore framework adapters",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/browser/index.d.ts",
+      "import": "./dist/browser/index.js"
+    }
+  },
+  "sideEffects": false,
+  "license": "Apache-2.0",
+  "author": {
+    "name": "aiperceivable",
+    "email": "tercel.yi@gmail.com"
+  },
+  "keywords": [
+    "apcore",
+    "mcp",
+    "scanner",
+    "schema",
+    "yaml",
+    "openapi",
+    "toolkit"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aiperceivable/apcore-toolkit-typescript"
+  },
+  "homepage": "https://aiperceivable.com",
+  "bugs": {
+    "url": "https://github.com/aiperceivable/apcore-toolkit-typescript/issues"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:packaging": "APCORE_PACKAGING_TEST=1 vitest run tests/packaging.test.ts",
+    "lint": "eslint src/ tests/",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "ajv": "^8.17.0",
+    "apcore-js": ">=0.33.0",
+    "js-yaml": "^4.3.2"
+  },
+  "peerDependencies": {
+    "@sinclair/typebox": ">=0.31.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^5.1.0",
+    "apdev-js": "^0.2.1",
+    "eslint": "^9.0.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^5.1.0"
+  },
+  "engines": {
+    "node": ">=20.10.0"
+  },
+  "apdev": {
+    "base_package": "apcore-toolkit"
+  }
+}
