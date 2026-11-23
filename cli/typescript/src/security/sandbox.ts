@@ -1,0 +1,326 @@
+/**
+ * Sandbox — Subprocess isolation for module execution.
+ *
+ * Protocol spec: Security — sandboxed execution (tech-design §8.6.4).
+ *
+ * Uses a re-exec model: spawns `node <this-binary> --internal-sandbox-runner
+ * <module_id>` with a stripped environment and isolated HOME/TMPDIR.
+ * The child reads JSON from stdin, runs the module via a fresh
+ * Registry+Executor, and writes JSON to stdout.
+ */
+
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve as resolvePath } from "node:path";
+
+import { assertDelegatedAccess } from "../acl-loader.js";
+import type { Executor } from "../cli.js";
+import { ModuleExecutionError } from "../errors.js";
+
+// Environment forwarding strategy: allow PATH, LANG, LC_ALL + all APCORE_*
+// except APCORE_AUTH_* (credentials must not cross the trust boundary).
+const SANDBOX_ALLOW_KEYS = ["PATH", "LANG", "LC_ALL"];
+const SANDBOX_ALLOW_PREFIX = "APCORE_";
+const SANDBOX_DENY_PREFIX = "APCORE_AUTH_";
+// Explicit deny-list for known credential keys (defense-in-depth mirroring Rust).
+const SANDBOX_DENY_KEYS: readonly string[] = ["APCORE_AUTH_API_KEY"];
+
+const SANDBOX_DEFAULT_OUTPUT_SIZE_LIMIT = 64 * 1024 * 1024; // 64 MiB
+
+// ---------------------------------------------------------------------------
+// Sandbox
+// ---------------------------------------------------------------------------
+
+/**
+ * Executes modules in an isolated subprocess to limit the blast radius
+ * of untrusted or third-party modules.
+ *
+ * When disabled (the default), delegates directly to the Executor.
+ * When enabled, spawns a restricted child process via re-exec with
+ * `--internal-sandbox-runner <module_id>`.
+ */
+export class Sandbox {
+  /** Default post-capture stdout+stderr byte budget for sandboxed children. */
+  static readonly DEFAULT_MAX_OUTPUT_BYTES = SANDBOX_DEFAULT_OUTPUT_SIZE_LIMIT;
+
+  private readonly enabled: boolean;
+  private readonly timeoutSeconds: number;
+  private extensionsRoot: string | null = null;
+  private maxOutputBytes: number = SANDBOX_DEFAULT_OUTPUT_SIZE_LIMIT;
+
+  constructor(enabled = false, timeoutSeconds = 300) {
+    this.enabled = enabled;
+    this.timeoutSeconds = timeoutSeconds;
+  }
+
+  /**
+   * Set the extensions root that is forwarded to the sandboxed runner via
+   * `APCORE_EXTENSIONS_ROOT`. The path is resolved to absolute when injected
+   * so the child (whose cwd is the fresh sandbox tempdir) can locate modules.
+   *
+   * Builder-style — returns `this` so call sites can chain. Mirrors Python's
+   * `Sandbox.with_extensions_root` (D1-004 cross-SDK parity).
+   */
+  withExtensionsRoot(extensionsRoot: string | null): this {
+    this.extensionsRoot = extensionsRoot;
+    return this;
+  }
+
+  /**
+   * Cap the post-capture stdout+stderr byte budget for the sandboxed
+   * subprocess. Default: 64 MiB (`Sandbox.DEFAULT_MAX_OUTPUT_BYTES`).
+   *
+   * Builder-style — returns `this`. Mirrors Python's
+   * `Sandbox.with_max_output_bytes` (D1-004 cross-SDK parity).
+   */
+  withMaxOutputBytes(maxOutputBytes: number): this {
+    this.maxOutputBytes = maxOutputBytes;
+    return this;
+  }
+
+  /**
+   * Execute a module, optionally inside a sandboxed subprocess.
+   *
+   * @param context - Optional apcore `Context`, supplied by the CLI only when
+   *   the FE-14 identity flags asserted one. It cannot cross the subprocess
+   *   boundary, so the sandboxed path deliberately ignores it — a sandboxed
+   *   call presents no identity, which is the conservative reading.
+   */
+  async execute(
+    moduleId: string,
+    inputData: Record<string, unknown>,
+    executor: Executor,
+    context?: unknown,
+  ): Promise<unknown> {
+    if (!this.enabled) {
+      // Arity is preserved when no identity was asserted: `call` is the
+      // executor's hot path and downstream doubles assert on its arguments,
+      // so a `undefined` third argument is not appended for the common case.
+      return context === undefined
+        ? executor.call(moduleId, inputData)
+        : executor.call(moduleId, inputData, context);
+    }
+    // FE-14 §4.10 — the child builds a fresh Registry + Executor from
+    // APCORE_EXTENSIONS_ROOT and carries NO ACL, so the decision has to be
+    // reached here, in the parent, and BEFORE the spawn. Without this,
+    // `--sandbox` — a *security* flag — silently switches access control off.
+    //
+    // Deliberately at the delegation boundary rather than only at the CLI call
+    // sites: a caller that forgets to gate cannot reach a subprocess through
+    // this method. The call sites check too, one step earlier, because they
+    // must compose the ACL's approval requirement with the module annotation
+    // before the approval gate runs. `checkAccess` is pure, so evaluating it
+    // twice costs a decision and changes nothing.
+    assertDelegatedAccess(moduleId, inputData);
+    return this._sandboxedExecute(moduleId, inputData);
+  }
+
+  private async _sandboxedExecute(
+    moduleId: string,
+    inputData: Record<string, unknown>,
+  ): Promise<unknown> {
+    const tmpDir = mkdtempSync(join(tmpdir(), "apcore_sandbox_"));
+
+    const env = buildSandboxEnv(tmpDir);
+
+    // Resolve APCORE_EXTENSIONS_ROOT to absolute BEFORE forwarding into the
+    // child env. The child's cwd is the fresh tmpDir, so any relative path
+    // (default `./extensions` or user-provided `./relative/foo`) would
+    // otherwise resolve under the empty tmpDir → MODULE_NOT_FOUND.
+    //
+    // Precedence: explicit `withExtensionsRoot(...)` builder value wins over
+    // an inherited APCORE_EXTENSIONS_ROOT env var (mirrors Python parity).
+    if (this.extensionsRoot !== null) {
+      env.APCORE_EXTENSIONS_ROOT = resolvePath(this.extensionsRoot);
+    } else if (env.APCORE_EXTENSIONS_ROOT) {
+      env.APCORE_EXTENSIONS_ROOT = resolvePath(env.APCORE_EXTENSIONS_ROOT);
+    }
+    const binaryPath = process.argv[1];
+    const child = spawn(process.execPath, [binaryPath, "--internal-sandbox-runner", moduleId], {
+      env,
+      cwd: tmpDir,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let sizeExceeded = false;
+
+    const outputCap = this.maxOutputBytes;
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (sizeExceeded) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > outputCap) {
+        sizeExceeded = true;
+        child.kill("SIGKILL");
+        return;
+      }
+      stdout += chunk.toString();
+    });
+    // stderr cap: hostile modules spamming stderr can OOM the parent
+    // without an upper bound. Apply the same per-stream ceiling as stdout
+    // (independent counter so each stream gets its full budget).
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (sizeExceeded) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > outputCap) {
+        sizeExceeded = true;
+        child.kill("SIGKILL");
+        return;
+      }
+      stderr += chunk.toString();
+    });
+
+    // Register an 'error' listener BEFORE .write() so an EPIPE from a
+    // child that exited before consuming stdin does not surface as an
+    // unhandled exception. The child's exit/close handlers below already
+    // own reject() — swallowing the stdin error here is intentional.
+    child.stdin.on("error", () => {
+      /* swallow EPIPE when child exits before consuming stdin */
+    });
+    child.stdin.write(JSON.stringify(inputData));
+    child.stdin.end();
+
+    return new Promise<unknown>((resolve, reject) => {
+      // Cleanup helper — called from all terminal branches (close, timeout, error)
+      // to ensure tempdir is always removed. Python/Rust use context-manager / Drop
+      // which guarantees cleanup on any exit path; this mirrors that invariant.
+      const cleanup = (): void => {
+        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      };
+
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        cleanup();
+        reject(
+          new ModuleExecutionError(
+            `Sandbox module '${moduleId}' timed out after ${this.timeoutSeconds}s.`,
+          ),
+        );
+      }, this.timeoutSeconds * 1000);
+
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        cleanup();
+
+        if (sizeExceeded) {
+          const limitMiB = Math.floor(outputCap / (1024 * 1024));
+          reject(new ModuleExecutionError(
+            `Sandbox module '${moduleId}' output exceeded ${limitMiB}MiB limit.`,
+          ));
+          return;
+        }
+        if (code !== 0) {
+          reject(new ModuleExecutionError(
+            `Sandbox module '${moduleId}' exited with code ${code}.${stderr ? ` stderr: ${stderr}` : ""}`,
+          ));
+          return;
+        }
+        try {
+          resolve(JSON.parse(stdout));
+        } catch {
+          reject(new ModuleExecutionError(
+            `Sandbox module '${moduleId}' returned non-JSON output: ${stdout.slice(0, 200)}`,
+          ));
+        }
+      });
+
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        cleanup();
+        reject(new ModuleExecutionError(`Failed to spawn sandbox process: ${err.message}`));
+      });
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox runner (invoked as a child process via --internal-sandbox-runner)
+// ---------------------------------------------------------------------------
+
+/**
+ * Entry point for the sandbox child process.
+ * Called when `--internal-sandbox-runner <module_id>` appears in argv.
+ * Reads JSON from stdin, runs the module, writes JSON to stdout.
+ */
+export async function runSandboxRunner(moduleId: string): Promise<void> {
+  const extensionsRoot = process.env.APCORE_EXTENSIONS_ROOT ?? "./extensions";
+  // Dynamic import avoids circular deps and keeps the sandbox runner
+  // isolated from the host CLI initialization code.
+  const apcore = await import("apcore-js").catch(() => {
+    process.stderr.write(
+      "sandbox runner: apcore-js is not available in the sandboxed environment.\n",
+    );
+    process.exit(1);
+  });
+  if (!apcore) return;
+
+  let inputJson = "";
+  for await (const chunk of process.stdin) {
+    inputJson += chunk.toString();
+  }
+
+  let inputData: Record<string, unknown>;
+  try {
+    inputData = JSON.parse(inputJson);
+  } catch {
+    process.stderr.write("sandbox runner: failed to parse stdin as JSON.\n");
+    process.exit(1);
+    return;
+  }
+
+  // No ACL is attached here, and that is deliberate: the PARENT reached the
+  // access decision before spawning this process (FE-14 §4.10,
+  // `assertDelegatedAccess`). A child re-loading `acl.root` would not be a
+  // trustworthy gate anyway — the sandbox forwards a narrow environment
+  // allowlist by design, so the child's view of the path is neither
+  // guaranteed nor under the parent's control.
+  const registry = new apcore.Registry({ extensionsDir: extensionsRoot });
+  await registry.discover();
+  const executor = new apcore.Executor({ registry });
+  try {
+    const result = await executor.call(moduleId, inputData);
+    process.stdout.write(JSON.stringify(result));
+    process.exit(0);
+  } catch (err: unknown) {
+    process.stderr.write(`sandbox runner error: ${err}\n`);
+    process.exit(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Test-only seam: re-exported under an underscore-prefixed name so unit
+ * tests can verify env-forwarding behavior (D11-009 empty-string parity)
+ * without spawning a real subprocess. Production code MUST NOT call this.
+ */
+export function _buildSandboxEnvForTesting(tmpDir: string): NodeJS.ProcessEnv {
+  return buildSandboxEnv(tmpDir);
+}
+
+function buildSandboxEnv(tmpDir: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of SANDBOX_ALLOW_KEYS) {
+    // Forward empty-string values uniformly with Python/Rust (D11-009).
+    // Treating "" as "unset" diverges from POSIX semantics callers may rely on.
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  for (const [key, val] of Object.entries(process.env)) {
+    if (
+      key.startsWith(SANDBOX_ALLOW_PREFIX) &&
+      !key.startsWith(SANDBOX_DENY_PREFIX) &&
+      !(SANDBOX_DENY_KEYS as readonly string[]).includes(key)
+    ) {
+      env[key] = val;
+    }
+  }
+  env.HOME = tmpDir;
+  env.TMPDIR = tmpDir;
+  return env;
+}

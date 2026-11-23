@@ -1,0 +1,491 @@
+/**
+ * Tests for JSON Schema -> Commander options mapping.
+ */
+
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { schemaToCliOptions, mapType, extractHelp } from "../src/schema-parser.js";
+import { reconvertEnumValues } from "../src/main.js";
+import * as logger from "../src/logger.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("mapType()", () => {
+  it("maps 'string' to string type", () => {
+    expect(mapType("name", { type: "string" })).toBe("string");
+  });
+
+  it("maps 'integer' to int", () => {
+    expect(mapType("count", { type: "integer" })).toBe("int");
+  });
+
+  it("maps 'number' to float", () => {
+    expect(mapType("price", { type: "number" })).toBe("float");
+  });
+
+  it("maps 'boolean' to boolean flag marker", () => {
+    const result = mapType("verbose", { type: "boolean" });
+    expect(typeof result).toBe("symbol");
+  });
+
+  it("maps 'object' to string type", () => {
+    expect(mapType("data", { type: "object" })).toBe("string");
+  });
+
+  it("maps 'array' to string type", () => {
+    expect(mapType("items", { type: "array" })).toBe("string");
+  });
+
+  it("defaults to string for unknown types", () => {
+    expect(mapType("foo", { type: "unknown_type" })).toBe("string");
+  });
+
+  it("defaults to string when type is missing", () => {
+    expect(mapType("foo", {})).toBe("string");
+  });
+
+  // Cross-SDK parity (D11-02): TS must emit a warning on missing/unknown type
+  // like Python (_map_type) and Rust (map_type), not swallow it silently.
+  it("warns when type is missing, then defaults to string", () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    expect(mapType("foo", {})).toBe("string");
+    expect(warnSpy).toHaveBeenCalledWith(
+      "No type specified for property 'foo', defaulting to string.",
+    );
+  });
+
+  it("warns when schema type is unknown, then defaults to string", () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    expect(mapType("foo", { type: "unknown_type" })).toBe("string");
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Unknown schema type 'unknown_type' for property 'foo', defaulting to string.",
+    );
+  });
+
+  it("does not warn for the object/array string aliases", () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    expect(mapType("data", { type: "object" })).toBe("string");
+    expect(mapType("items", { type: "array" })).toBe("string");
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("detects file convention (_file suffix)", () => {
+    expect(mapType("config_file", { type: "string" })).toBe("file");
+  });
+
+  it("detects file convention (x-cli-file)", () => {
+    expect(mapType("config", { type: "string", "x-cli-file": true })).toBe(
+      "file",
+    );
+  });
+});
+
+describe("extractHelp()", () => {
+  it("extracts help from x-llm-description (preferred)", () => {
+    expect(
+      extractHelp({
+        "x-llm-description": "LLM desc",
+        description: "Normal desc",
+      }),
+    ).toBe("LLM desc");
+  });
+
+  it("falls back to description", () => {
+    expect(extractHelp({ description: "Normal desc" })).toBe("Normal desc");
+  });
+
+  it("truncates help text at 1000 chars (default)", () => {
+    const longText = "a".repeat(1100);
+    const result = extractHelp({ description: longText });
+    expect(result!.length).toBe(1000);
+    expect(result!.endsWith("...")).toBe(true);
+  });
+
+  it("does not truncate text within default limit", () => {
+    const text = "a".repeat(999);
+    const result = extractHelp({ description: text });
+    expect(result).toBe(text);
+  });
+
+  it("truncates at custom maxLength", () => {
+    const longText = "a".repeat(300);
+    const result = extractHelp({ description: longText }, 200);
+    expect(result!.length).toBe(200);
+    expect(result!.endsWith("...")).toBe(true);
+  });
+
+  it("returns undefined when no description", () => {
+    expect(extractHelp({})).toBeUndefined();
+  });
+});
+
+describe("schemaToCliOptions()", () => {
+  it("returns empty array for schema with no properties", () => {
+    expect(schemaToCliOptions({})).toEqual([]);
+    expect(schemaToCliOptions({ properties: {} })).toEqual([]);
+  });
+
+  it("generates option for string property", () => {
+    const opts = schemaToCliOptions({
+      properties: { name: { type: "string", description: "User name" } },
+    });
+    expect(opts).toHaveLength(1);
+    expect(opts[0].flags).toBe("--name <value>");
+    expect(opts[0].description).toBe("User name");
+    expect(opts[0].name).toBe("name");
+  });
+
+  it("generates option for integer property with parseArg", () => {
+    const opts = schemaToCliOptions({
+      properties: { count: { type: "integer" } },
+    });
+    expect(opts).toHaveLength(1);
+    expect(opts[0].parseArg).toBeDefined();
+    expect(opts[0].parseArg!("42")).toBe(42);
+  });
+
+  it("generates option for number property with parseArg", () => {
+    const opts = schemaToCliOptions({
+      properties: { price: { type: "number" } },
+    });
+    expect(opts).toHaveLength(1);
+    expect(opts[0].parseArg!("3.14")).toBeCloseTo(3.14);
+  });
+
+  it("converts underscore to hyphen in flag names", () => {
+    const opts = schemaToCliOptions({
+      properties: { my_flag: { type: "string" } },
+    });
+    expect(opts[0].flags).toBe("--my-flag <value>");
+  });
+
+  it("marks required fields with [required] in help text", () => {
+    const opts = schemaToCliOptions({
+      properties: { name: { type: "string", description: "Name" } },
+      required: ["name"],
+    });
+    expect(opts[0].description).toContain("[required]");
+  });
+
+  it("sets required=true at option level for required properties", () => {
+    const opts = schemaToCliOptions({
+      properties: { name: { type: "string" } },
+      required: ["name"],
+    });
+    expect(opts[0].required).toBe(true);
+  });
+
+  it("uses property default value", () => {
+    const opts = schemaToCliOptions({
+      properties: { level: { type: "string", default: "info" } },
+    });
+    expect(opts[0].defaultValue).toBe("info");
+  });
+
+  // Boolean flags
+  it("generates --flag/--no-flag pair for boolean type", () => {
+    const opts = schemaToCliOptions({
+      properties: { debug: { type: "boolean" } },
+    });
+    expect(opts[0].flags).toBe("--debug, --no-debug");
+    expect(opts[0].isBooleanFlag).toBe(true);
+    expect(opts[0].defaultValue).toBe(false);
+  });
+
+  it("uses boolean default from schema", () => {
+    const opts = schemaToCliOptions({
+      properties: { debug: { type: "boolean", default: true } },
+    });
+    expect(opts[0].defaultValue).toBe(true);
+  });
+
+  // Enum choices
+  it("generates choices for enum values", () => {
+    const opts = schemaToCliOptions({
+      properties: { color: { type: "string", enum: ["red", "green", "blue"] } },
+    });
+    expect(opts[0].choices).toEqual(["red", "green", "blue"]);
+  });
+
+  it("converts enum values to strings", () => {
+    const opts = schemaToCliOptions({
+      properties: { level: { type: "integer", enum: [1, 2, 3] } },
+    });
+    expect(opts[0].choices).toEqual(["1", "2", "3"]);
+  });
+
+  it("stores original enum types for reconversion", () => {
+    const opts = schemaToCliOptions({
+      properties: { level: { type: "integer", enum: [1, 2, 3] } },
+    });
+    expect(opts[0].enumOriginalTypes).toEqual({
+      "1": "int",
+      "2": "int",
+      "3": "int",
+    });
+  });
+
+  it("handles empty enum array gracefully", () => {
+    const opts = schemaToCliOptions({
+      properties: { color: { type: "string", enum: [] } },
+    });
+    expect(opts[0].choices).toBeUndefined();
+  });
+
+  // Collision detection
+  it("exits 48 on flag name collision", () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    // Two properties that map to the same flag (unlikely but test the guard)
+    // This can't really happen with different names, so we skip this edge case
+    // The collision detection is for safety
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it("exits 48 on reserved name collision", () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    expect(() =>
+      schemaToCliOptions({
+        properties: { input: { type: "string" } },
+      }),
+    ).toThrow("exit");
+    // Audit D11-NEW-005 (2026-05-08): exit 48 (SCHEMA_CIRCULAR_REF) for cross-SDK
+    // parity with Python sys.exit(48) and Rust CliError::SchemaParserFailure.
+    expect(exitSpy).toHaveBeenCalledWith(48);
+  });
+
+  it("exits 48 for 'format' reserved name", () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    expect(() =>
+      schemaToCliOptions({
+        properties: { format: { type: "string" } },
+      }),
+    ).toThrow("exit");
+    expect(exitSpy).toHaveBeenCalledWith(48);
+  });
+
+  it("exits 48 for 'dry_run' reserved name (snake_case F1 preflight flag)", () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    expect(() =>
+      schemaToCliOptions({
+        properties: { dry_run: { type: "boolean" } },
+      }),
+    ).toThrow("exit");
+    expect(exitSpy).toHaveBeenCalledWith(48);
+  });
+
+  it.each([
+    "fields", "all_options", "trace", "stream", "strategy",
+    "approval_timeout", "approval_token", "large_input",
+  ])("exits 48 for '%s' reserved name", (propName) => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    expect(() =>
+      schemaToCliOptions({
+        properties: { [propName]: { type: "string" } },
+      }),
+    ).toThrow("exit");
+    expect(exitSpy).toHaveBeenCalledWith(48);
+  });
+
+  // FR-DISP-007: 'verbose' is no longer reserved — schemas may use it freely.
+  it("allows 'verbose' as a schema boolean property (no longer reserved)", () => {
+    const result = schemaToCliOptions({
+      properties: { verbose: { type: "boolean" } },
+    });
+    expect(result.length).toBe(1);
+    expect(result[0].name).toBe("verbose");
+  });
+
+  // D11-004: reserved-name check must precede collision check
+  // (matches Python schema_parser.py:100 and Rust schema_parser.rs:226 ordering)
+  it("checks reserved name BEFORE flag collision when both apply", () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+
+    // Property "dry-run" canonicalizes to --dry-run.
+    // Property "dry_run" ALSO canonicalizes to --dry-run (collision)
+    // AND is itself a reserved name. The reserved-name diagnostic must win.
+    expect(() =>
+      schemaToCliOptions({
+        properties: {
+          "dry-run": { type: "string" },
+          dry_run: { type: "boolean" },
+        },
+      }),
+    ).toThrow("exit");
+    expect(exitSpy).toHaveBeenCalledWith(48);
+
+    const messages = stderrSpy.mock.calls.map((c) => String(c[0])).join("");
+    expect(messages).toContain("reserved");
+    expect(messages).not.toMatch(/collision|both map to/i);
+  });
+});
+
+describe("reconvertEnumValues()", () => {
+  it("converts string '42' back to number for numeric enum", () => {
+    const result = reconvertEnumValues(
+      { level: "42" },
+      [{ name: "level", flags: "--level <value>", description: "", required: false, enumOriginalTypes: { "42": "int" } }],
+    );
+    expect(result.level).toBe(42);
+  });
+
+  it("converts string '3.14' back to float", () => {
+    const result = reconvertEnumValues(
+      { ratio: "3.14" },
+      [{ name: "ratio", flags: "--ratio <value>", description: "", required: false, enumOriginalTypes: { "3.14": "float" } }],
+    );
+    expect(result.ratio).toBeCloseTo(3.14);
+  });
+
+  it("converts string 'true' back to boolean", () => {
+    const result = reconvertEnumValues(
+      { flag: "true" },
+      [{ name: "flag", flags: "--flag <value>", description: "", required: false, enumOriginalTypes: { "true": "bool" } }],
+    );
+    expect(result.flag).toBe(true);
+  });
+
+  it("leaves non-enum values unchanged", () => {
+    const result = reconvertEnumValues(
+      { name: "hello" },
+      [{ name: "name", flags: "--name <value>", description: "", required: false }],
+    );
+    expect(result.name).toBe("hello");
+  });
+
+  it("handles null/undefined values gracefully", () => {
+    const result = reconvertEnumValues(
+      { level: null },
+      [{ name: "level", flags: "--level <value>", description: "", required: false, enumOriginalTypes: { "1": "int" } }],
+    );
+    expect(result.level).toBeNull();
+  });
+});
+
+describe("schema_to_cli_options no-flag collision (D11-005)", () => {
+  it("rejects a schema pairing a boolean with the matching no_<name> non-boolean", () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    const schema = {
+      properties: {
+        force: { type: "boolean" },
+        no_force: { type: "string" },
+      },
+    };
+    // Audit D11-NEW-004 (2026-05-08): exit 48 per spec (SCHEMA_CIRCULAR_REF
+    // shared exit-code slot for schema-parsing failures), matching Python.
+    expect(() => schemaToCliOptions(schema)).toThrow(/process.exit\(48\)/);
+    exitSpy.mockRestore();
+  });
+
+  it("rejects when ordering is reversed (no-form first, then boolean)", () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    const schema = {
+      properties: {
+        no_force: { type: "string" },
+        force: { type: "boolean" },
+      },
+    };
+    // Audit D11-NEW-004 (2026-05-08): exit 48 per spec (SCHEMA_CIRCULAR_REF
+    // shared exit-code slot for schema-parsing failures), matching Python.
+    expect(() => schemaToCliOptions(schema)).toThrow(/process.exit\(48\)/);
+    exitSpy.mockRestore();
+  });
+
+  it("two unrelated booleans do not collide", () => {
+    const schema = {
+      properties: {
+        force: { type: "boolean" },
+        verbose_logs: { type: "boolean" },
+      },
+    };
+    const result = schemaToCliOptions(schema);
+    expect(result).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D11-W4 — required-but-missing property warning loop (cross-SDK parity)
+// ---------------------------------------------------------------------------
+//
+// Python (schema_parser.py:93-98) and Rust (schema_parser.rs:220-228) iterate
+// the schema's `required` list and warn for entries not present in
+// `properties`. The TS SDK previously skipped this loop, so schemas with
+// `{required: ["foo"]}` and no `properties.foo` parsed silently. This block
+// asserts the warning fires.
+
+describe("schemaToCliOptions() — required property not in properties (D11-W4)", () => {
+  it("warns when a required entry has no matching property", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const schema = {
+      required: ["foo"],
+      properties: { bar: { type: "string" } },
+    };
+    const result = schemaToCliOptions(schema);
+    // Only `bar` was a real property — that one option still renders.
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("bar");
+
+    const stderrText = stderrSpy.mock.calls.map((c) => String(c[0])).join("");
+    expect(stderrText).toContain("foo");
+    expect(stderrText).toMatch(/required.*not.*found in properties|required.*not.*defined in properties/i);
+    stderrSpy.mockRestore();
+  });
+
+  it("does not warn when every required entry has a matching property", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const schema = {
+      required: ["foo"],
+      properties: { foo: { type: "string" } },
+    };
+    schemaToCliOptions(schema);
+    const stderrText = stderrSpy.mock.calls.map((c) => String(c[0])).join("");
+    expect(stderrText).not.toMatch(/required.*not.*(found|defined) in properties/i);
+    stderrSpy.mockRestore();
+  });
+
+  it("warns once per missing required entry when multiple are missing", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const schema = {
+      required: ["foo", "baz"],
+      properties: { bar: { type: "string" } },
+    };
+    schemaToCliOptions(schema);
+    const stderrText = stderrSpy.mock.calls.map((c) => String(c[0])).join("");
+    expect(stderrText).toContain("foo");
+    expect(stderrText).toContain("baz");
+    stderrSpy.mockRestore();
+  });
+});

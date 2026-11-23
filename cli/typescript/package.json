@@ -1,0 +1,75 @@
+{
+  "name": "apcore-cli",
+  "version": "0.14.1",
+  "description": "CLI wrapper for the apcore core SDK — exposes apcore modules as CLI commands",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "apcore-cli": "./dist/bin/apcore-cli.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:cov": "vitest run --coverage",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "lint": "tsc --noEmit && tsc -p tsconfig.typecheck.json && eslint src tests --ext .ts",
+    "clean": "rm -rf dist",
+    "run-examples": "npx tsx examples/run-examples.ts"
+  },
+  "keywords": [
+    "apcore",
+    "cli",
+    "ai",
+    "modules"
+  ],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "peerDependencies": {
+    "apcore-js": ">=0.33.0",
+    "apcore-toolkit": ">=0.15.0"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0",
+    "commander": "^12.0.0",
+    "js-yaml": "^4.3.2"
+  },
+  "optionalDependencies": {
+    "keytar": "^7.9.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.0",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.0",
+    "@typescript-eslint/parser": "^8.59.0",
+    "@vitest/coverage-v8": "^5.1.0",
+    "apcore-js": "^0.32.3 || ^0.33.0",
+    "apcore-toolkit": ">=0.15.0",
+    "apdev-js": "^0.2.4",
+    "eslint": "^10.2.1",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^5.1.0"
+  },
+  "apdev": {
+    "base_package": "apcore-cli"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aiperceivable/apcore-cli-typescript.git"
+  },
+  "homepage": "https://github.com/aiperceivable",
+  "bugs": {
+    "url": "https://github.com/aiperceivable/apcore-cli-typescript/issues"
+  }
+}

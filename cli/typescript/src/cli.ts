@@ -1,0 +1,636 @@
+/**
+ * LazyModuleGroup — Dynamic command loading from Registry.
+ *
+ * Equivalent to the Python LazyModuleGroup. Dynamically discovers apcore
+ * modules from the Registry and exposes them as Commander subcommands.
+ *
+ * Protocol spec: CLI command structure & lazy loading
+ */
+
+import { Command } from "commander";
+import { exitWith } from "./exit.js";
+import { buildModuleCommand } from "./main.js";
+import { getDisplay } from "./display-helpers.js";
+import { ExposureFilter } from "./exposure.js";
+import { warn } from "./logger.js";
+import { getReservedGroupNames } from "./builtin-group.js";
+import { EXIT_CODES } from "./errors.js";
+
+// v0.10.0 alignment (2026-05-18, resolves "D9-W2 Known gap"): the CLI's
+// Registry, Executor, and ModuleDescriptor shim interfaces now match
+// apcore-js >= 0.22.0 — Registry.list() / Registry.getDefinition(),
+// Executor.call(), and ModuleDescriptor.moduleId. Embedders may pass
+// apcore-js `Registry` / `Executor` instances (and the descriptors they
+// return) directly to createCli — no adapter is needed. CLI JSON output
+// continues to emit the field as `id` for backward compatibility with
+// downstream scripts; see the moduleId → id mapping in `output.ts`.
+
+// ---------------------------------------------------------------------------
+// CLI-internal type shims (paired with apcore-js shape divergence — see above).
+// These are structural subsets of the apcore-js types: real apcore-js Registry /
+// Executor instances and the descriptors they return satisfy them as-is.
+// ---------------------------------------------------------------------------
+
+/**
+ * CLI-internal Registry shim. Method names align with apcore-js >= 0.22.0
+ * (Registry.list() / Registry.getDefinition()). Embedders may pass an
+ * apcore-js `Registry` instance directly — no adapter required.
+ *
+ * The required surface is intentionally the apcore-js surface (no batch
+ * `listModules()`); use the {@link listAllDefinitions} helper to iterate
+ * all descriptors.
+ */
+export interface Registry {
+  /** Enumerate module IDs. Aligned with apcore-js Registry.list(). */
+  list(): string[];
+  /** Resolve a module descriptor by ID. Aligned with apcore-js Registry.getDefinition(). */
+  getDefinition(moduleId: string): ModuleDescriptor | null;
+}
+
+/**
+ * Iterate all descriptors via `list() + getDefinition()` — the apcore-js
+ * pattern. Used by CLI command builders that need full descriptor metadata
+ * for every registered module. Skips IDs whose getDefinition() returns null
+ * (a module unregistered between list() and getDefinition() is dropped).
+ */
+export function listAllDefinitions(registry: Registry): ModuleDescriptor[] {
+  const defs: ModuleDescriptor[] = [];
+  for (const id of registry.list()) {
+    const def = registry.getDefinition(id);
+    if (def) defs.push(def);
+  }
+  return defs;
+}
+
+/** Strategy info returned by Executor.describePipeline(). */
+export interface StrategyInfo {
+  name: string;
+  stepCount: number;
+  stepNames: string[];
+  description: string;
+}
+
+/** A step in the executor strategy (shape parity with apcore-js Step). */
+export interface StrategyStep {
+  name: string;
+  pure?: boolean;
+  removable: boolean;
+  timeoutMs?: number;
+}
+
+/**
+ * What is actually gating an executor's registry (PROTOCOL_SPEC §6.6.5).
+ *
+ * Shape parity with apcore-js `GovernanceState`. `aclConfigured` alone is NOT
+ * the answer to "what is gating this registry": the ACL and approval gates are
+ * pipeline *steps*, and the `internal`, `testing` and `minimal` strategies
+ * remove them — so an executor can hold an ACL that no step ever consults.
+ * Rendered by `apcli acl status` (FE-14 §4.7).
+ */
+export interface GovernanceState {
+  controlModulesRegistered: boolean;
+  readModulesRegistered: boolean;
+  aclConfigured: boolean;
+  builtinAclGateWired: boolean;
+  approvalHandlerConfigured: boolean;
+  builtinApprovalGateWired: boolean;
+  policyStrict: boolean;
+  allControlModulesRequireApproval: boolean;
+  /** Derived: control modules registered and no recognised built-in gate engages. */
+  unprotectedControlSurface: boolean;
+}
+
+/**
+ * CLI-internal Executor shim. Method names align with apcore-js >= 0.22.0
+ * (Executor.call as the primary invocation method). Embedders may pass
+ * an apcore-js `Executor` instance directly — no adapter required.
+ */
+export interface Executor {
+  /**
+   * Invoke a module. Aligned with apcore-js Executor.call().
+   *
+   * The optional third argument is the apcore `Context`, which the CLI
+   * supplies only when the FE-14 identity flags asserted one. It is typed
+   * `unknown` here because `cli.ts` deliberately carries no apcore-js import.
+   */
+  call(moduleId: string, input: Record<string, unknown>, context?: unknown): Promise<unknown>;
+  /**
+   * The executor's registry. Aligned with apcore-js `Executor.registry`.
+   * Used for synchronous availability probes (e.g. system-module gating)
+   * since `validate` is async and cannot be awaited during sync registration.
+   */
+  registry?: Registry;
+  /** Validate inputs without executing. Returns a PreflightResult. */
+  validate?(moduleId: string, input: Record<string, unknown>, context?: unknown): Promise<PreflightResult>;
+  /** Execute with pipeline trace. Returns [result, PipelineTrace]. */
+  callWithTrace?(moduleId: string, input: Record<string, unknown>, options?: { strategy?: string }): Promise<[unknown, PipelineTrace]>;
+  /** Stream execution — async iterator of chunks. */
+  stream?(moduleId: string, input: Record<string, unknown>): AsyncIterable<unknown>;
+  /**
+   * Describe the executor's currently-set strategy. Returns StrategyInfo
+   * (apcore-js >= 0.18.0). Takes no arguments — to introspect a different
+   * strategy, use `Executor.listStrategies()` (static) via `executor.constructor`.
+   */
+  describePipeline?(): StrategyInfo;
+  /** The current execution strategy object, exposing step metadata. */
+  currentStrategy?: { readonly steps: readonly StrategyStep[] };
+  /**
+   * Attach an access-control provider (FE-14 §4.2). Aligned with apcore-js
+   * `Executor.setAcl` — updates both the executor field and the strategy's
+   * ACL step. Typed `unknown` because `cli.ts` carries no apcore-js import.
+   */
+  setAcl?(acl: unknown): void;
+  /**
+   * Report what is actually gating this registry (apcore-js >= 0.29.0).
+   * A pure read — it never enforces, warns, throws or mutates.
+   */
+  governanceState?(): GovernanceState;
+}
+
+/** Result of a preflight validation check. */
+export interface PreflightCheck {
+  readonly check: string;
+  readonly passed: boolean;
+  readonly error?: unknown;
+  readonly warnings?: string[];
+}
+
+/** Result of executor.validate() — parity with apcore-js PreflightResult. */
+export interface PreflightResult {
+  readonly valid: boolean;
+  readonly requiresApproval: boolean;
+  readonly checks: readonly PreflightCheck[];
+  readonly errors?: ReadonlyArray<Record<string, unknown>>;
+}
+
+/** A single step in a pipeline trace — parity with apcore-js StepTrace. */
+export interface PipelineTraceStep {
+  readonly name: string;
+  readonly durationMs: number;
+  readonly skipped: boolean;
+  readonly skipReason?: string | null;
+}
+
+/** Pipeline execution trace returned by callWithTrace() — parity with apcore-js PipelineTrace. */
+export interface PipelineTrace {
+  readonly moduleId?: string;
+  readonly strategyName: string;
+  readonly totalDurationMs: number;
+  readonly success: boolean;
+  readonly steps: readonly PipelineTraceStep[];
+}
+
+/**
+ * CLI-internal ModuleDescriptor shim. Field names align with apcore-js
+ * >= 0.22.0 — embedders may pass apcore-js descriptors directly without
+ * field-level remapping. The interface is intentionally a structural
+ * subset of apcore-js's `ModuleDescriptor`: only fields actually consumed
+ * by the CLI are listed. apcore-js descriptors satisfy this shape
+ * trivially because every CLI-required field is also required there with
+ * the same name and a compatible type.
+ *
+ * Note: CLI JSON output (e.g. `apcli list --format json`) still emits the
+ * field as `id` for backward compatibility with downstream scripts —
+ * see `output.ts` for the moduleId → id mapping at the output boundary.
+ */
+export interface ModuleDescriptor {
+  /** Module ID (`a.b.c` form). Aligned with apcore-js `ModuleDescriptor.moduleId`. */
+  moduleId: string;
+  /** Human-readable name. `null` when unset (matches apcore-js). */
+  name: string | null;
+  description: string;
+  tags?: string[];
+  inputSchema?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  requiresApproval?: boolean;
+  /**
+   * Annotation bag. Typed `object | null` rather than
+   * `Record<string, unknown>` on purpose: apcore-js declares
+   * `annotations: ModuleAnnotations | null`, and `ModuleAnnotations` is a
+   * named *interface*, which never gets an implicit index signature. A
+   * `Record<string, unknown>` here would therefore reject every real
+   * apcore-js descriptor (and thus every real apcore-js Registry). The CLI
+   * only ever reads annotations through the `getAnnotation()` helper, which
+   * takes `unknown`, so the bag stays opaque at this boundary.
+   */
+  annotations?: object | null;
+  metadata?: Record<string, unknown>;
+}
+
+// FE-13 (builtin-group) replaced the per-command collision constant with a
+// live Commander tree walk (root + apcli subgroup). The reserved top-level
+// group name is `apcli` (see RESERVED_GROUP_NAMES in ./builtin-group.ts);
+// individual subcommand names are no longer a global namespace since they
+// live under the apcli/ prefix.
+
+/**
+ * Hard-fail with exit 2 when a module resolves to a reserved CLI name.
+ * FE-13 §4.10 enumerates three cases: explicit group, auto-group prefix,
+ * and top-level alias/id. Error messages identify both the module id and
+ * the offending name for debuggability.
+ */
+function assertNotReserved(
+  kind: "group" | "auto-group" | "top-level",
+  name: string,
+  moduleId: string,
+): void {
+  if (!getReservedGroupNames().has(name)) return;
+  let msg: string;
+  if (kind === "group") {
+    msg =
+      `Error: Module '${moduleId}': display.cli.group '${name}' is reserved. ` +
+      `Use a different CLI alias or set display.cli.group to another value.\n`;
+  } else if (kind === "auto-group") {
+    msg =
+      `Error: Module '${moduleId}': auto-group '${name}' is reserved. ` +
+      `Rename the module id or set display.cli.group to another value.\n`;
+  } else {
+    msg =
+      `Error: Module '${moduleId}': top-level CLI name '${name}' is reserved. ` +
+      `Use a different CLI alias.\n`;
+  }
+  process.stderr.write(msg);
+  exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+}
+
+// ---------------------------------------------------------------------------
+// LazyModuleGroup
+// ---------------------------------------------------------------------------
+
+/**
+ * Dynamically loads apcore modules as Commander subcommands from Registry.
+ */
+export class LazyModuleGroup {
+  protected readonly registry: Registry;
+  readonly executor: Executor;
+  protected readonly helpTextMaxLength: number;
+  protected commandCache: Map<string, Command> = new Map();
+  /** alias -> canonical module_id (populated lazily) */
+  protected aliasMap: Map<string, string> = new Map();
+  /** module_id -> descriptor cache (populated during alias map build) */
+  protected descriptorCache: Map<string, ModuleDescriptor> = new Map();
+  protected aliasMapBuilt = false;
+
+  constructor(registry: Registry, executor: Executor, helpTextMaxLength = 1000) {
+    this.registry = registry;
+    this.executor = executor;
+    this.helpTextMaxLength = helpTextMaxLength;
+  }
+
+  /**
+   * Build alias->module_id map from display overlay metadata.
+   */
+  buildAliasMap(): void {
+    if (this.aliasMapBuilt) {
+      return;
+    }
+    try {
+      for (const descriptor of listAllDefinitions(this.registry)) {
+        const moduleId = descriptor.moduleId;
+        this.descriptorCache.set(moduleId, descriptor);
+        const display = getDisplay(descriptor);
+        const cliDisplay = (display.cli && typeof display.cli === "object" && !Array.isArray(display.cli))
+          ? (display.cli as Record<string, unknown>)
+          : {};
+        const cliAlias = cliDisplay.alias as string | undefined;
+        if (cliAlias && cliAlias !== moduleId) {
+          this.aliasMap.set(cliAlias, moduleId);
+        }
+      }
+      this.aliasMapBuilt = true;
+    } catch {
+      warn("Failed to build alias map from registry");
+    }
+  }
+
+  /**
+   * List all available command names from the Registry.
+   */
+  listCommands(): string[] {
+    this.buildAliasMap();
+    // Reverse map: module_id -> cli alias (if any)
+    const reverse = new Map<string, string>();
+    for (const [alias, moduleId] of this.aliasMap) {
+      reverse.set(moduleId, alias);
+    }
+    const moduleIds = listAllDefinitions(this.registry).map((m) => m.moduleId);
+    const names = moduleIds.map((mid) => reverse.get(mid) ?? mid);
+    return [...new Set(names)].sort();
+  }
+
+  /**
+   * Get or lazily build a Commander Command for the given module.
+   */
+  getCommand(cmdName: string): Command | null {
+    if (this.commandCache.has(cmdName)) {
+      return this.commandCache.get(cmdName)!;
+    }
+
+    // Resolve alias -> canonical module_id
+    this.buildAliasMap();
+    const moduleId = this.aliasMap.get(cmdName) ?? cmdName;
+
+    // Look up in descriptor cache or registry
+    let moduleDef = this.descriptorCache.get(moduleId);
+    if (!moduleDef) {
+      moduleDef = this.registry.getDefinition(moduleId) ?? undefined;
+    }
+    if (!moduleDef) {
+      return null;
+    }
+
+    const cmd = buildModuleCommand(moduleDef, this.executor, this.helpTextMaxLength, cmdName);
+    this.commandCache.set(cmdName, cmd);
+    return cmd;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LazyGroup — A Commander Command group for a single namespace
+// ---------------------------------------------------------------------------
+
+/**
+ * Command group for a single namespace — lazily builds subcommands.
+ */
+export class LazyGroup {
+  private readonly members: Map<string, [string, ModuleDescriptor]>;
+  private readonly _executor: Executor;
+  private readonly _helpTextMaxLength: number;
+  private readonly _cmdCache: Map<string, Command> = new Map();
+  readonly command: Command;
+
+  constructor(
+    members: Map<string, [string, ModuleDescriptor]>,
+    executor: Executor,
+    name: string,
+    helpTextMaxLength = 1000,
+  ) {
+    this.members = members;
+    this._executor = executor;
+    this._helpTextMaxLength = helpTextMaxLength;
+    this.command = new Command(name).description(`${name} commands`);
+
+    // Build and register all subcommands
+    for (const [cmdName, [, descriptor]] of this.members) {
+      const cmd = buildModuleCommand(
+        descriptor,
+        this._executor,
+        this._helpTextMaxLength,
+        cmdName,
+      );
+      this._cmdCache.set(cmdName, cmd);
+      this.command.addCommand(cmd);
+    }
+  }
+
+  listCommands(): string[] {
+    return [...this.members.keys()].sort();
+  }
+
+  getCommand(cmdName: string): Command | null {
+    if (this._cmdCache.has(cmdName)) {
+      return this._cmdCache.get(cmdName)!;
+    }
+    const entry = this.members.get(cmdName);
+    if (!entry) {
+      return null;
+    }
+    const [, descriptor] = entry;
+    const cmd = buildModuleCommand(
+      descriptor,
+      this._executor,
+      this._helpTextMaxLength,
+      cmdName,
+    );
+    this._cmdCache.set(cmdName, cmd);
+    return cmd;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GroupedModuleGroup
+// ---------------------------------------------------------------------------
+
+/**
+ * Extended LazyModuleGroup that organises modules into named groups.
+ *
+ * Modules with dotted IDs (e.g., "math.add") are automatically grouped
+ * by their namespace prefix. The display overlay can override grouping
+ * via metadata.display.cli.group.
+ */
+export class GroupedModuleGroup extends LazyModuleGroup {
+  /** groupName -> { cmdName -> [moduleId, descriptor] } */
+  private groupMap: Map<string, Map<string, [string, ModuleDescriptor]>> = new Map();
+  /** cmdName -> [moduleId, descriptor] for top-level (ungrouped) modules */
+  private topLevelModules: Map<string, [string, ModuleDescriptor]> = new Map();
+  /** Cached LazyGroup instances */
+  private groupCache: Map<string, LazyGroup> = new Map();
+  private groupMapBuilt = false;
+  /** Exposure filter (FE-12) — controls which modules appear as CLI commands */
+  exposureFilter: ExposureFilter;
+  /** Effective group depth (CLAUDE.md v0.6.0): constructor arg > APCORE_CLI_GROUP_DEPTH env > 1. */
+  readonly groupDepth: number;
+
+  constructor(
+    registry: Registry,
+    executor: Executor,
+    helpTextMaxLength = 1000,
+    exposureFilter?: ExposureFilter,
+    groupDepth?: number,
+  ) {
+    super(registry, executor, helpTextMaxLength);
+    this.exposureFilter = exposureFilter ?? new ExposureFilter();
+    this.groupDepth = GroupedModuleGroup.resolveGroupDepth(groupDepth);
+  }
+
+  /**
+   * Resolve group depth from constructor arg > APCORE_CLI_GROUP_DEPTH env > default 1.
+   * Invalid env values (non-integer, non-positive) fall through to the default.
+   */
+  static resolveGroupDepth(explicit: number | undefined): number {
+    if (explicit !== undefined && Number.isFinite(explicit) && explicit > 0) {
+      return Math.floor(explicit);
+    }
+    const raw = process.env.APCORE_CLI_GROUP_DEPTH;
+    if (raw !== undefined && raw !== "") {
+      const parsed = parseInt(raw, 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+    return 1;
+  }
+
+  /**
+   * Determine (groupName | null, commandName) for a module from its display overlay.
+   *
+   * @param groupDepth  Number of dotted segments to consume as the group prefix.
+   *                    Defaults to 1 (e.g., "math.add" → group="math", cmd="add").
+   *                    Set to 2 for multi-level grouping (e.g., "math.trig.sin" →
+   *                    group="math.trig", cmd="sin").
+   */
+  static resolveGroup(moduleId: string, descriptor: ModuleDescriptor, groupDepth = 1): [string | null, string] {
+    if (!moduleId) {
+      warn("Empty module_id encountered in resolveGroup");
+      return [null, ""];
+    }
+
+    const display = getDisplay(descriptor);
+    const cliDisplay = (display.cli && typeof display.cli === "object" && !Array.isArray(display.cli))
+      ? (display.cli as Record<string, unknown>)
+      : {};
+    const explicitGroup = cliDisplay.group;
+
+    // Explicit non-empty string group
+    if (typeof explicitGroup === "string" && explicitGroup !== "") {
+      return [explicitGroup, (cliDisplay.alias as string | undefined) ?? moduleId];
+    }
+    // Explicit empty string = opt-out (top-level)
+    if (explicitGroup === "") {
+      return [null, (cliDisplay.alias as string | undefined) ?? moduleId];
+    }
+
+    // Auto-extraction from alias or module_id with configurable depth
+    const cliName = (cliDisplay.alias as string | undefined) ?? moduleId;
+    if (cliName.includes(".")) {
+      const parts = cliName.split(".");
+      const depth = Math.max(1, Math.min(groupDepth, parts.length - 1));
+      const group = parts.slice(0, depth).join(".");
+      const cmd = parts.slice(depth).join(".");
+      return [group, cmd];
+    }
+    return [null, cliName];
+  }
+
+  /**
+   * Build the group map from registry modules.
+   *
+   * FE-13: hard-fails with exit 2 when a module resolves to the reserved
+   * `apcli` namespace in any of three ways — explicit `display.cli.group`,
+   * auto-grouped dotted prefix, or top-level alias/id. See spec §4.10.
+   */
+  buildGroupMap(): void {
+    if (this.groupMapBuilt) {
+      return;
+    }
+    this.buildAliasMap();
+    for (const descriptor of listAllDefinitions(this.registry)) {
+      const moduleId = descriptor.moduleId;
+      const cached = this.descriptorCache.get(moduleId);
+      if (!cached) {
+        continue;
+      }
+      if (!this.exposureFilter.isExposed(moduleId)) {
+        continue;
+      }
+
+      // Detect reserved-name collisions BEFORE routing — spec §4.10 three
+      // cases: explicit group, auto-group prefix, top-level name.
+      const display = getDisplay(cached);
+      const cliDisplay = (display.cli && typeof display.cli === "object" && !Array.isArray(display.cli))
+        ? (display.cli as Record<string, unknown>)
+        : {};
+      const explicitGroup = typeof cliDisplay.group === "string" && cliDisplay.group !== ""
+        ? (cliDisplay.group as string)
+        : undefined;
+      if (explicitGroup !== undefined) {
+        assertNotReserved("group", explicitGroup, moduleId);
+      }
+
+      const [group, cmd] = GroupedModuleGroup.resolveGroup(moduleId, cached, this.groupDepth);
+      if (group !== null && explicitGroup === undefined) {
+        // Auto-grouped (e.g. `apcli.foo` → group=`apcli`).
+        assertNotReserved("auto-group", group, moduleId);
+      }
+      if (group === null) {
+        assertNotReserved("top-level", cmd, moduleId);
+        this.topLevelModules.set(cmd, [moduleId, cached]);
+      } else if (!/^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)*$/.test(group)) {
+        warn(
+          `Module '${moduleId}': group name '${group}' is not shell-safe — treating as top-level.`,
+        );
+        this.topLevelModules.set(cmd, [moduleId, cached]);
+      } else {
+        if (!this.groupMap.has(group)) {
+          this.groupMap.set(group, new Map());
+        }
+        this.groupMap.get(group)!.set(cmd, [moduleId, cached]);
+      }
+    }
+    this.groupMapBuilt = true;
+  }
+
+  /**
+   * List all available command names: group names + top-level module names.
+   *
+   * FE-13: the built-in subcommand list is no longer folded in here — those
+   * commands live under the `apcli` prefix and are registered directly by
+   * `createCli`.
+   */
+  override listCommands(): string[] {
+    this.buildGroupMap();
+    const reserved = getReservedGroupNames();
+    const groupNames = [...this.groupMap.keys()].filter(
+      (g) => !reserved.has(g),
+    );
+    const topNames = [...this.topLevelModules.keys()];
+    return [...new Set([...groupNames, ...topNames])].sort();
+  }
+
+  /**
+   * Get a command by name: check builtins -> group cache -> group map -> top-level modules.
+   */
+  override getCommand(cmdName: string): Command | null {
+    this.buildGroupMap();
+
+    // Check group cache
+    if (this.groupCache.has(cmdName)) {
+      return this.groupCache.get(cmdName)!.command;
+    }
+
+    // Check if it's a group
+    if (this.groupMap.has(cmdName)) {
+      const lazyGrp = new LazyGroup(
+        this.groupMap.get(cmdName)!,
+        this.executor,
+        cmdName,
+        this.helpTextMaxLength,
+      );
+      this.groupCache.set(cmdName, lazyGrp);
+      return lazyGrp.command;
+    }
+
+    // Check top-level modules
+    if (this.topLevelModules.has(cmdName)) {
+      if (this.commandCache.has(cmdName)) {
+        return this.commandCache.get(cmdName)!;
+      }
+      const [, descriptor] = this.topLevelModules.get(cmdName)!;
+      const cmd = buildModuleCommand(
+        descriptor,
+        this.executor,
+        this.helpTextMaxLength,
+        cmdName,
+      );
+      this.commandCache.set(cmdName, cmd);
+      return cmd;
+    }
+
+    return null;
+  }
+
+  /** Expose groupMap for testing. */
+  getGroupMap(): Map<string, Map<string, [string, ModuleDescriptor]>> {
+    return this.groupMap;
+  }
+
+  /** Expose topLevelModules for testing. */
+  getTopLevelModules(): Map<string, [string, ModuleDescriptor]> {
+    return this.topLevelModules;
+  }
+
+  /** Expose groupMapBuilt for testing. */
+  isGroupMapBuilt(): boolean {
+    return this.groupMapBuilt;
+  }
+}

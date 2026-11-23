@@ -1,0 +1,429 @@
+/**
+ * System management commands — health, usage, enable, disable, reload, config (FE-11 F2).
+ *
+ * Each registrar delegates to the corresponding system.* module via the
+ * executor. The six registrars are pure attach-only operations and are
+ * dispatched by `createCli()`'s FE-13 apcli group integration.
+ */
+
+import { Command } from "commander";
+import { Config } from "apcore-js";
+import { checkApproval } from "./approval.js";
+import type { Executor, ModuleDescriptor } from "./cli.js";
+import { exitCodeForError } from "./errors.js";
+import { exitWith } from "./exit.js";
+import { formatExecResult, resolveFormat } from "./output.js";
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Call a system module. After 0.10.0 the `Executor.call` method is the
+ * single required invocation surface (aligned with apcore-js >= 0.22.0);
+ * this helper is retained so call sites can switch invocation strategies
+ * (sandboxed vs direct) without each site repeating the call.
+ */
+async function callSystemModule(
+  executor: Executor,
+  moduleId: string,
+  inputs: Record<string, unknown>,
+): Promise<unknown> {
+  return executor.call(moduleId, inputs);
+}
+
+/**
+ * Emit a result as JSON when in non-TTY or when the caller requested
+ * JSON format, otherwise invoke the TTY render callback. The callback
+ * closes over the caller's local state (moduleId, opts.reason, etc.) so
+ * each registrar can render its own TTY shape without threading those
+ * values through this helper.
+ */
+function emitResult(
+  jsonPayload: unknown,
+  fmt: string,
+  ttyRender: () => void,
+): void {
+  if (fmt === "json" || !process.stdout.isTTY) {
+    process.stdout.write(JSON.stringify(jsonPayload, null, 2) + "\n");
+  } else {
+    ttyRender();
+  }
+}
+
+// Exit code mapped from the error's class / apcore `.code` via exitCodeForError
+// so scripted callers can distinguish ACL_DENIED (77) from MODULE_NOT_FOUND (44)
+// from generic MODULE_EXECUTE_ERROR (1).
+function emitErrorAndExit(e: unknown): never {
+  process.stderr.write(`Error: ${e instanceof Error ? e.message : e}\n`);
+  exitWith(exitCodeForError(e));
+}
+
+/**
+ * Run the client-side approval gate for a mutating system command.
+ *
+ * Mirrors Python ``_check_system_approval`` (system_cmd.py:36) and Rust
+ * ``require_approval_for_system_command`` (system_cmd.rs:294). Audit
+ * D11-B-001 (2026-05-08): the prior version of this file exposed `--yes`
+ * but never called ``checkApproval``, leaving the operator-confirmation
+ * contract (FR-SYSCMD-013) entirely dependent on server-side enforcement.
+ *
+ * Synthesises a minimal ``ModuleDescriptor`` with
+ * ``annotations.requires_approval = true`` so ``checkApproval`` runs the
+ * same TTY-prompt / non-TTY-deny / env-var-bypass logic used by the main
+ * exec dispatcher. ``ApprovalDeniedError`` / ``ApprovalTimeoutError``
+ * propagate to ``emitErrorAndExit`` which maps them to exit 46 via
+ * ``exitCodeForError``.
+ */
+async function requireApprovalForSystemCommand(
+  moduleId: string,
+  autoApprove: boolean,
+): Promise<void> {
+  const syntheticModuleDef: ModuleDescriptor = {
+    moduleId,
+    name: moduleId,
+    description: `system command: ${moduleId}`,
+    annotations: { requires_approval: true },
+  };
+  await checkApproval(syntheticModuleDef, autoApprove, undefined);
+}
+
+// ---------------------------------------------------------------------------
+// TTY formatters (pre-split shape, unchanged)
+// ---------------------------------------------------------------------------
+
+/** Render health summary as TTY text. */
+function formatHealthSummaryTty(result: Record<string, unknown>): void {
+  const summary = (result.summary ?? {}) as Record<string, unknown>;
+  const modules = (result.modules ?? []) as Record<string, unknown>[];
+
+  if (modules.length === 0) {
+    process.stdout.write("No modules found.\n");
+    return;
+  }
+
+  const total = summary.total_modules ?? modules.length;
+  process.stdout.write(`Health Overview (${total} modules)\n\n`);
+  process.stdout.write(`  ${"Module".padEnd(28)} ${"Status".padEnd(12)} ${"Error Rate".padEnd(12)} Top Error\n`);
+  process.stdout.write(`  ${"-".repeat(28)} ${"-".repeat(12)} ${"-".repeat(12)} ${"-".repeat(20)}\n`);
+
+  for (const m of modules) {
+    const top = m.top_error as Record<string, unknown> | undefined;
+    const topStr = top ? `${top.code} (${top.count ?? "?"})` : "—";
+    const rate = `${((m.error_rate as number ?? 0) * 100).toFixed(1)}%`;
+    process.stdout.write(
+      `  ${String(m.module_id).padEnd(28)} ${String(m.status).padEnd(12)} ${rate.padEnd(12)} ${topStr}\n`,
+    );
+  }
+
+  // The health tiers are healthy / degraded / error / unknown — four, not
+  // three. `unknown` means "no calls recorded yet", which is the state every
+  // module in a fresh project is in, so omitting it made the summary line
+  // contradict the table right above it: the rows listed modules while the
+  // total read "no data". apcore >= 0.28.0 declares the four-tier set
+  // canonically in sys-health-summary.schema.json (§6.6); the SDKs have
+  // emitted `unknown` all along.
+  const parts: string[] = [];
+  for (const key of ["healthy", "degraded", "error", "unknown"]) {
+    const count = summary[key] as number | undefined;
+    if (count) parts.push(`${count} ${key}`);
+  }
+  process.stdout.write(`\nSummary: ${parts.join(", ") || "no data"}\n`);
+}
+
+/** Render single-module health detail. */
+function formatHealthModuleTty(result: Record<string, unknown>): void {
+  process.stdout.write(`Module: ${result.module_id ?? "?"}\n`);
+  process.stdout.write(`Status: ${result.status ?? "unknown"}\n`);
+  const total = result.total_calls as number ?? 0;
+  const errors = result.error_count as number ?? 0;
+  const rate = result.error_rate as number ?? 0;
+  const avg = result.avg_latency_ms as number ?? 0;
+  const p99 = result.p99_latency_ms as number ?? 0;
+  process.stdout.write(`Calls: ${total.toLocaleString()} total | ${errors.toLocaleString()} errors | ${(rate * 100).toFixed(1)}% error rate\n`);
+  process.stdout.write(`Latency: ${avg.toFixed(0)}ms avg | ${p99.toFixed(0)}ms p99\n`);
+
+  const recent = (result.recent_errors ?? []) as Record<string, unknown>[];
+  if (recent.length > 0) {
+    process.stdout.write(`\nRecent Errors (top ${recent.length}):\n`);
+    for (const e of recent) {
+      const count = e.count ?? "?";
+      const last = e.last_occurred ?? "?";
+      process.stdout.write(`  ${String(e.code ?? "?").padEnd(24)} x${count}  (last: ${last})\n`);
+    }
+  }
+}
+
+/** Render usage summary as TTY text. */
+function formatUsageSummaryTty(result: Record<string, unknown>): void {
+  const modules = (result.modules ?? []) as Record<string, unknown>[];
+  const period = result.period ?? "?";
+
+  if (modules.length === 0) {
+    process.stdout.write(`No usage data for period ${period}.\n`);
+    return;
+  }
+
+  process.stdout.write(`Usage Summary (last ${period})\n\n`);
+  process.stdout.write(`  ${"Module".padEnd(24)} ${"Calls".padStart(8)} ${"Errors".padStart(8)} ${"Avg Latency".padStart(12)} ${"Trend".padStart(10)}\n`);
+  process.stdout.write(`  ${"-".repeat(24)} ${"-".repeat(8)} ${"-".repeat(8)} ${"-".repeat(12)} ${"-".repeat(10)}\n`);
+
+  for (const m of modules) {
+    const avg = `${((m.avg_latency_ms as number) ?? 0).toFixed(0)}ms`;
+    process.stdout.write(
+      `  ${String(m.module_id).padEnd(24)} ${String((m.call_count as number) ?? 0).padStart(8)} ` +
+      `${String((m.error_count as number) ?? 0).padStart(8)} ${avg.padStart(12)} ${String(m.trend ?? "").padStart(10)}\n`,
+    );
+  }
+
+  const totalCalls = (result.total_calls as number) ?? modules.reduce((s, m) => s + ((m.call_count as number) ?? 0), 0);
+  const totalErrors = (result.total_errors as number) ?? modules.reduce((s, m) => s + ((m.error_count as number) ?? 0), 0);
+  process.stdout.write(`\nTotal: ${totalCalls.toLocaleString()} calls | ${totalErrors.toLocaleString()} errors\n`);
+}
+
+// ---------------------------------------------------------------------------
+// Per-subcommand registrars (FE-13)
+// ---------------------------------------------------------------------------
+
+/**
+ * Attach the `health` subcommand to the passed apcliGroup.
+ */
+export function registerHealthCommand(apcliGroup: Command, executor: Executor): void {
+  const healthCmd = new Command("health")
+    .description("Show module health status. Optionally specify a module ID for details.")
+    .argument("[module-id]", "Module ID for detailed health")
+    .option("--threshold <number>", "Error rate threshold (default: 0.01).", parseFloat, 0.01)
+    .option("--all", "Include healthy modules.", false)
+    .option("--errors <count>", "Max recent errors (module detail only).", parseInt, 10)
+    .option("--format <format>", "Output format.")
+    .action(async (
+      moduleId: string | undefined,
+      opts: { threshold: number; all: boolean; errors: number; format?: string },
+    ) => {
+      const fmt = resolveFormat(opts.format);
+      try {
+        if (moduleId) {
+          const result = await callSystemModule(executor, "system.health.module", {
+            module_id: moduleId,
+            error_limit: opts.errors,
+          }) as Record<string, unknown>;
+          emitResult(result, fmt, () => formatHealthModuleTty(result));
+        } else {
+          const result = await callSystemModule(executor, "system.health.summary", {
+            error_rate_threshold: opts.threshold,
+            include_healthy: opts.all,
+          }) as Record<string, unknown>;
+          emitResult(result, fmt, () => formatHealthSummaryTty(result));
+        }
+      } catch (e) {
+        emitErrorAndExit(e);
+      }
+    });
+  apcliGroup.addCommand(healthCmd);
+}
+
+/**
+ * Attach the `usage` subcommand to the passed apcliGroup.
+ */
+export function registerUsageCommand(apcliGroup: Command, executor: Executor): void {
+  const usageCmd = new Command("usage")
+    .description("Show module usage statistics. Optionally specify a module ID for details.")
+    .argument("[module-id]", "Module ID for detailed usage")
+    .option("--period <period>", "Time window: 1h, 24h, 7d, 30d.", "24h")
+    .option("--format <format>", "Output format.")
+    .action(async (moduleId: string | undefined, opts: { period: string; format?: string }) => {
+      const fmt = resolveFormat(opts.format);
+      try {
+        let result: unknown;
+        if (moduleId) {
+          result = await callSystemModule(executor, "system.usage.module", {
+            module_id: moduleId,
+            period: opts.period,
+          });
+        } else {
+          result = await callSystemModule(executor, "system.usage.summary", {
+            period: opts.period,
+          });
+        }
+        emitResult(result, fmt, () => {
+          if (moduleId) {
+            formatExecResult(result, fmt);
+          } else {
+            formatUsageSummaryTty(result as Record<string, unknown>);
+          }
+        });
+      } catch (e) {
+        emitErrorAndExit(e);
+      }
+    });
+  apcliGroup.addCommand(usageCmd);
+}
+
+/**
+ * Attach the `enable` subcommand to the passed apcliGroup.
+ */
+export function registerEnableCommand(apcliGroup: Command, executor: Executor): void {
+  const enableCmd = new Command("enable")
+    .description("Enable a disabled module at runtime.")
+    .argument("<module-id>", "Module ID to enable")
+    .requiredOption("--reason <reason>", "Reason for enabling (required for audit).")
+    .option("-y, --yes", "Skip approval prompt (audit D11-B-001 cross-SDK parity).", false)
+    .option("--format <format>", "Output format.")
+    .action(async (moduleId: string, opts: { reason: string; yes: boolean; format?: string }) => {
+      const fmt = resolveFormat(opts.format);
+      try {
+        await requireApprovalForSystemCommand("system.control.toggle_feature", opts.yes);
+        const result = await callSystemModule(executor, "system.control.toggle_feature", {
+          module_id: moduleId,
+          enabled: true,
+          reason: opts.reason,
+        }) as Record<string, unknown>;
+        emitResult(result, fmt, () => {
+          process.stdout.write(`Module '${moduleId}' enabled.\n  Reason: ${opts.reason}\n`);
+        });
+      } catch (e) {
+        emitErrorAndExit(e);
+      }
+    });
+  apcliGroup.addCommand(enableCmd);
+}
+
+/**
+ * Attach the `disable` subcommand to the passed apcliGroup.
+ */
+export function registerDisableCommand(apcliGroup: Command, executor: Executor): void {
+  const disableCmd = new Command("disable")
+    .description("Disable a module at runtime (calls are rejected until re-enabled).")
+    .argument("<module-id>", "Module ID to disable")
+    .requiredOption("--reason <reason>", "Reason for disabling (required for audit).")
+    .option("-y, --yes", "Skip approval prompt (audit D11-B-001 cross-SDK parity).", false)
+    .option("--format <format>", "Output format.")
+    .action(async (moduleId: string, opts: { reason: string; yes: boolean; format?: string }) => {
+      const fmt = resolveFormat(opts.format);
+      try {
+        await requireApprovalForSystemCommand("system.control.toggle_feature", opts.yes);
+        const result = await callSystemModule(executor, "system.control.toggle_feature", {
+          module_id: moduleId,
+          enabled: false,
+          reason: opts.reason,
+        }) as Record<string, unknown>;
+        emitResult(result, fmt, () => {
+          process.stdout.write(`Module '${moduleId}' disabled.\n  Reason: ${opts.reason}\n`);
+        });
+      } catch (e) {
+        emitErrorAndExit(e);
+      }
+    });
+  apcliGroup.addCommand(disableCmd);
+}
+
+/**
+ * Attach the `reload` subcommand to the passed apcliGroup.
+ */
+export function registerReloadCommand(apcliGroup: Command, executor: Executor): void {
+  const reloadCmd = new Command("reload")
+    .description("Hot-reload a module from disk.")
+    .argument("<module-id>", "Module ID to reload")
+    .requiredOption("--reason <reason>", "Reason for reload (required for audit).")
+    .option("-y, --yes", "Skip approval prompt (audit D11-B-001 cross-SDK parity).", false)
+    .option("--format <format>", "Output format.")
+    .action(async (moduleId: string, opts: { reason: string; yes: boolean; format?: string }) => {
+      const fmt = resolveFormat(opts.format);
+      try {
+        await requireApprovalForSystemCommand("system.control.reload_module", opts.yes);
+        const result = await callSystemModule(executor, "system.control.reload_module", {
+          module_id: moduleId,
+          reason: opts.reason,
+        }) as Record<string, unknown>;
+        emitResult(result, fmt, () => {
+          const prev = result.previous_version ?? "?";
+          const newVer = result.new_version ?? "?";
+          const dur = result.reload_duration_ms ?? "?";
+          process.stdout.write(`Module '${moduleId}' reloaded.\n`);
+          process.stdout.write(`  Version: ${prev} -> ${newVer}\n`);
+          process.stdout.write(`  Duration: ${dur}ms\n`);
+        });
+      } catch (e) {
+        emitErrorAndExit(e);
+      }
+    });
+  apcliGroup.addCommand(reloadCmd);
+}
+
+/**
+ * Attach the `config` subcommand (with `get` and `set` children) to the
+ * passed apcliGroup.
+ *
+ * Signature note: config reads/writes go through `executor.call()` to
+ * `system.config.get` / `system.control.update_config`, so this registrar
+ * takes an {@link Executor} (not a Registry). The FE-13 dispatcher table
+ * entry for `config` sets `requiresExecutor: true` accordingly.
+ */
+export function registerConfigCommand(apcliGroup: Command, executor: Executor): void {
+  const configGroup = new Command("config")
+    .description("Read or update runtime configuration.");
+
+  const configGetCmd = new Command("get")
+    .description("Read a configuration value by dot-path key.")
+    .argument("<key>", "Configuration key (dot-path)")
+    .option("--format <format>", "Output format.", "table")
+    .action(async (key: string, opts: { format?: string }) => {
+      const fmt = resolveFormat(opts.format);
+      try {
+        // Spec (usability-enhancements.md): `config get` reads Config.get(key)
+        // directly (read-only, no approval, no executor round-trip). Matches
+        // apcore-cli-python `Config().get(key)`. Does NOT route through
+        // executor.call("system.config.get").
+        const value = new Config().get(key);
+        emitResult({ key, value }, fmt, () => {
+          process.stdout.write(`${key} = ${JSON.stringify(value)}\n`);
+        });
+      } catch (e) {
+        emitErrorAndExit(e);
+      }
+    });
+  configGroup.addCommand(configGetCmd);
+
+  const configSetCmd = new Command("set")
+    .description("Update a runtime configuration value (audit-logged; client-side approval gate applies).")
+    .argument("<key>", "Configuration key (dot-path)")
+    .argument("<value>", "New value")
+    .requiredOption("--reason <reason>", "Reason for config change (required for audit).")
+    .option("-y, --yes", "Skip approval prompt (audit D11-B-001 cross-SDK parity).", false)
+    .option("--format <format>", "Output format.")
+    .action(async (key: string, value: string, opts: { reason: string; yes: boolean; format?: string }) => {
+      const fmt = resolveFormat(opts.format);
+      // Attempt to parse value as JSON for typed values
+      let parsedValue: unknown;
+      try {
+        parsedValue = JSON.parse(value);
+      } catch {
+        parsedValue = value;
+      }
+
+      try {
+        await requireApprovalForSystemCommand("system.control.update_config", opts.yes);
+        const result = await callSystemModule(executor, "system.control.update_config", {
+          key,
+          value: parsedValue,
+          reason: opts.reason,
+        }) as Record<string, unknown>;
+        emitResult(result, fmt, () => {
+          const old = result.old_value ?? "?";
+          const newVal = result.new_value ?? "?";
+          process.stdout.write(`Config updated: ${key}\n`);
+          process.stdout.write(`  ${JSON.stringify(old)} -> ${JSON.stringify(newVal)}\n`);
+          process.stdout.write(`  Reason: ${opts.reason}\n`);
+        });
+      } catch (e) {
+        emitErrorAndExit(e);
+      }
+    });
+  configGroup.addCommand(configSetCmd);
+
+  apcliGroup.addCommand(configGroup);
+}
+
+// registerSystemCommands was removed in FE-13 create-cli-integration.
+// createCli() now dispatches the six per-subcommand registrars directly via
+// the `_registerApcliSubcommands` table in src/main.ts.

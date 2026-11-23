@@ -1,0 +1,1667 @@
+/**
+ * CLI entry point — createCli / main equivalents.
+ *
+ * Protocol spec: CLI bootstrapping & command registration
+ * Implements: F1 (dry-run), F3 (enhanced errors), F4 (trace),
+ * F5 (approval handler), F6 (stream), F8 (strategy), F9 (output formats),
+ * F11 (extra commands)
+ */
+
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
+import { Command, CommanderError, Option } from "commander";
+import packageInfo from "../package.json" with { type: "json" };
+import { EXIT_CODES, exitCodeForError, MaxDepthExceededError, CircularRefError, UnresolvableRefError, SchemaValidationError, ModuleExecutionError, InvalidCliInputError } from "./errors.js";
+import { exitWith } from "./exit.js";
+import { reportModuleError, resolveModuleError } from "./error-output.js";
+import type { ErrorStream } from "./error-output.js";
+import { resolveRefs } from "./ref-resolver.js";
+import { schemaToCliOptions } from "./schema-parser.js";
+import { checkApproval } from "./approval.js";
+import { getAnnotation } from "./annotations.js";
+import { formatExecResult, formatPreflightResult, firstFailedExitCode, resolveFormat } from "./output.js";
+import { setLogLevel, warn as logWarn } from "./logger.js";
+import { registerInitCommand } from "./init-cmd.js";
+import { getDisplay } from "./display-helpers.js";
+import { ConfigResolver, registerConfigNamespace } from "./config.js";
+import { CliApprovalHandler } from "./approval.js";
+import { configureManHelp, registerCompletionCommand } from "./shell.js";
+import {
+  registerDescribeCommand,
+  registerExecCommand,
+  registerListCommand,
+  registerValidateCommand,
+} from "./discovery.js";
+import {
+  registerConfigCommand,
+  registerDisableCommand,
+  registerEnableCommand,
+  registerHealthCommand,
+  registerReloadCommand,
+  registerUsageCommand,
+} from "./system-cmd.js";
+import { registerPipelineCommand } from "./strategy.js";
+import { registerAclCommand } from "./acl-cmd.js";
+import { registerOpenapiCommand } from "./openapi-cmd.js";
+import {
+  assertDelegatedAccess,
+  buildCliContext,
+  collectRole,
+  IDENTITY_FLAGS,
+  loadAclOrExit,
+  noteNoAclConfigured,
+  resolveAclRoot,
+  setAttachedAcl,
+  setCliIdentity,
+  warnStrategyBypassesAcl,
+} from "./acl-loader.js";
+import { ApcliGroup, setReservedGroupNames } from "./builtin-group.js";
+import type { ACL } from "apcore-js";
+// apcore-toolkit is a REQUIRED peer dependency (>=0.7.0). Static import —
+// no runtime fallback. If toolkit is missing the import fails at module
+// load time with a clear MODULE_NOT_FOUND error, matching the package.json
+// peer-dependency contract. See CHANGELOG 0.10.0 (resolves 6.2).
+import { BindingLoader, DisplayResolver } from "apcore-toolkit";
+import type { ApcliConfig } from "./builtin-group.js";
+import { ExposureFilter } from "./exposure.js";
+import { AuditLogger, setAuditLogger } from "./security/audit.js";
+import type { Executor, ModuleDescriptor, Registry } from "./cli.js";
+import { canonicalFormatHelp } from "./canonical-help.js";
+
+/**
+ * Whether --all-options was passed (controls help detail level).
+ *
+ * Module-private mutable flag. The setter `setVerboseHelp` is the sanctioned
+ * public API; raw `let`-binding access from outside this module is an audit
+ * violation (D9-W1) and unstable across bundlers.
+ */
+let verboseHelp = false;
+
+/** Set the all-options help flag. When false, built-in options are hidden from help. */
+export function setAllOptionsHelp(allOptions: boolean): void {
+  verboseHelp = allOptions;
+}
+
+/** @deprecated Use {@link setAllOptionsHelp} instead. Kept for backward compatibility. */
+export function setVerboseHelp(verbose: boolean): void {
+  setAllOptionsHelp(verbose);
+}
+
+/**
+ * Base URL for online documentation. Null means no docs link shown.
+ *
+ * Module-private. Use the setter `setDocsUrl` from outside this module.
+ */
+let docsUrl: string | null = null;
+
+/**
+ * Set the base URL for online documentation links shown in help and man pages.
+ * Pass null to disable. Command-level help appends `/commands/{module path}`
+ * automatically. A trailing slash on the base URL is removed so the link never
+ * contains `//`.
+ *
+ * @example setDocsUrl("https://docs.apcore.dev/cli");
+ */
+export function setDocsUrl(url: string | null): void {
+  docsUrl = url === null ? null : url.replace(/\/+$/, "");
+}
+
+/** Check if --all-options is present in process.argv (pre-parse, before Commander). */
+function hasVerboseFlag(): boolean {
+  return process.argv.includes("--all-options");
+}
+
+/**
+ * Read a `--flag VALUE` / `--flag=VALUE` pair out of `process.argv` before
+ * Commander parses it.
+ *
+ * `createCli` has to resolve the ACL during construction — `registerAclCommand`
+ * takes the loaded ACL, and `executor.setAcl` must happen before any action
+ * runs — but Commander only parses argv inside `program.parse()`, long after
+ * `createCli` returns. Same pre-scan precedent as {@link hasVerboseFlag}.
+ */
+function argvOptionValue(flag: string): string | undefined {
+  const argv = process.argv;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === flag) {
+      const next = argv[i + 1];
+      return next !== undefined && !next.startsWith("-") ? next : undefined;
+    }
+    if (arg.startsWith(`${flag}=`)) {
+      return arg.slice(flag.length + 1);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a positive-integer option: CLI flag > env var > default.
+ * Invalid env values (non-integer, zero, negative) are ignored with a warning
+ * so users aren't silently downgraded to the default.
+ */
+export function resolveIntOption(
+  cliValue: number | undefined,
+  envValue: string | undefined,
+  defaultValue: number,
+): number {
+  if (cliValue !== undefined && Number.isFinite(cliValue) && cliValue > 0) {
+    return cliValue;
+  }
+  if (envValue !== undefined && envValue !== "") {
+    const parsed = parseInt(envValue, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+    process.stderr.write(
+      `Warning: invalid integer env value '${envValue}'; using default ${defaultValue}.\n`,
+    );
+  }
+  return defaultValue;
+}
+
+/**
+ * Resolve a string option: CLI flag > env var > undefined.
+ * Empty strings are treated as absent.
+ */
+export function resolveStringOption(
+  cliValue: unknown,
+  envValue: string | undefined,
+): string | undefined {
+  if (typeof cliValue === "string" && cliValue !== "") {
+    return cliValue;
+  }
+  if (envValue !== undefined && envValue !== "") {
+    return envValue;
+  }
+  return undefined;
+}
+
+/** Reject execution options that the sandbox runner cannot honor. */
+export function validateSandboxOptions(
+  sandbox: boolean,
+  trace: boolean,
+  stream: boolean,
+  strategy?: string,
+): void {
+  if (sandbox && (trace || stream || strategy)) {
+    throw new InvalidCliInputError("--sandbox cannot be combined with --trace, --stream, or --strategy.");
+  }
+}
+
+const VERSION = packageInfo.version;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** Configuration for a single Commander option derived from a JSON Schema property. */
+export interface OptionConfig {
+  /** The property name from the schema. */
+  name: string;
+  /** Commander flags string (e.g. "--my-flag <value>" or "--flag, --no-flag"). */
+  flags: string;
+  /** Help text for the option. */
+  description: string;
+  /** Default value. */
+  defaultValue?: unknown;
+  /** Whether the field is required (for display only). */
+  required: boolean;
+  /** Enum choices (string values). */
+  choices?: string[];
+  /** Whether this is a boolean flag pair (--flag/--no-flag). */
+  isBooleanFlag?: boolean;
+  /** Maps string enum value → original type name ("int", "float", "bool"). */
+  enumOriginalTypes?: Record<string, string>;
+  /** Parser function for Commander (e.g. parseInt, parseFloat). */
+  parseArg?: (value: string) => unknown;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-execute input validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate input against a JSON Schema's required fields and basic types.
+ * Returns the first error message, or null on success.
+ *
+ * Mirrors Python `jsonschema.validate` and Rust `validate_against_schema` so
+ * missing required fields produce exit 45 instead of a TypeError inside execute.
+ */
+function validateInputSchema(
+  schema: Record<string, unknown>,
+  input: Record<string, unknown>,
+): string | null {
+  const required = schema.required as string[] | undefined;
+  if (required && Array.isArray(required)) {
+    for (const field of required) {
+      const val = input[field];
+      if (val === null || val === undefined) {
+        return `'${field}' is required`;
+      }
+    }
+  }
+  const properties = schema.properties as Record<string, Record<string, unknown>> | undefined;
+  if (properties) {
+    for (const [field, propSchema] of Object.entries(properties)) {
+      const val = input[field];
+      if (val === null || val === undefined) continue;
+      const expectedType = propSchema.type as string | undefined;
+      if (!expectedType) continue;
+      const actualType = typeof val;
+      if (expectedType === "string" && actualType !== "string") {
+        return `'${field}' must be a string, got ${actualType}`;
+      }
+      if ((expectedType === "integer" || expectedType === "number") && actualType !== "number") {
+        return `'${field}' must be a number, got ${actualType}`;
+      }
+      if (expectedType === "boolean" && actualType !== "boolean") {
+        return `'${field}' must be a boolean, got ${actualType}`;
+      }
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// createCli
+// ---------------------------------------------------------------------------
+
+/**
+ * APCore unified client facade (apcore-js >= 0.18.0).
+ * Exposes registry and executor as top-level properties.
+ */
+export interface APCore {
+  registry: Registry;
+  executor: Executor;
+}
+
+export type { ErrorStream } from "./error-output.js";
+
+/** Context handed to {@link ModuleResultOptions.onError} before the exit runs. */
+export interface ModuleErrorContext {
+  /** The error that failed the call (validation, approval, execution, ...). */
+  error: unknown;
+  /** Effective exit code, after {@link ModuleResultOptions.exitCodes} mapping. */
+  exitCode: number;
+  /** The apcore error code, when the failure carries one. */
+  code: string | null;
+  /** Canonical ID of the module that was invoked. */
+  moduleId: string;
+}
+
+/** Controls how a successful, non-streaming module result is delivered. */
+export interface ModuleResultOptions {
+  /** Print the result to stdout. Defaults to true. */
+  printResult?: boolean;
+  /** Receives the raw result and canonical module ID before success is audited. */
+  onResult?: (result: unknown, moduleId: string) => void | Promise<void>;
+  /**
+   * Called after a failure has been classified and before the process exits.
+   * Embedded hosts use this to log, translate, or replace the exit entirely
+   * (pair it with {@link exit}). Awaited.
+   */
+  onError?: (context: ModuleErrorContext) => void | Promise<void>;
+  /**
+   * Translate apcore error codes into host exit codes. Keys are the values of
+   * `error.code` (`SCHEMA_VALIDATION_ERROR`, `MODULE_TIMEOUT`, ...). Unmapped
+   * codes keep the CLI's own mapping.
+   */
+  exitCodes?: Record<string, number>;
+  /**
+   * Replace the exit action for this command. Defaults to the process-wide
+   * handler installed with `setExitHandler()` (which defaults to
+   * `process.exit`). Pass a function that throws or records the code to keep
+   * the host process alive.
+   */
+  exit?: (code: number) => void;
+  /**
+   * Where the JSON / human-readable failure envelope is written. Defaults to
+   * stderr. Agent-facing hosts that require "stdout contains exactly one
+   * document on failure" set this to `"stdout"`.
+   */
+  errorStream?: ErrorStream;
+  /**
+   * Extra input merged after stdin / CLI keyword input and before schema
+   * validation. Use it to inject host-level flags (e.g. a program-level
+   * `--json`) that are part of the module's input contract. A function
+   * receives the command so it can read `command.optsWithGlobals()`.
+   */
+  extraInput?:
+    | Record<string, unknown>
+    | ((command: Command) => Record<string, unknown> | Promise<Record<string, unknown>>);
+}
+
+/** Options for createCli. Result options apply to the built-in exec command. */
+export interface CreateCliOptions extends ModuleResultOptions {
+  extensionsDir?: string;
+  progName?: string;
+  /**
+   * Show all options in help output (controls `--all-options` behaviour;
+   * parameter was named `verbose` prior to v0.9.0).
+   */
+  allOptions?: boolean;
+  /** @deprecated Use {@link allOptions} instead. Kept for backward compatibility with pre-v0.9.0 callers. */
+  verbose?: boolean;
+  /**
+   * APCore unified client instance (apcore-js >= 0.18.0).
+   * Mutually exclusive with registry/executor — providing app alongside
+   * either of those will throw.
+   */
+  app?: APCore;
+  /** Pre-populated Registry instance. Skips filesystem discovery when provided. */
+  registry?: Registry;
+  /** Pre-built Executor instance. Used alongside registry. */
+  executor?: Executor;
+  /** Extra commands to register after built-in commands (FE-11 F11). */
+  extraCommands?: Command[];
+  /** Exposure filter config or instance (FE-12). */
+  expose?: Record<string, unknown> | import("./exposure.js").ExposureFilter;
+  /** Path to convention-based commands directory (apcore-toolkit ConventionScanner). */
+  commandsDir?: string;
+  /** Path to binding.yaml for display overlay (apcore-toolkit DisplayResolver). */
+  bindingPath?: string;
+  /**
+   * Optional allowlist of module-path prefixes forwarded to
+   * apcore-toolkit's `RegistryWriter.write` when registering convention-scanned
+   * or binding-loaded modules. When set, the writer rejects any `target:`
+   * path outside the listed prefixes — mitigates arbitrary-code-execution via
+   * forged binding YAML (e.g. `target: "os:system"`).
+   *
+   * Mirrors the Python SDK's `allowed_prefixes` kwarg
+   * (apcore-cli-python/src/apcore_cli/factory.py).
+   */
+  allowedPrefixes?: string[];
+  /**
+   * Built-in apcli group configuration (FE-13).
+   *
+   * Accepts:
+   *  - `true` / `false` (shorthand for `{mode: "all"}` / `{mode: "none"}`)
+   *  - A config object (see {@link ApcliConfig})
+   *  - A pre-built {@link ApcliGroup} instance (Tier 1 override)
+   *
+   * When absent, Tier 3 (apcore.yaml `apcli:` block) is consulted, falling
+   * back to auto-detect: standalone → visible, embedded → hidden.
+   */
+  apcli?: ApcliConfig | ApcliGroup;
+  /**
+   * Override the name of the built-in command group (default `"apcli"`).
+   * Downstream branded CLIs that want their built-ins under a custom
+   * namespace (e.g. `mycorp-cli admin health`) pass a different value
+   * here. Must match `/^[a-z][a-z0-9_-]*$/` — non-empty, lowercase,
+   * alphanumeric + `_` / `-`. Invalid values cause exit code 2.
+   *
+   * Note: env var `APCORE_CLI_APCLI` and config keys `apcli.*` remain
+   * stable regardless of this rename — they are apcore-cli-internal
+   * toggles, not user-facing. Mirrors Python
+   * `create_cli(builtin_group_name=)`. Cross-SDK parity: 2026-05-08.
+   */
+  builtinGroupName?: string;
+  /**
+   * Host application version printed by `-V, --version`.
+   *
+   * When omitted, the `--version` flag is NOT registered — embedded CLIs
+   * that do not opt in will not surface the SDK's own version. The
+   * standalone `apcore-cli` binary entry point passes its package version
+   * explicitly (see `main()`).
+   */
+  version?: string;
+  /**
+   * Top-level CLI description shown at the head of `--help`. Defaults to
+   * `${progName} CLI` when omitted, so embedded CLIs do not leak the
+   * "apcore" framework name into their own help output.
+   */
+  description?: string;
+  /**
+   * ACL governance (FE-14 §4.1 tier 1).
+   *
+   * Accepts either a **path** (file or directory, resolved exactly as
+   * `acl.root` is) or a pre-built apcore `ACL` instance.
+   *
+   * Passing this is an INSTRUCTION and is always honoured. Without it, an
+   * embedded host that supplied its own `executor` keeps its own governance:
+   * the CLI does not attach a discovered ACL behind the host's back
+   * (FE-14 §4.2).
+   *
+   * There is deliberately no `acl: false` kill switch — to disable
+   * enforcement, point the root at a path that does not exist (FE-14 §5).
+   */
+  acl?: string | object;
+}
+
+/**
+ * Build and return the top-level Commander program.
+ *
+ * @param extensionsDirOrOpts  Path to extensions directory, or a CreateCliOptions object.
+ * @param progName       Program name shown in help (default: apcore-cli)
+ * @param allOptions     Show all options in help output (controls `--all-options` behaviour;
+ *                       parameter was named `verbose` prior to v0.9.0)
+ */
+export function createCli(
+  extensionsDirOrOpts?: string | CreateCliOptions,
+  progName?: string,
+  allOptions = false,
+): Command {
+  // Normalise overloaded first argument.
+  let extensionsDir: string | undefined;
+  let registry: Registry | undefined;
+  let executor: Executor | undefined;
+  let extraCommands: Command[] | undefined;
+  let app: APCore | undefined;
+  let expose: Record<string, unknown> | import("./exposure.js").ExposureFilter | undefined;
+  let apcliOption: ApcliConfig | ApcliGroup | undefined;
+  let appVersion: string | undefined;
+  let appDescription: string | undefined;
+  let allowedPrefixes: string[] | undefined;
+  let builtinGroupName: string | undefined;
+  let aclOption: string | object | undefined;
+  let resultOptions: ModuleResultOptions | undefined;
+  if (typeof extensionsDirOrOpts === "object" && extensionsDirOrOpts !== null) {
+    extensionsDir = extensionsDirOrOpts.extensionsDir;
+    progName = extensionsDirOrOpts.progName ?? progName;
+    // D1-W5: prefer the canonical `allOptions`; fall back to legacy `verbose`
+    // for one MINOR cycle (slated for removal in v0.10). Matches the
+    // setAllOptionsHelp/setVerboseHelp deprecation pair.
+    allOptions = extensionsDirOrOpts.allOptions ?? extensionsDirOrOpts.verbose ?? allOptions;
+    app = extensionsDirOrOpts.app;
+    registry = extensionsDirOrOpts.registry;
+    executor = extensionsDirOrOpts.executor;
+    extraCommands = extensionsDirOrOpts.extraCommands;
+    expose = extensionsDirOrOpts.expose;
+    apcliOption = extensionsDirOrOpts.apcli;
+    appVersion = extensionsDirOrOpts.version;
+    appDescription = extensionsDirOrOpts.description;
+    builtinGroupName = extensionsDirOrOpts.builtinGroupName;
+    allowedPrefixes = extensionsDirOrOpts.allowedPrefixes;
+    aclOption = extensionsDirOrOpts.acl;
+    const {
+      printResult,
+      onResult,
+      onError,
+      exitCodes,
+      exit,
+      errorStream,
+      extraInput,
+    } = extensionsDirOrOpts;
+    resultOptions = { printResult, onResult, onError, exitCodes, exit, errorStream, extraInput };
+  } else {
+    extensionsDir = extensionsDirOrOpts;
+  }
+
+  verboseHelp = allOptions;
+  // Register Config Bus namespace (apcore >= 0.15.0)
+  registerConfigNamespace();
+
+  // Initialize audit logger (parity with apcore-cli-python __main__.py).
+  // Silently disabled if initialization fails (e.g., unwritable audit path).
+  try {
+    const auditLogger = new AuditLogger();
+    setAuditLogger(auditLogger);
+  } catch {
+    // audit logging unavailable — non-fatal
+  }
+
+  // Resolve program name
+  const resolvedProgName = progName ?? path.basename(process.argv[1] ?? "apcore-cli") ?? "apcore-cli";
+
+  // Resolve log level
+  const cliLogLevel = process.env.APCORE_CLI_LOGGING_LEVEL ?? process.env.APCORE_LOGGING_LEVEL ?? "WARNING";
+  setLogLevel(cliLogLevel);
+
+  // Validate parameter combination: app is mutually exclusive with registry/executor.
+  if (app && (registry || executor)) {
+    process.stderr.write("Error: app is mutually exclusive with registry/executor\n");
+    exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+  }
+
+  // Extract registry/executor from APCore unified client when provided.
+  if (app) {
+    registry = app.registry;
+    executor = app.executor;
+  }
+
+  // Validate parameter combination: executor without registry is invalid.
+  if (executor && !registry) {
+    process.stderr.write("Error: executor requires registry — pass both or neither\n");
+    exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+  }
+
+  // Wire CliApprovalHandler to the executor (FE-11 §3.5) so module calls that
+  // set `requires_approval: true` route through the interactive CLI prompt
+  // (or auto-approve when APCORE_CLI_AUTO_APPROVE=1). Parity with
+  // ../apcore-cli-python/src/apcore_cli/factory.py:315-327 — previously the
+  // TypeScript CliApprovalHandler class was exported but never plugged in,
+  // so requires_approval modules were rejected by the built-in gate even
+  // though the CLI had its own interactive handler ready to use.
+  if (executor && typeof (executor as unknown as Record<string, unknown>).setApprovalHandler === "function") {
+    try {
+      const handler = new CliApprovalHandler(/*autoApprove*/ false);
+      (executor as unknown as { setApprovalHandler: (h: unknown) => void }).setApprovalHandler(handler);
+    } catch {
+      // Non-fatal: handler wiring failed; built-in gate still applies.
+    }
+  }
+
+  const registryInjected = registry !== undefined;
+  // FE-14 §4.2: an embedded host that constructed its own Executor owns its
+  // own governance. Silently attaching a CLI-discovered ACL over the host's
+  // configuration would change enforcement behind its back.
+  const executorInjected = executor !== undefined;
+
+  const program = new Command(resolvedProgName)
+    .exitOverride()
+    .helpOption("-h, --help", "Print help")
+    .addHelpCommand("help [command]", "Print this message or the help of the given subcommand(s)")
+    .description(appDescription ?? `${resolvedProgName} CLI`)
+    .option("--log-level <level>", "Logging level (DEBUG|INFO|WARNING|ERROR)", "WARNING")
+    .option("--all-options", "Show all options in help output (including built-in options)");
+  if (appVersion) {
+    program.version(appVersion, "-V, --version", "Print version");
+  }
+  program.configureHelp({ formatHelp: canonicalFormatHelp });
+
+  // Discovery flags are standalone-only (FE-13 T-APCLI-27/28). `--acl` joins
+  // them for the same reason: an embedded host configures governance through
+  // its own Executor, not through this CLI's argv (FE-14 §4.1 tier 1).
+  if (!registryInjected) {
+    program.option("--extensions-dir <path>", "Path to extensions directory");
+    program.option("--commands-dir <path>", "Path to convention-based commands directory");
+    program.option("--binding <path>", "Path to binding.yaml for display overlay");
+    program.option("--acl <path>", "Path to the ACL file or directory (default: ./acl)");
+  }
+
+  // FE-14 §4.3 identity flags. They build the `Identity` that the `roles` and
+  // `identity_types` conditions read; `Context.callerId` is NEVER settable
+  // from argv, so a real invocation is always the effective caller
+  // `@external` (§7.2).
+  //
+  // These are UNAUTHENTICATED assertions, and the help text says so because
+  // §7.1 requires each flag to carry the warning: a rule set that grants on
+  // `roles: [admin]` is trivially satisfied by anyone who can run the binary.
+  program.option(IDENTITY_FLAGS.id.flags, IDENTITY_FLAGS.id.description);
+  program.option(IDENTITY_FLAGS.type.flags, IDENTITY_FLAGS.type.description);
+  program.option(
+    IDENTITY_FLAGS.role.flags,
+    IDENTITY_FLAGS.role.description,
+    collectRole,
+    [] as string[],
+  );
+
+  // Build ApcliGroup via 3-source dispatch (FE-13 §4.8):
+  //   1) Pre-built ApcliGroup instance (pass-through)
+  //   2) CliConfig boolean/object (Tier 1, fromCliConfig)
+  //   3) Tier 3 yaml via ConfigResolver.resolveObject (fromYaml)
+  let apcliCfg: ApcliGroup;
+  try {
+    if (apcliOption instanceof ApcliGroup) {
+      // Pre-built ApcliGroup wins; surface a conflict if the caller also
+      // passed builtinGroupName with a different value.
+      if (
+        builtinGroupName !== undefined
+        && builtinGroupName !== "apcli"
+        && apcliOption.name !== builtinGroupName
+      ) {
+        throw new Error(
+          `builtinGroupName=${JSON.stringify(builtinGroupName)} conflicts with `
+            + `the name on the supplied ApcliGroup (${JSON.stringify(apcliOption.name)}). Pass only one.`,
+        );
+      }
+      apcliCfg = apcliOption;
+    } else if (apcliOption !== undefined) {
+      apcliCfg = ApcliGroup.fromCliConfig(apcliOption, {
+        registryInjected,
+        name: builtinGroupName,
+      });
+    } else {
+      let yamlVal: unknown = null;
+      try {
+        const resolver = new ConfigResolver();
+        yamlVal = resolver.resolveObject("apcli");
+      } catch {
+        yamlVal = null;
+      }
+      apcliCfg = ApcliGroup.fromYaml(yamlVal, {
+        registryInjected,
+        name: builtinGroupName,
+      });
+    }
+  } catch (e) {
+    // ApcliGroup name validation failure or conflict — exit 2.
+    process.stderr.write(`Error: ${e instanceof Error ? e.message : String(e)}\n`);
+    exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+  }
+
+  // Sync the module-level reserved-group cache so cli.ts's `assertNotReserved`
+  // and `listCommands` filter against the live (possibly renamed) name. Reset
+  // to the default afterwards is the createCli caller's responsibility — in
+  // practice processes invoke createCli once at startup, so this is fine.
+  setReservedGroupNames(new Set([apcliCfg.name]));
+
+  // Construct the apcli sub-group. Hidden when visibility resolves to "none".
+  // Group name resolves from `apcliCfg.name` so downstream branded CLIs
+  // that overrode `builtinGroupName` see their custom namespace.
+  const apcliGroup = program
+    .command(apcliCfg.name, { hidden: !apcliCfg.isGroupVisible() })
+    .description("Built-in commands");
+
+  // Dispatch the 13-entry subcommand registrar table (FE-13 §4.9).
+  if (registry) {
+    (program as unknown as Record<string, unknown>)._registry = registry;
+    if (executor) {
+      (program as unknown as Record<string, unknown>)._executor = executor;
+    }
+  } else {
+    const resolvedExtDir = extensionsDir
+      ?? process.env.APCORE_EXTENSIONS_ROOT
+      ?? "./extensions";
+    void resolvedExtDir; // Will be used when apcore-js registry is wired
+  }
+
+  // Build exposure filter (FE-12) BEFORE the apcli dispatcher table so
+  // registerListCommand can consult the filter for --exposure. fromConfig
+  // throws on malformed shape (e.g. { mode: "bogus" }) — catch and exit with
+  // INVALID_CLI_INPUT so the caller sees a friendly message and the documented
+  // exit code, matching ApcliGroup._build's contract (review fix #1).
+  let exposureFilter: ExposureFilter;
+  try {
+    if (expose instanceof ExposureFilter) {
+      exposureFilter = expose;
+    } else if (typeof expose === "object" && expose !== null) {
+      exposureFilter = ExposureFilter.fromConfig({ expose });
+    } else {
+      exposureFilter = new ExposureFilter();
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Error: invalid 'expose' option — ${msg}\n`);
+    exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+  }
+
+  // -------------------------------------------------------------------------
+  // FE-14 — resolve, load and attach the ACL (§4.1, §4.2)
+  // -------------------------------------------------------------------------
+  //
+  // Enforcement is on ONLY when configured: a missing root attaches nothing
+  // and changes no behaviour, preserving apcore's `ACL.discover` invariant
+  // that a missing path must not synthesize an empty default-deny ACL.
+  let cliAcl: ACL | null = null;
+  let aclSource: string | null = null;
+  if (typeof aclOption === "object" && aclOption !== null) {
+    // A pre-built ACL is an instruction — always honoured, even when the host
+    // supplied its own executor (FE-14 §4.2, T-ACL-29).
+    cliAcl = aclOption as ACL;
+    aclSource = null;
+  } else if (!executorInjected || typeof aclOption === "string") {
+    const flagPath =
+      typeof aclOption === "string" && aclOption !== ""
+        ? aclOption
+        : registryInjected
+          ? undefined
+          : argvOptionValue("--acl");
+    let resolver: ConfigResolver | null = null;
+    try {
+      resolver = new ConfigResolver();
+    } catch {
+      resolver = null;
+    }
+    const root = resolver ? resolveAclRoot(resolver, flagPath) : flagPath ?? null;
+    if (root !== null) {
+      // The resolver is threaded through so `acl.audit.*` (FE-14 §4.8) is read
+      // from the same `apcore.yaml` the root came from, rather than a second
+      // parse of a file that may have changed underneath.
+      const [loaded, source] = loadAclOrExit(root, resolver);
+      cliAcl = loaded;
+      aclSource = source;
+      if (loaded === null) noteNoAclConfigured(root);
+    } else {
+      noteNoAclConfigured(null);
+    }
+  }
+
+  if (cliAcl && executor && typeof executor.setAcl === "function") {
+    try {
+      executor.setAcl(cliAcl);
+      // Also held CLI-side: §4.10's delegated execution paths (`--sandbox`)
+      // build their own executor and must be gated from the parent, which is
+      // the only process that reliably holds the rule set.
+      setAttachedAcl(cliAcl);
+    } catch (err) {
+      // A refused attachment is a governance fault, not a warning: the user
+      // configured an ACL and would otherwise run unprotected.
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`Error: failed to attach ACL: ${msg}\n`);
+      exitWith(EXIT_CODES.ACL_RULE_ERROR);
+    }
+  } else {
+    setAttachedAcl(null);
+  }
+
+  _registerApcliSubcommands(
+    apcliGroup,
+    apcliCfg,
+    registry,
+    executor,
+    exposureFilter,
+    cliAcl,
+    aclSource,
+    resultOptions,
+  );
+
+  // Footer hints for discoverability
+  program.addHelpText("after", [
+    "",
+    "Use --help --all-options to show all options (including built-in options).",
+    "Use --help --man to display a formatted man page.",
+  ].join("\n"));
+
+  // Register --help --man support (stays at root — spec §4.1).
+  // The man page reflects the host app's version when supplied; otherwise
+  // falls back to the SDK version so the manpage still has a stamp.
+  configureManHelp(program, resolvedProgName, appVersion ?? VERSION);
+
+  // Register extra commands (F11) — validate no name collisions with live
+  // Commander tree (root + apcli group subcommands). FE-13 moved the old
+  // per-command constant into a live-tree walk; collision detection now
+  // reads the actual program shape. Reserved-name (`apcli`) and
+  // live-collision cases are hard exit 2 (FE-13 §4.10 / §7 FR-13-09).
+  if (extraCommands && extraCommands.length > 0) {
+    // Reserved-name set follows the resolved built-in-group name, not the
+    // static default. When a downstream branded CLI renames the group via
+    // `builtinGroupName`, an extraCommands entry that shadows the renamed
+    // group is the same kind of collision and is rejected here.
+    const _reservedForExtra: ReadonlySet<string> = new Set([apcliCfg.name]);
+    for (const cmd of extraCommands) {
+      const cmdName = cmd.name();
+      if (_reservedForExtra.has(cmdName)) {
+        process.stderr.write(
+          `Error: extraCommands name '${cmdName}' is reserved\n`,
+        );
+        exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+      }
+      const existing = program.commands.find((c) => c.name() === cmdName);
+      if (existing) {
+        process.stderr.write(
+          `Error: extraCommands name '${cmdName}' collides with an existing command\n`,
+        );
+        exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+      }
+      program.addCommand(cmd);
+    }
+  }
+
+  // Hook to apply optional toolkit integration before command execution.
+  // Commander actions are async, so we can set up toolkit state lazily.
+  program.hook("preAction", async (thisCommand) => {
+    const opts = thisCommand.opts();
+    // FE-14 §4.3 — record the asserted identity before any action runs, so
+    // `apcli exec` / `apcli validate` / module dispatch can hand apcore a
+    // Context carrying it. When none of the three flags is given, nothing is
+    // recorded and no Identity is constructed at all.
+    const roles = Array.isArray(opts.role) ? (opts.role as string[]) : [];
+    setCliIdentity({
+      id: opts.identityId as string | undefined,
+      type: opts.identityType as string | undefined,
+      roles: roles.length > 0 ? roles : undefined,
+    });
+    const commandsDir = opts.commandsDir as string | undefined;
+    const bindingPath = opts.binding as string | undefined;
+    await applyToolkitIntegration(commandsDir, bindingPath, { allowedPrefixes });
+  });
+
+  return program;
+}
+
+// ---------------------------------------------------------------------------
+// FE-13 apcli subcommand dispatcher (§4.9)
+// ---------------------------------------------------------------------------
+
+/**
+ * Subcommand names that are registered regardless of the resolved visibility
+ * mode's include/exclude filter. `exec` is the documented always-registered
+ * escape hatch (spec §4.9) so that downstream callers can always invoke modules
+ * by ID even when the apcli group is configured with a minimal surface.
+ */
+const _ALWAYS_REGISTERED: ReadonlySet<string> = new Set<string>(["exec"]);
+
+interface _RegistrarEntry {
+  name: string;
+  requiresExecutor: boolean;
+  register: (
+    apcliGroup: Command,
+    registry: Registry | undefined,
+    executor: Executor | undefined,
+  ) => void;
+}
+
+/**
+ * Central dispatcher for the 15 canonical apcli subcommands. Called once per
+ * createCli invocation after the apcli Commander group is built. Honors
+ * {@link ApcliGroup.resolveVisibility} for include/exclude modes, and skips
+ * entries whose `requiresExecutor: true` flag is not satisfied.
+ */
+function _registerApcliSubcommands(
+  apcliGroup: Command,
+  apcliCfg: ApcliGroup,
+  registry: Registry | undefined,
+  executor: Executor | undefined,
+  exposureFilter: ExposureFilter,
+  acl: ACL | null = null,
+  aclSource: string | null = null,
+  resultOptions?: ModuleResultOptions,
+): void {
+  // Standalone-mode fallback registry. Previously returned an empty list +
+  // null; that silently masked the "no registry wired" contract gap — users
+  // saw empty `apcli list` output with no clue the CLI was unwired. The
+  // erroring fallback below surfaces the gap with a clear message + exit code
+  // whenever list/describe actions actually reach into registry methods.
+  const emitUnwiredError = (): never => {
+    process.stderr.write(
+      "Error: no module registry wired. In standalone mode, pass " +
+        "--extensions-dir <path> to enable module discovery.\n",
+    );
+    exitWith(EXIT_CODES.CONFIG_INVALID);
+  };
+  const effectiveRegistry: Registry = registry ?? {
+    list: () => emitUnwiredError(),
+    getDefinition: () => emitUnwiredError(),
+  };
+
+  const TABLE: _RegistrarEntry[] = [
+    { name: "list",              requiresExecutor: false, register: (g) => registerListCommand(g, effectiveRegistry, exposureFilter) },
+    { name: "describe",          requiresExecutor: false, register: (g) => registerDescribeCommand(g, effectiveRegistry) },
+    { name: "exec",              requiresExecutor: true,  register: (g, _r, ex) => registerExecCommand(g, effectiveRegistry, ex!, resultOptions) },
+    { name: "validate",          requiresExecutor: true,  register: (g, _r, ex) => registerValidateCommand(g, effectiveRegistry, ex!) },
+    { name: "init",              requiresExecutor: false, register: (g) => registerInitCommand(g) },
+    { name: "health",            requiresExecutor: true,  register: (g, _r, ex) => registerHealthCommand(g, ex!) },
+    { name: "usage",             requiresExecutor: true,  register: (g, _r, ex) => registerUsageCommand(g, ex!) },
+    { name: "enable",            requiresExecutor: true,  register: (g, _r, ex) => registerEnableCommand(g, ex!) },
+    { name: "disable",           requiresExecutor: true,  register: (g, _r, ex) => registerDisableCommand(g, ex!) },
+    { name: "reload",            requiresExecutor: true,  register: (g, _r, ex) => registerReloadCommand(g, ex!) },
+    { name: "config",            requiresExecutor: true,  register: (g, _r, ex) => registerConfigCommand(g, ex!) },
+    { name: "completion",        requiresExecutor: false, register: (g) => registerCompletionCommand(g) },
+    { name: "describe-pipeline", requiresExecutor: true,  register: (g, _r, ex) => registerPipelineCommand(g, ex!) },
+    // FE-14 — `acl status` reads Executor.governanceState(), so the group
+    // needs the executor even though list/check/validate do not.
+    { name: "acl",               requiresExecutor: true,  register: (g, _r, ex) => registerAclCommand(g, ex!, acl, aclSource) },
+    // FE-15a — pure document-in / artifact-out. Registers nothing, builds no
+    // executor and never touches the registry, so it works in standalone mode
+    // where no registry is wired (T-OAPI-27).
+    { name: "openapi",           requiresExecutor: false, register: (g) => registerOpenapiCommand(g) },
+  ];
+
+  // The six system subcommands register atomically: either all appear (the
+  // executor's registry exposes `system.health.summary`) or none do. Partial
+  // registration is a cross-SDK parity bug (apcore-cli usability-enhancements.md
+  // §register_system_commands). Mirrors apcore-cli-python `_system_modules_available`;
+  // the registry-lookup probe is used instead of `executor.validate` because
+  // `validate` is async in TS and cannot be awaited during synchronous registration.
+  const _SYSTEM_COMMANDS = new Set(["health", "usage", "enable", "disable", "reload", "config"]);
+  const systemModulesAvailable = ((): boolean => {
+    if (!executor) return false;
+    const reg = executor.registry ?? registry;
+    if (!reg) return false;
+    try {
+      return reg.getDefinition("system.health.summary") != null;
+    } catch {
+      return false;
+    }
+  })();
+
+  const mode = apcliCfg.resolveVisibility();
+  for (const entry of TABLE) {
+    // Determine whether this entry would be registered BEFORE short-circuiting
+    // on missing executor — otherwise _ALWAYS_REGISTERED never gets consulted
+    // for executor-required entries (e.g. "exec"), which violates spec §4.9.
+    let shouldRegister: boolean;
+    if (mode === "all" || mode === "none") {
+      // mode:"none" still registers all subcommands — the group itself is
+      // hidden, but subcommands remain individually reachable (spec §4.6).
+      shouldRegister = true;
+    } else {
+      shouldRegister =
+        _ALWAYS_REGISTERED.has(entry.name) || apcliCfg.isSubcommandIncluded(entry.name);
+    }
+    if (!shouldRegister) continue;
+
+    // System-module gating (spec parity): skip the six system subcommands
+    // atomically when system modules are not available on the executor.
+    if (_SYSTEM_COMMANDS.has(entry.name) && !systemModulesAvailable) continue;
+
+    // Executor-required entry but no executor wired. Silent skip for ordinary
+    // entries — loud WARN for _ALWAYS_REGISTERED entries since the spec §4.9
+    // contract says they are always registered, and silently dropping them
+    // would mask a legitimate wiring gap for the caller.
+    if (entry.requiresExecutor && !executor) {
+      if (_ALWAYS_REGISTERED.has(entry.name)) {
+        logWarn(
+          `apcli.${entry.name} is in _ALWAYS_REGISTERED but no executor is wired — ` +
+            `subcommand unavailable. Pass executor to createCli() or avoid ${entry.name} invocations.`,
+        );
+      }
+      continue;
+    }
+
+    entry.register(apcliGroup, registry, executor);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// applyToolkitIntegration
+// ---------------------------------------------------------------------------
+
+/**
+ * Optionally apply apcore-toolkit features (DisplayResolver, RegistryWriter).
+ *
+ * Uses dynamic import so the dependency remains optional — if apcore-toolkit
+ * is not installed, a warning is printed and the CLI continues without it.
+ */
+/**
+ * Module-level binding display overlay map: moduleId → resolved `display`
+ * metadata (as produced by `DisplayResolver.resolve()`). Consulted by
+ * `getDisplay()` when a `ModuleDescriptor`'s own `metadata.display` is absent.
+ */
+const bindingDisplayMap = new Map<string, Record<string, unknown>>();
+
+/**
+ * Internal accessor for the binding display overlay map — used by
+ * `display-helpers.ts#getDisplay` as a fallback when the descriptor itself
+ * carries no resolved display metadata.
+ */
+export function lookupBindingDisplay(moduleId: string): Record<string, unknown> | undefined {
+  return bindingDisplayMap.get(moduleId);
+}
+
+/**
+ * Clear the binding display overlay map. Primarily for tests.
+ */
+export function clearBindingDisplayMap(): void {
+  bindingDisplayMap.clear();
+}
+
+/** Options bag for {@link applyToolkitIntegration}. */
+export interface ApplyToolkitIntegrationOptions {
+  /**
+   * Allowlist of module-path prefixes forwarded to apcore-toolkit's
+   * `RegistryWriter.write` when registering scanned/loaded modules. Mirrors
+   * the Python factory's `allowed_prefixes` kwarg.
+   */
+  allowedPrefixes?: string[];
+}
+
+export async function applyToolkitIntegration(
+  commandsDir?: string,
+  bindingPath?: string,
+  options: ApplyToolkitIntegrationOptions = {},
+): Promise<void> {
+  if (!commandsDir && !bindingPath) {
+    return;
+  }
+
+  // ConventionScanner has no TypeScript equivalent (the Python adapter is
+  // pydantic-specific and does not port cleanly). See the upstream
+  // apcore-toolkit README for the tri-language parity note.
+  if (commandsDir) {
+    logWarn("Convention scanning not available in the TypeScript toolkit");
+  }
+
+  if (bindingPath) {
+    try {
+      await loadBindingDisplayOverlay(bindingPath, options.allowedPrefixes);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logWarn(`apcore-toolkit: failed to load binding '${bindingPath}': ${msg}`);
+    }
+  }
+}
+
+/**
+ * Parse a `.binding.yaml` (or directory thereof) and populate the module-level
+ * `bindingDisplayMap` with resolved display overlay entries. Uses the
+ * apcore-toolkit `BindingLoader` + `DisplayResolver` pipeline so the overlay
+ * produced here is identical to what apcore-toolkit's registry-writer would
+ * emit at scan time.
+ */
+async function loadBindingDisplayOverlay(
+  bindingPath: string,
+  allowedPrefixes?: string[],
+): Promise<void> {
+  const loader = new BindingLoader();
+  const scanned = loader.load(bindingPath);
+  const resolver = new DisplayResolver();
+  const resolved = resolver.resolve(scanned, { bindingPath });
+
+  // Mirrors Python's RegistryWriter `allowed_prefixes` gate: any entry whose
+  // `target:` path is outside the allowlist is dropped before its display
+  // overlay reaches the runtime — the TS overlay path doesn't go through
+  // RegistryWriter, so we apply the same check inline.
+  const prefixes = allowedPrefixes && allowedPrefixes.length > 0 ? allowedPrefixes : null;
+  const isTargetAllowed = (target: unknown): boolean => {
+    if (!prefixes) return true;
+    if (typeof target !== "string" || target.length === 0) return true;
+    return prefixes.some((p) => target.startsWith(p));
+  };
+
+  for (const mod of resolved) {
+    if (!mod || typeof mod !== "object") continue;
+    const entry = mod as { moduleId?: unknown; metadata?: unknown; target?: unknown };
+    const id = typeof entry.moduleId === "string" ? entry.moduleId : null;
+    if (!id) continue;
+    if (!isTargetAllowed(entry.target)) {
+      logWarn(
+        `apcore-toolkit: dropped binding entry '${id}' — target '${String(entry.target)}' ` +
+          `is outside allowedPrefixes`,
+      );
+      continue;
+    }
+    const meta = (entry.metadata as Record<string, unknown> | undefined) ?? {};
+    const display = meta.display;
+    if (display && typeof display === "object" && !Array.isArray(display)) {
+      bindingDisplayMap.set(id, display as Record<string, unknown>);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse argv and run the CLI. Handles top-level error catching and exit codes.
+ */
+export function main(progName?: string): void {
+  verboseHelp = hasVerboseFlag();
+  // Standalone bin entry: SDK version IS the app version. Pass it through
+  // explicitly so createCli registers --version (which is intentionally
+  // gated on opts.version for embedded callers — see issue #18).
+  const program = createCli({
+    progName,
+    allOptions: verboseHelp,
+    version: VERSION,
+    description: `${progName ?? "apcore-cli"} — execute modules from the command line`,
+  });
+
+  try {
+    program.parse(process.argv);
+  } catch (error: unknown) {
+    if (error instanceof CommanderError) {
+      // Commander already printed the error message
+      exitWith(error.exitCode);
+    }
+    const code = exitCodeForError(error);
+    if (error instanceof Error) {
+      process.stderr.write(`Error: ${error.message}\n`);
+    }
+    exitWith(code);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// buildModuleCommand
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a Commander Command for a single apcore module.
+ *
+ * Includes all 11 FE-11 options: --dry-run, --trace, --stream, --strategy,
+ * --approval-timeout, --approval-token, --fields, and enhanced --format choices.
+ */
+export function buildModuleCommand(
+  moduleDef: ModuleDescriptor,
+  executor: Executor,
+  helpTextMaxLength = 1000,
+  cmdName?: string,
+  verbose = verboseHelp,
+  resultOptions: ModuleResultOptions = {},
+): Command {
+  const { printResult = true, onResult } = resultOptions;
+  const exit = resultOptions.exit ?? exitWith;
+  const moduleId = moduleDef.moduleId;
+  let resolvedSchema: Record<string, unknown> = {};
+  let schemaOptions: OptionConfig[] = [];
+
+  // Resolve display overlay fields
+  const display = getDisplay(moduleDef);
+  const cliDisplay = (display.cli && typeof display.cli === "object" && !Array.isArray(display.cli))
+    ? (display.cli as Record<string, unknown>)
+    : {};
+  const effectiveCmdName: string = cmdName ?? (cliDisplay.alias as string | undefined) ?? moduleId;
+  const cmdHelp: string = (cliDisplay.description as string | undefined) ?? moduleDef.description;
+
+  // Resolve schema
+  const inputSchema = moduleDef.inputSchema;
+  if (inputSchema && typeof inputSchema === "object" && inputSchema.properties) {
+    try {
+      resolvedSchema = resolveRefs(inputSchema, 32, moduleId);
+    } catch (err) {
+      if (err instanceof MaxDepthExceededError || err instanceof CircularRefError) {
+        process.stderr.write(`Error: ${(err as Error).message}\n`);
+        exitWith(EXIT_CODES.SCHEMA_CIRCULAR_REF);
+      }
+      if (err instanceof UnresolvableRefError) {
+        process.stderr.write(`Error: ${(err as Error).message}\n`);
+        exitWith(EXIT_CODES.SCHEMA_VALIDATION_ERROR);
+      }
+      resolvedSchema = inputSchema; // unexpected error: fall through to raw schema
+    }
+    schemaOptions = schemaToCliOptions(resolvedSchema, helpTextMaxLength);
+  }
+
+  const cmd = new Command(effectiveCmdName).exitOverride().description(cmdHelp);
+
+  // Built-in options (hidden unless --all-options)
+  const inputOpt = new Option("--input <source>", "Read JSON input from a file path, or use '-' to read from stdin pipe");
+  const yesOpt = new Option("-y, --yes", "Skip interactive approval prompts (for scripts and CI)").default(false);
+  const largeInputOpt = new Option("--large-input", "Allow stdin input larger than 10MB (default limit protects against accidental pipes)").default(false);
+  const formatOpt = new Option("--format <format>", "Output format: json, table, csv, yaml, jsonl.")
+    .choices(["json", "table", "csv", "yaml", "jsonl"]);
+  const fieldsOpt = new Option("--fields <fields>", "Comma-separated dot-paths to select from the result (e.g., 'status,data.count').");
+  // --sandbox is always hidden (not yet implemented)
+  const sandboxOpt = new Option("--sandbox", "Run module in an isolated subprocess with restricted filesystem and env access").default(false).hideHelp();
+  // F1: --dry-run
+  const dryRunOpt = new Option("--dry-run", "Run preflight checks without executing the module. Shows validation results.").default(false);
+  // F4: --trace
+  const traceOpt = new Option("--trace", "Show execution pipeline trace with per-step timing after the result.").default(false);
+  // F6: --stream
+  const streamOpt = new Option("--stream", "Stream module output as JSONL (one JSON object per line, flushed immediately).").default(false);
+  // F8: --strategy
+  const strategyOpt = new Option("--strategy <name>", "Execution pipeline strategy: standard (default), internal, testing, performance.")
+    .choices(["standard", "internal", "testing", "performance", "minimal"]);
+  // F5: --approval-timeout, --approval-token
+  const approvalTimeoutOpt = new Option("--approval-timeout <seconds>", "Override approval prompt timeout in seconds (default: 60).").argParser(parseInt);
+  const approvalTokenOpt = new Option("--approval-token <token>", "Resume a pending approval with the given token (for async approval flows).");
+
+  if (!verbose) {
+    inputOpt.hideHelp();
+    yesOpt.hideHelp();
+    largeInputOpt.hideHelp();
+    formatOpt.hideHelp();
+    fieldsOpt.hideHelp();
+    dryRunOpt.hideHelp();
+    traceOpt.hideHelp();
+    streamOpt.hideHelp();
+    strategyOpt.hideHelp();
+    approvalTimeoutOpt.hideHelp();
+    approvalTokenOpt.hideHelp();
+  }
+
+  cmd.addOption(inputOpt);
+  cmd.addOption(yesOpt);
+  cmd.addOption(largeInputOpt);
+  cmd.addOption(formatOpt);
+  cmd.addOption(fieldsOpt);
+  cmd.addOption(sandboxOpt);
+  cmd.addOption(dryRunOpt);
+  cmd.addOption(traceOpt);
+  cmd.addOption(streamOpt);
+  cmd.addOption(strategyOpt);
+  cmd.addOption(approvalTimeoutOpt);
+  cmd.addOption(approvalTokenOpt);
+
+  // Help footer: --all-options hint + optional docs link
+  const footerParts: string[] = [];
+  if (!verbose) {
+    footerParts.push("Use --all-options to show all options (including built-in options).");
+  }
+  if (docsUrl) {
+    // Use the canonical module path, not the command name: hosts that nest a
+    // module under a group pass `cmdName` as the leaf (`add`), which would
+    // drop the `series.asset` prefix from the documentation link.
+    footerParts.push(`Docs: ${docsUrl}/commands/${moduleId}`);
+  }
+  if (footerParts.length > 0) {
+    cmd.addHelpText("after", "\n" + footerParts.join("\n") + "\n");
+  }
+
+  // Schema-generated options
+  for (const opt of schemaOptions) {
+    if (opt.isBooleanFlag) {
+      // Commander does not parse the combined "--flag, --no-flag" spec the
+      // way Python click does — it ends up storing `false` for both forms.
+      // Register the affirmative form (carrying the schema default and help
+      // text) and a hidden `--no-<flag>` companion; commander auto-routes
+      // both to the same camelCase attribute and applies negation correctly.
+      const flagBase = opt.name.replace(/_/g, "-");
+      cmd.addOption(
+        new Option(`--${flagBase}`, opt.description).default(
+          opt.defaultValue as boolean,
+        ),
+      );
+      cmd.addOption(new Option(`--no-${flagBase}`).hideHelp());
+    } else if (opt.parseArg) {
+      cmd.option(opt.flags, opt.description, opt.parseArg, opt.defaultValue);
+    } else {
+      cmd.option(opt.flags, opt.description, opt.defaultValue as string | boolean | undefined);
+    }
+  }
+
+  // Action callback
+  cmd.action(async (options: Record<string, unknown>) => {
+    // Pop built-in options
+    const stdinFlag = options.input as string | undefined;
+    const autoApprove = options.yes as boolean;
+    const largeInput = options.largeInput as boolean;
+    const outputFormat = options.format as string | undefined;
+    const outputFields = options.fields as string | undefined;
+    const sandboxEnabled = options.sandbox as boolean;
+    const dryRun = options.dryRun as boolean;
+    const traceFlag = options.trace as boolean;
+    const streamFlag = options.stream as boolean;
+    const strategyName = resolveStringOption(options.strategy, process.env.APCORE_CLI_STRATEGY);
+    const approvalTimeout = resolveIntOption(
+      options.approvalTimeout as number | undefined,
+      process.env.APCORE_CLI_APPROVAL_TIMEOUT,
+      60,
+    );
+    const approvalToken = options.approvalToken as string | undefined;
+
+    // Build schema kwargs from parsed options. Commander stores parsed flag
+    // values under camelCase keys (e.g. `--has-solution` -> `hasSolution`),
+    // but downstream module code keys off the original schema property names
+    // (snake_case) to match Python click and Rust clap behavior. Drive the
+    // mapping from schemaOptions so each value is written back under its
+    // original propName.
+    const schemaKwargs: Record<string, unknown> = {};
+    for (const opt of schemaOptions) {
+      const commanderKey = opt.name.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
+      if (commanderKey in options) {
+        schemaKwargs[opt.name] = options[commanderKey];
+      } else if (opt.name in options) {
+        schemaKwargs[opt.name] = options[opt.name];
+      }
+    }
+
+    let merged: Record<string, unknown> = {};
+    let preflightExitCode: number | undefined;
+    const startTime = performance.now();
+
+    try {
+      if (!dryRun) validateSandboxOptions(sandboxEnabled, traceFlag, streamFlag, strategyName);
+      // 1. Collect and merge input
+      merged = await readModuleInput(stdinFlag, schemaKwargs, largeInput);
+
+      // 2. Reconvert enum values
+      const reconverted = reconvertEnumValues(merged, schemaOptions);
+      merged = reconverted;
+
+      // 2b. Host-injected input (program-level flags, envelope fields). Merged
+      // before validation so the values are validated like any other input.
+      if (resultOptions.extraInput !== undefined) {
+        const extra =
+          typeof resultOptions.extraInput === "function"
+            ? await resultOptions.extraInput(cmd)
+            : resultOptions.extraInput;
+        if (extra === null || typeof extra !== "object" || Array.isArray(extra)) {
+          throw new InvalidCliInputError("extraInput must resolve to a plain object");
+        }
+        merged = { ...merged, ...extra };
+      }
+
+      // -- Dry-run: preflight validation only, no execution (F1) --
+      if (dryRun) {
+        if (!executor.validate) {
+          throw new ModuleExecutionError("Executor does not support validate.");
+        }
+        const preflight = await executor.validate(moduleId, merged, buildCliContext());
+        formatPreflightResult(preflight, outputFormat);
+        // --trace --dry-run: show pipeline preview
+        if (traceFlag) {
+          const pureSteps = new Set([
+            "context_creation", "call_chain_guard", "module_lookup", "acl_check", "input_validation",
+          ]);
+          const allSteps = [
+            "context_creation", "call_chain_guard", "module_lookup", "acl_check",
+            "approval_gate", "middleware_before", "input_validation", "execute",
+            "output_validation", "middleware_after", "return_result",
+          ];
+          process.stderr.write("\nPipeline preview (dry-run):\n");
+          for (const s of allSteps) {
+            if (pureSteps.has(s)) {
+              process.stderr.write(`  \u2713 ${s.padEnd(24)} (pure \u2014 would execute)\n`);
+            } else {
+              process.stderr.write(`  \u25cb ${s.padEnd(24)} (impure \u2014 skipped in dry-run)\n`);
+            }
+          }
+        }
+        preflightExitCode = preflight.valid ? 0 : firstFailedExitCode(preflight);
+        return;
+      }
+
+      // 3. Pre-execute schema validation (parity with Python jsonschema.validate
+      // and Rust validate_against_schema). Catches missing required fields before
+      // they reach executor.call() and produce an opaque TypeError.
+      if (resolvedSchema.properties) {
+        const validationErr = validateInputSchema(resolvedSchema, merged);
+        if (validationErr) {
+          throw new SchemaValidationError(`Validation failed: ${validationErr}`);
+        }
+      }
+
+      // -- Inject approval token if provided (F5) --
+      if (approvalToken) {
+        merged._approval_token = approvalToken;
+      }
+
+      // 4. Check approval.
+      //
+      // FE-14 §4.10 — when the call is about to be delegated to an execution
+      // path that carries no ACL, the decision is reached here, before the
+      // gate, so an ACL-sourced `approval: required` composes with the
+      // module's annotation. A denial throws ACLDeniedError and exits 77
+      // before anything is spawned.
+      const aclRequiresApproval = sandboxEnabled
+        ? assertDelegatedAccess(moduleId, merged)
+        : false;
+      await checkApproval(moduleDef, autoApprove, approvalTimeout, aclRequiresApproval);
+
+      // 5. Execute with timing
+
+      // -- Streaming execution (F6) --
+      if (streamFlag) {
+        // Streaming always outputs JSONL; --format table is ignored (spec §3.6.2)
+        if (resolveFormat(outputFormat) === "table") {
+          process.stderr.write("Warning: Streaming mode always outputs JSONL; --format table is ignored.\n");
+        }
+        const isStreaming = getAnnotation(moduleDef.annotations, "streaming", false) === true;
+        if (!isStreaming) {
+          process.stderr.write(
+            `Warning: Module '${moduleId}' does not declare streaming support. Falling back to standard execution.\n`,
+          );
+        }
+
+        if (isStreaming && executor.stream) {
+          let chunks = 0;
+          for await (const chunk of executor.stream(moduleId, merged)) {
+            chunks++;
+            process.stdout.write(JSON.stringify(chunk) + "\n");
+            if (process.stderr.isTTY) {
+              process.stderr.write(`\rStreaming ${moduleId}... (${chunks} chunks)`);
+            }
+          }
+          if (process.stderr.isTTY) {
+            process.stderr.write("\n");
+          }
+          const durationMs = Math.round(performance.now() - startTime);
+
+          // Audit log (success)
+          const { getAuditLogger } = await import("./security/audit.js");
+          const auditLogger = getAuditLogger();
+          if (auditLogger) {
+            auditLogger.logExecution(moduleId, merged, "success", 0, durationMs);
+          }
+          return;
+        }
+        // else: fall through to normal execution
+      }
+
+      // -- Traced execution (F4) --
+      if (traceFlag && executor.callWithTrace) {
+        const [result, trace] = await executor.callWithTrace(
+          moduleId,
+          merged,
+          strategyName ? { strategy: strategyName } : undefined,
+        );
+        const durationMs = Math.round(performance.now() - startTime);
+
+        // Print result
+        const traceToStderr = resolveFormat(outputFormat) !== "json" && process.stdout.isTTY;
+        if (printResult && !traceToStderr) {
+          // Merge _trace into JSON output. JSON keys remain snake_case to
+          // match the cross-language CLI output contract; runtime reads use
+          // the camelCase shape returned by apcore-js PipelineTrace.
+          const traceData = {
+            strategy: trace.strategyName,
+            total_duration_ms: trace.totalDurationMs,
+            success: trace.success,
+            steps: trace.steps.map((s) => ({
+              name: s.name,
+              duration_ms: s.durationMs,
+              skipped: s.skipped,
+              ...(s.skipped ? { skip_reason: s.skipReason ?? null } : {}),
+            })),
+          };
+          let output: Record<string, unknown>;
+          if (typeof result === "object" && result !== null && !Array.isArray(result)) {
+            output = { ...(result as Record<string, unknown>), _trace: traceData };
+          } else {
+            output = { result, _trace: traceData };
+          }
+          process.stdout.write(JSON.stringify(output, null, 2) + "\n");
+        } else if (traceToStderr) {
+          if (printResult) formatExecResult(result, outputFormat, outputFields);
+          // Print trace to stderr
+          const stepCount = trace.steps.length;
+          process.stderr.write(
+            `\nPipeline Trace (strategy: ${trace.strategyName}, ` +
+            `${stepCount} steps, ${trace.totalDurationMs.toFixed(1)}ms)\n`,
+          );
+          for (const s of trace.steps) {
+            if (s.skipped) {
+              const reason = s.skipReason ?? "n/a";
+              process.stderr.write(`  \u25cb ${s.name.padEnd(24)} ${"\u2014".padStart(8)}  skipped (${reason})\n`);
+            } else {
+              process.stderr.write(`  \u2713 ${s.name.padEnd(24)} ${(s.durationMs.toFixed(1) + "ms").padStart(8)}\n`);
+            }
+          }
+        }
+        if (onResult) await onResult(result, moduleId);
+        // Audit log AFTER format (canonical ordering: format \u2192 audit on success)
+        const { getAuditLogger: getAL2 } = await import("./security/audit.js");
+        const al2 = getAL2();
+        if (al2) {
+          al2.logExecution(moduleId, merged, "success", 0, durationMs);
+        }
+        return;
+      }
+
+      // -- Standard execution (with optional strategy F8) --
+      let result: unknown;
+      if (strategyName && executor.callWithTrace) {
+        // Strategy requires callWithTrace to pass strategy param
+        const [res] = await executor.callWithTrace(
+          moduleId,
+          merged,
+          { strategy: strategyName },
+        );
+        result = res;
+        if (strategyName !== "standard" && process.stderr.isTTY) {
+          process.stderr.write(`Warning: Using '${strategyName}' strategy.\n`);
+        }
+        // FE-14 §6.2 — bypassing a *configured* ACL is a materially different
+        // event from running with no rules at all, and is reported even when
+        // stderr is not a terminal.
+        warnStrategyBypassesAcl(strategyName);
+      } else {
+        const { Sandbox } = await import("./security/index.js");
+        const sandbox = new Sandbox(sandboxEnabled);
+        result = await sandbox.execute(moduleId, merged, executor, buildCliContext());
+      }
+      const durationMs = Math.round(performance.now() - startTime);
+
+      // 6. Format and print result first (canonical order: format → audit)
+      if (printResult) formatExecResult(result, outputFormat, outputFields);
+      if (onResult) await onResult(result, moduleId);
+
+      // 7. Audit log (success) — called AFTER format so formatter exceptions
+      //    suppress the success entry (matches Python canonical ordering).
+      const { getAuditLogger } = await import("./security/audit.js");
+      const auditLogger = getAuditLogger();
+      if (auditLogger) {
+        auditLogger.logExecution(moduleId, merged, "success", 0, durationMs);
+      }
+    } catch (err: unknown) {
+      const failure = resolveModuleError(err, moduleId, resultOptions.exitCodes);
+      const durationMs = Math.round(performance.now() - startTime);
+
+      // Audit log (error) with real elapsed duration_ms
+      try {
+        const { getAuditLogger } = await import("./security/audit.js");
+        const auditLogger = getAuditLogger();
+        if (auditLogger) {
+          auditLogger.logExecution(moduleId, merged, "error", failure.exitCode, durationMs);
+        }
+      } catch {
+        // Ignore audit failures during error handling
+      }
+
+      await reportModuleError(failure, resultOptions, outputFormat);
+    } finally {
+      // A preflight already wrote its result. Keep the host's exit outside
+      // the dispatch catch so an exception from it is never reported again.
+      if (preflightExitCode !== undefined) exit(preflightExitCode);
+    }
+  });
+
+  return cmd;
+}
+
+// ---------------------------------------------------------------------------
+// validateModuleId — see src/validate.ts (extracted to mirror Python/Rust layout, audit D8-W2)
+// ---------------------------------------------------------------------------
+
+export { validateModuleId } from "./validate.js";
+
+// ---------------------------------------------------------------------------
+// collectInput
+// ---------------------------------------------------------------------------
+
+/**
+ * Collect module input from stdin and/or CLI keyword arguments.
+ */
+export async function collectInput(
+  stdinFlag?: string,
+  cliKwargs: Record<string, unknown> = {},
+  largeInput?: boolean,
+): Promise<Record<string, unknown>> {
+  try {
+    return await readModuleInput(stdinFlag, cliKwargs, largeInput);
+  } catch (error) {
+    if (!(error instanceof InvalidCliInputError)) throw error;
+    process.stderr.write(`Error: ${error.message}\n`);
+    exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+  }
+}
+
+/** Collect input for a dispatch that owns its error output and exit. */
+export async function readModuleInput(
+  stdinFlag: string | undefined,
+  cliKwargs: Record<string, unknown>,
+  largeInput?: boolean,
+): Promise<Record<string, unknown>> {
+  // Remove null/undefined values from CLI kwargs
+  const cliKwargsNonNull: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(cliKwargs)) {
+    if (v !== null && v !== undefined) {
+      cliKwargsNonNull[k] = v;
+    }
+  }
+
+  if (!stdinFlag) {
+    return cliKwargsNonNull;
+  }
+
+  let raw: string;
+  let source: string;
+  if (stdinFlag === "-") {
+    source = "STDIN";
+    try {
+      raw = await readStdin();
+    } catch (error) {
+      throw new InvalidCliInputError(`Could not read STDIN: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else {
+    // File-path source (help text: "JSON input file or '-' for stdin")
+    source = `file '${stdinFlag}'`;
+    try {
+      raw = readFileSync(stdinFlag, "utf-8");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new InvalidCliInputError(`Could not read input ${source}: ${msg}`);
+    }
+  }
+
+  const rawSize = Buffer.byteLength(raw, "utf-8");
+  if (rawSize > 10_485_760 && !largeInput) {
+    throw new InvalidCliInputError(
+      `${source} input exceeds 10MB limit. Use --large-input to override.`,
+    );
+  }
+
+  if (!raw) {
+    return cliKwargsNonNull;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new InvalidCliInputError(`${source} does not contain valid JSON.`);
+  }
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new InvalidCliInputError(
+      `${source} JSON must be an object, got ${Array.isArray(parsed) ? "array" : typeof parsed}.`,
+    );
+  }
+
+  // CLI flags override stdin/file for duplicate keys
+  return { ...(parsed as Record<string, unknown>), ...cliKwargsNonNull };
+}
+
+/**
+ * Read all data from stdin with proper cleanup.
+ */
+function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const onData = (chunk: Buffer) => chunks.push(chunk);
+    const onEnd = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks).toString("utf-8"));
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    const cleanup = () => {
+      process.stdin.removeListener("data", onData);
+      process.stdin.removeListener("end", onEnd);
+      process.stdin.removeListener("error", onError);
+    };
+    process.stdin.on("data", onData);
+    process.stdin.on("end", onEnd);
+    process.stdin.on("error", onError);
+    process.stdin.resume();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// reconvertEnumValues
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-convert CLI string values back to their schema-typed equivalents
+ * based on the option configs.
+ */
+export function reconvertEnumValues(
+  kwargs: Record<string, unknown>,
+  options: OptionConfig[],
+): Record<string, unknown> {
+  const result = { ...kwargs };
+  for (const opt of options) {
+    if (!opt.enumOriginalTypes) continue;
+    const paramName = opt.name;
+    if (!(paramName in result) || result[paramName] === null || result[paramName] === undefined) {
+      continue;
+    }
+    const strVal = String(result[paramName]);
+    const origType = opt.enumOriginalTypes[strVal];
+    if (origType === "int") {
+      result[paramName] = parseInt(strVal, 10);
+    } else if (origType === "float") {
+      result[paramName] = parseFloat(strVal);
+    } else if (origType === "bool") {
+      result[paramName] = strVal.toLowerCase() === "true";
+    }
+  }
+  return result;
+}

@@ -1,0 +1,246 @@
+/**
+ * JSON Schema -> Commander options mapping.
+ *
+ * Protocol spec: Schema-driven argument parsing
+ */
+
+import type { OptionConfig } from "./main.js";
+import { EXIT_CODES } from "./errors.js";
+import { exitWith } from "./exit.js";
+import { warn as logWarn } from "./logger.js";
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/** Sentinel type marker for boolean flags. */
+const BOOLEAN_FLAG = Symbol("BOOLEAN_FLAG");
+
+type TypeResult = "string" | "int" | "float" | typeof BOOLEAN_FLAG | "file";
+
+/**
+ * Map JSON Schema type to a type identifier.
+ */
+export function mapType(propName: string, propSchema: Record<string, unknown>): TypeResult {
+  const schemaType = propSchema.type as string | undefined;
+
+  // Check file convention
+  if (
+    schemaType === "string" &&
+    (propName.endsWith("_file") || propSchema["x-cli-file"] === true)
+  ) {
+    return "file";
+  }
+
+  const typeMap: Record<string, TypeResult> = {
+    string: "string",
+    integer: "int",
+    number: "float",
+    boolean: BOOLEAN_FLAG,
+    object: "string",
+    array: "string",
+  };
+
+  // Cross-SDK parity (D11-02): warn on a missing or unknown schema type before
+  // defaulting to string, mirroring Python schema_parser._map_type and Rust
+  // schema_parser::map_type. Without this the TS SDK silently swallows a
+  // typo'd or absent `type`, giving operators no diagnostic.
+  if (!schemaType) {
+    logWarn(`No type specified for property '${propName}', defaulting to string.`);
+    return "string";
+  }
+
+  const mapped = typeMap[schemaType];
+  if (mapped === undefined) {
+    logWarn(
+      `Unknown schema type '${schemaType}' for property '${propName}', defaulting to string.`,
+    );
+    return "string";
+  }
+  return mapped;
+}
+
+/**
+ * Extract help text from schema property, preferring x-llm-description.
+ */
+export function extractHelp(propSchema: Record<string, unknown>, maxLength = 1000): string | undefined {
+  let text = propSchema["x-llm-description"] as string | undefined;
+  if (!text) {
+    text = propSchema.description as string | undefined;
+  }
+  if (!text) {
+    return undefined;
+  }
+  if (maxLength > 0 && text.length > maxLength) {
+    return text.slice(0, maxLength - 3) + "...";
+  }
+  return text;
+}
+
+// ---------------------------------------------------------------------------
+// schemaToCliOptions
+// ---------------------------------------------------------------------------
+
+/** Reserved CLI option names that cannot be used by schema properties. */
+const RESERVED_NAMES = new Set([
+  "input", "yes", "large_input", "format", "fields", "sandbox",
+  "all_options", "dry_run", "trace", "stream", "strategy",
+  "approval_timeout", "approval_token",
+]);
+
+/**
+ * Convert a JSON Schema `properties` object into an array of
+ * Commander option configurations.
+ */
+export function schemaToCliOptions(
+  schema: Record<string, unknown>,
+  maxHelpLength = 1000,
+): OptionConfig[] {
+  const properties = (schema.properties ?? {}) as Record<
+    string,
+    Record<string, unknown>
+  >;
+  const requiredList = (schema.required ?? []) as string[];
+  const options: OptionConfig[] = [];
+  const flagNames: Record<string, string> = {};
+
+  // Cross-SDK parity (D11-W4): warn when a name appears in `required` but
+  // has no matching entry in `properties`. Mirrors Python schema_parser.py
+  // (lines 93-98) and Rust schema_parser.rs (lines 220-228); without this
+  // loop schemas like `{required: ["foo"]}` with no `properties.foo` parse
+  // silently in the TS SDK only.
+  for (const reqName of requiredList) {
+    if (!(reqName in properties)) {
+      logWarn(
+        `Required property '${reqName}' not found in properties, skipping.`,
+      );
+    }
+  }
+
+  for (const [propName, propSchema] of Object.entries(properties)) {
+    const flagName = "--" + propName.replace(/_/g, "-");
+
+    // Reserved name check (must precede collision check to match Python/Rust).
+    // Exit 48 (SCHEMA_CIRCULAR_REF — the protocol-spec slot for schema-validity
+    // errors) for cross-SDK parity with Python sys.exit(48) and Rust
+    // SchemaParserError::ReservedPropertyName → CliError::SchemaParserFailure.
+    // Audit D11-NEW-005 (2026-05-08).
+    if (RESERVED_NAMES.has(propName)) {
+      process.stderr.write(
+        `Error: Module schema property '${propName}' conflicts with a reserved CLI option name. Rename the property.\n`,
+      );
+      exitWith(EXIT_CODES.SCHEMA_CIRCULAR_REF);
+    }
+
+    // Collision detection — exit 48 per spec (docs/features/schema-parser.md
+    // Contract: schema_to_click_options Errors), matching Python sys.exit(48)
+    // at schema_parser.py:116. Audit D11-NEW-004 (2026-05-08).
+    if (flagName in flagNames) {
+      process.stderr.write(
+        `Error: Flag name collision: properties '${propName}' and '${flagNames[flagName]}' both map to '${flagName}'.\n`,
+      );
+      exitWith(EXIT_CODES.SCHEMA_CIRCULAR_REF);
+    }
+    flagNames[flagName] = propName;
+
+    const typeResult = mapType(propName, propSchema);
+    const isRequired = requiredList.includes(propName);
+    const helpBase = extractHelp(propSchema, maxHelpLength);
+    const helpText = isRequired
+      ? (helpBase ? helpBase + " " : "") + "[required]"
+      : helpBase ?? "";
+    const defaultValue = propSchema.default as unknown;
+
+    if (typeResult === BOOLEAN_FLAG) {
+      // Boolean flag pair: --flag/--no-flag
+      const flagBase = propName.replace(/_/g, "-");
+      // Cross-SDK parity (D11-005): Rust schema_parser.rs:272 also tracks
+      // the auto-generated `--no-<flag>` name in the collision map so a
+      // schema pairing a boolean ``force`` with a non-boolean ``no_force``
+      // is rejected at parse time. Without this, the second property
+      // silently shadows the negation flag.
+      const noFlag = `--no-${flagBase}`;
+      if (noFlag in flagNames) {
+        process.stderr.write(
+          `Error: Flag name collision: boolean property '${propName}' auto-generates '${noFlag}' which is already used by property '${flagNames[noFlag]}'.\n`,
+        );
+        // Audit D11-NEW-004 (2026-05-08): exit 48 per spec, matching
+        // Python sys.exit(48) at schema_parser.py:137.
+        exitWith(EXIT_CODES.SCHEMA_CIRCULAR_REF);
+      }
+      flagNames[noFlag] = propName;
+      const defaultVal = (propSchema.default as boolean) ?? false;
+      options.push({
+        name: propName,
+        flags: `--${flagBase}, --no-${flagBase}`,
+        description: helpText,
+        defaultValue: defaultVal,
+        required: isRequired,
+        isBooleanFlag: true,
+      });
+    } else if ("enum" in propSchema && Array.isArray(propSchema.enum)) {
+      const enumValues = propSchema.enum as unknown[];
+      if (enumValues.length === 0) {
+        // Empty enum — fall back to plain string option
+        options.push({
+          name: propName,
+          flags: `${flagName} <value>`,
+          description: helpText,
+          defaultValue,
+          required: isRequired,
+        });
+      } else {
+        const stringValues = enumValues.map(String);
+        const enumOriginalTypes: Record<string, string> = {};
+        for (const v of enumValues) {
+          if (typeof v === "number" && Number.isInteger(v)) {
+            enumOriginalTypes[String(v)] = "int";
+          } else if (typeof v === "number") {
+            enumOriginalTypes[String(v)] = "float";
+          } else if (typeof v === "boolean") {
+            enumOriginalTypes[String(v)] = "bool";
+          }
+        }
+        options.push({
+          name: propName,
+          flags: `${flagName} <value>`,
+          description: helpText,
+          defaultValue:
+            defaultValue !== undefined ? String(defaultValue) : undefined,
+          required: isRequired,
+          choices: stringValues,
+          enumOriginalTypes:
+            Object.keys(enumOriginalTypes).length > 0
+              ? enumOriginalTypes
+              : undefined,
+        });
+      }
+    } else {
+      // Standard option
+      let parseArg: ((value: string) => unknown) | undefined;
+      if (typeResult === "int") {
+        parseArg = (v: string) => {
+          const n = parseInt(v, 10);
+          if (isNaN(n)) throw new Error(`Invalid integer: ${v}`);
+          return n;
+        };
+      } else if (typeResult === "float") {
+        parseArg = (v: string) => {
+          const n = parseFloat(v);
+          if (isNaN(n)) throw new Error(`Invalid number: ${v}`);
+          return n;
+        };
+      }
+      options.push({
+        name: propName,
+        flags: `${flagName} <value>`,
+        description: helpText,
+        defaultValue,
+        required: isRequired,
+        parseArg,
+      });
+    }
+  }
+
+  return options;
+}

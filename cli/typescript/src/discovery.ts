@@ -1,0 +1,453 @@
+/**
+ * Discovery commands — list, describe, exec, validate (FE-04, FE-11, FE-13).
+ *
+ * Protocol spec: Module discovery & introspection
+ *
+ * FE-13 (builtin-group): these registrars attach per-subcommand to an
+ * `apcli` Commander sub-group rather than to the root program.
+ */
+
+import { Command, Option } from "commander";
+import { exitWith } from "./exit.js";
+import { checkApproval } from "./approval.js";
+import { getAnnotation } from "./annotations.js";
+import { listAllDefinitions } from "./cli.js";
+import type { Executor, ModuleDescriptor, Registry } from "./cli.js";
+import { EXIT_CODES, exitCodeForError, InvalidCliInputError, ModuleNotFoundError } from "./errors.js";
+import { reportModuleError, resolveModuleError } from "./error-output.js";
+import { validateModuleId, collectInput, readModuleInput, validateSandboxOptions } from "./main.js";
+import type { ModuleResultOptions } from "./main.js";
+import { assertValidModuleId } from "./validate.js";
+import {
+  formatExecResult,
+  formatModuleDetail,
+  formatModuleList,
+  formatPreflightResult,
+  firstFailedExitCode,
+  resolveFormat,
+} from "./output.js";
+import {
+  assertDelegatedAccess,
+  buildCliContext,
+  warnStrategyBypassesAcl,
+} from "./acl-loader.js";
+import { getAuditLogger } from "./security/audit.js";
+import { sortModulesByUsage } from "./system-usage.js";
+
+const TAG_PATTERN = /^[a-z][a-z0-9_-]*$/;
+
+function validateTag(tag: string): void {
+  if (!TAG_PATTERN.test(tag)) {
+    process.stderr.write(
+      `Error: Invalid tag format: '${tag}'. Tags must match [a-z][a-z0-9_-]*.\n`,
+    );
+    exitWith(EXIT_CODES.INVALID_CLI_INPUT);
+  }
+}
+
+/**
+ * Collect repeated --tag options into an array.
+ */
+function collectTag(value: string, previous: string[]): string[] {
+  return previous.concat([value]);
+}
+
+/**
+ * Collect repeated --annotation options into an array.
+ */
+function collectAnnotation(value: string, previous: string[]): string[] {
+  return previous.concat([value]);
+}
+
+/**
+ * Get an annotation value from a module descriptor.
+ *
+ * The CLI flag spelling (`requires-approval`) and both key conventions are
+ * resolved by getAnnotation(), so an in-memory apcore-js descriptor
+ * (camelCase) and a JSON/toolkit descriptor (snake_case) behave identically.
+ */
+function getAnnotationFlag(moduleDef: ModuleDescriptor, flag: string): boolean {
+  return getAnnotation(moduleDef.annotations, flag, false) === true;
+}
+
+/**
+ * Register the `list` subcommand on the given group (FE-13).
+ */
+export function registerListCommand(
+  apcliGroup: Command,
+  registry: Registry,
+  exposureFilter?: import("./exposure.js").ExposureFilter,
+): void {
+  const listCmd = new Command("list")
+    .description("List available modules in the registry.")
+    .option("--tag <tag>", "Filter modules by tag (AND logic). Repeatable.", collectTag, [])
+    .option("--flat", "Show flat list (no grouping).", false)
+    .addOption(
+      new Option("--format <format>", "Output format.")
+        .choices(["table", "json", "csv", "yaml", "jsonl", "markdown", "skill"]),
+    )
+    .option("-s, --search <query>", "Filter by substring match on ID and description.")
+    .addOption(
+      new Option("--status <status>", "Filter by module status.")
+        .choices(["enabled", "disabled", "all"])
+        .default("enabled"),
+    )
+    .option("-a, --annotation <flag>", "Filter by annotation flag (AND logic). Repeatable.", collectAnnotation, [])
+    .addOption(
+      new Option("--sort <field>", "Sort order.")
+        .choices(["id", "calls", "errors", "latency"])
+        .default("id"),
+    )
+    .option("--reverse", "Reverse sort order.", false)
+    .option("--deprecated", "Include deprecated modules.", false)
+    .option("--deps", "Show dependency count column.", false)
+    .addOption(
+      new Option("--exposure <mode>", "Filter by exposure status.")
+        .choices(["exposed", "hidden", "all"])
+        .default("exposed"),
+    )
+    .action((opts: {
+      tag: string[];
+      flat: boolean;
+      format?: string;
+      search?: string;
+      status: string;
+      annotation: string[];
+      sort: string;
+      reverse: boolean;
+      deprecated: boolean;
+      deps: boolean;
+      exposure: string;
+    }) => {
+      // Validate tags
+      for (const t of opts.tag) {
+        validateTag(t);
+      }
+
+      let modules: ModuleDescriptor[] = [];
+      for (const m of listAllDefinitions(registry)) {
+        modules.push(m);
+      }
+
+      // Tag filter (AND logic)
+      if (opts.tag.length > 0) {
+        const filterTags = new Set(opts.tag);
+        modules = modules.filter((m) => {
+          const mTags = m.tags ?? [];
+          return [...filterTags].every((t) => mTags.includes(t));
+        });
+      }
+
+      // Search filter (case-insensitive substring on id + description)
+      if (opts.search) {
+        const query = opts.search.toLowerCase();
+        modules = modules.filter(
+          (m) =>
+            (m.moduleId ?? "").toLowerCase().includes(query) ||
+            (m.description ?? "").toLowerCase().includes(query),
+        );
+      }
+
+      // Status filter
+      if (opts.status === "enabled") {
+        modules = modules.filter((m) => {
+          const enabled = (m as unknown as Record<string, unknown>).enabled;
+          return enabled !== false;
+        });
+      } else if (opts.status === "disabled") {
+        modules = modules.filter((m) => {
+          const enabled = (m as unknown as Record<string, unknown>).enabled;
+          return enabled === false;
+        });
+      }
+      // "all": no filter
+
+      // Deprecated filter (excluded by default)
+      if (!opts.deprecated) {
+        modules = modules.filter((m) => {
+          const deprecated = (m as unknown as Record<string, unknown>).deprecated;
+          return deprecated !== true;
+        });
+      }
+
+      // Annotation filter (AND logic)
+      if (opts.annotation.length > 0) {
+        for (const annFlag of opts.annotation) {
+          modules = modules.filter((m) => getAnnotationFlag(m, annFlag));
+        }
+      }
+
+      // Sort — usage-based sorts read aggregates from the audit log
+      // (issue #17). Falls back to id-sort with a visible note if the log
+      // has no entries in the default 24h window.
+      if (opts.sort === "calls" || opts.sort === "errors" || opts.sort === "latency") {
+        const { used } = sortModulesByUsage(modules, opts.sort, { reverse: !opts.reverse });
+        if (!used) {
+          process.stderr.write(
+            `note: no usage data available for --sort ${opts.sort}; sorted by id. ` +
+            "Run some modules first to populate ~/.apcore-cli/audit.jsonl.\n",
+          );
+        }
+      } else {
+        modules.sort((a, b) => (a.moduleId ?? "").localeCompare(b.moduleId ?? ""));
+        if (opts.reverse) {
+          modules.reverse();
+        }
+      }
+
+      // Exposure filter (FE-12)
+      let showExposureCol = false;
+      if (exposureFilter && opts.exposure !== "all") {
+        if (opts.exposure === "exposed") {
+          modules = modules.filter((m) => exposureFilter.isExposed(m.moduleId ?? ""));
+        } else if (opts.exposure === "hidden") {
+          modules = modules.filter((m) => !exposureFilter.isExposed(m.moduleId ?? ""));
+        }
+      }
+      if (opts.exposure === "all" && exposureFilter) {
+        showExposureCol = true;
+      }
+
+      const fmt = resolveFormat(opts.format);
+      const filterTagsArg = opts.tag.length > 0 ? opts.tag : undefined;
+      void formatModuleList(modules, fmt, filterTagsArg, opts.deps, showExposureCol ? exposureFilter : undefined);
+    });
+  apcliGroup.addCommand(listCmd);
+}
+
+/**
+ * Register the `describe` subcommand on the given group (FE-13).
+ */
+export function registerDescribeCommand(
+  apcliGroup: Command,
+  registry: Registry,
+): void {
+  const describeCmd = new Command("describe")
+    .description("Show metadata, schema, and annotations for a module.")
+    .argument("<module-id>", "Module ID to describe")
+    .addOption(
+      new Option("--format <format>", "Output format.")
+        .choices(["table", "json", "csv", "yaml", "jsonl", "markdown", "skill"]),
+    )
+    .action((moduleId: string, opts: { format?: string }) => {
+      validateModuleId(moduleId);
+
+      const moduleDef = registry.getDefinition(moduleId);
+      if (!moduleDef) {
+        process.stderr.write(
+          `Error: Module '${moduleId}' not found.\n`,
+        );
+        exitWith(EXIT_CODES.MODULE_NOT_FOUND);
+      }
+
+      const fmt = resolveFormat(opts.format);
+      void formatModuleDetail(moduleDef, fmt);
+    });
+  apcliGroup.addCommand(describeCmd);
+}
+
+/**
+ * Register the `exec` subcommand on the given group (FE-13).
+ *
+ * Generic dispatch: `apcli exec <module-id> [--format fmt] [--input json]`.
+ * Unlike the per-module commands built by `buildModuleCommand`, this command
+ * does not derive options from the module's input schema — inputs are passed
+ * as a JSON object via `--input`. This mirrors the apcli-flavoured generic
+ * dispatch contract in the builtin-group feature spec.
+ */
+export function registerExecCommand(
+  apcliGroup: Command,
+  registry: Registry,
+  executor: Executor,
+  resultOptions: ModuleResultOptions = {},
+): void {
+  const { printResult = true, onResult } = resultOptions;
+  const execCmd = new Command("exec")
+    .exitOverride()
+    .description("Execute a module by ID with JSON input.")
+    .argument("<module-id>", "Module ID to execute")
+    .option("--format <format>", "Output format (json, table, csv, yaml, jsonl).")
+    .option("--fields <fields>", "Comma-separated dot-paths to select from the result.")
+    .option(
+      "--input <json>",
+      "JSON object passed as input to the module. Use '-' to read JSON from stdin.",
+    )
+    .option("-y, --yes", "Auto-approve if the module declares requires_approval.", false)
+    .option(
+      "--approval-timeout <seconds>",
+      "Seconds to wait for interactive approval.",
+      parseInt,
+    )
+    .option("--sandbox", "Run module in an isolated subprocess with restricted env.", false)
+    .option("--strategy <name>", "Execution strategy (standard, parallel, sequential, etc.).")
+    .option("--trace", "Enable pipeline trace output.", false)
+    .option("--dry-run", "Validate inputs without executing the module.", false)
+    .option("--stream", "Stream output as JSONL instead of buffering.", false)
+    .action(async (
+      moduleId: string,
+      opts: {
+        format?: string;
+        fields?: string;
+        input?: string;
+        yes: boolean;
+        approvalTimeout?: number;
+        sandbox: boolean;
+        strategy?: string;
+        trace: boolean;
+        dryRun: boolean;
+        stream: boolean;
+      },
+    ) => {
+      let merged: Record<string, unknown> = {};
+      const startTime = performance.now();
+      try {
+        if (!opts.dryRun) validateSandboxOptions(opts.sandbox, opts.trace, opts.stream, opts.strategy);
+        assertValidModuleId(moduleId);
+
+        const moduleDef = registry.getDefinition(moduleId);
+        if (!moduleDef) throw new ModuleNotFoundError(`Module '${moduleId}' not found.`);
+
+        if (opts.input === "-") {
+          merged = await readModuleInput("-", {});
+        } else if (opts.input !== undefined) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(opts.input);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new InvalidCliInputError(`--input is not valid JSON: ${message}`);
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            throw new InvalidCliInputError("--input JSON must be an object.");
+          }
+          merged = parsed as Record<string, unknown>;
+        }
+
+        if (resultOptions.extraInput !== undefined) {
+          const extra =
+            typeof resultOptions.extraInput === "function"
+              ? await resultOptions.extraInput(execCmd)
+              : resultOptions.extraInput;
+          if (extra === null || typeof extra !== "object" || Array.isArray(extra)) {
+            throw new InvalidCliInputError("extraInput must resolve to a plain object");
+          }
+          merged = { ...merged, ...extra };
+        }
+        // FE-14 §4.10 — see main.ts buildModuleCommand: the sandboxed path
+        // carries no ACL, so the decision is reached here, before the gate,
+        // and its approval requirement composes with the annotation.
+        const aclRequiresApproval = opts.sandbox
+          ? assertDelegatedAccess(moduleId, merged)
+          : false;
+        await checkApproval(moduleDef, opts.yes, opts.approvalTimeout, aclRequiresApproval);
+
+        // --dry-run: validate without executing
+        if (opts.dryRun) {
+          if (executor.validate) {
+            const preflight = await executor.validate(moduleId, merged, buildCliContext());
+            formatPreflightResult(preflight, opts.format);
+          } else {
+            process.stdout.write(JSON.stringify({ valid: true }) + "\n");
+          }
+          return;
+        }
+
+        let result: unknown;
+        // D11-011: --trace alone (no --strategy) must also route through
+        // callWithTrace, matching Python discovery.py:382. Previously the
+        // short-circuit only checked opts.strategy, leaving --trace silently
+        // dropped on the TS side.
+        if ((opts.trace || opts.strategy) && executor.callWithTrace) {
+          // FE-14 §6.2 — a strategy that removes `acl_check` bypasses a
+          // configured ACL; say so rather than enforcing nothing silently.
+          warnStrategyBypassesAcl(opts.strategy);
+          const [res] = await executor.callWithTrace(moduleId, merged, { strategy: opts.strategy });
+          result = res;
+        } else {
+          const { Sandbox } = await import("./security/index.js");
+          const sandbox = new Sandbox(opts.sandbox);
+          result = await sandbox.execute(moduleId, merged, executor, buildCliContext());
+        }
+        const durationMs = Math.round(performance.now() - startTime);
+
+        // Format output first (canonical ordering: format → audit on success)
+        if (printResult) formatExecResult(result, resolveFormat(opts.format), opts.fields);
+        if (onResult) await onResult(result, moduleId);
+
+        // Audit success AFTER format so a formatter exception suppresses the entry
+        const auditLogger = getAuditLogger();
+        if (auditLogger) {
+          auditLogger.logExecution(moduleId, merged, "success", 0, durationMs);
+        }
+      } catch (err: unknown) {
+        const failure = resolveModuleError(err, moduleId, resultOptions.exitCodes);
+        const durationMs = Math.round(performance.now() - startTime);
+        try {
+          const auditLogger = getAuditLogger();
+          if (auditLogger) {
+            auditLogger.logExecution(moduleId, merged, "error", failure.exitCode, durationMs);
+          }
+        } catch {
+          // Ignore audit failures during error handling
+        }
+        await reportModuleError(failure, resultOptions, opts.format);
+      }
+    });
+  apcliGroup.addCommand(execCmd);
+}
+
+/**
+ * Register the standalone validate command.
+ */
+export function registerValidateCommand(
+  cli: Command,
+  registry: Registry,
+  executor: Executor,
+): void {
+  const validateCmd = new Command("validate")
+    .description("Run preflight checks without executing a module.")
+    .argument("<module-id>", "Module ID to validate")
+    .option("--input <source>", "JSON input file or '-' for stdin.")
+    .option("--format <format>", "Output format.")
+    .action(async (moduleId: string, opts: { input?: string; format?: string }) => {
+      validateModuleId(moduleId);
+
+      const moduleDef = registry.getDefinition(moduleId);
+      if (!moduleDef) {
+        process.stderr.write(`Error: Module '${moduleId}' not found.\n`);
+        exitWith(EXIT_CODES.MODULE_NOT_FOUND);
+      }
+
+      const merged = opts.input ? await collectInput(opts.input, {}, false) : {};
+
+      if (!executor.validate) {
+        process.stderr.write("Error: Executor does not support validate.\n");
+        exitWith(EXIT_CODES.MODULE_EXECUTE_ERROR);
+      }
+
+      // Mirror buildModuleCommand's dry-run path: no approval gate (preflight
+      // does not execute), but audit-log exceptions so scripted callers
+      // always produce a trail even on failed validation (main.ts:1151-1159).
+      try {
+        const preflight = await executor.validate(moduleId, merged, buildCliContext());
+        formatPreflightResult(preflight, opts.format);
+        exitWith(preflight.valid ? 0 : firstFailedExitCode(preflight));
+      } catch (err: unknown) {
+        const exitCode = exitCodeForError(err);
+        try {
+          const auditLogger = getAuditLogger();
+          if (auditLogger) {
+            auditLogger.logExecution(moduleId, merged, "error", exitCode, 0);
+          }
+        } catch {
+          // Ignore audit failures during error handling
+        }
+        process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+        exitWith(exitCode);
+      }
+    });
+  cli.addCommand(validateCmd);
+}
+
+// registerDiscoveryCommands was removed in FE-13 create-cli-integration.
+// Call registerListCommand + registerDescribeCommand directly.
