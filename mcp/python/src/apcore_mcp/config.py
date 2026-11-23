@@ -1,0 +1,52 @@
+"""MCP config namespace registration for the Config Bus (apcore 0.15.0 §9.4)."""
+
+from __future__ import annotations
+
+import logging
+
+from apcore.config import Config
+
+logger = logging.getLogger(__name__)
+
+MCP_NAMESPACE = "mcp"
+MCP_ENV_PREFIX = "APCORE_MCP"
+
+MCP_DEFAULTS: dict[str, object] = {
+    "transport": "stdio",
+    "host": "127.0.0.1",
+    "port": 8000,
+    "name": "apcore-mcp",
+    "log_level": None,
+    "validate_inputs": False,
+    "explorer": False,
+    "explorer_prefix": "/explorer",
+    "require_auth": True,
+    # Declarative middleware list — each entry is {type: str, ...kwargs}.
+    # See middleware_builder.build_middleware_from_config for supported types.
+    "middleware": [],
+    # Declarative ACL — {default_effect: "deny"|"allow", rules: [ACLRule...]}.
+    # Empty / null means "no ACL" (allow all). See acl_builder.build_acl_from_config.
+    "acl": None,
+    # OpenAPI backend — {spec, base_url, prefix, include, exclude,
+    # include_deprecated, timeout, headers, acknowledge_unapproved_writes}.
+    #
+    # `spec` is the FIRST path-typed key in this namespace, and apcore 0.30.0's
+    # protections for path-typed keys do not reach it: `Config.path_typed_keys()`
+    # is a hardcoded tuple of apcore's own four keys and never consults a
+    # namespace registered here, and the §9.2.1 requirement-5 empty-value
+    # discard is gated on that same set. `openapi_backend.resolve_spec_location`
+    # owns the three rules instead — see that module's docstring.
+    "openapi": None,
+}
+
+
+def register_mcp_namespace() -> None:
+    """Register the 'mcp' config namespace. Safe to call multiple times."""
+    try:
+        Config.register_namespace(
+            MCP_NAMESPACE,
+            env_prefix=MCP_ENV_PREFIX,
+            defaults=MCP_DEFAULTS,
+        )
+    except Exception:
+        logger.debug("MCP config namespace already registered")

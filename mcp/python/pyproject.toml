@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apcore-mcp"
+version = "0.23.4"
+description = "Automatic MCP Server & OpenAI Tools Bridge for apcore"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "aiperceivable", email = "team@aiperceivable.com" },
+]
+keywords = ["apcore", "mcp", "openai", "tools", "ai", "agent", "llm", "server", "bridge", "api", "automation", "middleware", "jwt", "fastapi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "apcore>=0.33.0",
+    "mcp>=1.26,<2.0",
+    "jsonschema>=4.20,<5",
+    "referencing>=0.30,<1",
+    "mcp-embedded-ui>=0.5.0",
+    "PyJWT>=2.0",
+]
+
+[project.optional-dependencies]
+
+# apcore-toolkit powers Markdown tool descriptions (rich_description=True) and
+# the csv/jsonl output formatters. Every import of it in src/ is lazy and every
+# call site degrades gracefully when it is absent, so it is an extra rather than
+# a runtime dependency — this is the extra the "install 'apcore-mcp[markdown]'"
+# WARN logs point at.
+markdown = [
+    "apcore-toolkit>=0.14.2",
+]
+
+# The OpenAPI backend. `[http-proxy]` resolves httpx, which both `load_spec`
+# and `HTTPProxyRegistryWriter` need; YAML specs need nothing extra because
+# apcore already depends on pyyaml. Unlike `markdown`, absence is not a
+# graceful degradation — there is no fallback for "serve this API" — so the
+# entry point raises with an actionable install message instead of returning
+# None.
+openapi = [
+    "apcore-toolkit[http-proxy]>=0.15.0",
+]
+
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+    "mypy>=1.0",
+    "ruff>=0.1",
+    "apdev[dev]>=0.2.3",
+    "apcore-toolkit[http-proxy]>=0.15.0",
+]
+
+[project.scripts]
+apcore-mcp = "apcore_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://aiperceivable.com"
+Repository = "https://github.com/aiperceivable/apcore-mcp-python"
+Documentation = "https://github.com/aiperceivable/apcore-mcp-python#readme"
+Issues = "https://github.com/aiperceivable/apcore-mcp-python/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/apcore_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+
+[tool.coverage.run]
+source = ["src/apcore_mcp"]
+omit = ["src/apcore_mcp/__main__.py"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[tool.apdev]
+base_package = "apcore_mcp"
+src_dir = "src"
+
+[tool.ruff.lint.isort]
+# `apcore_mcp` and `tests` are this repository's own packages, so isort must group
+# them apart from third-party imports. Without this ruff reads `apcore_mcp` as
+# third-party and flags the correct grouping as I001.
+known-first-party = ["apcore_mcp", "tests"]

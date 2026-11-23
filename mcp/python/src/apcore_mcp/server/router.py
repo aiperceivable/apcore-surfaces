@@ -1,0 +1,815 @@
+"""ExecutionRouter: route MCP tool calls -> apcore Executor pipeline."""
+
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+import threading
+import uuid
+from collections import OrderedDict
+from collections.abc import Callable, Coroutine
+from typing import Any
+
+from apcore import CancelToken, Context
+from apcore.trace_context import TraceContext, TraceParent
+
+from apcore_mcp.adapters.errors import ErrorMapper
+from apcore_mcp.helpers import MCP_ELICIT_KEY, MCP_PROGRESS_KEY
+
+logger = logging.getLogger(__name__)
+
+_DEEP_MERGE_MAX_DEPTH = 32
+# [B-002] Maximum number of cancel-token entries (active + tombstones)
+# kept in the per-router map. When exceeded, oldest entries are evicted
+# in FIFO order. Tombstones for unknown call_ids accumulate here, so
+# without an eviction cap a long-running server would leak memory.
+_CANCEL_TOKENS_MAX = 4096
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any], depth: int = 0) -> dict[str, Any]:
+    """Recursively merge *overlay* into *base*, capped at ``_DEEP_MERGE_MAX_DEPTH``.
+
+    When both sides have a dict for the same key the merge recurses.
+    All other types are overwritten by *overlay*.
+    """
+    if depth >= _DEEP_MERGE_MAX_DEPTH:
+        return {**base, **overlay}
+    merged = dict(base)
+    for key, value in overlay.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value, depth + 1)
+        else:
+            merged[key] = value
+    return merged
+
+
+class ExecutionRouter:
+    """Routes MCP tool calls through the apcore Executor pipeline.
+
+    The router sits between the MCP server's call_tool handler and the
+    apcore Executor.  It delegates to ``executor.call_async()`` and
+    converts the result (or any exception) into a
+    ``(content, is_error, trace_id)`` tuple that the MCP factory can
+    pass directly to ``CallToolResult``.
+
+    When the executor also exposes an async ``stream()`` method **and**
+    the caller provides a ``progress_token`` + ``send_notification``
+    callback via the *extra* dict, the router iterates the async
+    generator and forwards each chunk as a ``notifications/progress``
+    message, accumulating chunks via recursive deep merge.
+
+    Args:
+        executor: An apcore Executor instance (duck-typed -- must expose
+            an async ``call_async(module_id, inputs)`` method and
+            optionally an async ``stream(module_id, inputs)`` generator).
+        validate_inputs: Validate tool inputs against schemas before execution.
+        output_formatter: Optional callable ``(dict) -> str`` that formats
+            execution results into text for LLM consumption.  When None,
+            results are serialised with ``json.dumps(result, default=str)``.
+        output_format: Optional built-in format name ("json", "csv", "jsonl").
+            Takes precedence over output_formatter if both are set.
+    """
+
+    def __init__(
+        self,
+        executor: Any,
+        *,
+        validate_inputs: bool = False,
+        output_formatter: Callable[[dict[str, Any]], str] | None = None,
+        output_format: str | None = None,
+        redact_output: bool = True,
+        output_schema_map: dict[str, dict] | None = None,
+        trace: bool = False,
+        async_bridge: Any | None = None,
+        descriptor_lookup: Callable[[str], Any] | None = None,
+    ) -> None:
+        self._executor = executor
+        self._error_mapper = ErrorMapper()
+        self._validate_inputs = validate_inputs
+        self._output_formatter = output_formatter
+        self._output_format = output_format
+        self._redact_output = redact_output
+        self._output_schema_map = output_schema_map or {}
+        self._trace = trace
+
+        # Resolve built-in formatter if output_format is specified
+        if output_format and output_format != "json":
+            self._output_formatter = self._resolve_builtin_formatter(output_format)
+
+        # F-043 AsyncTaskBridge integration. The canonical production path
+        # also dispatches at the factory's `register_handlers` callsite
+        # (server/factory.py), but the router holds the bridge too as
+        # defense-in-depth for direct callers. When both layers are wired,
+        # the factory's dispatch fires first and the router never sees
+        # async-hinted modules. [A-D-001]
+        self._async_bridge = async_bridge
+        self._descriptor_lookup = descriptor_lookup
+
+        # [B-002] Per-server `call_id -> CancelToken` map. Populated on
+        # tool-call entry by handle_call(); consulted by cancel(call_id).
+        # The transport layer forwards inbound MCP `notifications/cancelled`
+        # to `router.cancel(call_id, reason)` which sets the token.
+        #
+        # OrderedDict gives us FIFO-evicted bounded growth: when the map
+        # exceeds _CANCEL_TOKENS_MAX entries (active + tombstones), the
+        # oldest entries are popped. Active tokens (currently in
+        # handle_call) are typically released within seconds, so eviction
+        # in practice only impacts tombstones — which have no semantic
+        # cost beyond the race-window protection.
+        self._cancel_tokens: OrderedDict[str, CancelToken] = OrderedDict()
+        self._cancel_lock = threading.Lock()
+
+        # Cache whether executor methods accept a context parameter,
+        # so we avoid a broad TypeError catch on every call.
+        self._call_async_accepts_context = self._check_accepts_context(executor.call_async)
+        self._stream_accepts_context = self._check_accepts_context(getattr(executor, "stream", None))
+
+    def _resolve_builtin_formatter(self, format_name: str) -> Callable[[Any], str]:
+        """Resolve a built-in formatter name to a callable.
+
+        Supports "csv" and "jsonl" via apcore-toolkit.
+        """
+
+        def _builtin_formatter(result: Any) -> str:
+            # Tabular formatters expect an iterable of mappings.
+            # If result is a single dict, wrap it in a list.
+            rows = result if isinstance(result, list) else [result]
+            if not all(isinstance(r, dict) for r in rows):
+                logger.warning(
+                    "output_format=%s requested but result is not tabular; falling back to JSON", format_name
+                )
+                return json.dumps(result, default=str)
+
+            try:
+                from apcore_toolkit import format_csv, format_jsonl
+
+                if format_name == "csv":
+                    return format_csv(rows)
+                if format_name == "jsonl":
+                    return format_jsonl(rows)
+            except ImportError:
+                logger.warning("apcore-toolkit not installed; cannot use output_format=%s", format_name)
+                return json.dumps(result, default=str)
+            except Exception:
+                logger.warning("Built-in formatter %s failed", format_name, exc_info=True)
+                return json.dumps(result, default=str)
+
+            return json.dumps(result, default=str)
+
+        return _builtin_formatter
+
+    def _maybe_redact(self, tool_name: str, result: Any) -> Any:
+        """Apply output redaction if enabled and an output_schema exists for the tool.
+
+        Uses ``apcore.redact_sensitive()`` to strip sensitive fields.
+        Fails open: if redaction raises, the original result is returned.
+        """
+        if not self._redact_output:
+            return result
+        output_schema = self._output_schema_map.get(tool_name)
+        if output_schema is None:
+            return result
+        try:
+            from apcore import redact_sensitive
+
+            return redact_sensitive(result, output_schema)
+        except Exception:
+            logger.warning("redact_sensitive failed for %s, returning unredacted output", tool_name, exc_info=True)
+            return result
+
+    def _format_result(self, result: Any) -> str:
+        """Format an execution result into text for LLM consumption.
+
+        Uses the configured output_formatter if set, otherwise falls back
+        to ``json.dumps(result, default=str)``.
+
+        The formatter is applied to dict or list results when a formatter
+        is configured.
+        """
+        if self._output_formatter is not None and isinstance(result, dict | list):
+            try:
+                return self._output_formatter(result)
+            except Exception:
+                logger.debug("output_formatter failed, falling back to json.dumps", exc_info=True)
+        return json.dumps(result, default=str)
+
+    @staticmethod
+    def _check_accepts_context(method: Any) -> bool:
+        """Return True if *method* accepts at least 3 positional parameters
+        (excluding ``self``), i.e. (tool_name, arguments, context)."""
+        if method is None:
+            return False
+        try:
+            sig = inspect.signature(method)
+            return len(sig.parameters) >= 3
+        except (ValueError, TypeError):
+            return True  # assume yes if we cannot inspect
+
+    def validate_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run preflight validation on a tool call without executing it.
+
+        Calls ``executor.validate()`` and converts the ``PreflightResult``
+        into a plain dict.
+
+        Returns:
+            A dict with ``valid``, ``checks``, and ``requires_approval`` keys.
+        """
+        # [A-D-ER-3] An executor without validate() has nothing to object to, so
+        # the tool is reported callable — not invalid. Without this check the
+        # AttributeError landed in the generic handler below and preflight
+        # callers saw the same tool as un-callable on Python while TypeScript
+        # (router.ts:783) and Rust (router.rs:833) reported it valid. handle_call
+        # already treats the missing method as skip-and-continue (see the
+        # `except AttributeError` in _dispatch), so this also settles an
+        # inconsistency inside Python.
+        validate = getattr(self._executor, "validate", None)
+        if not callable(validate):
+            return {"valid": True, "checks": [], "requires_approval": False}
+
+        try:
+            result = validate(tool_name, arguments)
+            return {
+                "valid": result.valid,
+                "checks": [
+                    {
+                        "check": c.check,
+                        "passed": c.passed,
+                        "error": c.error,
+                        "warnings": list(c.warnings),
+                    }
+                    for c in result.checks
+                ],
+                "requires_approval": result.requires_approval,
+            }
+        except Exception as e:
+            error_info = self._error_mapper.to_mcp_error(e)
+            return {
+                "valid": False,
+                "checks": [
+                    {
+                        "check": "unexpected",
+                        "passed": False,
+                        "error": {
+                            "errorType": error_info.get("errorType", "UNEXPECTED_ERROR"),
+                            "message": error_info["message"],
+                        },
+                        "warnings": [],
+                    }
+                ],
+                "requires_approval": False,
+            }
+
+    async def handle_call(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        extra: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool, str | None]:
+        """Execute a tool call through the Executor pipeline.
+
+        Args:
+            tool_name: The MCP tool name (already denormalized to apcore
+                module ID by the caller, or passed through as-is).
+            arguments: The tool call arguments dict.
+            extra: Optional dict with ``progress_token``,
+                ``send_notification``, and ``session`` for streaming
+                and elicitation support.
+
+        Returns:
+            A ``(content, is_error, trace_id)`` tuple where *content* is
+            a list of ``TextContent``-compatible dicts, *is_error* signals
+            whether the result represents an error, and *trace_id* is the
+            execution trace ID (or None).
+        """
+        logger.debug("Executing tool call: %s", tool_name)
+
+        # [B-002] [A-D-210] Register a CancelToken FIRST — before any
+        # dispatch (async-bridge, meta-tool, or executor) — so that an
+        # inbound MCP `notifications/cancelled` (forwarded by the transport
+        # into `router.cancel(call_id, reason)`) cooperatively cancels
+        # in-flight work regardless of which dispatch path the call takes.
+        # Pre-fix this lived AFTER async-bridge dispatch, leaving bridge
+        # submits invisible to cancel. TS (router.ts:369) and Rust
+        # (router.rs:755) register the guard first.
+        #
+        # The call_id is sourced from `extras.call_id`,
+        # `_meta.progressToken`, or generated. Removed in `finally`.
+        call_id: str | None = None
+        if extra is not None:
+            raw_id = extra.get("call_id")
+            if isinstance(raw_id, str | int):
+                call_id = str(raw_id)
+            else:
+                meta = extra.get("_meta")
+                if isinstance(meta, dict):
+                    pt = meta.get("progressToken")
+                    if isinstance(pt, str | int):
+                        call_id = str(pt)
+        if call_id is None:
+            call_id = uuid.uuid4().hex
+        cancel_token = CancelToken()
+        with self._cancel_lock:
+            # Tombstone case: cancel arrived before the token was
+            # registered (race). When `_cancel_tokens[call_id]` is already
+            # set with `is_cancelled=True`, propagate that state to the
+            # new token so the dispatch sees an already-cancelled call.
+            existing = self._cancel_tokens.get(call_id)
+            if existing is not None and existing.is_cancelled:
+                cancel_token.cancel()
+            # OrderedDict semantics: re-insertion keeps original position;
+            # explicit move_to_end ensures this entry is LRU-recent.
+            self._cancel_tokens[call_id] = cancel_token
+            self._cancel_tokens.move_to_end(call_id)
+            self._evict_cancel_tokens_locked()
+
+        try:
+            return await self._dispatch(tool_name, arguments, extra, cancel_token)
+        except Exception as error:
+            # [A-D-ER-1] Contract: handle_call never raises — every exception
+            # becomes an error tuple. _dispatch guards its individual awaits
+            # (bridge.submit, executor.validate, ...) but not TraceContext.extract,
+            # Context.create, or the async-bridge meta-tool call, so the outer net
+            # is what makes the contract hold. TS wraps the whole
+            # _handleCallInner body (router.ts:450/753); Rust returns a Result.
+            logger.warning("handle_call failed for %s: %s", tool_name, error, exc_info=True)
+            error_info = self._error_mapper.to_mcp_error(error)
+            return ([{"type": "text", "text": error_info["message"]}], True, None)
+        finally:
+            # [B-002] Always release the call_id → CancelToken slot so the
+            # map doesn't grow unboundedly and a later same-id call doesn't
+            # see a stale token.
+            with self._cancel_lock:
+                self._cancel_tokens.pop(call_id, None)
+
+    async def _dispatch(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        extra: dict[str, Any] | None,
+        cancel_token: CancelToken,
+    ) -> tuple[list[dict[str, Any]], bool, str | None]:
+        """Inner dispatch: async-bridge → streaming → call_async, with the
+        already-registered ``cancel_token`` attached to every Context."""
+        # ── F-043 AsyncTaskBridge dispatch (defense-in-depth) ────────────
+        # The canonical production path dispatches at the factory's
+        # register_handlers callsite, but if the router was constructed
+        # directly (by tests or third-party callers) and given a bridge,
+        # we honour the same dispatch contract here. [A-D-001]
+        if self._async_bridge is not None:
+            # Meta-tool path: __apcore_task_submit / _status / _cancel / _list
+            if self._async_bridge.is_meta_tool(tool_name):
+                return await self._async_bridge.handle_meta_tool(
+                    tool_name,
+                    arguments,
+                    resolve_descriptor=self._descriptor_lookup,
+                    router_extra=extra,
+                )
+            # Async-hinted module path: route via bridge.submit
+            if self._descriptor_lookup is not None:
+                try:
+                    descriptor = self._descriptor_lookup(tool_name)
+                except Exception:  # noqa: BLE001  # defensive lookup
+                    descriptor = None
+                if descriptor is not None and self._async_bridge.is_async_module(descriptor):
+                    # [D11-6] Mirror the factory-layer dispatch
+                    # (factory.py:register_handlers) so direct-router consumers
+                    # (test harnesses, third-party embedders) get the same W3C
+                    # trace propagation and session mass-cancel indexing as the
+                    # production transport path. Pre-fix this fallback dropped
+                    # both, silently breaking trace continuity and per-session
+                    # cancellation for these callers.
+                    trace_parent: TraceParent | None = None
+                    if extra is not None:
+                        meta_in = extra.get("_meta")
+                        if isinstance(meta_in, dict):
+                            raw_tp = meta_in.get("traceparent")
+                            if isinstance(raw_tp, str):
+                                trace_parent = TraceContext.extract({"traceparent": raw_tp})
+                    # [A-D-210] Pass the already-registered cancel token as a
+                    # first-class Context.create() parameter (apcore 0.22.0
+                    # D-24) so the bridged submit observes cooperative
+                    # cancellation without the post-hoc-assignment anti-pattern.
+                    submit_ctx = Context.create(
+                        data={},
+                        identity=self._resolve_identity(extra),
+                        trace_parent=trace_parent,
+                        cancel_token=cancel_token,
+                    )
+                    # Forward the active transport session id so the bridge
+                    # can record this task under that session for mass-cancel
+                    # on disconnect. Lazy import to avoid a circular import on
+                    # the server/transport boundary.
+                    from apcore_mcp.server.transport import transport_session_var
+
+                    session_key = transport_session_var.get()
+                    try:
+                        envelope = await self._async_bridge.submit(
+                            tool_name,
+                            arguments,
+                            submit_ctx,
+                            progress_token=(extra or {}).get("progress_token"),
+                            send_notification=(extra or {}).get("send_notification"),
+                            session_key=session_key,
+                        )
+                        return ([{"type": "text", "text": json.dumps(envelope)}], False, None)
+                    except Exception as exc:  # noqa: BLE001
+                        info = self._error_mapper.to_mcp_error(exc)
+                        return ([{"type": "text", "text": info["message"]}], True, None)
+
+        # Extract streaming helpers from extra
+        progress_token: str | int | None = None
+        send_notification: Callable[[dict[str, Any]], Coroutine[Any, Any, None]] | None = None
+        session: Any = None
+        if extra is not None:
+            progress_token = extra.get("progress_token")
+            send_notification = extra.get("send_notification")
+            session = extra.get("session")
+
+        # ── Build context with MCP callbacks ─────────────────────────────
+        context_data: dict[str, Any] = {}
+
+        # Inject progress callback if progress_token + send_notification available
+        if progress_token is not None and send_notification is not None:
+            _pt = progress_token
+            _sn = send_notification
+
+            async def _progress_callback(
+                progress: float,
+                total: float | None = None,
+                message: str | None = None,
+            ) -> None:
+                notification: dict[str, Any] = {
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": _pt,
+                        "progress": progress,
+                        "total": total if total is not None else 0,
+                    },
+                }
+                if message is not None:
+                    notification["params"]["message"] = message
+                await _sn(notification)
+
+            context_data[MCP_PROGRESS_KEY] = _progress_callback
+
+        # Inject elicitation callback if session available
+        if session is not None:
+            _session = session
+
+            async def _elicit_callback(
+                message: str,
+                requested_schema: dict[str, Any] | None = None,
+            ) -> dict[str, Any] | None:
+                try:
+                    result = await _session.elicit_form(
+                        message=message,
+                        requestedSchema=requested_schema or {},
+                    )
+                    return {
+                        "action": result.action,
+                        "content": result.content,
+                    }
+                except Exception:
+                    logger.warning("Elicitation request failed", exc_info=True)
+                    return None
+
+            context_data[MCP_ELICIT_KEY] = _elicit_callback
+
+        # [A-D-211] Identity resolution: prefer extras.identity (set by the
+        # factory after reading auth_identity_var), fall back to the auth
+        # ContextVar so direct router callers (tests, third-party embedders)
+        # still see the authenticated identity. Mirrors Rust's two-source
+        # cascade (router.rs reads extras + auth_identity_var).
+        identity = self._resolve_identity(extra)
+
+        # Inbound W3C Trace Context: parse `_meta.traceparent` (per MCP _meta
+        # passthrough) and seed the apcore Context so downstream modules
+        # inherit the trace chain. Context.create() in apcore handles
+        # strict validation (all-zero/all-f → regen with WARN), so we do not
+        # duplicate validation here.
+        trace_parent: TraceParent | None = None
+        if extra is not None:
+            meta = extra.get("_meta")
+            if isinstance(meta, dict):
+                raw_tp = meta.get("traceparent")
+                if isinstance(raw_tp, str):
+                    trace_parent = TraceContext.extract({"traceparent": raw_tp})
+
+        # Pass the cancel token as a first-class Context.create() parameter
+        # (apcore 0.22.0 D-24) so the executor can check it — replaces the
+        # former post-hoc ``context.cancel_token = cancel_token`` assignment.
+        context = Context.create(
+            data=context_data,
+            identity=identity,
+            trace_parent=trace_parent,
+            cancel_token=cancel_token,
+        )
+
+        # version_hint resolution per spec's 3-source cascade: [A-D-006]
+        #   1. extras.version_hint (SDK caller-supplied, highest priority)
+        #   2. extras._meta.apcore.version (MCP client-supplied)
+        #   3. descriptor.metadata.version_hint (descriptor default, lowest)
+        # Pre-fix Python only consulted #1 and #2; #3 was never read.
+        version_hint: str | None = None
+        if extra is not None:
+            version_hint = extra.get("version_hint")
+            if version_hint is None:
+                meta = extra.get("_meta")
+                if isinstance(meta, dict):
+                    apcore_meta = meta.get("apcore")
+                    if isinstance(apcore_meta, dict):
+                        raw = apcore_meta.get("version")
+                        if isinstance(raw, str):
+                            version_hint = raw
+        # Source #3: descriptor default fallback
+        if version_hint is None:
+            registry = getattr(self._executor, "registry", None)
+            if registry is not None:
+                get_def = getattr(registry, "get_definition", None)
+                if callable(get_def):
+                    try:
+                        descriptor = get_def(tool_name)
+                    except Exception:  # noqa: BLE001  # defensive — registry may raise
+                        descriptor = None
+                    if descriptor is not None:
+                        meta_attr = getattr(descriptor, "metadata", None) or {}
+                        raw = meta_attr.get("version_hint") if isinstance(meta_attr, dict) else None
+                        if isinstance(raw, str):
+                            version_hint = raw
+
+        # Pre-execution validation
+        if self._validate_inputs:
+            try:
+                validation = self._executor.validate(tool_name, arguments, context)
+                if not validation.valid:
+                    parts: list[str] = []
+                    for e in validation.errors:
+                        if "errors" in e:
+                            for sub in e["errors"]:
+                                parts.append(f"{sub.get('field', '?')}: {sub.get('message', 'invalid')}")
+                        elif "field" in e:
+                            parts.append(f"{e['field']}: {e.get('message', 'invalid')}")
+                        else:
+                            parts.append(e.get("message", e.get("code", "invalid")))
+                    detail = "; ".join(parts)
+                    return (
+                        [{"type": "text", "text": f"Validation failed: {detail}"}],
+                        True,
+                        None,
+                    )
+            except AttributeError:
+                pass  # executor lacks validate() — skip
+            except Exception as error:
+                logger.warning("validate_inputs crashed for %s: %s", tool_name, error, exc_info=True)
+                error_info = self._error_mapper.to_mcp_error(error)
+                return ([{"type": "text", "text": error_info["message"]}], True, None)
+
+        # Streaming path: executor has stream() AND we have both helpers
+        can_stream = hasattr(self._executor, "stream") and progress_token is not None and send_notification is not None
+
+        if can_stream:
+            return await self._handle_stream(
+                tool_name,
+                arguments,
+                progress_token,  # type: ignore[arg-type]
+                send_notification,  # type: ignore[arg-type]
+                context=context,
+                version_hint=version_hint,
+            )
+
+        # Non-streaming path
+        return await self._handle_call_async(tool_name, arguments, context=context, version_hint=version_hint)
+
+    def _resolve_identity(self, extra: dict[str, Any] | None) -> Any:
+        """[A-D-211] Resolve identity with extras-then-ContextVar fallback.
+
+        Mirrors Rust's two-source cascade in router.rs: prefer the
+        identity passed via ``extra['identity']`` (set by the factory after
+        reading ``auth_identity_var`` for the canonical production path),
+        but fall back to the auth ContextVar so direct router callers
+        (tests, third-party embedders) still see the authenticated identity
+        from upstream ASGI middleware.
+        """
+        if extra is not None:
+            ident = extra.get("identity")
+            if ident is not None:
+                return ident
+        try:
+            from apcore_mcp.auth.middleware import auth_identity_var
+
+            return auth_identity_var.get(None)
+        except Exception:  # noqa: BLE001 — defensive: auth module always present in apcore-mcp
+            return None
+
+    def _evict_cancel_tokens_locked(self) -> None:
+        """Evict oldest entries when the cancel-tokens map exceeds the cap.
+
+        Caller must hold ``_cancel_lock``. Uses OrderedDict's FIFO
+        ordering — entries are popped from the front (least-recently-
+        inserted) until the size is back within bounds. [B-002]
+        """
+        while len(self._cancel_tokens) > _CANCEL_TOKENS_MAX:
+            self._cancel_tokens.popitem(last=False)
+
+    def cancel(self, call_id: str, reason: str | None = None) -> bool:
+        """Cancel an in-flight tool call cooperatively. [B-002]
+
+        Looks up the CancelToken registered for *call_id* in handle_call
+        and calls ``token.cancel()``. Subsequent calls to
+        ``token.check()`` (or ``ctx.cancel_token.check()`` from inside
+        the executing module) will raise ``ExecutionCancelledError``,
+        which the router's error mapper converts to MCP error code
+        ``EXECUTION_CANCELLED``.
+
+        When *call_id* is unknown (cancel arrived before submit, or
+        after the call already completed), the router records a
+        tombstone so a subsequent submit with the same id sees an
+        already-cancelled token. After-complete cancels are a no-op.
+
+        Returns True when a token was found and cancelled; False when
+        the call_id was unknown (tombstone recorded).
+
+        Wired by transport-level handlers parsing inbound MCP
+        ``notifications/cancelled`` messages.
+        """
+        with self._cancel_lock:
+            existing = self._cancel_tokens.get(call_id)
+            if existing is not None:
+                existing.cancel()
+                logger.debug(
+                    "router.cancel: cancelled in-flight call_id=%s reason=%s",
+                    call_id,
+                    reason,
+                )
+                return True
+            # Tombstone: store an already-cancelled token so a same-id
+            # submit immediately sees cancellation. Bounded by
+            # _CANCEL_TOKENS_MAX with FIFO eviction (oldest first) to
+            # prevent leaks when callers spam unknown call_ids.
+            tombstone = CancelToken()
+            tombstone.cancel()
+            self._cancel_tokens[call_id] = tombstone
+            self._cancel_tokens.move_to_end(call_id)
+            self._evict_cancel_tokens_locked()
+            logger.debug(
+                "router.cancel: tombstone for unknown call_id=%s reason=%s",
+                call_id,
+                reason,
+            )
+            return False
+
+    @staticmethod
+    def _attach_traceparent(content: list[dict[str, Any]], context: Any | None) -> None:
+        """Attach `_meta.traceparent` to the first content item for W3C trace propagation.
+
+        MCP clients can correlate traces across module boundaries. Failures
+        (malformed context, empty trace_id) are swallowed so response
+        delivery is never blocked by trace metadata.
+        """
+        if context is None or not content:
+            return
+        try:
+            headers = TraceContext.inject(context)
+        except Exception:
+            return
+        tp = headers.get("traceparent")
+        if not tp:
+            return
+        meta = content[0].get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["traceparent"] = tp
+        content[0]["_meta"] = meta
+
+    @staticmethod
+    def _build_error_text(error_info: dict[str, Any]) -> str:
+        """Build error text content, appending AI guidance fields as structured JSON when present.
+
+        Guidance keys use camelCase to match MCP convention and TypeScript output.
+        """
+        text = error_info["message"]
+        guidance = {
+            k: error_info[k] for k in ("retryable", "aiGuidance", "userFixable", "suggestion") if k in error_info
+        }
+        if guidance:
+            text += "\n\n" + json.dumps(guidance)
+        return text
+
+    async def _handle_call_async(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        context: Any | None = None,
+        version_hint: str | None = None,
+    ) -> tuple[list[dict[str, Any]], bool, str | None]:
+        """Non-streaming execution via executor.call_async()."""
+        try:
+            if self._trace:
+                # TODO(apcore>=0.19): plumb version_hint through call_async_with_trace
+                # (current signature only accepts strategy).
+                if self._call_async_accepts_context:
+                    result, pipeline_trace = await self._executor.call_async_with_trace(tool_name, arguments, context)
+                else:
+                    result, pipeline_trace = await self._executor.call_async_with_trace(tool_name, arguments)
+                trace_dict = {
+                    "strategy_name": pipeline_trace.strategy_name,
+                    "total_duration_ms": pipeline_trace.total_duration_ms,
+                    "steps": [
+                        {
+                            "name": s.name,
+                            "duration_ms": s.duration_ms,
+                            "skipped": s.skipped,
+                            "skip_reason": getattr(s, "skip_reason", None),
+                        }
+                        for s in pipeline_trace.steps
+                    ],
+                }
+            else:
+                call_kwargs: dict[str, Any] = {}
+                if version_hint is not None:
+                    call_kwargs["version_hint"] = version_hint
+                if self._call_async_accepts_context:
+                    result = await self._executor.call_async(tool_name, arguments, context, **call_kwargs)
+                else:
+                    result = await self._executor.call_async(tool_name, arguments, **call_kwargs)
+                trace_dict = None
+            result = self._maybe_redact(tool_name, result)
+            text_output = self._format_result(result)
+            content: list[dict[str, Any]] = [{"type": "text", "text": text_output}]
+            self._attach_traceparent(content, context)
+            if trace_dict is not None:
+                content.append({"type": "text", "text": json.dumps(trace_dict, default=str)})
+            trace_id = context.trace_id if context is not None else None
+            return (content, False, trace_id)
+        except Exception as error:
+            logger.error("handle_call error for %s: %s", tool_name, error)
+            error_info = self._error_mapper.to_mcp_error(error)
+            error_content: list[dict[str, Any]] = [{"type": "text", "text": self._build_error_text(error_info)}]
+            self._attach_traceparent(error_content, context)
+            return (error_content, True, context.trace_id if context is not None else None)
+
+    async def _handle_stream(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        progress_token: str | int,
+        send_notification: Callable[[dict[str, Any]], Coroutine[Any, Any, None]],
+        context: Any | None = None,
+        version_hint: str | None = None,
+    ) -> tuple[list[dict[str, Any]], bool, str | None]:
+        """Streaming execution via executor.stream().
+
+        Iterates the async generator, sends each chunk as a
+        ``notifications/progress`` message, accumulates via shallow
+        merge, and returns the final accumulated result.
+        """
+        # TODO(apcore>=0.19): streaming traces pending — Executor.stream()
+        # currently yields dict chunks only; no stream_with_trace API exists,
+        # so per-step pipeline traces cannot be attached to the stream result.
+        accumulated: dict[str, Any] = {}
+        chunk_index = 0
+
+        try:
+            stream_kwargs: dict[str, Any] = {}
+            if version_hint is not None:
+                stream_kwargs["version_hint"] = version_hint
+            if self._stream_accepts_context:
+                stream_iter = self._executor.stream(tool_name, arguments, context, **stream_kwargs)
+            else:
+                stream_iter = self._executor.stream(tool_name, arguments, **stream_kwargs)
+
+            async for chunk in stream_iter:
+                if not isinstance(chunk, dict):
+                    raise TypeError(f"stream chunk must be dict, got {type(chunk).__name__}: {chunk!r}")
+                # Redact each chunk before sending so sensitive fields never reach
+                # the client via progress notifications, even before final accumulation.
+                safe_chunk = self._maybe_redact(tool_name, chunk)
+                # Send progress notification for this chunk
+                notification: dict[str, Any] = {
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": progress_token,
+                        "progress": chunk_index + 1,
+                        "total": None,
+                        "message": json.dumps(safe_chunk, default=str),
+                    },
+                }
+                await send_notification(notification)
+
+                # Deep merge into accumulated result (depth-capped at 32)
+                accumulated = _deep_merge(accumulated, chunk)
+                chunk_index += 1
+
+            accumulated = self._maybe_redact(tool_name, accumulated)
+            text_output = self._format_result(accumulated)
+            content: list[dict[str, Any]] = [{"type": "text", "text": text_output}]
+            self._attach_traceparent(content, context)
+            trace_id = context.trace_id if context is not None else None
+            return (content, False, trace_id)
+        except Exception as error:
+            logger.error("handle_call stream error for %s: %s", tool_name, error)
+            error_info = self._error_mapper.to_mcp_error(error)
+            stream_error_content: list[dict[str, Any]] = [{"type": "text", "text": self._build_error_text(error_info)}]
+            self._attach_traceparent(stream_error_content, context)
+            return (stream_error_content, True, context.trace_id if context is not None else None)
