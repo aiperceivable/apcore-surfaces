@@ -1,0 +1,445 @@
+---
+description: "The BaseScanner ABC for framework adapters: filtering, deduplication, HTTP-method annotation inference, and a 5-phase ability-extraction methodology."
+---
+
+# Smart Scanning
+
+The `BaseScanner` ABC (Abstract Base Class) provides a consistent interface and shared utilities for framework-specific adapters (e.g., `django-apcore`, `flask-apcore`).
+
+## `BaseScanner` Core Methods
+
+| Method | Description |
+|--------|-------------|
+| `scan(**kwargs)` | **Abstract.** Framework-specific implementation of the scan logic. |
+| `get_source_name()` | **Abstract.** Returns the scanner's name (e.g., "django-ninja"). |
+| `extract_docstring(func)` | **TypeScript only.** Convenience wrapper around a docstring/comment parser. Python callers use `apcore.parse_docstring()` directly (no toolkit wrapper); Rust has no runtime-introspectable doc-comment equivalent to wrap. |
+| `filter_modules(...)` | Apply regex-based include/exclude filters to module IDs. |
+| `infer_annotations_from_method(...)` | Infer `readonly`, `destructive`, or `idempotent` from HTTP methods. |
+| `deduplicate_ids(...)` | Automatically resolve duplicate module IDs by appending suffixes (`_2`, `_3`). |
+
+## Ability Extraction Methodology
+
+When building a scanner for a new framework, follow this systematic approach to ensure comprehensive metadata extraction. This methodology is adapted from real-world experience scanning 10+ software systems.
+
+### Phase 1: Identify the Backend Engine
+
+Separate the framework's **routing/dispatch layer** from its **business logic layer**. The scanner should target the dispatch layer to discover endpoints, then reach into the business logic layer for metadata.
+
+| Framework | Dispatch Layer | Business Logic |
+|-----------|---------------|----------------|
+| Django REST | `urlpatterns` + `ViewSet` | serializer methods, queryset logic |
+| Flask | `@app.route` + Blueprints | view function body |
+| FastAPI | `@router.get/post` | endpoint function with type hints |
+| Express | `router.get/post` | handler functions |
+| NestJS | `@Controller` + `@Get/@Post` | service methods |
+
+### Phase 2: Map Operations to Modules
+
+For each discovered endpoint, extract the canonical mapping:
+
+```
+Framework endpoint  →  ScannedModule
+─────────────────     ─────────────
+route path            module_id
+handler function      target
+request schema        input_schema
+response schema       output_schema
+docstring             description + documentation
+(default)             version       (default: "1.0.0")
+usage samples         examples      (default: [])
+extra data            metadata      (default: {})
+```
+
+### `ScannedModule` Fields
+
+| Field | Python Type | TypeScript Type | Default |
+|-------|------------|-----------------|---------|
+| `module_id` / `moduleId` | `str` | `string` | *(required)* |
+| `description` | `str` | `string` | *(required)* |
+| `target` | `str` | `string` | *(required)* |
+| `input_schema` / `inputSchema` | `dict` | `Record<string, unknown>` | *(required)* |
+| `output_schema` / `outputSchema` | `dict` | `Record<string, unknown>` | *(required)* |
+| `tags` | `list[str]` | `string[]` | *(required)* |
+| `annotations` | `ModuleAnnotations \| None` | `ModuleAnnotations \| null` | `None` / `null` |
+| `version` | `str` | `string` | `"1.0.0"` |
+| `examples` | `list[ModuleExample]` | `ModuleExample[]` | `[]` |
+| `metadata` | `dict` | `Record<string, unknown>` | `{}` |
+| `documentation` | `str` | `string` | `None` / `null` |
+| `warnings` | `list[str]` | `string[]` | `[]` |
+
+### Phase 3: Extract Data Models
+
+Leverage the framework's native schema system:
+
+- **Python**: Pydantic models, Django serializers, marshmallow schemas
+- **TypeScript**: Zod schemas, class-validator decorators, interfaces
+
+Use the toolkit's `flatten_pydantic_params()` (Python) to convert nested models into flat schemas when needed. TypeScript's object-argument idiom is already flat and needs no equivalent wrapper — see [`pydantic.md`](pydantic.md) for the full cross-SDK rationale.
+
+### Phase 4: Discover Existing API Contracts
+
+Check for existing machine-readable API definitions that can supplement or replace code scanning:
+
+- OpenAPI/Swagger specs (use `extract_input_schema()` / `extract_output_schema()`)
+- GraphQL schemas
+- gRPC/Protobuf definitions
+- Existing MCP server manifests
+
+### Phase 5: Infer Behavioral Annotations
+
+Go beyond HTTP method heuristics. Analyze the function body for behavioral signals:
+
+| Signal in Code | Inferred Annotation |
+|---------------|-------------------|
+| `DELETE` method, `.delete()` calls, `DROP` SQL | `destructive=True` |
+| `GET` method, no DB writes, pure computation | `readonly=True` |
+| `PUT` method, upsert patterns | `idempotent=True` |
+| Sends email/SMS, processes payment, modifies permissions | `requires_approval=True` |
+| HTTP client calls, file I/O, subprocess | `open_world=True` |
+| `yield`, `StreamingResponse`, `async for` | `streaming=True` |
+| `GET` with stable results, no auth-dependent data | `cacheable=True` |
+| `Paginator`, `LIMIT/OFFSET`, cursor tokens | `paginated=True` |
+
+Static analysis can detect some of these patterns. For ambiguous cases, the built-in [AIEnhancer](../ai-enhancement.md) or [apcore-refinery](https://github.com/aiperceivable/apcore-refinery) can assist with AI-based inference.
+
+## Implementation Example
+
+When implementing a custom scanner, you inherit from `BaseScanner`:
+
+=== "Python"
+
+    ```python
+    from apcore_toolkit import BaseScanner, ScannedModule
+
+    class MyScanner(BaseScanner):
+        def scan(self, **kwargs) -> list[ScannedModule]:
+            # 1. Discover endpoints from your framework
+            endpoints = self.get_my_endpoints()
+
+            # 2. Convert endpoints to ScannedModules
+            modules = []
+            for e in endpoints:
+                desc, docs, params = self.extract_docstring(e.view_func)
+                modules.append(ScannedModule(
+                    module_id=e.name,
+                    description=desc,
+                    target=f"{e.module}:{e.func_name}",
+                    annotations=self.infer_annotations_from_method(e.method),
+                    # ... other metadata
+                ))
+
+            # 3. Apply shared refining utilities
+            modules = self.filter_modules(modules, include=kwargs.get("include"))
+            modules = self.deduplicate_ids(modules)
+
+            return modules
+
+        def get_source_name(self) -> str:
+            return "my-framework-scanner"
+    ```
+
+=== "TypeScript"
+
+    ```typescript
+    import { BaseScanner, ScannedModule, createScannedModule } from "apcore-toolkit";
+
+    class MyScanner extends BaseScanner {
+      scan(options?: { include?: string }): ScannedModule[] {
+        // 1. Discover endpoints from your framework
+        const endpoints = this.getMyEndpoints();
+
+        // 2. Convert endpoints to ScannedModules
+        let modules = endpoints.map((e) =>
+          createScannedModule({
+            moduleId: e.name,
+            description: this.extractDocstring(e.viewFunc).description ?? '',
+            inputSchema: {},
+            outputSchema: {},
+            tags: [],
+            target: `${e.module}:${e.funcName}`,
+            annotations: MyScanner.inferAnnotationsFromMethod(e.method),
+            // ... other metadata
+          })
+        );
+
+        // 3. Apply shared refining utilities
+        modules = this.filterModules(modules, { include: options?.include });
+        modules = this.deduplicateIds(modules);
+
+        return modules;
+      }
+
+      getSourceName(): string {
+        return "my-framework-scanner";
+      }
+    }
+    ```
+
+## Module Deduplication
+
+Scanners often encounter naming collisions (e.g., `GET /users` and `POST /users` both being called `users`). `deduplicate_ids()` handles this by:
+1.  Tracking encountered IDs.
+2.  Appending `_2`, `_3` etc. to duplicates.
+3.  Injecting a warning into the `ScannedModule.warnings` list for human audit.
+
+## Behavioral Inference
+
+`infer_annotations_from_method()` provides a sensible default for mapping HTTP verbs to apcore's `ModuleAnnotations`. The mapping is derived from RFC 9110 method semantics — methods declared safe by the spec map to `readonly`, idempotent-but-not-safe methods map to `idempotent`, and methods with the `destructive` flag are those whose intended effect is removal.
+
+| HTTP method | Annotation |
+|---|---|
+| `GET` | `readonly=True`, `cacheable=True` |
+| `HEAD` | `readonly=True` |
+| `OPTIONS` | `readonly=True` |
+| `PUT` | `idempotent=True` |
+| `DELETE` | `destructive=True` |
+| `POST`, `PATCH`, others | default (all flags false) |
+
+Implementations MUST honour this canonical mapping so a scanner emitting modules from one SDK and a registry consuming them from another agree on `readonly`/`destructive`/`idempotent` flags.
+
+For deeper behavioral analysis beyond HTTP methods, see [Phase 5](#phase-5-infer-behavioral-annotations) above and the [AI Enhancement](../ai-enhancement.md) module.
+
+---
+
+## Contract: BaseScanner.filter_modules
+
+### Inputs
+- `modules`: list of `ScannedModule`, required
+- `include`: string regex pattern, optional — if provided, only modules whose `module_id` matches are kept; invalid regex raises error
+- `exclude`: string regex pattern, optional — if provided, modules whose `module_id` matches are removed; invalid regex raises error
+
+### Errors
+- Invalid regex patterns: Python raises `ValueError` (wrapping the underlying `re.error` with `from exc`); TypeScript throws `SyntaxError` (subtype of `Error`, propagated from `new RegExp()`); Rust returns `Err(regex::Error)`. Note: Rust is the only SDK that surfaces the error via `Result` rather than throwing/raising. Python callers who need to distinguish regex errors from other `ValueError`s can inspect `exc.__cause__` for the original `re.error`.
+
+### Returns
+- On success: filtered `list[ScannedModule]` / `ScannedModule[]` / `Vec<ScannedModule>`
+
+### Properties
+- async: false
+- thread_safe: true (no mutation of inputs)
+- pure: true
+
+---
+
+## Contract: BaseScanner.deduplicate_ids
+
+### Inputs
+- `modules`: list of `ScannedModule`, required
+
+### Errors
+- None raised
+
+### Returns
+- On success: list with duplicate `module_id` values renamed (`_2`, `_3` suffix); original module order preserved; renamed modules have a warning appended to their `warnings` list
+
+### Properties
+- async: false
+- pure: true — all three SDKs return new `ScannedModule` instances (Python via `dataclasses.replace`, TypeScript via cloning, Rust by consuming and rebuilding the `Vec`) rather than mutating the input in place
+
+---
+
+## Contract: BaseScanner.scan
+
+### Inputs
+- Framework-specific — subclass defines the signature. Python implementations typically accept `**kwargs`; TypeScript implementations accept an options object. Rust fixes the shape to one argument, `app: &App`, where `App` is the trait's type parameter (default `()`); an implementation needing several inputs bundles them into its `App` type.
+
+### Errors
+- Framework-specific — subclass defines error behavior
+- `ValueError` (Python) / `Error` (TypeScript) — if `include`/`exclude` kwargs are forwarded to `filter_modules` with invalid patterns. Python's `filter_modules` catches the underlying `re.error` and re-raises `ValueError` (see [Contract: BaseScanner.filter_modules](#contract-basescannerfilter_modules)); `re.error` does not subclass `ValueError`, so a caller catching `re.error` here would not catch what is actually raised.
+- Rust: `Err(Self::Error)`. The trait declares an associated `type Error: std::error::Error + Send + Sync + 'static`, so an implementation chooses its own error type, and one that cannot fail uses `std::convert::Infallible`. Before toolkit-rust 0.13.0 `scan` returned a bare `Vec<ScannedModule>`, which left a Rust scanner no way to report the failures Python and TypeScript raise — it had to panic or return an empty list ([`apcore-toolkit-rust#4`](https://github.com/aiperceivable/apcore-toolkit-rust/issues/4)).
+
+### Returns
+- On success: `list[ScannedModule]` / `ScannedModule[]` / `Ok(Vec<ScannedModule>)` — all discovered modules after filtering and deduplication
+
+### Properties
+- async: false (Python, most TypeScript) / async: true (Rust — `async fn scan`)
+- pure: false (reads framework state, imports modules, may have I/O side effects)
+
+---
+
+## Contract: BaseScanner.infer_annotations_from_method
+
+### Inputs
+- `method`: string HTTP verb (e.g., `"GET"`, `"POST"`, `"DELETE"`, `"PUT"`), required — case-insensitive; implementations MUST upper-case before matching
+
+### Errors
+- None raised — unknown methods return default annotations (all fields false/None)
+
+### Canonical Mapping
+
+Implementations MUST produce the following annotation flags. All other flags default to false/None.
+
+| Method | Output flags |
+|---|---|
+| `GET` | `readonly=true`, `cacheable=true` |
+| `HEAD` | `readonly=true` |
+| `OPTIONS` | `readonly=true` |
+| `PUT` | `idempotent=true` |
+| `DELETE` | `destructive=true` |
+| `POST`, `PATCH`, others | default (all false) |
+
+Rationale: the mapping mirrors RFC 9110 §9.2 (safe methods → `readonly`) and §9.2.2 (idempotent methods that mutate → `idempotent`). `HEAD` and `OPTIONS` are safe by spec, so they receive `readonly=true` without `cacheable=true` (their responses are not generally cacheable for application-level use).
+
+### Returns
+- On success: `ModuleAnnotations` instance per the canonical mapping above
+
+### Properties
+- async: false
+- pure: true
+- thread_safe: true
+
+---
+
+## Contract: BaseScanner.get_source_name
+
+### Inputs
+- None (self/this only)
+
+### Errors
+- None — subclasses should never raise from this method
+
+### Returns
+- On success: string — human-readable name for the scanner source (e.g., `"django-ninja"`, `"flask-smorest"`)
+
+### Properties
+- async: false
+- pure: true
+- abstract: true — every BaseScanner subclass MUST implement this method
+
+---
+
+## Contract: BaseScanner.extract_docstring
+
+> **TypeScript only.** Python has no `extract_docstring` method on `BaseScanner` — callers use `apcore.parse_docstring()` directly. Rust has no equivalent: doc comments (`///`) are not runtime-introspectable the way a Python docstring or a JS function's source text is, so there is no natural wrapper to provide.
+
+### Inputs
+- `func`: function reference, required — the function whose docstring to extract
+- `method`: string, optional — HTTP method hint for schema enrichment
+
+### Errors
+- None raised — returns empty defaults if the function has no docstring or introspection fails
+
+### Returns
+- On success: tuple/object with three fields:
+  - `description`: string — first line of the docstring (or `""`)
+  - `documentation`: string — full docstring body after the first line (or `""`)
+  - `parameters`: dict — parameter name → description mapping extracted from `:param name:` or Google/NumPy-style docstring sections
+
+### Properties
+- async: false
+- pure: true
+
+---
+
+## Contract: ScannedModule
+
+### Inputs
+N/A — this is a data class, not a callable function.
+
+### Errors
+N/A — data classes are not called and do not raise secondary exceptions.
+
+### Returns
+N/A — data classes are not called and do not return values.
+
+### Construction
+- Python: dataclass — `ScannedModule(module_id=..., target=..., ...)` — all fields with defaults can be omitted
+- TypeScript: interface + factory — `createScannedModule({ moduleId, target, ... })` — NEVER use `new ScannedModule()`
+- Rust: struct literal — `ScannedModule { module_id: ..., target: ..., ..Default::default() }`
+
+### Fields
+- `module_id` / `moduleId`: string, required — unique identifier for this module (e.g., route path or function name)
+- `description`: string, required — one-line human-readable description
+- `target`: string, required — dotted import path to the callable (e.g., `"myapp.views:create_user"`)
+- `input_schema` / `inputSchema`: dict / `Record<string, unknown>`, required — JSON Schema for input parameters
+- `output_schema` / `outputSchema`: dict / `Record<string, unknown>`, required — JSON Schema for return value
+- `tags`: list[str] / string[], required — categorization tags
+- `annotations`: `ModuleAnnotations | None`, optional, default=None/null — behavioral annotations (readonly, idempotent, etc.)
+- `version`: string, optional, default=`"1.0.0"` — module version string
+- `examples`: list[ModuleExample] / ModuleExample[], optional, default=`[]`
+- `metadata`: dict / `Record<string, unknown>`, optional, default=`{}`
+- `documentation`: string | None, optional, default=None/null — extended documentation
+- `warnings`: list[str] / string[], optional, default=`[]` — scan-time warnings appended by deduplication and other utilities
+- `display`: dict | None, optional, default=None/null — overlay for display-layer rendering (emitted conditionally by YAMLWriter)
+- `suggested_alias` / `suggestedAlias`: string | None, optional, default=None/null — explicit alias suggestion produced by `simplify_ids` scanners; consumed by `DisplayResolver` as the alias fallback when no `display.alias` is set
+
+!!! note "`spec_version` is not a ScannedModule field"
+    `spec_version` appears at the top level of each emitted `.binding.yaml` document (stamped by `YAMLWriter`, default `"1.0"`) — it is **not** a field on the `ScannedModule` object itself. `BindingLoader` reads and validates it as advisory metadata for forward compatibility. See [Binding Loader — `spec_version` Handling](binding-loader.md#spec_version-handling).
+
+### Properties
+- immutable by convention (Python/TypeScript); owned value (Rust)
+- camelCase field names in TypeScript; snake_case in Python and Rust
+
+---
+
+## Contract: SerializationUtilities.annotations_to_dict
+
+`annotations_to_dict` / `annotationsToDict` — converts a `ModuleAnnotations` instance to a plain dictionary.
+
+### Inputs
+- `annotations`: `ModuleAnnotations` instance, required
+
+### Errors
+- None raised
+
+### Returns
+- On success: `dict[str, Any]` / `Record<string, unknown>` with snake_case keys; all 12 annotation fields included (falsy values included, not omitted)
+
+### Properties
+- pure: true
+- async: false
+- availability: all three SDKs (`annotations_to_dict` in Python/Rust, `annotationsToDict` in TypeScript)
+
+---
+
+## Contract: SerializationUtilities.module_to_dict
+
+`module_to_dict` / `moduleToDict` — converts a `ScannedModule` instance to a plain dictionary suitable for YAML/JSON serialization.
+
+### Inputs
+- `module`: `ScannedModule` instance, required
+
+### Errors
+- None raised
+
+### Returns
+- On success: `dict[str, Any]` / `Record<string, unknown>` with snake_case keys suitable for YAML/JSON serialization. **Every field is always present in the output — `None`/`null` fields are never omitted.** Verified against all three SDKs (`apcore-toolkit-python/src/apcore_toolkit/serializers.py:53-68`, `apcore-toolkit-rust/src/serializers.rs:35-60`, `apcore-toolkit-typescript/src/serializers.ts:37-58`): each emits the same fixed key set on every call, using `null`/`None` for any optional field that is unset (e.g. `documentation`, `display`) rather than dropping the key. This is deliberate, not an oversight — Rust's own implementation comment notes it exists to produce a **stable cross-SDK wire format** with a predictable key set, unlike `serde_json::to_value(&module)`, which (via `#[serde(skip_serializing_if = "Option::is_none")]`) would omit unset optionals and vary the key set between records. `annotations` is serialized via `annotations_to_dict` (itself `None`/`null` when the module carries no annotations).
+
+### Properties
+- pure: true
+- async: false
+- availability: all three SDKs (`module_to_dict` in Python/Rust, `moduleToDict` in TypeScript)
+
+---
+
+## Contract: SerializationUtilities.modules_to_dicts
+
+`modules_to_dicts` / `modulesToDicts` — batch version of `module_to_dict` for a list of `ScannedModule` instances.
+
+### Inputs
+- `modules`: `list[ScannedModule]` / `ScannedModule[]` / `&[ScannedModule]`, required
+
+### Errors
+- None raised
+
+### Returns
+- On success: `list[dict]` / `Record<string, unknown>[]` — one dict per module; equivalent to calling `module_to_dict` on each element
+
+### Properties
+- pure: true
+- async: false
+- availability: all three SDKs (`modules_to_dicts` in Python/Rust, `modulesToDicts` in TypeScript)
+
+---
+
+## Serialization Utilities
+
+Helper functions convert apcore objects to plain dictionaries for JSON/YAML serialization, and produce safe copies of `ScannedModule` instances:
+
+| Function (Python / TypeScript) | Description |
+|-------------------------------|-------------|
+| `annotations_to_dict()` / `annotationsToDict()` | Converts a `ModuleAnnotations` instance to a plain dict with snake_case keys |
+| `module_to_dict()` / `moduleToDict()` | Converts a `ScannedModule` to a dict with snake_case keys, suitable for YAML/JSON output |
+| `modules_to_dicts()` / `modulesToDicts()` | Converts a list of `ScannedModule` to a list of dicts (batch version of `module_to_dict`) |
+| `create_scanned_module()` / `createScannedModule()` | Construct a `ScannedModule` with defaults filled in (Python kwargs / TypeScript options object). Rust uses `ScannedModule::new(...)` instead. |
+| `clone_module()` / `cloneModule()` | Returns a deep-copy of a `ScannedModule` with optional field overrides. Useful before round-trip writes or when applying display overlays without mutating the source. Rust users derive `Clone` on `ScannedModule` and use `.clone()` directly. |

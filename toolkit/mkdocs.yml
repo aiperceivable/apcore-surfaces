@@ -1,0 +1,63 @@
+site_name: apcore-toolkit
+site_description: Shared scanner, schema extraction, and output toolkit for apcore framework adapters.
+repo_url: https://github.com/aiperceivable/apcore-toolkit
+repo_name: aiperceivable/apcore-toolkit
+
+theme:
+  name: material
+  logo: assets/apcore-toolkit-logo.svg
+  favicon: assets/apcore-toolkit-logo.svg
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Scope & Boundaries: scope.md
+  - Features:
+      - Overview: features/overview.md
+      - Core Model & Scanning:
+          - ScannedModule & BaseScanner: features/scanning.md
+          - Convention Scanner: features/convention-scanning.md
+          - OpenAPI Scanner: features/openapi-scanner.md
+      - Schema & Metadata:
+          - OpenAPI Schema Extraction: features/openapi.md
+          - Schema Utilities: features/pydantic.md
+          - Display Overlay: features/display-overlay.md
+          - AI Enhancement: ai-enhancement.md
+      - Artifacts & Runtime:
+          - Output Writers: features/output-writers.md
+          - Binding Loader: features/binding-loader.md
+      - Presentation & Interchange:
+          - Surface Formatting: features/formatting.md
+          - TUI View Model: features/tui-view-model.md
+  - Proposals:
+      - Device Authorization Flow: features/device-auth.md
+  - Reference:
+      - Cross-SDK Conformance: reference/conformance.md
+  - Changelog: https://github.com/aiperceivable/apcore-toolkit/blob/main/CHANGELOG.md
+
+markdown_extensions:
+  - tables
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true

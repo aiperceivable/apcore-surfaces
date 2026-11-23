@@ -1,0 +1,1250 @@
+---
+description: "OpenAPIScanner lifting a whole OpenAPI document into ScannedModule list, with a byte-identical module_id derivation and an HTTP-proxy execution contract."
+---
+
+# OpenAPI Scanner — V1
+
+!!! success "Status: IMPLEMENTED"
+    Ships in `apcore-toolkit-{python,typescript,rust}`: `derive_module_id`,
+    `OpenAPIScanner`, and `load_spec`, asserted byte-/structurally-identical
+    across all three SDKs by the shared conformance corpus below. The two
+    blocking `HTTPProxyRegistryWriter` defects (W1, W2 — see
+    [Blocking prerequisites](#blocking-prerequisites-in-the-shipped-writers))
+    were fixed in `apcore-toolkit-rust` alongside this work. It is the
+    relocated, re-scoped form of a proposal originally filed against
+    `apcore-cli` as "OpenAPI Spec-Driven Command Discovery and Mapping".
+
+    | | |
+    |---|---|
+    | **Author** | apcore-toolkit maintainers |
+    | **First drafted** | 2026-09-03 |
+    | **Implemented** | 2026-09-04 |
+    | **Revised** | 2026-09-28 — every emitted `module_id` is normalised into apcore's Canonical ID alphabet ([`module_id` Derivation](#module_id-derivation)); corpus `openapi_scan.json` 2.0.0 |
+    | **Tracking issue** | [aiperceivable/apcore-toolkit#16](https://github.com/aiperceivable/apcore-toolkit/issues/16) |
+    | **Depends on** | [`openapi.md`](openapi.md) (schema extraction primitives, already shipped) · [`scanning.md`](scanning.md) (`BaseScanner` contract) · [`output-writers.md`](output-writers.md) (`HTTPProxyRegistryWriter`, `YAMLWriter`) |
+    | **Affects** | The OpenAPI commands in `apcore-cli` and the standalone OpenAPI backends in `apcore-mcp` and `apcore-a2a` |
+
+!!! note "Rust: standalone struct, not a `BaseScanner` impl"
+    [`apcore-toolkit-rust#4`](https://github.com/aiperceivable/apcore-toolkit-rust/issues/4)
+    anticipated `OpenAPIScanner` as the `Scanner` trait's first non-framework
+    implementation. Half of what blocked it is fixed: `BaseScanner::scan` now
+    returns `Result<Vec<ScannedModule>, Self::Error>` (see
+    [Contract: BaseScanner.scan](scanning.md#contract-basescannerscan)), so a
+    Rust scanner no longer has to swallow its errors. `OpenAPIScanner`
+    nevertheless stays a standalone struct with an inherent `scan` method, by
+    decision rather than by limitation: its per-call input is a document plus
+    options rather than a framework application, and nothing in the ecosystem
+    dispatches over `BaseScanner` — `axum-apcore`, the one Rust adapter with a
+    scanner factory, uses its own `AxumScanner` trait. Implementing the trait
+    would add a second entry point that nothing calls. It reuses the trait's
+    free functions (`filter_modules`, `deduplicate_ids`,
+    `infer_annotations_from_method`) directly — exactly as they're designed
+    to be reused outside a `BaseScanner` impl.
+
+---
+
+## Goal
+
+Turn an **OpenAPI document** into a list of `ScannedModule` — one module per
+operation — so that any surface in the ecosystem (CLI, MCP, A2A, REST,
+registry) can expose a remote HTTP API without hand-writing a schema or a
+routing table.
+
+The unit of work is deliberately `spec → Vec<ScannedModule>`, **not**
+`spec → CLI commands`. Producing `ScannedModule` means every downstream
+surface is reached at once; producing CLI commands would reach exactly one.
+
+## Non-Goals
+
+- **No CLI command generation.** Mapping `ScannedModule` onto argv, `--help`
+  text, and man pages is `apcore-cli`'s job and already exists there. This
+  proposal stops at `ScannedModule`.
+- **No source-code generation.** The "build-time codegen" half of the original
+  proposal is already served by the shipped `YAMLWriter` → `.binding.yaml` →
+  `BindingLoader` path (see [Static Mode](#static-mode-build-time)). No new
+  codegen surface is introduced.
+- **No CLI-tool scanning.** Parsing `--help` output or man pages of arbitrary
+  binaries remains out of scope per [Scope & Boundaries](../scope.md#not-a-cli-tool-scanner).
+  Scanning a *machine-readable API contract* is a different problem and is
+  explicitly listed as Phase 4 of the [ability-extraction methodology](scanning.md#phase-4-discover-existing-api-contracts).
+- **No spec authoring, validation, or linting.** The scanner consumes a spec
+  it is given. Spec correctness is the API owner's problem; malformed input
+  degrades to warnings, never to an exception (see [Error Model](#error-model)).
+- **No OpenAPI 2.0 (Swagger) support in V1.** 3.0 and 3.1 only. 2.0 input is
+  detected and rejected with a clear error rather than mis-parsed.
+- **No authentication.** Acquiring credentials for the target API is the
+  subject of the sibling proposal [`device-auth.md`](device-auth.md); the two
+  compose at `HTTPProxyRegistryWriter` (see [End-to-End Composition](#end-to-end-composition)).
+
+## Motivation
+
+### What already exists, and what is actually missing
+
+The toolkit already ships the hard part of OpenAPI handling — the
+**operation-level** primitives documented in [`openapi.md`](openapi.md):
+
+| Shipped primitive | What it does |
+|---|---|
+| `extract_input_schema(op, doc)` | Merges path + query + body params into one flat JSON Schema |
+| `extract_output_schema(op, doc)` | Pulls the `200`/`201` response schema |
+| `deep_resolve_refs(schema, doc)` | Recursively inlines `$ref`, merging any sibling keys over the target (sibling wins — carries `x-sensitive` through); depth-limited to 16 |
+| `infer_annotations_from_method(method)` | Maps HTTP verb → `ModuleAnnotations` (canonical, RFC 9110-derived) |
+
+What is missing is only the **document-level** layer above them: the traversal
+of `paths` × `methods`, the derivation of a stable `module_id`, and the
+population of the fields `HTTPProxyRegistryWriter` needs in order to actually
+call the endpoint.
+
+That missing layer is roughly a `for` loop. Its value is not that it is hard —
+it is that of everything standing between "an existing HTTP API" and "modules
+every apcore surface can consume", it is the only piece nobody has.
+
+### Why this matters more than its size suggests
+
+**This is the on-ramp for existing APIs.** The ecosystem's premise is making
+capabilities AI-perceivable; the largest supply of not-yet-perceivable
+capability is the REST APIs organisations already run. Today, adopting apcore
+for one of them means hand-writing a `ScannedModule` per operation. A typical
+OpenAPI document describes dozens to hundreds of operations, so that cost is
+not merely tedious — it is high enough to decide against adoption entirely.
+
+Turning it into one function call changes the unit of adoption from "per
+endpoint" to "per API".
+
+**And one scan reaches every surface.** Because the output is `ScannedModule`,
+a single wrap yields CLI, MCP, A2A, and REST exposure simultaneously — all four
+already consume that type. This is the property the ecosystem is built around,
+and an OpenAPI scanner is the cheapest way to feed it.
+
+**The naming algorithm is the part that must not be duplicated.** Anyone
+writing this loop themselves must invent `module_id` derivation, and that is
+exactly the kind of trivial-looking decision that diverges silently — the
+failure shape documented in [`formatting.md`](formatting.md), where three
+independent `csv`/`jsonl` implementations produced three different outputs
+before v0.7.0. Specifying the derivation once, with a conformance corpus,
+prevents that class of divergence from arising rather than repairing it after
+the fact.
+
+### Why the toolkit and not `apcore-cli`
+
+The original issue scoped this to `apcore-cli`. Implemented there, the result
+is an OpenAPI-to-CLI generator — a crowded category already served by
+`openapi-generator`, `restish`, and others, with no differentiation and a large
+maintenance surface.
+
+Implemented as a `Scanner`, the same work reaches CLI, MCP, A2A, and REST
+surfaces simultaneously, because all four already consume `ScannedModule`.
+"Wrap once, fan out to every surface" is the property that is *not*
+commoditised by existing tooling; scoping to CLI trades it away for a strictly
+weaker version of the same feature.
+
+## Architecture
+
+```
+                    OpenAPI document (dict / JSON value)
+                                  │
+              ┌───────────────────┴───────────────────┐
+              │           OpenAPIScanner              │
+              │  (this proposal — document traversal) │
+              │                                       │
+              │  for each (path, method, operation):  │
+              │    module_id  ← derive_module_id()    │  ← NEW, byte-identical
+              │    input      ← extract_input_schema()│  ← shipped
+              │    output     ← extract_output_schema()  ← shipped
+              │    annots     ← infer_annotations_…() │  ← shipped
+              │    metadata   ← http invocation facts │  ← NEW contract
+              └───────────────────┬───────────────────┘
+                                  │
+                          Vec<ScannedModule>
+                                  │
+            ┌─────────────────────┼─────────────────────┐
+            ▼                     ▼                     ▼
+   HTTPProxyRegistryWriter    YAMLWriter          any other surface
+   (live, executable)      (.binding.yaml)       (MCP / A2A / REST)
+            │                     │
+     runtime execution     BindingLoader → static mode
+```
+
+The scanner is a thin, pure composition of already-shipped parts. Its entire
+novel surface is: **`derive_module_id`** and the **`metadata` invocation
+contract**. Those two are what need a conformance corpus; everything else
+inherits the guarantees it already has.
+
+## Separation of I/O from Traversal
+
+`BaseScanner.scan` is synchronous in Python and TypeScript and `async` in Rust
+(see [Contract: BaseScanner.scan](scanning.md#contract-basescannerscan)).
+Loading a spec from a URL is network I/O and cannot be made synchronous in
+Rust, nor should it be made async in Python purely to accommodate a remote
+fetch.
+
+**Decision: I/O is not part of the scanner.** The split is:
+
+| Function | I/O | Async | Owner |
+|---|---|---|---|
+| `load_spec(source)` | yes — file read or HTTP GET | Python/TS: sync + optional async variant; Rust: `async` | toolkit (thin convenience) |
+| `OpenAPIScanner.scan(spec)` | **no** | matches `BaseScanner` per SDK | toolkit (the real work) |
+
+`scan` takes an already-parsed document. This keeps the conformance-tested
+surface **pure** — fixtures are plain JSON in, plain JSON out, with no network
+mocking in any SDK — and lets consumers who already have a spec in hand (a
+FastAPI app can produce its own `app.openapi()` dict in-process) skip the
+loader entirely.
+
+`load_spec` is a convenience wrapper, explicitly outside the conformance
+corpus, and consumers are free to ignore it and pass their own parsed
+document.
+
+## Spec Location and Base URL
+
+Both of these vary per vendor and per stack, and neither may be guessed by the
+toolkit.
+
+### The spec URL is always supplied, never inferred
+
+Every framework publishes its OpenAPI document somewhere different — FastAPI,
+springdoc, ASP.NET's Swashbuckle, and drf-spectacular all use different default
+paths, and any of them can be reconfigured or served from a gateway. The
+scanner therefore **never probes candidate paths**. `load_spec` takes the
+complete URL or file path the caller provides, and a wrong URL produces an
+honest 404 rather than a silent fallback to some other document.
+
+### Fetching a protected spec
+
+An internal API's spec endpoint frequently requires the same credentials as the
+API itself. `load_spec` therefore accepts `headers` (and an optional
+`auth_header_factory` with the same shape the HTTP proxy writer uses), so the
+spec can be fetched with a bearer token:
+
+```python
+spec = load_spec(
+    "https://api.example.com/v3/api-docs",
+    headers={"X-Api-Version": "2024-01"},
+    auth_header_factory=client.as_auth_header_factory(),   # device-auth.md
+)
+```
+
+This is the second place the two proposals compose: credentials are needed not
+only to *call* the API but often to *discover* it.
+
+### Base URL resolution
+
+`servers[0].url` is unreliable in practice — it is frequently absent, a
+relative path, a developer's `localhost`, or a template with variables. The
+resolution order is therefore:
+
+1. **A `base_url` the caller passes to the writer always wins.** This is the
+   only value guaranteed correct, because the caller knows which environment it
+   is targeting.
+2. Otherwise `servers[0].url`, resolved as follows:
+    - **Relative** (`"/v1"`) — resolved against the URL the spec was loaded
+      from, so a spec fetched from `https://api.example.com/openapi.json`
+      yields `https://api.example.com/v1`. A relative server URL in a spec
+      loaded from a *local file* cannot be resolved and is skipped.
+    - **Templated** (`"https://{tenant}.example.com"`) — variables are
+      substituted from `servers[0].variables[*].default`. If any variable has
+      no default, the URL is unusable and skipped rather than emitted with
+      braces intact.
+3. If neither yields a usable absolute URL, `metadata["openapi"]["server_url"]`
+   is omitted and the caller **must** supply `base_url` to the writer.
+
+`server_url` remains advisory in all cases — the writer takes `base_url`
+explicitly and never reads it. Recording it is a convenience for a consumer
+deciding what to pass, not a value the execution path depends on.
+
+## `module_id` Derivation
+
+This is the one genuinely new algorithm in the proposal, and the one place
+where SDKs will diverge if it is not pinned exactly. Implementations MUST
+follow it byte-for-byte.
+
+Every `module_id` the scanner emits MUST be expressed in apcore's Canonical ID
+alphabet ([PROTOCOL_SPEC §2.7](https://github.com/aiperceivable/apcore/blob/main/docs/spec/protocol-spec.md#27-id-formal-grammar):
+`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`), because every apcore registry rejects
+anything else at registration. The one case normalisation cannot repair is
+reported, not hidden — see [What normalisation will not repair](#what-normalisation-will-not-repair).
+
+### Algorithm
+
+```
+derive_module_id(path, method, operation) -> string
+
+1. If operation has a non-empty string "operationId":
+       candidate = normalize_module_id(operationId), then strip trailing "_"
+       if candidate is non-empty                      → return candidate
+2. Otherwise, derive from path + method:
+       parts = []
+       for each segment of path.split("/"):
+           strip a single leading "{" and trailing "}" if both present
+           part = normalize_module_id(segment)
+           if part is non-empty: append part to parts
+       if parts is non-empty    → return ".".join(parts + [method.lowercased()])
+3. Return "root." + method.lowercased()
+
+normalize_module_id(s) -> string
+   1. insert "_" at word boundaries — two left-to-right, non-overlapping
+      replace-alls (applying them in either order gives the same result):
+          ([A-Z])([A-Z][a-z])    →  $1_$2      (acronym followed by a word)
+          ([a-z0-9])([A-Z])      →  $1_$2      (lower/digit followed by upper)
+   2. replace every code point not in [A-Za-z0-9_.] with "_"
+   3. lowercase (only ASCII letters remain after step 2)
+   4. split on "."; strip leading "_" from each segment; drop empty
+      segments; join the rest with "."
+```
+
+`normalize_module_id` has one property every implementation MUST preserve:
+**it returns a legal apcore ID unchanged.** Each step is the identity on
+`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$` — there is no uppercase for step 1 to
+split, nothing outside the alphabet for step 2, no leading `_` or empty segment
+for step 4. It is also idempotent, and segment-local — `normalize(a.b)` is
+the `.`-join of `normalize(a)` and `normalize(b)` with empty results dropped —
+which is why the path branch may normalise one segment at a time.
+
+The scanner applies `normalize_module_id` a second time, to the **final**
+`module_id` — after the `derive_module_id` hook, `base_path_prefix` and the
+`transform_module` hook — so the alphabet holds for every emitted ID, not only
+the default derivation (see [Invocation order](#invocation-order)). By the
+property above, default-derived IDs, and any legal ID a hook returns, pass
+through unchanged.
+
+!!! warning "Porting notes — where three regex engines disagree"
+    - The character classes are ASCII ranges written out: `[A-Z]`, `[a-z0-9]`.
+      Do not use `\d`, `\w` or a case-insensitive flag — all three are
+      Unicode-aware in at least one of Python, JavaScript and Rust.
+    - Step 3 lowercases **after** step 2 for the same reason: `"K"` (U+212A
+      KELVIN SIGN) lowercases to ASCII `k` under Unicode rules, so lowercasing
+      first would let a non-ASCII character survive as a letter in one SDK only.
+    - Step 2 is per **code point**. JavaScript MUST use the `u` flag
+      (`/[^A-Za-z0-9_.]/gu`): without it an astral character is two code units
+      and becomes `"__"`, where Python and Rust emit one `_` — and because runs
+      of `_` are deliberately kept (see
+      [A legal ID is never rewritten](#a-legal-id-is-never-rewritten)), the IDs
+      would differ. Case 025 pins it.
+    - Rust's `Regex::replace_all` parses `$1_` as a group **named** `1_`, which
+      does not exist and expands to the empty string. Write `${1}_${2}`.
+    - The acronym rule is written with a single `([A-Z])`, not `([A-Z]+)`.
+      Both put the `_` before the last capital of a run that is followed by a
+      lowercase letter, so the output is identical; but `([A-Z]+)` makes
+      Python's and JavaScript's backtracking engines rescan a long run of
+      capitals from every start position — quadratic time on a crafted
+      `operationId` or path (40,000 capitals: about 10 s in Python). The
+      scanner reads documents it did not write, so implementations MUST NOT use
+      a pattern whose running time is super-linear in its input.
+    - The legality test is a **full** match. Python's `re.match(r"^…$")`
+      accepts a trailing newline, because `$` also matches just before one;
+      use `re.fullmatch`.
+
+### Worked examples
+
+| Input | `operationId` | Derived `module_id` |
+|---|---|---|
+| `GET /users` | — | `users.get` |
+| `POST /users` | — | `users.post` |
+| `GET /users/{user_id}` | — | `users.user_id.get` |
+| `DELETE /users/{user_id}/orders/{order_id}` | — | `users.user_id.orders.order_id.delete` |
+| `GET /` | — | `root.get` |
+| `GET /-` | — | `root.get` — no segment survives normalisation |
+| `GET /v1/pets` | — | `v1.pets.get` |
+| `GET /users/{id}` | `getUserById` | `get_user_by_id` |
+| `GET /pets` | `listPets` | `list_pets` |
+| `GET /a` | `getHTTPResponse` | `get_http_response` |
+| `GET /c` | `OAuth2Token` | `o_auth2_token` |
+| `GET /d` | `list-pets` | `list_pets` |
+| `GET /items/{item_id}` | `read_item_items__item_id__get` (FastAPI) | `read_item_items__item_id__get` — already legal, unchanged |
+| `GET /h` | `getUser_` | `get_user` |
+| `GET /user-profiles/{userId}` | — | `user_profiles.user_id.get` |
+| `GET /v1/_debug/` | — | `v1.debug.get` |
+| `POST /a b/c` | — | `a_b.c.post` |
+| `POST /v1/2fa` | — | `v1.2fa.post` — **not legal**; emitted with a warning |
+
+### Design decisions, and why
+
+**Path parameters are kept as segments, not dropped.** Dropping them makes
+`GET /users` and `GET /users/{id}` both derive to `users.get`, which then
+collides and gets silently renamed to `users.get_2` by
+[`deduplicate_ids`](scanning.md#contract-basescannerdeduplicate_ids). The
+surviving names would then depend on the iteration order of the spec's `paths`
+object — an unstable, meaningless distinction between "get the collection" and
+"get one item". Keeping the parameter segment makes both names stable and
+self-describing at the cost of some verbosity.
+
+**IDs are normalised into apcore's alphabet, because nothing else registers.**
+V1 used `operationId` verbatim with case preserved, and sanitised to
+`[A-Za-z0-9_.-]`. That alphabet is not apcore's: every registry rejects
+uppercase and `-`, so the canonical Swagger Petstore (`listPets`,
+`createPets`, `showPetById`) scanned cleanly and registered **nothing**, and
+a path as ordinary as `/user-profiles` could not register either. Each
+consumer that composed the scanner with a registry — the `apcore-mcp` and
+`apcore-a2a` OpenAPI backends, in all three languages — shipped its own
+projection to compensate. The rule now lives here, once.
+
+**`operationId` becomes snake_case, with the regexes pinned.** apcore already
+requires this conversion for Canonical IDs — PROTOCOL_SPEC §2.2, Algorithm A02
+`normalize_to_canonical_id` ("If segment is camelCase → Convert to
+snake_case"), and §2.1.1 for class names — so V1's verbatim choice contradicted
+the protocol rather than merely choosing a style. V1 declined the conversion
+because such conversions diverge at acronym boundaries (`getHTTPResponse` →
+`get_http_response` or `get_h_t_t_p_response`, depending on the regex). The
+divergence comes from leaving the regex unspecified, not from converting, so
+the algorithm above fixes both regexes, and case
+`openapi_scan_025_operation_id_snake_case_boundaries` pins the outputs where
+engines are most likely to disagree. The two word-boundary rules are the ones
+apcore's own SDKs apply (apcore-python and apcore-typescript write the acronym
+rule as `([A-Z]+)([A-Z][a-z])` for §2.1.1, which inserts identically;
+apcore-rust's A02 applies the same two rules character by character), so a
+camelCase name yields the same words here as through apcore's
+ID Map — `OAuth2Token` → `o_auth2_token` and `getIDs` → `get_i_ds` included.
+Plain lowercasing was the alternative with no conversion at all, and was
+rejected: `getuserbyid` loses the word boundaries a human — or a model choosing
+between tools — reads the name by. The algorithm has known ugly outputs
+(`getIDs` → `get_i_ds`, `OAuth2Token` → `o_auth2_token`); they are pinned
+rather than special-cased, and an organisation that wants better names uses the
+`derive_module_id` hook.
+
+<a id="a-legal-id-is-never-rewritten"></a>
+**A legal ID is never rewritten.** Normalisation changes an ID only where apcore
+would reject it, or where camelCase is split into words. An `operationId` that
+is already a legal ID — FastAPI's generated `read_item_items__item_id__get`, a
+utoipa function name, any snake_case name — is used as it is (the one
+exception, a trailing `_`, is below), and so is a legal ID a hook returns. Measured against the IDs the `apcore-mcp` /
+`apcore-a2a` backends register today (V1 derivation plus their lowercase
+projection), every lowercase `operationId` and every lowercase path whose ID
+was legal derives the identical ID, with two exceptions no real API is likely
+to contain: an `operationId` whose last character before any trailing `.`,
+`_` or punctuation is a hyphen (`list-`: `list_` → `list`), and a path with no
+segment that survives normalisation (`/_`: `get` → `root.get`). What does change is every name containing an uppercase letter,
+which is now split into words — and that includes IDs that registered before:
+V1 lowercased a path before sanitising it, so a camelCase path parameter gave
+a legal, working ID that now changes (`/pets/{petId}`: `pets.petid.get` →
+`pets.pet_id.get`). That is the same trade as `getUserById` → `get_user_by_id`,
+made for the same reason, and one rule for both branches is what keeps an
+`operationId` and a path segment spelled alike from deriving differently.
+Two rules follow from the invariant:
+
+- **Runs of `_` are kept.** PROTOCOL_SPEC §2.7 also says a segment MUST NOT
+  contain `__`, but no apcore registry enforces that constraint, and apcore's
+  own A02 implementations emit `__`. Collapsing runs here would rename every
+  FastAPI-generated ID that registers today, for a rule the protocol does not
+  apply to itself. That tension is apcore's to resolve — by enforcing the
+  constraint everywhere or by dropping it — not a scanner's to settle
+  unilaterally, so the legality check uses the pattern the registries enforce.
+- **A trailing `_` is stripped only in `derive_module_id`'s `operationId`
+  branch**, which reproduces what V1's `sanitize` did (`getUser_` →
+  `get_user`). The final normalisation does not strip it, so a legal ID a hook
+  returns, such as `abc_`, is not rewritten.
+
+**The raw `operationId` is not lost.** It remains in
+`metadata["openapi"]["operation_id"]`, verbatim, for display and for mapping
+a module back to the document.
+
+<a id="why-no-suggested-alias"></a>
+**Why the scanner does not set `suggested_alias`.** PROTOCOL_SPEC §5.13.7 lets
+a scanner suggest a display alias, and the verbatim `operationId` looks like the
+obvious candidate — it is the name the API's documentation and generated
+clients use. The scanner deliberately sets none:
+
+- `suggested_alias` feeds **every** surface's alias chain
+  (`surface override > display.alias > binding alias > suggested_alias > module_id`),
+  but whether `getUserById` is an acceptable name depends on the surface. MCP
+  tool names allow it; CLI command names must match `^[a-z][a-z0-9_-]*$`, and
+  `apcore-cli` uses the resolved alias as the command name without normalising
+  it. One scanner-wide suggestion would put uppercase commands on the CLI.
+- The route-derived alternative the toolkit already ships,
+  `generate_suggested_alias(path, method)` (used by `hono-apcore`,
+  `axum-apcore` and `nestjs-apcore`), replaces the author's name with invented
+  verbs and can collide: `/users/{id}/posts` and `/users/posts` both give
+  `users.posts.list`.
+- Neither would be observable today. No consumer of this scanner runs
+  `DisplayResolver`: the `apcore-mcp` / `apcore-a2a` backends register modules
+  without the display layer, and `apcore-cli`'s `openapi` commands would only
+  copy the value into generated binding files, whose `suggested_alias` key no
+  apcore SDK reads on load. An alias set here would reach no tool, skill or
+  command name.
+- Nothing is lost by leaving it unset. The canonical ID now carries the
+  author's words readably (`get_user_by_id`), and the verbatim `operationId`
+  is in `metadata["openapi"]["operation_id"]` for any surface that wants it.
+
+A surface that wants its names to match the API's `operationId`s exactly maps
+`metadata["openapi"]["operation_id"]` onto its **own** alias
+(`display.mcp.alias`, for MCP) when it adopts the display layer. That is the
+one place where the choice can respect the surface's naming rules.
+
+**Normalisation applies to the final ID, not only the default derivation.**
+`base_path_prefix` and both ID-affecting hooks feed into the emitted ID, and a
+hook returning `"Custom-Space.GetThing"` produces an ID no registry accepts
+exactly as surely as the default derivation did. The hook chooses the words;
+the scanner owns the alphabet — and, by the invariant, a hook that already
+returns a legal ID keeps it.
+
+<a id="what-normalisation-will-not-repair"></a>
+**What normalisation will not repair.** After normalisation an ID can still be
+illegal in exactly two ways: a segment beginning with a digit
+(`/v1/2fa` → `v1.2fa.post`, or `operationId: 3ds`), or an empty ID, which only
+a hook can produce. Repairing either would mean *inventing* a name — a naming
+decision that belongs to the operator, not to a silent default. Per the
+[Error Model](#error-model), the module is still emitted. After
+`filter_modules` and `deduplicate_ids`, every emitted module whose ID is still
+illegal has this warning appended, verbatim — so it names the ID actually
+emitted (`3ds_2`, not `3ds`) and follows any deduplication warning:
+
+```
+module_id '<id>' is not a legal apcore module ID: segment '<segment>' must match ^[a-z][a-z0-9_]*$; name this operation with a derive_module_id or transform_module hook
+```
+
+where `<segment>` is the first dot-separated segment that is not a full match
+of `^[a-z][a-z0-9_]*$` (for an empty ID, the empty string). A consumer that
+registers modules decides what to do with it — drop it, or pass a hook. The
+scanner checks only the alphabet: the 192-character limit and the reserved
+first segments of PROTOCOL_SPEC §2.5 remain the registry's to enforce, per
+module, where the rules are defined.
+
+**Collisions remain possible and are handled downstream.** Two operations may
+legitimately carry the same `operationId` in a malformed spec, and
+normalisation can create a collision the document did not have (`listPets`
+and `list-pets` both become `list_pets`). Because normalisation runs before
+`deduplicate_ids`, both are handled the same way: `_2`/`_3` suffixes and a
+warning appended to `ScannedModule.warnings` — the scanner MUST call it,
+exactly as framework scanners do.
+
+## Execution Contract (`metadata` keys)
+
+For a framework scanner, `ScannedModule.target` is a dotted import path to a
+local callable — `"myapp.views:create_user"`. An OpenAPI operation has **no
+local callable**: the implementation lives behind an HTTP endpoint on another
+host.
+
+The shipped `HTTPProxyRegistryWriter` resolves this by reading the route from
+**`metadata`, never from `target`**. This section is therefore not a design
+choice — it is a description of what the writer already requires. A scanner
+that emits anything else produces modules the writer cannot execute.
+
+### Required keys (normative — these exact names)
+
+| `metadata` key | Value | Example |
+|---|---|---|
+| `http_method` | **Uppercase** HTTP method | `"GET"` |
+| `url_path` | Path template, `{param}` braces retained, leading slash | `"/users/{user_id}"` |
+
+These flat, snake_case keys are portable across all three writers. The
+[effective preflight](output-writers.md#effective-proxy-diagnostics) reports
+missing route fields. The legacy writer can fall back to `"GET"` or `"/"`
+when a field is absent.
+
+!!! danger "Uppercase is mandatory, not cosmetic"
+    The Rust writer matches the method against exact uppercase literals and
+    returns `Unsupported HTTP method: post` for a lowercase value. The Python
+    writer compares case-sensitively when deciding whether a request carries a
+    body, so a lowercase `"post"` would send its arguments as a **query
+    string** instead of a JSON body. Only the TypeScript writer upper-cases
+    defensively.
+
+    OpenAPI path-item keys are lowercase by specification, so the scanner
+    **MUST** upper-case the method when writing `http_method`. This is the
+    single most likely way to get a working Python/TypeScript integration and a
+    broken Rust one.
+
+### Informational keys
+
+The following informational fields are recorded under `metadata.openapi`.
+Effective scans also record [proxy input metadata](#effective-parameter-scanning)
+under that key.
+
+| `metadata["openapi"]` field | Value | Omitted when |
+|---|---|---|
+| `operation_id` | The spec's `operationId` | absent from the spec |
+| `spec_version` | The document's `openapi` version string | never |
+| `server_url` | `servers[0].url` | no `servers` entry |
+| `summary` | `operation.summary` | absent |
+
+### Input locations and the legacy scanner
+
+`scan()` retains the original flat schema and route metadata. The generic
+writer uses the template to collect path values, then sends the remaining
+values as JSON for `POST`, `PUT` and `PATCH`, or as query parameters for other
+methods. To validate that this routing can represent an OpenAPI operation,
+use [effective parameter scanning](#effective-parameter-scanning) and the
+[shared preflight](output-writers.md#effective-proxy-diagnostics).
+
+### Which field gets `target`, then?
+
+`target` is a required `ScannedModule` field and must hold something. The
+scanner sets it to `"<METHOD> <url_path>"` (e.g. `"GET /users/{user_id}"`) as
+a stable, human-readable identifier that surfaces in listings and generated
+documentation.
+
+This **deviates from `target`'s documented meaning** ("callable reference in
+`module.path:callable` format"). The deviation is safe today because no writer
+reads the field, but it should be made explicit rather than left implicit:
+[`scanning.md`](scanning.md#contract-scannedmodule) should note that modules
+representing remote endpoints carry a route descriptor in `target` instead of
+an import path. Filed as [Open Questions](#open-questions) Q2.
+
+### Blocking prerequisites in the shipped writers
+
+Verification of the three implementations surfaced defects that this scanner
+would trigger in normal use. These are **pre-existing writer bugs**, not
+scanner design issues, but the scanner is what makes them reachable, so they
+must be fixed alongside — or the OpenAPI integration will be quietly broken on
+Rust.
+
+| # | Defect | Impact on OpenAPI-scanned modules |
+|---|---|---|
+| W1 | ~~Rust's path-parameter regex is `\{(\w+)\}` (word characters only), while Python/TypeScript use `\{[^}]+\}`~~ — **see correction below** | ~~OpenAPI permits `{item-id}` and `{id:int}`. On Rust these are not recognised as path parameters, so the value is sent as a query argument~~ — see correction |
+| W2 | Rust accepts only `GET`/`POST`/`PUT`/`PATCH`/`DELETE` and errors on anything else | `HEAD`, `OPTIONS`, and `TRACE` operations scan fine but fail at execution on Rust only |
+| W3 | Rust reads `metadata` only; Python/TypeScript also honour top-level `http_method`/`url_path` attributes, and TypeScript additionally accepts camelCase `metadata.httpMethod`/`metadata.urlPath` | Not triggered by this scanner (it writes snake_case metadata, the intersection all three read) — documented as intentional in `output-writers.md` rather than reconciled |
+| W4 | The legacy Rust writer accepts an absolute `url_path` | The [effective OpenAPI writer](output-writers.md#effective-openapi-forwarding) rejects absolute paths consistently across SDKs |
+
+!!! success "W1 and W2 fixed in `apcore-toolkit-rust` — W1 diagnosis corrected"
+    Re-verifying against the actual code during implementation found the W1
+    row above overstated the bug: Rust's path-parameter *extraction and
+    substitution* (used to build the actual outgoing request) already went
+    through `extract_path_param_names`, which uses the same broad
+    `\{[^}]+\}` pattern as Python/TypeScript — a hyphenated param like
+    `{item-id}` was already correctly recognised and substituted. The narrow
+    `\{(\w+)\}` regex was used only by a separate, later
+    *unfilled-placeholder* check (verifying no `{...}` template syntax was
+    left in the URL after substitution) — so the real, narrower gap was
+    that an unfilled hyphenated param would not have been flagged by that
+    check, not that a filled one was silently mis-routed to the query
+    string. Fixed by having the unfilled-placeholder check reuse
+    `extract_path_param_names` directly, removing the second, divergent
+    regex literal. W2 was confirmed exactly as described (HEAD/OPTIONS/
+    TRACE rejected before any network call) and fixed by adding the three
+    missing method-match arms. Both fixes shipped with regression tests.
+    W4 remains a limitation of the legacy Rust route reader. The effective
+    OpenAPI path has its own shared validation contract.
+
+## Effective Parameter Scanning
+
+The 0.15.0 SDK contract combines the effective scanner with the toolkit's
+[proxy diagnostics and preflight](output-writers.md#effective-proxy-diagnostics).
+The scanner accepts the same options and transformation hooks as `scan()`.
+
+| SDK | Entry point |
+|---|---|
+| Python | `OpenAPIScanner().scan_with_effective_parameters(spec, **options)` |
+| TypeScript | `new OpenAPIScanner().scanWithEffectiveParameters(spec, options)` |
+| Rust | `OpenAPIScanner::new().scan_with_effective_parameters(&spec, &options).await` |
+
+The scanner resolves same-document Parameter Object references, collects Path
+Item parameters, then applies operation-level overrides by `(name, in)`.
+Path and query declarations and the named properties of a supported JSON
+request body form the flat input schema. The effective schema resolver
+preserves boolean schemas and applies both the referenced schema and its
+sibling assertions. See [Schema extraction modes](openapi.md#schema-extraction-modes).
+
+The operation hook runs before parameter resolution. The module hook and
+selection filters run in their [usual order](#invocation-order). Call the
+preflight on the final modules so an excluded operation cannot block import.
+Change parameter declarations in the operation hook to regenerate both the
+input schema and its routing metadata together.
+
+The same resolved inputs that produce `input_schema` also produce
+`metadata.openapi.proxy_inputs`.
+
+| Field | Meaning |
+|---|---|
+| `path` | Effective path parameter names |
+| `query` | Effective query parameter names |
+| `body` | Names of JSON body properties exposed as tool inputs |
+| `problems` | Operation-local findings, including reference failures, duplicate parameters and unsupported input encodings |
+| `required_json_body` | Optional marker emitted as `true` for a supported required JSON body |
+
+The scanner keeps affected operations in the result so callers can report or
+filter them. The preflight turns findings in a selected set into an error
+before the caller invokes the writer. External reference identifiers are
+redacted to `<external-ref>` in effective findings and warnings. Local
+pointers remain available for troubleshooting.
+
+## Annotations
+
+Annotations come from the shipped
+[`infer_annotations_from_method`](scanning.md#contract-basescannerinfer_annotations_from_method),
+which the scanner MUST call rather than reimplement. OpenAPI adds exactly one
+signal of its own:
+
+| OpenAPI field | Effect |
+|---|---|
+| `operation.deprecated == true` | Sets `annotations.deprecated = true` |
+
+No other OpenAPI field is mapped to an annotation in V1. In particular,
+`security` requirements are **not** mapped to `requires_approval` — needing a
+token is not the same as needing a human to approve the call, and conflating
+them would spuriously gate every operation of an authenticated API behind an
+approval prompt.
+
+## Descriptions and Documentation
+
+| `ScannedModule` field | Source, in precedence order |
+|---|---|
+| `description` | `operation.summary` → first line of `operation.description` → `""` |
+| `documentation` | `operation.description` → `None` |
+| `tags` | `operation.tags` → `[]` |
+| `version` | `document.info.version` → `"1.0.0"` |
+| `examples` | Not populated in V1 — see below |
+
+`summary` is preferred for `description` because OpenAPI defines it as the
+short form, matching `ScannedModule.description`'s one-line contract, while
+`description` is explicitly allowed to be long-form CommonMark.
+
+`examples` stays empty in V1. OpenAPI carries examples in at least four
+distinct places (`operation.requestBody.content.*.example`, `.examples`,
+per-parameter `example`, and response examples), with differing shapes between
+3.0 and 3.1. Mapping them onto `ModuleExample` correctly is a self-contained
+problem worth its own iteration, and getting it wrong produces confidently
+misleading documentation. Emitting nothing is the honest V1 answer.
+
+## Dynamic and Static Modes
+
+The original issue asked for both a runtime mode and a build-time mode. Both
+fall out of existing pieces; neither needs new machinery beyond the scanner.
+
+### Dynamic mode (runtime)
+
+Load the spec, scan for effective parameters and preflight the selection
+before registering it. The exposed modules reflect the current API document.
+
+```
+load_spec(url) → effective scan → select modules → proxy preflight → HTTPProxyRegistryWriter.write() → Registry
+```
+
+Cost: one spec fetch and parse per process start. Benefit: zero redeploy when
+the API changes.
+
+### Static mode (build time)
+
+Scan once during the build, persist to `.binding.yaml`, load that at runtime.
+
+```
+build:    load_spec(url) → effective scan → YAMLWriter.write() → api.binding.yaml
+runtime:  BindingLoader.load("api.binding.yaml") → select modules → proxy preflight → HTTPProxyRegistryWriter.write()
+```
+
+Regenerate bindings produced by the legacy scanner before using them with
+effective preflight so the persisted modules carry the proxy input metadata.
+
+Cost: a re-sync step when the API changes. Benefit: no network dependency and
+no parse cost at startup, plus the generated bindings are reviewable artifacts
+that can be diffed in a pull request — which is how an API contract change
+becomes visible to a human before it ships.
+
+**Both writers and the loader already exist.** The original issue's
+"build-time utility to generate optimized, type-safe command stubs embedded
+into the binary" is served by this path without generating any source code.
+This removes what would otherwise have been the largest and least maintainable
+part of the work.
+
+## End-to-End Composition
+
+This proposal and [`device-auth.md`](device-auth.md) are two halves of one
+scenario — *"expose a remote, authenticated HTTP API as apcore modules"* —
+and they meet at exactly one point: `HTTPProxyRegistryWriter`'s existing
+`auth_header_factory` hook.
+
+```python
+from apcore_toolkit import (
+    HTTPProxyRegistryWriter,
+    OpenAPIScanner,
+    load_spec,
+    validate_effective_proxy_modules,
+)
+
+# 1. Credentials  (device-auth.md proposal)
+tokens = DeviceAuthClient(config).login(on_user_code=cli_prompt)
+
+# 2. Modules      (this proposal)
+spec    = load_spec("https://api.example.com/openapi.json")
+modules = OpenAPIScanner().scan_with_effective_parameters(spec)
+
+# 3. Execution    (both — already shipped)
+writer = HTTPProxyRegistryWriter(
+    base_url="https://api.example.com",
+    auth_header_factory=tokens.as_auth_header_factory(),
+)
+validate_effective_proxy_modules(modules)
+writer.write(modules, registry)
+```
+
+Neither proposal depends on the other being implemented: the scanner works
+against unauthenticated or statically-keyed APIs, and the device-auth client
+is useful to anything holding a bearer token. They are specified separately
+and can ship in either order.
+
+## Public API
+
+### Python
+
+```python
+from apcore_toolkit import OpenAPIScanner, load_spec
+
+spec = load_spec("https://api.example.com/openapi.json")   # or a local path
+# or: spec = json.load(open("openapi.json"))               # loader is optional
+
+scanner = OpenAPIScanner()
+modules = scanner.scan(
+    spec,
+    include=r"^users\.",       # forwarded to filter_modules
+    exclude=None,
+    base_path_prefix=None,     # optional module_id namespace, e.g. "petstore"
+    include_deprecated=True,
+)
+```
+
+### TypeScript
+
+```typescript
+import { OpenAPIScanner, loadSpec } from "apcore-toolkit";
+
+const spec = await loadSpec("https://api.example.com/openapi.json");
+
+const scanner = new OpenAPIScanner();
+const modules = scanner.scan(spec, {
+  include: "^users\\.",
+  exclude: undefined,
+  basePathPrefix: undefined,
+  includeDeprecated: true,
+});
+```
+
+### Rust
+
+```rust
+use apcore_toolkit::{OpenAPIScanner, ScanOptions, load_spec};
+
+let spec = load_spec("https://api.example.com/openapi.json").await?;
+
+let scanner = OpenAPIScanner::new();
+let modules = scanner.scan(&spec, &ScanOptions {
+    include: Some("^users\\.".into()),
+    exclude: None,
+    base_path_prefix: None,
+    include_deprecated: true,
+}).await?;
+```
+
+Rust's `scan` is `async`, matching the ecosystem convention that a
+`Scanner`'s `scan` method is async — even though this implementation
+performs no I/O, the document is already parsed by the time it arrives.
+`OpenAPIScanner` is a standalone struct with this inherent `scan` method,
+**not** an `impl BaseScanner for OpenAPIScanner`. `BaseScanner::scan` is now
+fallible, which removed one of the two obstacles
+[`apcore-toolkit-rust#4`](https://github.com/aiperceivable/apcore-toolkit-rust/issues/4)
+recorded; the other — a document-plus-options input rather than an
+application — is kept deliberately, for the reasons in the note at the top of
+this document. `OpenAPIScanner` reuses the trait's free functions
+(`filter_modules`, `deduplicate_ids`, `infer_annotations_from_method`)
+directly.
+
+## Error Model
+
+A scanner that raises on the first malformed operation is useless against
+real-world specs, which are frequently non-conforming in small ways. The
+scanner therefore **degrades rather than fails**:
+
+| Condition | Behaviour |
+|---|---|
+| Spec is not OpenAPI 3.x (`openapi` key missing, or `swagger: "2.0"`) | Raise / throw / `Err` — this is a caller error, not spec noise |
+| `paths` missing or empty | Return an empty module list; no error |
+| Operation has no `operationId` | Derive from path + method (normal path, not an error) |
+| Operation has unresolvable `$ref` | Schema degrades to `{}` per the shipped [`resolve_ref` contract](openapi.md#contract-resolve_ref); module is still emitted; a warning is appended to `ScannedModule.warnings` |
+| Operation has no request body and no parameters | `input_schema` is `{}` — valid, means "takes no arguments" |
+| Operation has no `200`/`201` response | `output_schema` is `{}`; warning appended |
+| Path item contains non-operation keys (`summary`, `parameters`, `servers`, `$ref`) | Skipped, not treated as HTTP methods |
+| Duplicate derived `module_id` | Resolved by `deduplicate_ids`, warning appended |
+| Final `module_id` still illegal after normalisation (a segment begins with a digit, or a hook produced an empty ID) | Module emitted with its normalised ID; after deduplication the [legality warning](#what-normalisation-will-not-repair) is appended, naming the ID actually emitted |
+
+Only the first row raises. Everything else produces a module plus a warning,
+because a partially-understood operation is more useful than a hard failure —
+and `warnings` is exactly the field
+[`ScannedModule`](scanning.md#contract-scannedmodule) provides for
+human audit of scan-time degradation.
+
+### Recognised HTTP methods
+
+Only these keys in a path item are treated as operations, matching the OpenAPI
+3.x Path Item Object specification:
+
+`get`, `put`, `post`, `delete`, `options`, `head`, `patch`, `trace`
+
+The scanner recognises all eight because each can be declared in the API
+document. The [effective proxy preflight](output-writers.md#effective-proxy-diagnostics)
+reports `TRACE` as unsupported across the default transports.
+
+Iteration order MUST be the document's own key order (not this list's order,
+and not alphabetical) so that `deduplicate_ids` suffix assignment is
+reproducible across SDKs. Implementations in languages with unordered map
+types MUST use an insertion-ordered parse (Python `dict` and JS objects
+preserve insertion order natively; Rust requires `serde_json`'s
+`preserve_order` feature, which pulls in `indexmap`).
+
+## Extension Hooks
+
+Real specs are non-conforming in vendor-specific ways, and organisations have
+their own module-naming conventions. Declarative options cannot anticipate
+either, so the scanner accepts three hooks. All are optional; with none
+installed, behaviour is exactly what the conformance corpus asserts.
+
+| Hook | Signature | Purpose |
+|---|---|---|
+| `transform_operation` | `(path, method, operation) -> operation \| None` | Patch or normalise an operation before extraction. Returning `None` **skips** the operation entirely |
+| `derive_module_id` | `(path, method, operation) -> string \| None` | Override the naming algorithm. Returning `None` falls back to the [default derivation](#module_id-derivation) |
+| `transform_module` | `(module) -> ScannedModule \| None` | Adjust the finished module — extra metadata, tag rewriting. Returning `None` drops it from the result |
+
+`transform_operation` is where vendor `x-*` extensions are handled. OpenAPI's
+extension mechanism is open by design, and specs in the wild carry pagination
+hints, auth requirements, and rate-limit annotations under vendor-prefixed
+keys. Rather than guessing at a mapping for extensions the toolkit cannot know
+about, it gives the consumer the operation object and lets them fold whatever
+matters into a shape the scanner already understands.
+
+### The trade this makes explicit
+
+Unlike the sibling proposal, this scanner has **no protocol-decision layer** to
+protect — it is a pure transformation. The property at risk is different:
+
+!!! warning "`derive_module_id` overrides the corpus guarantee — deliberately"
+    Module ID derivation is the *primary* subject of the conformance corpus,
+    precisely because it is the thing most likely to drift across SDKs.
+    Overriding it hands that guarantee back to the consumer: if they run
+    scanners in more than one language, **they must implement the same naming
+    logic in each**, and nothing will warn them if they diverge.
+
+    The override exists anyway, because an organisation with an established
+    module-naming convention would otherwise be unable to adopt the scanner at
+    all — and would write their own loop, which is the duplication this
+    proposal set out to eliminate. Offering the hook keeps them on the shared
+    extraction path while they diverge only on naming.
+
+    Consumers running a single SDK, which is most of them, pay nothing.
+
+### Invocation order
+
+```
+for each (path, method, operation) in document order:
+    operation ← transform_operation(...)        skip if None
+    module_id ← derive_module_id(...) ?? default derivation
+    module_id ← base_path_prefix + "." + module_id, if a prefix is set
+    module    ← build from shipped extraction primitives
+    module    ← transform_module(module)        drop if None
+    module.module_id ← normalize_module_id(module.module_id)
+then: filter_modules → deduplicate_ids
+then: for each module whose module_id is not a legal apcore ID:
+          append the legality warning
+```
+
+Hooks run **before** filtering and deduplication, so `include`/`exclude`
+patterns match hook-produced IDs and collisions introduced by a custom naming
+scheme are still resolved by `deduplicate_ids`. Normalisation runs after the
+last hook for the same reason: filters match, and deduplication resolves, the
+ID that is actually emitted. The legality check runs last of all, so its
+warning names that same ID — including a `_2` suffix.
+
+## Security Considerations
+
+| Risk | Mitigation |
+|---|---|
+| **SSRF via `load_spec(url)`** | `load_spec` performs an arbitrary GET against a caller-supplied URL. It is a convenience helper, outside the conformance corpus, and MUST document that the URL is trusted input. Callers taking a spec URL from an untrusted source are responsible for their own allowlisting. |
+| **External `$ref` resolution** | The shipped `resolve_ref` handles internal JSON pointers (`#/...`) only. External refs (`https://…`, `./other.yaml`) MUST NOT be fetched — resolving them would turn a spec parse into an arbitrary outbound request chain. They degrade to `{}` plus a warning. |
+| **Billion-laughs / deeply nested `$ref`** | Already bounded by the shipped depth limit of 16 (see [`deep_resolve_refs`](openapi.md#contract-deep_resolve_refs)). |
+| **Circular `$ref`** | Same depth limit; terminates rather than hanging. |
+| **Prototype pollution (TypeScript)** | Already handled by the shipped `safe-keys` guard in `resolve_ref` (blocks `__proto__`, `constructor`, `prototype`). Inherited at no cost. |
+| **Spec-driven credential leakage** | The scanner excludes `securitySchemes`, `servers[].variables` defaults, and examples from metadata. The effective scanner redacts external reference identifiers in findings and warnings. |
+| **Enormous specs** | A spec with tens of thousands of operations produces a module per operation. Consumers can apply `include`/`exclude` filters. |
+
+!!! note "This guard is a known, intentional TS-only source of cross-SDK output divergence"
+    Because the guard blocks `$ref` path segments and schema/parameter keys literally named `__proto__`, `constructor`, or `prototype`, a spec using one of those names (valid JSON, if unusual) produces a *different* `scan()` result in TypeScript (the field is dropped, with a warning) than in Python or Rust (the field is resolved/kept normally, since neither language is vulnerable to the underlying attack). This is out of scope for the byte-identical conformance corpus below — no fixture exercises a `__proto__`-named schema key — and is not a bug to reconcile: the vulnerability class this guard defends against is JS-runtime-specific.
+
+## Conformance Corpus
+
+A fixture file lives at `conformance/fixtures/openapi_scan.json`, following the
+structure already used by `format_csv.json` and `display_resolve.json`
+(a single JSON document with `$schema`, `title`, `description`, `version`, and
+a `test_cases` array of `{id, description, input, expected}`).
+
+!!! note "Fixture layout"
+    The corpus convention is **one file containing many `test_cases`**, not one
+    file per case. This matches the shipped `format_csv.json` /
+    `display_resolve.json` fixtures and the other proposed corpora.
+
+Because `scan` is pure, each case is a spec fragment in and a module list out,
+with no network mocking required in any SDK.
+
+| Test case | Purpose |
+|---|---|
+| `openapi_scan_001_empty_paths` | `paths: {}` → empty list, no error |
+| `openapi_scan_002_single_get` | Minimal `GET /users` → one module, `users.get` |
+| `openapi_scan_003_operation_id_preserved` | `operationId: getUserById` → `get_user_by_id`; the raw value stays in `metadata.openapi.operation_id` (the case keeps its V1 id so that history stays traceable) |
+| `openapi_scan_004_path_param_segment` | `GET /users/{user_id}` → `users.user_id.get` |
+| `openapi_scan_005_collection_vs_item` | `GET /users` and `GET /users/{id}` coexist without collision |
+| `openapi_scan_006_all_methods` | All 8 recognised methods on one path |
+| `openapi_scan_007_non_operation_keys_skipped` | `summary` / `parameters` / `servers` in a path item are not scanned as methods |
+| `openapi_scan_008_annotations_from_method` | `GET`→readonly+cacheable, `DELETE`→destructive, `PUT`→idempotent; also asserts `metadata.http_method` is **uppercase** |
+| `openapi_scan_009_deprecated_flag` | `deprecated: true` → `annotations.deprecated` |
+| `openapi_scan_010_execution_metadata` | `metadata.http_method` and `metadata.url_path` present, correctly named, and consumable by `HTTPProxyRegistryWriter` |
+| `openapi_scan_011_description_precedence` | `summary` wins over `description` for the `description` field |
+| `openapi_scan_012_ref_resolution` | Nested `$ref` in request body fully inlined |
+| `openapi_scan_013_unresolvable_ref_warns` | Bad `$ref` → `{}` schema + warning, module still emitted |
+| `openapi_scan_014_external_ref_refused` | `$ref: "https://…"` not fetched → `{}` + warning |
+| `openapi_scan_015_duplicate_operation_id` | Two ops share an `operationId` → `list_things`, `list_things_2` + warning (normalised before deduplication) |
+| `openapi_scan_016_sanitize_illegal_chars` | `POST /a b/c` → `a_b.c.post` |
+| `openapi_scan_017_root_path` | `GET /` → `root.get` |
+| `openapi_scan_018_no_success_response` | Only a `404` defined → empty `output_schema` + warning |
+| `openapi_scan_019_document_order_preserved` | Module order follows document key order, not alphabetical |
+| `openapi_scan_020_swagger_2_rejected` | `swagger: "2.0"` raises in all three SDKs |
+| `openapi_scan_021_hook_skip_operation` | `transform_operation` returning `None` omits that operation |
+| `openapi_scan_022_hook_custom_module_id` | `derive_module_id` override is used; returning `None` falls back to the default |
+| `openapi_scan_023_hook_before_dedup` | A custom naming scheme producing a collision is still resolved by `deduplicate_ids` |
+| `openapi_scan_024_no_hooks_matches_baseline` | With no hooks installed, output is identical to the corresponding hook-free case |
+| `openapi_scan_025_operation_id_snake_case_boundaries` | Pins both word-boundary regexes on acronyms (`getHTTPResponse`, `getUserID`, `OAuth2Token`, `getIDs`), digits (`v2Items`) and hyphens; a legal FastAPI ID with `__` runs passes through unchanged; `getUser_` → `get_user`; an astral character becomes one `_` (the JavaScript `u` flag) |
+| `openapi_scan_026_path_derivation_normalised` | `GET /user-profiles/{userId}` → `user_profiles.user_id.get`; `GET /v1/_debug/` → `v1.debug.get` (a segment's leading `_` is stripped) |
+| `openapi_scan_027_illegal_segment_warns` | A digit-leading segment is not repaired: `v1.2fa.post` and `3ds` are emitted with the legality warning, from both derivation branches |
+| `openapi_scan_028_prefix_normalised` | `base_path_prefix: "Pet-Store"` → `pet_store.users.get` |
+| `openapi_scan_029_hook_output_normalised` | A `derive_module_id` hook returning `Custom-Space.GetThing` yields `custom_space.get_thing`. Drivers implement the named hook `always_returns_mixed_case_id` |
+| `openapi_scan_030_illegal_id_warning_follows_dedup` | Two `3ds` operations: the legality check runs after `deduplicate_ids`, so the second module's warning names `3ds_2` and follows the dedup warning |
+| `openapi_scan_031_degenerate_path_root_fallback` | `GET /-` → `root.get`, `POST /{}` → `root.post`: a path with no segment that survives normalisation falls back like `GET /` |
+| `openapi_scan_032_final_pass_keeps_legal_ids` | A hook returning `abc_` under `base_path_prefix: "pre_"` is emitted as `pre_.abc_`: the final pass strips no trailing `_`, per segment or at the end. Drivers implement the named hook `always_returns_legal_trailing_underscore_id` |
+| `openapi_scan_033_replacement_is_per_code_point` | `list--pets` → `list__pets` (each character its own `_`, never collapsed); `GET /items_` → `items_.get`; `\u212Aelvin` (KELVIN SIGN) → `elvin`, never `kelvin` (lowercasing follows replacement) |
+
+Each SDK's test suite runs the corpus; CI fails on divergence.
+
+!!! danger "Prerequisite: fixtures must actually run"
+    [Issue #15](https://github.com/aiperceivable/apcore-toolkit/issues/15)
+    ("Conformance fixtures are silently skipped in all three SDK CIs") is
+    closed, but this proposal's entire cross-SDK guarantee rests on the corpus
+    genuinely executing. Verify that the new fixture file is picked up and
+    failing-on-purpose in each SDK before trusting a green build.
+
+---
+
+## Contract: OpenAPIScanner.scan
+
+### Inputs
+- `spec` / `document`: dict / `Record<string, unknown>` / `serde_json::Value`, required — a parsed OpenAPI 3.0 or 3.1 document
+- `include`: string regex, optional — forwarded to `filter_modules`
+- `exclude`: string regex, optional — forwarded to `filter_modules`
+- `base_path_prefix` / `basePathPrefix`: string, optional, default `None` — when set, prepended to every derived `module_id` as `"<prefix>.<id>"`; applied **before** filtering and deduplication
+- `include_deprecated` / `includeDeprecated`: boolean, optional, default `true` — when `false`, operations with `deprecated: true` are omitted entirely rather than annotated
+- `transform_operation`, `derive_module_id`, `transform_module`: callables, optional — see [Extension Hooks](#extension-hooks). Each may return `None` to mean "no opinion" (`derive_module_id`) or "drop this" (the other two)
+
+### Errors
+- Non-OpenAPI-3.x input (missing `openapi` key, or `swagger: "2.0"`): Python raises `ValueError`; TypeScript throws `InvalidSpecError`; Rust returns `Err(ScannerError::InvalidSpec)`
+- Invalid `include`/`exclude` regex: inherits the [`filter_modules` error contract](scanning.md#contract-basescannerfilter_modules) exactly (Python `ValueError`, TypeScript `SyntaxError`, Rust `Err(regex::Error)`)
+- No other condition raises — malformed operations degrade to warnings per the [Error Model](#error-model)
+
+### Returns
+- On success: `list[ScannedModule]` / `ScannedModule[]` / `Vec<ScannedModule>` — one module per recognised operation, in document key order, after filtering and deduplication. Every `module_id` has passed through `normalize_module_id`; one that is still not a legal apcore ID carries the [legality warning](#what-normalisation-will-not-repair)
+
+### Properties
+- async: false (Python, TypeScript) / true (Rust — the ecosystem's `async fn scan` convention; `OpenAPIScanner` is not a `BaseScanner` impl, see the note at the top)
+- pure: true — no I/O; the document is already parsed
+- thread_safe: true — no mutation of the input document
+- deterministic: true — identical input yields byte-identical output across all three SDKs
+
+---
+
+## Contract: OpenAPIScanner.get_source_name
+
+### Inputs
+- None (self/this only)
+
+### Errors
+- None
+
+### Returns
+- On success: the literal string `"openapi"` in all three SDKs
+
+### Properties
+- async: false
+- pure: true
+
+---
+
+## Contract: derive_module_id
+
+### Inputs
+- `path`: string, required — the OpenAPI path template (e.g., `"/users/{user_id}"`)
+- `method`: string, required — the HTTP method key as written in the document, one of the eight [recognised methods](#recognised-http-methods) (e.g., `"get"`). It is lowercased, not normalised: an arbitrary string is outside the contract
+- `operation`: dict / object, required — the operation object, consulted only for `operationId`
+
+### Errors
+- None raised — every input produces some identifier; empty results fall back to `"root.<method>"`
+
+### Returns
+- On success: string — the derived module ID per the [algorithm](#algorithm), in apcore's Canonical ID alphabet. It is a legal apcore ID unless a segment begins with a digit (see [What normalisation will not repair](#what-normalisation-will-not-repair)); this function does not warn — the scanner does
+
+### Properties
+- async: false
+- pure: true
+- deterministic: true — this function is the primary subject of the conformance corpus
+- availability: exported publicly in all three SDKs, so that adapters building non-OpenAPI HTTP scanners can reuse the same naming convention
+
+---
+
+## Contract: load_spec
+
+### Inputs
+- `source`: string or Path, required — a local filesystem path or an `http(s)://` URL. Taken verbatim; no candidate paths are probed
+- `headers`: mapping of string→string, optional — extra request headers (API-version headers, tenant selectors, and similar vendor requirements)
+- `auth_header_factory` / `authHeaderFactory`: callable, optional — same shape the HTTP proxy writer uses; invoked once per fetch, for specs behind authentication
+- `timeout`: number, optional — request timeout; unit follows each SDK's existing convention (Python/Rust seconds, TypeScript milliseconds), matching `HTTPProxyRegistryWriter`
+
+### Errors
+- File not found / unreadable: Python `OSError`; TypeScript `Error`; Rust `Err(io::Error)`
+- HTTP non-2xx or network failure: Python `httpx.HTTPError`; TypeScript `Error`; Rust `Err(reqwest::Error)`
+- Malformed JSON/YAML: Python `ValueError`; TypeScript `SyntaxError`; Rust `Err(serde_json::Error)`
+
+### Returns
+- On success: the parsed document as the SDK's native mapping type
+
+### Properties
+- async: false in Python (sync `httpx`), true in TypeScript and Rust
+- pure: false — performs file or network I/O
+- conformance: **excluded from the corpus** — I/O behaviour is deliberately not byte-specified
+- security: the URL is trusted input; see [Security Considerations](#security-considerations)
+
+---
+
+## Migration Plan
+
+### Phase 1 — Close the writer gaps (blocking) — done
+
+Three independent pieces of work, none of which is scanner code.
+
+1. [x] **Document the `metadata` contract** in `output-writers.md` — see
+   § "`metadata` Contract" under `HTTPProxyRegistryWriter`. Includes the
+   uppercase requirement, the `GET` / `/` fallback behaviour, and the
+   method-driven body-vs-query rule.
+2. [x] **Fix Rust defects W1 and W2** (see
+   [Blocking prerequisites](#blocking-prerequisites-in-the-shipped-writers)).
+   Re-verifying W1 against the actual code during implementation found the
+   original diagnosis above overstated it: path-parameter *extraction and
+   substitution* already used the broad pattern (same breadth as Python/
+   TypeScript) via `extract_path_param_names`; only the separate
+   post-substitution *unfilled-placeholder* check used the narrow
+   `\{(\w+)\}` regex, so a hyphenated param left unfilled by the caller
+   went undetected — a real but narrower gap than "silently wrong request"
+   implied. Fixed by having that check reuse `extract_path_param_names`
+   directly, removing the second, divergent regex literal. W2 (`HEAD`/
+   `OPTIONS`/`TRACE` rejected before any network call) was confirmed
+   exactly as described and fixed by adding the three missing method-match
+   arms. Both fixes shipped with regression tests in `apcore-toolkit-rust`.
+3. [x] **Reader asymmetry (W3, W4)** — documented as intentional rather
+   than reconciled; see the "Cross-SDK reader asymmetry" note in
+   `output-writers.md`. No shipped scanner (including this one) relies on
+   the wider Python/TypeScript reader surface, so the scanner's own
+   correctness doesn't depend on closing this gap.
+
+### Phase 2 — Toolkit implementation — done
+
+In `apcore-toolkit-{python,typescript,rust}`:
+
+1. [x] Implement `derive_module_id` as a standalone public function.
+2. [x] Implement `OpenAPIScanner` on top of the shipped extraction primitives.
+3. [x] Implement `load_spec`.
+4. [x] Add `conformance/fixtures/openapi_scan.json` and wire it into all three
+   test suites.
+5. [x] Add the Contract blocks above to this file and flip the status banner.
+6. [x] Update [`overview.md`](overview.md) and `mkdocs.yml`. (`README.md`
+   left as-is — it lists SDKs and top-level capabilities, not individual
+   feature proposals.)
+
+Rust already had `serde_json`'s `preserve_order` feature enabled crate-wide
+(see [Recognised HTTP methods](#recognised-http-methods)) — no change needed
+there.
+
+### Phase 3 — Consumers (separate PRs, per repo)
+
+- `apcore-cli` uses effective scanning for `apcli openapi scan` and
+  `generate` and reports the shared proxy diagnostics.
+- The standalone OpenAPI backends in `apcore-mcp` and `apcore-a2a`
+  preflight their effective selections before registration.
+- Framework adapters (`fastapi-apcore`, `django-apcore`, …) may optionally
+  offer OpenAPI-based scanning as an alternative to code introspection for
+  routes whose handlers cannot be imported.
+
+## Open Questions
+
+1. **`operationId` normalisation.** **Resolved 2026-09-28: normalise, always,
+   to snake_case.** V1 kept `operationId` verbatim and recommended revisiting
+   only if a consumer demonstrated concrete friction. The friction was not
+   cosmetic, as this question assumed: a verbatim `getUserById` is not a legal
+   apcore ID, so an `operationId`-rich spec registered nothing, and six
+   consumers each shipped their own repair. It was not added as an opt-in flag
+   either: the verbatim form a flag would preserve is exactly the one that
+   cannot register, while every `operationId` that could register already
+   passes through unchanged (see
+   [A legal ID is never rewritten](#a-legal-id-is-never-rewritten)). The
+   related question of surfacing the verbatim name as a display alias is
+   settled in [Why the scanner does not set `suggested_alias`](#why-no-suggested-alias).
+2. **`target` carries a route descriptor, not an import path.** Resolved as a
+   fact, open as a documentation question: the writers ignore `target`
+   entirely, so `"GET /users/{id}"` is safe there, but it contradicts the
+   field's documented meaning in
+   [`scanning.md`](scanning.md#contract-scannedmodule).
+   **Recommendation: amend `scanning.md` to state that modules representing
+   remote endpoints carry a route descriptor**, rather than inventing a fake
+   import path or leaving the contradiction undocumented.
+3. **`base_path_prefix` before or after filtering?** Specified above as
+   *before*, so `include` patterns match the final visible ID. The alternative
+   (filter on the bare ID, then prefix) would make filters independent of
+   namespacing. **Recommendation: before**, on the principle that a filter
+   should match what the user actually sees.
+4. **Multiple `servers[]` entries and per-operation overrides.** Relative and
+   templated server URLs are specified in
+   [Base URL resolution](#base-url-resolution); what remains open is a spec
+   listing several servers (prod/staging/regional) or overriding `servers` at
+   the path-item or operation level. V1 records only the document-level
+   `servers[0]`. **Recommendation: keep it at one advisory value.** The caller
+   passes the real `base_url` to the writer, so modelling an environment list
+   the writer cannot act on would add surface without capability. If per-
+   operation servers turn out to matter, the natural V2 shape is an extra
+   `metadata["openapi"]["server_url"]` override on just those modules.
+5. **Response-status selection.** Inherited from the shipped
+   `extract_output_schema`, which handles `200`/`201` only. Operations
+   returning `202 Accepted` or `204 No Content` get an empty `output_schema`.
+   Widening this is a change to a shipped contract and belongs in its own
+   issue, not here.
+6. **Should `examples` be populated in V2?** Deferred; see
+   [Descriptions and Documentation](#descriptions-and-documentation).
+
+## Risks
+
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| Rust defect W1 makes `{item-id}`-style parameters silently produce wrong requests | **High** (any spec using a hyphenated path parameter) | Phase 1 item 2 fixes it before the scanner can reach it. This is the single most dangerous interaction, because it fails silently rather than loudly. |
+| Rust defect W2 makes `HEAD`/`OPTIONS`/`TRACE` operations unexecutable | Medium | Phase 1 item 2. Scanning them is still correct; only proxy execution is affected, and only on Rust. |
+| A legacy import sends `POST` query inputs as body fields | Medium | Use the [effective preflight](output-writers.md#effective-proxy-diagnostics) to reject selected operations whose input locations conflict with the writer's method-based routing. |
+| Lowercase `http_method` reaching the writer | Low (spec mandates uppercasing) | Conformance fixture `openapi_scan_008` asserts the emitted method is uppercase. |
+| `module_id` derivation diverges across SDKs despite the spec | Medium | 33-case conformance corpus, with the derivation as its primary subject; case 025 pins the word-boundary regexes where engines are most likely to disagree. This is exactly the failure the corpus mechanism exists to catch. |
+| Real-world specs violate assumptions in ways not covered by fixtures | Medium | Degrade-with-warning error model means unknown shapes produce imperfect modules, never crashes. Add fixtures as real specs surface problems. |
+| Huge specs produce unmanageable module counts | Low-medium | `include`/`exclude` filters shipped from day one; documented in the API examples. |
+| Scope creep back toward CLI generation / codegen | Medium | Non-Goals are explicit, and the static-mode path deliberately reuses `YAMLWriter` instead of generating source. |
+| `derive_module_id` override causes silent cross-SDK ID divergence for multi-language consumers | Low-medium | Documented as an explicit trade in [Extension Hooks](#extension-hooks) rather than buried. Single-SDK consumers — the majority — are unaffected, and the alternative (no override) pushes those users into hand-rolling the whole scan loop. |
+| OpenAPI 3.1's JSON Schema 2020-12 divergences (e.g., `exclusiveMinimum` as number, `type` arrays) surprise consumers | Low-medium | The toolkit passes schemas through without interpretation; downstream validators own their dialect handling. Note it in the docs rather than transforming. |
+
+## Implementation Estimate
+
+| Phase | Component | Estimated LOC | Notes |
+|---|---|---|---|
+| 1 | `output-writers.md` reconciliation | ~60 | Docs only; unblocks everything else |
+| 2 | Python — scanner + derivation + loader + tests | ~350 | Extraction primitives already exist |
+| 2 | TypeScript — same | ~350 | |
+| 2 | Rust — same (+ `preserve_order`) | ~400 | Async trait wiring adds a little |
+| 2 | Conformance corpus (24 cases) | ~520 | Shared; the bulk is spec fragments. 4 cases assert hook contracts |
+| 2 | Spec doc updates (this file, overview, README, mkdocs) | ~150 | |
+| **Phase 2 total** | | **~1700 LOC** | Comparable to the TuiViewModel estimate |
+| 3 | `apcore-cli` `--from-openapi` per SDK | ~80 each | Consumer-side, no toolkit change |
+
+The estimate is dominated by fixtures rather than logic, which is the expected
+shape when the feature is a thin composition of shipped primitives whose main
+risk is cross-SDK drift.
+
+## See Also
+
+- [`openapi.md`](openapi.md) — the shipped operation-level extraction primitives this builds on.
+- [`scanning.md`](scanning.md) — `BaseScanner` contract, `ScannedModule` fields, annotation inference.
+- [`output-writers.md`](output-writers.md) — `HTTPProxyRegistryWriter` (execution) and `YAMLWriter` (static mode).
+- [`binding-loader.md`](binding-loader.md) — the read path completing static mode.
+- [`device-auth.md`](device-auth.md) — the sibling proposal supplying credentials for authenticated APIs.
+- [Scope & Boundaries](../scope.md) — why CLI-tool scanning stays out and API-contract scanning comes in.
+- [`apcore-toolkit-rust#4`](https://github.com/aiperceivable/apcore-toolkit-rust/issues/4) — why the Rust `OpenAPIScanner` is not a `BaseScanner` impl, and the trait's move to a fallible `scan`.
