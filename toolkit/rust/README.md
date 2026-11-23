@@ -4,7 +4,7 @@
 
 # apcore-toolkit
 
-Rust toolkit for building [APCore](https://github.com/aiperceivable/apcore-rust) framework integrations. Scan web framework endpoints (Axum, Actix, Rocket, etc.), extract JSON Schemas, infer behavioral annotations, and output APCore-compatible module definitions — as YAML binding files, direct registry entries, or HTTP proxy modules.
+Rust toolkit for building [APCore](https://github.com/aiperceivable/apcore/tree/main/rust) framework integrations. Scan web framework endpoints (Axum, Actix, Rocket, etc.), extract JSON Schemas, infer behavioral annotations, and output APCore-compatible module definitions — as YAML binding files, direct registry entries, or HTTP proxy modules.
 
 If you're building an APCore adapter for a Rust web framework, this crate provides all the shared infrastructure so you only need to write the framework-specific scanning logic.
 
@@ -12,7 +12,7 @@ If you're building an APCore adapter for a Rust web framework, this crate provid
 
 ```toml
 [dependencies]
-apcore-toolkit = { git = "https://github.com/aiperceivable/apcore-toolkit-rust" }
+apcore-toolkit = "0.15"
 ```
 
 `http-proxy` (which provides `HTTPProxyRegistryWriter`) is a **default** feature, so
@@ -22,7 +22,7 @@ leaner build:
 
 ```toml
 [dependencies]
-apcore-toolkit = { git = "https://github.com/aiperceivable/apcore-toolkit-rust", default-features = false }
+apcore-toolkit = { version = "0.15", default-features = false }
 ```
 
 ## Core Modules

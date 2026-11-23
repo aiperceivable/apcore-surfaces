@@ -52,7 +52,7 @@ nav:
       - Device Authorization Flow: features/device-auth.md
   - Reference:
       - Cross-SDK Conformance: reference/conformance.md
-  - Changelog: https://github.com/aiperceivable/apcore-toolkit/blob/main/CHANGELOG.md
+  - Changelog: changelog.md
 
 markdown_extensions:
   - tables

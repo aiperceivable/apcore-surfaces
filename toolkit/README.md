@@ -5,26 +5,26 @@
 # apcore-toolkit
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/aiperceivable/apcore-toolkit-python)
-[![Python SDK](https://img.shields.io/badge/python_sdk-0.14.0-green)](https://github.com/aiperceivable/apcore-toolkit-python)
-[![TypeScript Version](https://img.shields.io/badge/typescript-5.0%2B-blue)](https://github.com/aiperceivable/apcore-toolkit-typescript)
-[![TypeScript SDK](https://img.shields.io/badge/typescript_sdk-0.14.0-green)](https://github.com/aiperceivable/apcore-toolkit-typescript)
-[![Rust Version](https://img.shields.io/badge/rust-1.70%2B-blue)](https://github.com/aiperceivable/apcore-toolkit-rust)
-[![Rust SDK](https://img.shields.io/badge/rust_sdk-0.14.0-green)](https://github.com/aiperceivable/apcore-toolkit-rust)
+[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/python)
+[![Python SDK](https://img.shields.io/badge/python_sdk-0.14.0-green)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/python)
+[![TypeScript Version](https://img.shields.io/badge/typescript-5.0%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/typescript)
+[![TypeScript SDK](https://img.shields.io/badge/typescript_sdk-0.14.0-green)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/typescript)
+[![Rust Version](https://img.shields.io/badge/rust-1.70%2B-blue)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/rust)
+[![Rust SDK](https://img.shields.io/badge/rust_sdk-0.14.0-green)](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/rust)
 [![apcore](https://img.shields.io/badge/apcore-0.32.0%2B-orange)](https://github.com/aiperceivable/apcore-python)
 
 **apcore-toolkit** is a cross-language metadata pipeline for the [apcore](https://github.com/aiperceivable/apcore-python) ecosystem. It turns framework routes, convention-based functions, or complete OpenAPI 3.0/3.1 documents into portable `ScannedModule` values, then refines, presents, exports, or registers them for downstream surfaces.
 
 Available in:
-- [🐍 Python](https://github.com/aiperceivable/apcore-toolkit-python)
-- [📘 TypeScript](https://github.com/aiperceivable/apcore-toolkit-typescript)
-- [🦀 Rust](https://github.com/aiperceivable/apcore-toolkit-rust)
+- [🐍 Python](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/python)
+- [📘 TypeScript](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/typescript)
+- [🦀 Rust](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/rust)
 
 ---
 
 ## Key Features
 
-- **🚀 Multi-Language Support**: Implementation available for [🐍 Python](https://github.com/aiperceivable/apcore-toolkit-python), [📘 TypeScript](https://github.com/aiperceivable/apcore-toolkit-typescript), and [🦀 Rust](https://github.com/aiperceivable/apcore-toolkit-rust).
+- **🚀 Multi-Language Support**: Implementation available for [🐍 Python](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/python), [📘 TypeScript](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/typescript), and [🦀 Rust](https://github.com/aiperceivable/apcore-surfaces/tree/main/toolkit/rust).
 - **🔍 Smart Scanning**: Abstract base classes for framework scanners with filtering and deduplication.
 - **📄 OpenAPI Scanning**: Scan a whole OpenAPI 3.x document into one module per operation with byte-identical module-ID derivation across Python, TypeScript, and Rust.
 - **📦 Output & Runtime Registration**: Writers for YAML bindings, language-specific wrappers, direct Registry registration, and HTTP-proxied remote APIs.
@@ -56,7 +56,7 @@ Available in:
 
     ```toml
     [dependencies]
-    apcore-toolkit = { git = "https://github.com/aiperceivable/apcore-toolkit-rust" }
+    apcore-toolkit = "0.15"
     ```
     Requires Rust 1.70+ and apcore 0.32.0+.
 

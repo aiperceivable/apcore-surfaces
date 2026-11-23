@@ -40,5 +40,6 @@ index.write_text(text)
 PY
 
 cd "$scratch"
-python3 scripts/gen_llms_full.py
+LLMS_BASE_URL=$(python3 -c 'import yaml; print(yaml.safe_load(open("mkdocs.yml"))["site_url"])') \
+    python3 scripts/gen_llms_full.py
 mkdocs build --strict --site-dir "$output"

@@ -43,14 +43,14 @@ This guide walks you through installing **apcore-toolkit** and using its core mo
 
     ```toml
     [dependencies]
-    apcore-toolkit = { git = "https://github.com/aiperceivable/apcore-toolkit-rust" }
+    apcore-toolkit = "0.15"
     ```
 
     The `http-proxy` feature (which provides `HTTPProxyRegistryWriter`) is **enabled by default** — a plain dependency declaration already includes it. To opt out for a leaner build:
 
     ```toml
     [dependencies]
-    apcore-toolkit = { git = "https://github.com/aiperceivable/apcore-toolkit-rust", default-features = false }
+    apcore-toolkit = { version = "0.15", default-features = false }
     ```
 
 ---

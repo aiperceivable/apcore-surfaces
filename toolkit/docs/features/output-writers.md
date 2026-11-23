@@ -213,10 +213,10 @@ Registers scanned modules as HTTP proxy classes that forward requests to a runni
 
     ```toml
     [dependencies]
-    apcore-toolkit = { git = "https://github.com/aiperceivable/apcore-toolkit-rust" }
+    apcore-toolkit = "0.15"
 
     # To opt out (omit the `reqwest` dependency for lean builds):
-    apcore-toolkit = { git = "https://github.com/aiperceivable/apcore-toolkit-rust", default-features = false }
+    apcore-toolkit = { version = "0.15", default-features = false }
     ```
 
 ### Usage
