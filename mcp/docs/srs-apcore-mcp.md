@@ -1,0 +1,5212 @@
+---
+description: "IEEE 830 Software Requirements Specification for apcore-mcp: functional/non-functional requirements (FR/NFR) and revision history spanning JWT auth, approval, async tasks, and extension bridge."
+---
+
+# Software Requirements Specification: apcore-mcp
+
+| Field       | Value                                                                    |
+|-------------|--------------------------------------------------------------------------|
+| Title       | apcore-mcp: Automatic MCP Server & OpenAI Tools Bridge                   |
+| Document    | Software Requirements Specification (SRS)                                |
+| Version     | 2.5                                                                      |
+| Date        | 2026-09-28                                                               |
+| Author      | aiperceivable Engineering Team                                             |
+| Status      | Draft                                                                    |
+| PRD Ref     | `docs/prd-apcore-mcp.md` v1.8                                           |
+| Tech Design | `docs/tech-design-apcore-mcp.md` v1.9                                   |
+| Standard    | IEEE 830 / ISO/IEC/IEEE 29148                                            |
+
+---
+
+## Revision History
+
+| Version | Date       | Author                      | Description                                                                 |
+|---------|------------|------------------------------|-----------------------------------------------------------------------------|
+| 1.0     | 2026-02-15 | aiperceivable Engineering Team | Initial draft                                                               |
+| 1.1     | 2026-02-23 | aiperceivable Engineering Team | Streaming bridge spec; expanded feature count; updated naming conventions   |
+| 1.2     | 2026-02-25 | aiperceivable Engineering Team | MCP Tool Explorer feature; response key changed from "output" to "result"   |
+| 1.3     | 2026-02-27 | aiperceivable Engineering Team | JWT Authentication (F-027): Authenticator protocol, JWTAuthenticator, AuthMiddleware |
+| 1.4     | 2026-03-02 | aiperceivable Engineering Team | Approval system (F-028), AI guidance fields, AI intent metadata, streaming annotations |
+| 1.5     | 2026-03-13 | aiperceivable Engineering Team | Sync update: async_serve(), ExecutionCancelledError, updated serve() signature, Python >= 3.11, apcore >= 0.13.0, new annotation fields |
+| 1.6     | 2026-03-31 | aiperceivable Engineering Team | apcore 0.15.0 upgrade: Config Bus namespace (F-033), Error Formatter Registry (F-034), dot-namespaced events (F-035), 6 new error codes, apcore >= 0.15.1 |
+| 1.7     | 2026-04-05 | aiperceivable Engineering Team | apcore 0.17.0 upgrade: Pipeline v2 delegation, 11-step pipeline (safety_check → call_chain_guard rename, middleware_before before input_validation), Step metadata, YAML pipeline config, PipelineContext fields, StepTrace.skip_reason, sensitive field redaction utility, apcore >= 0.17.0 |
+| 1.8     | 2026-04-06 | aiperceivable Engineering Team | apcore 0.17.0 feature integration: Pipeline Strategy (F-036), Trace Exposure (F-037), Output Redaction (F-038), Preflight Validation (F-039), YAML Pipeline Config (F-040), Annotation Metadata Passthrough (F-041), 4 new error mappings, 2 new NFRs |
+| 1.9     | 2026-04-23 | aiperceivable Engineering Team | apcore 0.19.0 + apcore-toolkit 0.5.0: Extension Bridge (F-042) and Async Task Bridge (F-043) requirements; FR-EXTMGR-001..003, FR-ASYNC-001..006 added; isinstance-based error dispatch; W3C Trace Context propagation; observability auto-wiring |
+| 2.0     | 2026-04-28 | aiperceivable Engineering Team | Cross-language deferred-modules sync (released as 0.14.0): mcp-embedded-ui 0.4.0 dependency raised + `/validate` endpoint flow-through; cross-SDK API unification (JWT-1 `Authenticator` headers-map signature, OC-5 Rust `convert_registry` Registry-trait input); Python TM-4 transport-disconnect cancellation forwarding; EM-3 hardcoded `userFixable` for dependency/binding errors; EM-6 Rust generic-error fallback; MID-5 bijection-guarded denormalize variants; OC-1 TS strict-mode walker parity; AH-1 Rust per-request elicit task-local; EB-2 adapter-hook kwargs in `serve()` (Python+TS) |
+| 2.1     | 2026-08-18 | aiperceivable Engineering Team | Cross-language spec-correctness sync against all three SDKs at 0.17.2 (released as docs 0.18.0). Corrected `handle_call` / `to_mcp_error` / `to_mcp_annotations` return types (call-result tuple and plain dicts, not MCP SDK objects); §8.1.1 / §8.1.1a now carry the complete 37- and 32-parameter `serve()` / `async_serve()` signatures and §7.8 is marked a partial constraints table; `exempt_paths` is a set defaulting to `{/health, /metrics}`; the parameter is `middleware`, not `middlewares`; FR-REDACT-001's empty-`{}` boundary condition corrected to match FR-REDACT-002 and the conformance fixture; `validate_tool` returns a projected dict, not `PreflightResult`; NFR-COMPAT-002 floor raised to apcore 0.27.0; F-045/F-046 names aligned with the PRD; §7.9 records that the `to_openai_tools` `strict` default is not uniform across languages. **Correction to revision 2.0:** its claim that EB-2 shipped adapter-hook kwargs in `serve()` for Python and TypeScript was incorrect — the hooks exist in no SDK and never have; see `features/extension-bridge.md`. |
+| 2.2     | 2026-09-05 | aiperceivable Engineering Team | apcore 0.29.0 + apcore-toolkit 0.11.0 (released as docs 0.20.0). NFR-COMPAT-002 floor raised to apcore 0.29.0 / apcore-toolkit 0.11.0, both correctness floors rather than conventions. New §3.25 FR-ACL (F-052, F-053): PROTOCOL_SPEC §6.2.1 pattern-array shape closure at the `mcp.acl` door, §6.2.1's normative validation order (all three bridges currently run it reversed), `ACLRuleError` wrapping with the rule index — in Python it is a `ModuleError`, not the `ValueError` the builder promises — and the tier-2 `validate_rules()` startup diagnostic. New §3.26 FR-OPENAPI (F-054, F-055): the OpenAPI backend source, `module_id` projection onto both protocol surfaces, scan-warning reporting, the mandatory prefix in mixed deployments, and the write-method-with-no-ACL warning that records `requires_approval = false` on every scanned module. |
+| 2.3     | 2026-09-06 | aiperceivable Engineering Team | apcore 0.30.0 + apcore-toolkit 0.11.1. NFR-COMPAT-002 floors raised to apcore 0.30.0 / apcore-toolkit 0.11.1, with the four justifications kept separate (0.29.0 correctness, 0.11.0 capability, 0.11.1 floor-only, 0.30.0 transitive + `Config.project_root`). New FR-OPENAPI-007: `mcp.openapi.spec` is the `mcp` namespace's first path-typed key, and apcore 0.30.0's §9.2.1/§9.2.2 protections do not extend to a consumer namespace — `Config.path_typed_keys()` is a hardcoded tuple and the empty-value discard is gated on it — so the bridge owns URL-verbatim, empty-discard and project-root resolution itself, adopting §9.2.2's target semantics early because the key has no deployed population. The rest of apcore 0.30.0 (binding discovery, `bindings.*` defaults, `target_id` → `target`) is out of scope; no bridge references any of it. |
+| 2.4     | 2026-09-06 | aiperceivable Engineering Team | Both conformance fixtures landed (`acl_config.json` 1.2, `openapi_backend.json` 1.0), and authoring them exposed a blocking defect in FR-OPENAPI-002 as written. apcore-toolkit's `derive_module_id` emits IDs over `[A-Za-z0-9_.-]`; apcore's registry accepts only `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`, enforced at `Registry.register` and `Executor.call`. Only two of nine realistic operation shapes register unrepaired, and the canonical Swagger Petstore is entirely in the rejected set — verified end-to-end, yielding an empty registry. FR-OPENAPI-002 now specifies the projection (lowercase, `-` → `_`, run after `transform_module` and before `deduplicate_ids`); new FR-OPENAPI-008 specifies the loud skip for a segment that cannot be repaired without inventing a character. Also an upstream gap: `OpenAPIScanner` and `HTTPProxyRegistryWriter` are documented as an end-to-end pair that cannot serve the reference spec the scanner was verified against. |
+| 2.5     | 2026-09-28 | aiperceivable Engineering Team | apcore-toolkit 0.13.0 closed the module-ID alphabet gap that FR-OPENAPI-002 v2.4 worked around: `OpenAPIScanner` now normalises every emitted `module_id` into apcore's Canonical ID alphabet itself — camelCase split into words (`listPets` → `list_pets`), `-` and other characters → `_`, a legal ID never rewritten, the final ID normalised after `base_path_prefix` and both ID-affecting hooks. FR-OPENAPI-002 now requires the bridge to register the scanner's IDs as emitted, with no projection of its own; the v2.4 projection (lowercase, `-` → `_`) was redundant for the alphabet and disagreed with the toolkit on every camelCase name (`listpets` vs `list_pets`). FR-OPENAPI-008's skip moves from inside `transform_module` to the IDs `scan` returns, before the preflight and the writer, and names the emitted ID. FR-OPENAPI-006 intersects the IDs about to be written. NFR-COMPAT-002: apcore-toolkit floor raised to 0.13.0 (correctness floor), and the apcore floor corrected to 0.31.0, raised at 0.22.0 and not recorded here then. `openapi_backend.json` contract 2.0. |
+
+---
+
+## Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [Overall Description](#2-overall-description)
+3. [Specific Requirements -- Functional Requirements](#3-specific-requirements-functional-requirements)
+4. [Specific Requirements -- Non-Functional Requirements](#4-specific-requirements-non-functional-requirements)
+5. [Use Cases](#5-use-cases)
+6. [CRUD Matrix](#6-crud-matrix)
+7. [Data Dictionary](#7-data-dictionary)
+8. [Interface Requirements](#8-interface-requirements)
+9. [Traceability Matrix](#9-traceability-matrix)
+10. [Appendix](#10-appendix)
+
+---
+
+## 1. Introduction
+
+### 1.1 Purpose
+
+This Software Requirements Specification defines the complete functional and non-functional requirements for **apcore-mcp**, an independent adapter package available in Python, TypeScript, and Rust that automatically bridges any apcore Module Registry into both a fully functional MCP (Model Context Protocol) Server and OpenAI-compatible tool definitions. This document formalizes the upstream PRD's F-IDs into traceable, testable requirements organized by component module. It serves as the authoritative reference for implementation, testing, and acceptance of apcore-mcp v0.15.0 (released 2026-05-14). The v0.15.0 surface extends the v0.14.0 baseline with rich Markdown tool descriptions (`rich_description` / `richDescription` / `with_rich_description`), the `__apcore_module_preview` meta-tool (apcore PROTOCOL_SPEC §5.6), the public `markdown` module, the `CIRCUIT_BREAKER_OPEN` error code, and Rust-side `async fn` lifecycle methods on `AsyncTaskBridge`; the F-ID series is additively extended rather than renumbered.
+
+The intended audience includes software engineers implementing apcore-mcp, QA engineers writing test plans, and project stakeholders evaluating feature completeness.
+
+> **Note:** FR-STREAM-001, FR-EXT-001, FR-EXT-002, and FR-EXT-003 are defined in this document but not yet included in the traceability matrix (Section 9). The effective FR count is 84.
+
+### 1.2 Scope
+
+apcore-mcp provides two primary capabilities:
+
+1. **MCP Server Bridge**: A `serve(registry)` function that launches a standards-compliant MCP Server exposing all apcore modules as MCP tools, supporting stdio, Streamable HTTP, and SSE transports.
+2. **OpenAI Tools Export**: A `to_openai_tools(registry)` function that returns a list of OpenAI-compatible tool definition dicts for use with OpenAI Function Calling APIs.
+
+The system reads apcore module metadata (`input_schema`, `output_schema`, `description`, `annotations`) and generates correct tool definitions at runtime with zero per-module code. All MCP tool calls are routed through the apcore `Executor` pipeline, preserving ACL enforcement, input validation, middleware execution, and timeout enforcement.
+
+apcore-mcp does NOT reimplement the MCP protocol (it uses the official `mcp` Python SDK), does NOT define modules (that is apcore-python's responsibility), does NOT implement domain-specific wrapping (that is the job of `xxx-apcore` projects), and does NOT build an OpenAI API client or agent runtime.
+
+### 1.3 Definitions, Acronyms, and Abbreviations
+
+| Term | Definition |
+|------|------------|
+| **apcore** | A schema-driven module development framework providing Registry, Executor, and schema validation for modular applications. |
+| **apcore-python** | The Python SDK implementation of the apcore framework. Provides `Registry`, `Executor`, `ModuleDescriptor`, `ModuleAnnotations`, and the error hierarchy. |
+| **MCP** | Model Context Protocol -- an open protocol introduced by Anthropic for connecting AI assistants to external tools and data sources. |
+| **MCP Server** | A process that implements the MCP protocol and exposes tools, resources, and/or prompts to MCP clients. |
+| **MCP Client** | An AI assistant or application that connects to MCP Servers to discover and invoke tools. Examples: Claude Desktop, Cursor, Windsurf. |
+| **MCP Tool** | A callable function exposed by an MCP Server, defined by a name, description, and input schema. |
+| **MCP Tool Annotations** | Metadata on an MCP tool describing behavioral characteristics: `destructiveHint`, `readOnlyHint`, `idempotentHint`, `openWorldHint`. |
+| **OpenAI Function Calling / Tools** | OpenAI's mechanism for allowing language models to invoke external functions, defined with name, description, and parameters (JSON Schema). |
+| **Strict Mode** | An OpenAI feature where `"strict": true` on a tool definition constrains the model to produce outputs exactly matching the schema. Requires `additionalProperties: false` and all properties marked required. |
+| **Registry** | An apcore class that discovers, registers, and provides query access to modules. |
+| **Executor** | An apcore class that orchestrates the module execution pipeline via `PipelineEngine`: context creation, call-chain guard, module lookup, ACL, approval gate, middleware before, input validation, execution, output validation, middleware after, and result return (11 steps). |
+| **ModuleDescriptor** | An apcore dataclass containing a module's full metadata: `module_id`, `name`, `description`, `input_schema`, `output_schema`, `annotations`, `examples`, `tags`, `version`. |
+| **ModuleAnnotations** | An apcore frozen dataclass with behavioral flags: `readonly` (bool, default False), `destructive` (bool, default False), `idempotent` (bool, default False), `requires_approval` (bool, default False), `open_world` (bool, default True). |
+| **ModuleError** | Base exception class for all apcore framework errors. Contains `code`, `message`, `details`, `cause`, `trace_id`, and `timestamp` fields. |
+| **Transport** | The communication mechanism between MCP client and server: stdio, Streamable HTTP, or SSE. |
+| **stdio** | A transport where the MCP server reads from stdin and writes to stdout. |
+| **Streamable HTTP** | The recommended HTTP-based MCP transport, replacing SSE as the primary network transport. |
+| **SSE** | Server-Sent Events -- a deprecated MCP transport supported for backward compatibility. |
+| **ACL** | Access Control List -- apcore's built-in mechanism for controlling which callers can invoke which modules. |
+| **$ref inlining** | The process of resolving JSON Schema `$ref` references by substituting the referenced definition in-place and removing the `$defs` section. |
+| **Module ID normalization** | Converting apcore module IDs (dot-notation, e.g., `image.resize`) to OpenAI-compatible function names (e.g., `image-resize`) by replacing `.` with `-`. |
+| **xxx-apcore** | Convention for apcore adapter projects targeting specific domains: `comfyui-apcore`, `vnpy-apcore`, `blender-apcore`, etc. |
+| **CallToolResult** | MCP SDK type representing the result of a tool call, containing `content` (list of content items) and `isError` (boolean). This is the **protocol-level** result the MCP client observes. The factory handler constructs it from the call-result tuple below. The next SDK release optionally adds `structuredContent` for supported negotiated protocol versions. |
+| **Call-result tuple** | What `ExecutionRouter.handle_call()` actually returns: `(content, is_error, trace_id)` — `content` a list of `{"type": "text", "text": str}` dicts, `is_error` a bool, `trace_id` a string or None. The MCP SDK handler registered by `MCPServerFactory` turns the first two into a `CallToolResult`. Wherever this SRS says handle_call "returns a CallToolResult", read it as "produces the tuple the SDK renders as that CallToolResult". |
+| **Error response dict** | What `ErrorMapper.to_mcp_error()` returns: a plain dict with `isError`, `errorType`, `message`, `details`, and the AI-guidance keys `retryable` / `aiGuidance` / `userFixable` / `suggestion` (camelCase on the wire). It is not an MCP SDK object; the router lifts `message` into the content items. |
+| **TextContent** | MCP SDK type for text-based content items within a CallToolResult. |
+| **ToolAnnotations** | MCP SDK type for behavioral hints on tools: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. |
+| **JSON Schema** | A vocabulary for annotating and validating JSON documents (draft 2020-12 or compatible). |
+
+### 1.4 References
+
+| ID   | Reference | Description |
+|------|-----------|-------------|
+| REF-01 | `docs/prd-apcore-mcp.md` v1.0 | Product Requirements Document -- primary input for this SRS |
+| REF-02 | `docs/tech-design-apcore-mcp.md` v1.9 | Technical Design Document -- architecture and API details |
+| REF-03 | `ideas/apcore-mcp.md` | Original idea document with schema mapping and architecture context |
+| REF-04 | apcore-python source (`apcore` package) | SDK source: Registry, Executor, ModuleDescriptor, ModuleAnnotations, error hierarchy |
+| REF-05 | [MCP Specification](https://modelcontextprotocol.io/) | Official Model Context Protocol specification |
+| REF-06 | [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) | Official Python SDK for MCP servers and clients |
+| REF-07 | [OpenAI Function Calling](https://platform.openai.com/docs/guides/function-calling) | OpenAI's guide to function calling / tools |
+| REF-08 | IEEE 830-1998 | IEEE Recommended Practice for SRS |
+| REF-09 | ISO/IEC/IEEE 29148:2018 | Systems and software engineering -- Life cycle processes -- Requirements engineering |
+
+### 1.5 Overview
+
+Section 2 provides the overall product description, including ecosystem context, user characteristics, constraints, and assumptions. Section 3 specifies all functional requirements organized by component module. Section 4 specifies non-functional requirements for performance, security, reliability, maintainability, compatibility, and portability. Section 5 defines use cases for major workflows. Sections 6-8 provide the CRUD matrix, data dictionary, and interface requirements. Section 9 contains the bidirectional traceability matrix. Section 10 is the appendix with glossary and API surface references.
+
+---
+
+## 2. Overall Description
+
+### 2.1 Product Perspective
+
+apcore-mcp is a thin adapter layer that sits between the apcore-python SDK and the AI agent ecosystem. It occupies a specific architectural position defined by apcore's SCOPE.md:
+
+```
+apcore-python (core SDK)
+    |
+    +-- Provides: Registry, Executor, ModuleDescriptor, ModuleAnnotations, error hierarchy
+    |
+apcore-mcp (this project)
+    |
+    +-- Consumes: Registry API, Executor.call() / call_async()
+    +-- Produces: MCP Server (via mcp SDK), OpenAI tools list (pure dict conversion)
+    |
+    +-- MCP path --> Claude Desktop, Cursor, Windsurf, any MCP client
+    +-- OpenAI path --> OpenAI API, Azure OpenAI, any OpenAI-compatible platform
+```
+
+apcore-mcp is the first adapter in a planned family (apcore-a2a is future). It depends on the `apcore` package for module metadata and execution, and on the `mcp` package for MCP protocol implementation. It has no dependency on the `openai` package at runtime.
+
+### 2.2 Product Functions (High-Level Summary)
+
+1. **Schema Conversion**: Convert apcore `input_schema` (JSON Schema with potential `$defs`/`$ref`) to clean schemas for MCP and OpenAI consumption.
+2. **Annotation Mapping**: Map apcore `ModuleAnnotations` to MCP `ToolAnnotations` and optionally embed in OpenAI tool descriptions.
+3. **MCP Server Launch**: Create and start an MCP Server via `serve()` with configurable transport (stdio, Streamable HTTP, SSE).
+4. **Execution Routing**: Route MCP tool calls through the apcore `Executor` pipeline with full ACL, validation, and middleware.
+5. **Error Mapping**: Translate apcore error hierarchy to structured MCP error responses.
+6. **OpenAI Export**: Export registry modules as OpenAI-compatible tool definition dicts via `to_openai_tools()`.
+7. **CLI Entry Point**: Provide `python -m apcore_mcp` for launching the server without writing Python code.
+8. **Dynamic Registration**: Reflect runtime registry changes in the MCP tool list.
+9. **Logging**: Structured logging for tool calls, errors, and server lifecycle events.
+
+### 2.3 User Characteristics
+
+| Persona | Role | Experience | Primary Interaction |
+|---------|------|------------|---------------------|
+| **Maya** (Module Developer) | Writes apcore modules, wants AI agent integration | 3+ years Python, familiar with Pydantic, new to MCP | Calls `serve(registry)` or `to_openai_tools(registry)` |
+| **David** (xxx-apcore Project Dev) | Builds domain-specific apcore projects (comfyui-apcore, etc.) | 5+ years Python, expert in domain, familiar with apcore | Adds apcore-mcp as dependency, calls `serve()` with pre-configured Executor |
+| **Alex** (AI Agent Builder) | Integrates external tools into Claude/GPT workflows | Familiar with MCP clients and OpenAI function calling | Connects MCP client to apcore-mcp server, or receives OpenAI tool dicts |
+
+### 2.4 Constraints
+
+| ID | Constraint | Rationale |
+|----|-----------|-----------|
+| C-01 | Must use official `mcp` Python SDK for MCP protocol implementation | MCP protocol is complex; reimplementation is out of scope and error-prone |
+| C-02 | Must use apcore `Executor` for all tool call routing | ACL, validation, and middleware guarantees must be preserved |
+| C-03 | Core logic must not exceed 1,200 lines (excluding tests and docs) | Thin adapter design principle; complexity belongs in apcore-python and mcp SDK |
+| C-04 | Python >= 3.11 required | Aligns with apcore-python minimum; needed for modern type hints, `match`, and `ExceptionGroup` |
+| C-05 | Authentication bridges to apcore ACL, not replaces it | Optional `JWTAuthenticator` validates tokens at HTTP layer and injects `Identity` into `Context` for the Executor's ACL. No OAuth flows, API key management, or user stores. |
+| C-06 | `to_openai_tools()` must have zero runtime dependency on `openai` package | Maximum interoperability; returns plain dicts |
+
+### 2.5 Assumptions and Dependencies
+
+| ID | Assumption/Dependency | Type |
+|----|----------------------|------|
+| A-01 | apcore-python SDK API (`Registry`, `Executor`, `ModuleDescriptor`, `ModuleAnnotations`) is stable and will not undergo breaking changes during development | Assumption |
+| A-02 | The `mcp` Python SDK (>= 1.0.0) provides stable APIs for tool registration, transport configuration, and error handling | Assumption |
+| A-03 | MCP clients (Claude Desktop, Cursor) correctly implement the MCP protocol for tool discovery and invocation | Assumption |
+| A-04 | apcore modules produce JSON-serializable output dicts from their `execute()` methods | Assumption |
+| A-05 | Python >= 3.11 is available in the target deployment environment | Assumption |
+| D-01 | `apcore` package >= 0.17.0 | Dependency |
+| D-02 | `mcp` package >= 1.0.0 | Dependency |
+| D-03 | `openai` package (optional, not required at runtime) | Dependency |
+
+---
+
+## 3. Specific Requirements -- Functional Requirements
+
+### 3.1 FR-SCHEMA: Schema Conversion Requirements
+
+FR-SCHEMA-001 through FR-SCHEMA-003 describe the standalone SchemaConverter utility. MCPServerFactory discovery follows the runtime-preserving input contract in section 7.1 instead; it does not invoke that utility.
+
+---
+
+#### FR-SCHEMA-001: Convert ModuleDescriptor input_schema to MCP inputSchema
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SCHEMA-001 |
+| **Title** | Convert apcore input_schema to MCP-compatible inputSchema |
+| **Priority** | P0 |
+| **Traces to** | F-001 |
+
+**Description:** The `SchemaConverter.convert_input_schema()` method shall accept a `ModuleDescriptor` instance and return a JSON Schema dict suitable for use as an MCP Tool's `inputSchema`. The returned schema shall be a valid JSON Schema object with `"type": "object"` at the root level.
+
+**Input/Trigger:** A `ModuleDescriptor` with a populated `input_schema` dict (as produced by Pydantic `model_json_schema()`).
+
+**Expected Output:**
+- A `dict[str, Any]` representing a valid JSON Schema.
+- The root-level `"type"` key shall equal `"object"`.
+- All `$ref` references within the schema shall be inlined (replaced with the referenced definition content).
+- The `$defs` key (or `definitions` key) shall be removed from the returned schema.
+- The `properties` key shall be preserved with all field definitions intact.
+
+**Boundary Conditions:**
+- Empty `input_schema` (`{}`): Return `{"type": "object", "properties": {}}`.
+- Schema with no `"type"` key but with `"properties"` key: Add `"type": "object"` to the returned schema.
+- Schema with `"title"` key: Preserve the `"title"` key in the returned schema.
+- Schema with `"required"` key: Preserve the `"required"` array in the returned schema.
+
+**Error Conditions:**
+- Circular `$ref` (e.g., definition A references definition B which references definition A): Raise `ValueError` with a message identifying the circular reference path.
+- `$ref` pointing to a non-existent definition key: Raise `KeyError` with the missing definition name.
+- Recursion depth exceeding 32 levels during `$ref` resolution: Raise `ValueError` indicating maximum recursion depth exceeded.
+
+---
+
+#### FR-SCHEMA-002: Inline $defs/$ref references in input_schema
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SCHEMA-002 |
+| **Title** | Resolve and inline all $defs-local $ref references |
+| **Priority** | P0 |
+| **Traces to** | F-001 |
+
+**Description:** The `SchemaConverter._inline_refs()` method shall resolve all `$ref` nodes that reference `$defs`-local definitions (format: `"$ref": "#/$defs/DefinitionName"`) by deep-copying the referenced definition and substituting it in place of the `$ref` node. After inlining, the `$defs` key shall be removed from the root schema.
+
+**Input/Trigger:** A JSON Schema dict containing `$defs` and `$ref` nodes, as produced by Pydantic v2's `model_json_schema()`.
+
+**Expected Output:**
+- A new dict (original not mutated) with all `$ref` nodes replaced by their resolved definitions.
+- Nested `$ref` within definitions shall also be resolved recursively.
+- The `$defs` key shall not appear in the returned dict.
+- The `definitions` key (legacy format) shall also be handled and removed if present.
+
+**Boundary Conditions:**
+- Schema with zero `$ref` nodes: Return the schema unchanged (minus any empty `$defs`).
+- Schema with deeply nested `$ref` (up to 32 levels): Resolve all levels.
+- Schema with `$ref` in array items (`"items": {"$ref": "#/$defs/X"}`): Resolve correctly.
+- Schema with `$ref` in `oneOf`, `anyOf`, `allOf` arrays: Resolve each branch.
+- Schema with the same `$ref` used in multiple locations: Each location receives its own deep copy.
+
+**Error Conditions:**
+- Circular `$ref` chain: Raise `ValueError` with the cycle path (e.g., "Circular reference: A -> B -> A").
+- Resolution depth exceeding 32: Raise `ValueError`.
+
+---
+
+#### FR-SCHEMA-003: Ensure root schema type is "object"
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SCHEMA-003 |
+| **Title** | Guarantee root-level type: object in converted schemas |
+| **Priority** | P0 |
+| **Traces to** | F-001 |
+
+**Description:** The `SchemaConverter._ensure_object_type()` method shall verify that the root schema has `"type": "object"`. If the schema is empty or lacks a `"type"` key, it shall add the appropriate keys.
+
+**Input/Trigger:** A JSON Schema dict (post-`$ref` inlining).
+
+**Expected Output:**
+- If schema is `{}`: Return `{"type": "object", "properties": {}}`.
+- If schema has `"properties"` but no `"type"`: Return schema with `"type": "object"` added.
+- If schema already has `"type": "object"`: Return schema unchanged.
+
+**Boundary Conditions:**
+- Schema with `"type": "object"` and `"properties": {}`: Return as-is.
+- Schema with `"type": "object"` and populated `"properties"`: Return as-is.
+
+**Error Conditions:** None. This method always produces a valid result.
+
+---
+
+#### FR-SCHEMA-004: Convert ModuleDescriptor input_schema to OpenAI parameters
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SCHEMA-004 |
+| **Title** | Convert apcore input_schema to OpenAI-compatible parameters schema |
+| **Priority** | P0 |
+| **Traces to** | F-008 |
+
+**Description:** The schema conversion for OpenAI `parameters` shall apply the same `$ref` inlining and `type: object` guarantee as the standalone SchemaConverter utility (FR-SCHEMA-001 through FR-SCHEMA-003). The resulting schema shall be usable as the `"parameters"` value in an OpenAI tool definition.
+
+**Input/Trigger:** A `ModuleDescriptor` with a populated `input_schema` dict.
+
+**Expected Output:** An explicitly converted OpenAI parameters schema. OpenAI conversion may inline references and apply strict-mode rules; MCP factory discovery independently preserves the runtime schema and does not share that projection.
+
+**Boundary Conditions:** Same as FR-SCHEMA-001.
+
+**Error Conditions:** Same as FR-SCHEMA-001.
+
+---
+
+#### FR-SCHEMA-005: Convert output_schema for structured MCP responses
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SCHEMA-005 |
+| **Title** | Convert apcore output_schema for MCP structured output |
+| **Priority** | P1 |
+| **Traces to** | F-013 |
+
+**Description:** The `SchemaConverter.convert_output_schema()` method shall accept a `ModuleDescriptor` and return a cleaned JSON Schema dict for the output. The same `$ref` inlining logic shall apply. If the `output_schema` is empty (`{}`), the method shall return an empty dict `{}`.
+
+**Input/Trigger:** A `ModuleDescriptor` with `output_schema` dict.
+
+**Expected Output:**
+- A JSON Schema dict with all `$ref` inlined and `$defs` removed.
+- Empty dict `{}` if the input `output_schema` is empty.
+
+**Boundary Conditions:**
+- Empty `output_schema` (`{}`): Return `{}`.
+- Complex `output_schema` with `$defs`/`$ref`: Inline all references.
+
+**Error Conditions:**
+- Circular `$ref`: Raise `ValueError`.
+
+---
+
+#### FR-SCHEMA-006: Handle all JSON Schema types in conversion
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SCHEMA-006 |
+| **Title** | Support all JSON Schema types during schema conversion |
+| **Priority** | P0 |
+| **Traces to** | F-001 |
+
+**Description:** The schema converter shall correctly preserve and pass through all JSON Schema types in property definitions: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"array"`, `"object"`, and `"null"`. Union types (e.g., `"type": ["string", "null"]`) shall also be preserved.
+
+**Input/Trigger:** A JSON Schema dict containing properties of any valid JSON Schema type.
+
+**Expected Output:** All type declarations shall be preserved exactly in the output schema. No type information shall be lost or transformed.
+
+**Boundary Conditions:**
+- Property with `"type": "array"` and `"items"` subschema: Preserve both.
+- Property with `"type": "object"` and nested `"properties"`: Preserve the full nested structure.
+- Property with `"enum"` values: Preserve the enum array.
+- Property with `"const"` value: Preserve.
+- Property with `"format"` (e.g., `"date-time"`, `"email"`): Preserve.
+- Property with `"default"` value: Preserve (for MCP; OpenAI strict mode strips defaults per FR-OPENAI-003).
+- Property with `"description"`: Preserve.
+
+**Error Conditions:** None. All valid JSON Schema types shall be passed through.
+
+---
+
+### 3.2 FR-ANNOT: Annotation Mapping Requirements
+
+`AnnotationMapper.to_mcp_annotations()` returns a plain dict keyed in MCP wire casing
+(`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), not an MCP SDK
+`ToolAnnotations` instance. `MCPServerFactory` passes that dict straight into the `Tool` it builds.
+`ToolAnnotations(...)` in the requirements below names the shape of the resulting object as the
+client sees it.
+
+---
+
+#### FR-ANNOT-001: Map destructive annotation to MCP destructiveHint
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ANNOT-001 |
+| **Title** | Map apcore destructive annotation to MCP destructiveHint |
+| **Priority** | P0 |
+| **Traces to** | F-002 |
+
+**Description:** When `ModuleAnnotations.destructive` is `True`, the `AnnotationMapper.to_mcp_annotations()` method shall return an annotations dict with `destructiveHint=True`. When `False`, it shall return `destructiveHint=False`.
+
+**Input/Trigger:** A `ModuleAnnotations` instance with `destructive` field set.
+
+**Expected Output:** `ToolAnnotations(destructiveHint=<value>)` where `<value>` equals the input `destructive` value.
+
+**Boundary Conditions:**
+- `destructive=True`: `destructiveHint=True`.
+- `destructive=False`: `destructiveHint=False`.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ANNOT-002: Map readonly annotation to MCP readOnlyHint
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ANNOT-002 |
+| **Title** | Map apcore readonly annotation to MCP readOnlyHint |
+| **Priority** | P0 |
+| **Traces to** | F-002 |
+
+**Description:** When `ModuleAnnotations.readonly` is `True`, the `AnnotationMapper.to_mcp_annotations()` method shall return an annotations dict with `readOnlyHint=True`. When `False`, it shall return `readOnlyHint=False`.
+
+**Input/Trigger:** A `ModuleAnnotations` instance with `readonly` field set.
+
+**Expected Output:** `ToolAnnotations(readOnlyHint=<value>)` where `<value>` equals the input `readonly` value.
+
+**Boundary Conditions:**
+- `readonly=True`: `readOnlyHint=True`.
+- `readonly=False`: `readOnlyHint=False`.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ANNOT-003: Map idempotent annotation to MCP idempotentHint
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ANNOT-003 |
+| **Title** | Map apcore idempotent annotation to MCP idempotentHint |
+| **Priority** | P0 |
+| **Traces to** | F-002 |
+
+**Description:** When `ModuleAnnotations.idempotent` is `True`, the `AnnotationMapper.to_mcp_annotations()` method shall return an annotations dict with `idempotentHint=True`. When `False`, it shall return `idempotentHint=False`.
+
+**Input/Trigger:** A `ModuleAnnotations` instance with `idempotent` field set.
+
+**Expected Output:** `ToolAnnotations(idempotentHint=<value>)` where `<value>` equals the input `idempotent` value.
+
+**Boundary Conditions:**
+- `idempotent=True`: `idempotentHint=True`.
+- `idempotent=False`: `idempotentHint=False`.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ANNOT-004: Map open_world annotation to MCP openWorldHint
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ANNOT-004 |
+| **Title** | Map apcore open_world annotation to MCP openWorldHint |
+| **Priority** | P0 |
+| **Traces to** | F-002 |
+
+**Description:** When `ModuleAnnotations.open_world` is `True`, the `AnnotationMapper.to_mcp_annotations()` method shall return an annotations dict with `openWorldHint=True`. When `False`, it shall return `openWorldHint=False`.
+
+**Input/Trigger:** A `ModuleAnnotations` instance with `open_world` field set.
+
+**Expected Output:** `ToolAnnotations(openWorldHint=<value>)` where `<value>` equals the input `open_world` value.
+
+**Boundary Conditions:**
+- `open_world=True` (default): `openWorldHint=True`.
+- `open_world=False`: `openWorldHint=False`.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ANNOT-005: Default MCP annotations when ModuleAnnotations is None
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ANNOT-005 |
+| **Title** | Return MCP default annotations when apcore annotations are None |
+| **Priority** | P0 |
+| **Traces to** | F-002 |
+
+**Description:** When the `annotations` parameter is `None`, the `AnnotationMapper.to_mcp_annotations()` method shall return an annotations dict with all fields set to their MCP defaults: `readOnlyHint=False`, `destructiveHint=False`, `idempotentHint=False`, `openWorldHint=True`.
+
+**Input/Trigger:** `annotations=None`.
+
+**Expected Output:** `ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)`.
+
+**Boundary Conditions:** None (single case: input is `None`).
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ANNOT-006: Preserve requires_approval for MCP clients
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ANNOT-006 |
+| **Title** | Preserve requires_approval annotation for MCP client consumption |
+| **Priority** | P0 |
+| **Traces to** | F-002 |
+
+**Description:** The `AnnotationMapper.has_requires_approval()` method shall return `True` when `ModuleAnnotations.requires_approval` is `True`, and `False` when annotations are `None` or `requires_approval` is `False`. This value shall be accessible to MCP server handlers to enable confirmation flows.
+
+**Input/Trigger:** A `ModuleAnnotations` instance or `None`.
+
+**Expected Output:**
+- `annotations=None`: Return `False`.
+- `annotations.requires_approval=True`: Return `True`.
+- `annotations.requires_approval=False`: Return `False`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ANNOT-007: Generate parseable annotation suffix for OpenAI descriptions
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ANNOT-007 |
+| **Title** | Generate annotation suffix string for OpenAI tool descriptions |
+| **Priority** | P1 |
+| **Traces to** | F-011 |
+
+**Description:** The `AnnotationMapper.to_description_suffix()` method shall generate a structured, parseable string containing annotation metadata for embedding in OpenAI tool descriptions. Only annotation fields that differ from their defaults shall be included.
+
+**Input/Trigger:** A `ModuleAnnotations` instance or `None`.
+
+**Expected Output:**
+- `annotations=None`: Return empty string `""`.
+- All annotations at default values: Return empty string `""`.
+- Non-default values present: Return string in format `"\n\n[Annotations: <field>=<value>, ...]"`. Example: `"\n\n[Annotations: readonly=true, idempotent=true]"`.
+
+**Default values (excluded when matching):**
+- `readonly=False`
+- `destructive=False`
+- `idempotent=False`
+- `requires_approval=False`
+- `open_world=True`
+
+**Boundary Conditions:**
+- Single non-default field: Return suffix with one field (e.g., `"\n\n[Annotations: destructive=true]"`).
+- All five fields non-default: Return suffix with all five fields listed.
+
+**Error Conditions:** None.
+
+---
+
+### 3.3 FR-EXEC: Execution Routing Requirements
+
+---
+
+#### FR-EXEC-001: Route MCP tool call to Executor.call_async
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXEC-001 |
+| **Title** | Route MCP tool calls through Executor.call_async() |
+| **Priority** | P0 |
+| **Traces to** | F-003 |
+
+**Description:** The `ExecutionRouter.handle_call()` async method shall receive a tool name (string), arguments (dict) and an optional `extra` dict, invoke `Executor.call_async(tool_name, arguments)`, and return the call-result tuple `(content, is_error, trace_id)`. The MCP SDK handler renders that tuple as the `CallToolResult` the client sees. The tool name equals the apcore `module_id`.
+
+**Input/Trigger:** MCP `tools/call` request with `name` (string) and `arguments` (dict).
+
+**Expected Output:** On success, `(content, False, trace_id)` where `content` is a single `{"type": "text", "text": <json>}` item holding the JSON-serialized module output dict — observed by the client as a `CallToolResult` with `isError=False`.
+
+**Boundary Conditions:**
+- Empty arguments dict `{}`: Pass `{}` to `Executor.call_async()`.
+- Module output containing nested objects: Serialize the full output dict as JSON.
+
+**Error Conditions:** See FR-ERROR-001 through FR-ERROR-009 for error handling.
+
+---
+
+#### FR-EXEC-002: Serialize module output as JSON text content
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXEC-002 |
+| **Title** | Serialize successful module output to JSON string in MCP TextContent |
+| **Priority** | P0 |
+| **Traces to** | F-003, F-013 |
+
+**Description:** On successful execution, the `ExecutionRouter` shall serialize the module output dict to a JSON string using `json.dumps()` with `default=str` to handle non-serializable types (e.g., `datetime`, `Path`, `UUID`). The JSON string shall be wrapped in a `{"type": "text", "text": <json_string>}` content item, which the SDK renders as `TextContent` inside the `CallToolResult`.
+
+**Input/Trigger:** A `dict[str, Any]` returned by `Executor.call_async()`.
+
+**Expected Output:** `([{"type": "text", "text": <json_string>}], False, trace_id)` — on the wire, `CallToolResult(content=[TextContent(type="text", text=<json_string>)], isError=False)`.
+
+**Boundary Conditions:**
+- Empty output dict `{}`: Serialize as `"{}"`.
+- Output containing `datetime` objects: Convert to string via `default=str`.
+- Output containing `Path` objects: Convert to string via `default=str`.
+- Output containing `bytes`: Convert to string via `default=str`.
+
+**Error Conditions:**
+- If serialization fails even with `default=str`: Return `is_error=True` with message "Failed to serialize module output".
+
+---
+
+#### FR-EXEC-003: Preserve full Executor pipeline for MCP-originated calls
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXEC-003 |
+| **Title** | Execute full apcore pipeline for all MCP tool calls |
+| **Priority** | P0 |
+| **Traces to** | F-003 |
+
+**Description:** Every MCP tool call routed through `ExecutionRouter.handle_call()` shall pass through the complete apcore Executor 11-step pipeline (delegated to `PipelineEngine.run()`): (1) context creation, (2) call-chain guard (depth, cycle, repeat checks), (3) module lookup, (4) ACL enforcement, (5) approval gate, (6) middleware before hooks, (7) input validation, (8) module execution, (9) output validation, (10) middleware after hooks, (11) result return. No step shall be bypassed.
+
+**Input/Trigger:** Any MCP `tools/call` request.
+
+**Expected Output:** The Executor pipeline executes in full. The final output (post-middleware) is returned.
+
+**Boundary Conditions:**
+- Module with no middleware: Steps 6 and 10 execute with zero middlewares (no-op).
+- Module with no ACL: Step 4 (acl_check) is skipped (Executor behavior when `acl=None`).
+- Module with no input_schema: Step 7 (input_validation) is skipped (Executor behavior).
+
+**Error Conditions:** Any pipeline step may raise errors mapped per FR-ERROR-001 through FR-ERROR-009.
+
+---
+
+#### FR-EXEC-004: Support both sync and async module execute methods
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXEC-004 |
+| **Title** | Support sync and async module execution via Executor.call_async() |
+| **Priority** | P0 |
+| **Traces to** | F-003 |
+
+**Description:** The `ExecutionRouter` shall always use `Executor.call_async()`, which natively handles both synchronous and asynchronous module `execute()` methods. For sync modules, the Executor uses `asyncio.to_thread()` to avoid blocking the event loop. No additional bridging logic is required in apcore-mcp.
+
+**Input/Trigger:** A tool call to any module (sync or async).
+
+**Expected Output:** The module executes correctly regardless of whether its `execute()` method is sync or async.
+
+**Boundary Conditions:**
+- Sync module: Executed via `asyncio.to_thread()` by the Executor.
+- Async module: Executed directly as a coroutine by the Executor.
+
+**Error Conditions:** None specific to this requirement.
+
+---
+
+#### FR-EXEC-005: Accept pre-configured Executor instance
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXEC-005 |
+| **Title** | Accept Executor instance for tool call routing in serve() |
+| **Priority** | P1 |
+| **Traces to** | F-014 |
+
+**Description:** The `serve()` function shall accept either a `Registry` or an `Executor` as its first argument. When an `Executor` is passed, `serve()` shall use that Executor for all tool call routing (preserving its ACL, middleware, and timeout configuration). When a `Registry` is passed, `serve()` shall create a default `Executor(registry)` internally.
+
+**Input/Trigger:**
+- `serve(executor)` where `executor` is an `Executor` instance.
+- `serve(registry)` where `registry` is a `Registry` instance.
+
+**Expected Output:**
+- With Executor: The Executor's `registry` property is used for tool discovery; the Executor is used for `call_async()`.
+- With Registry: A new `Executor(registry)` is created with default configuration.
+
+**Boundary Conditions:**
+- Executor with ACL: ACL rules are enforced on all MCP tool calls.
+- Executor with custom middleware: Middleware before/after hooks execute on all MCP tool calls.
+- Executor with custom timeout: Timeout configuration applies to all MCP tool calls.
+
+**Error Conditions:**
+- First argument is neither `Registry` nor `Executor`: Raise `TypeError` with message "Expected Registry or Executor instance, got <type>".
+
+---
+
+#### FR-EXEC-006: Accept pre-configured Executor in to_openai_tools
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXEC-006 |
+| **Title** | Accept Executor instance in to_openai_tools() for registry extraction |
+| **Priority** | P1 |
+| **Traces to** | F-014 |
+
+**Description:** The `to_openai_tools()` function shall accept either a `Registry` or an `Executor` as its first argument. When an `Executor` is passed, the function shall extract the Registry via `executor.registry` for module enumeration and schema reading.
+
+**Input/Trigger:**
+- `to_openai_tools(executor)` where `executor` is an `Executor` instance.
+- `to_openai_tools(registry)` where `registry` is a `Registry` instance.
+
+**Expected Output:** Same list of OpenAI tool definition dicts regardless of whether Registry or Executor was passed (the source Registry is the same).
+
+**Boundary Conditions:** None additional.
+
+**Error Conditions:**
+- First argument is neither `Registry` nor `Executor`: Raise `TypeError`.
+
+---
+
+#### FR-EXEC-007: ExecutionRouter never propagates exceptions
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXEC-007 |
+| **Title** | handle_call() catches all exceptions and returns an error tuple |
+| **Priority** | P0 |
+| **Traces to** | F-003, F-004 |
+
+**Description:** The `ExecutionRouter.handle_call()` method shall never propagate exceptions to the MCP Server layer. All exceptions -- whether apcore `ModuleError` subclasses or unexpected `Exception` instances -- shall be caught and converted, via the `ErrorMapper`, into a call-result tuple whose `is_error` is `True`.
+
+**Input/Trigger:** Any exception raised during `Executor.call_async()` execution.
+
+**Expected Output:** `(content, True, trace_id)` with an appropriate error message (see FR-ERROR section), observed by the client as a `CallToolResult` with `isError=True`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None (this requirement defines how errors are handled).
+
+---
+
+### 3.4 FR-ERROR: Error Mapping Requirements
+
+`ErrorMapper.to_mcp_error()` returns an **error response dict**, not an MCP SDK object. Every
+requirement in this section describes that dict; the `CallToolResult(...)` shown under **Expected
+Output** is what the MCP client observes after `ExecutionRouter` lifts `message` into the content
+items and the SDK renders the result.
+
+The envelope carries `isError`, `errorType`, `message`, `details`, and the AI-guidance keys. **The
+AI-guidance keys are camelCase on the wire** — `retryable`, `aiGuidance`, `userFixable`,
+`suggestion` — even though the apcore-side source attributes they are read from are snake_case. A
+client indexing `response["ai_guidance"]` gets a KeyError. See `features/error-mapper.md`.
+
+---
+
+#### FR-ERROR-001: Map ModuleNotFoundError to MCP error response
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-001 |
+| **Title** | Map apcore ModuleNotFoundError to MCP tool-not-found error |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises `ModuleNotFoundError`, the `ErrorMapper.to_mcp_error()` method shall return an error response dict with `isError=True` whose `message` is `"Module not found: {module_id}"` where `{module_id}` is the value from `error.details["module_id"]`.
+
+**Input/Trigger:** `ModuleNotFoundError(module_id="image.resize")`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Module not found: image.resize")], isError=True)`.
+
+**Boundary Conditions:**
+- Module ID with dots: Preserve dots in error message (e.g., "Module not found: comfyui.workflow.execute").
+- Module ID as empty string: Display "Module not found: ".
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-002: Map SchemaValidationError to MCP error with field details
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-002 |
+| **Title** | Map apcore SchemaValidationError to MCP error with field-level details |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises `SchemaValidationError`, the
+`ErrorMapper` shall return an error response dict with `isError=True` and a message
+formatted as:
+
+```text
+Schema validation failed:
+  {location}: {message}
+  {location}: {message}
+```
+
+Each line corresponds to an entry in `error.details["errors"]`. apcore 0.32.0 uses
+`{path, keyword, message}`. A string JSON Pointer `path` takes precedence over the
+legacy `field` key; an empty pointer is displayed as `<root>`. Otherwise, `field`
+is used, with `unknown` as the missing-location fallback. `details.errors` is
+preserved unchanged, including `keyword`.
+
+**Input/Trigger:** `SchemaValidationError("Validation failed", errors=[{"path": "/width", "keyword": "type", "message": "Input should be a valid integer"}])`.
+
+**Expected Output:** An error dict whose message is
+`"Schema validation failed:\n  /width: Input should be a valid integer"` and whose
+`details` contains the original diagnostic entries.
+
+**Boundary Conditions:**
+- Single or multiple errors: One indented line per error.
+- Empty errors list: `"Schema validation failed"` with no appended lines.
+- Nested and escaped JSON Pointers: Preserve `/items/0/a~1b~0c` verbatim.
+- Empty pointer: Display `<root>` without changing the original `path` in details.
+- Legacy field-only entries remain supported; a canonical `path` wins if both exist.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-003: Map ACLDeniedError to MCP error without sensitive data
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-003 |
+| **Title** | Map apcore ACLDeniedError to sanitized MCP access denied error |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises `ACLDeniedError`, the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Access denied"`. The `caller_id` and `target_id` from the error details shall NOT be included in the MCP response to prevent leaking security-sensitive information.
+
+**Input/Trigger:** `ACLDeniedError(caller_id="mcp_client_123", target_id="admin.delete_all")`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Access denied")], isError=True)`.
+
+**Boundary Conditions:**
+- `caller_id=None`: Message remains "Access denied".
+- Any `target_id` value: Message remains "Access denied".
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-004: Map ModuleTimeoutError to MCP error with duration
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-004 |
+| **Title** | Map apcore ModuleTimeoutError to MCP timeout error with duration |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises `ModuleTimeoutError`, the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Module timed out after {timeout_ms}ms"` where `{timeout_ms}` is from `error.details["timeout_ms"]`.
+
+**Input/Trigger:** `ModuleTimeoutError(module_id="slow.module", timeout_ms=30000)`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Module timed out after 30000ms")], isError=True)`.
+
+**Boundary Conditions:**
+- `timeout_ms=0`: Display "Module timed out after 0ms".
+- Large timeout (e.g., 60000): Display "Module timed out after 60000ms".
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-005: Map InvalidInputError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-005 |
+| **Title** | Map apcore InvalidInputError to MCP invalid input error |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises `InvalidInputError`, the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Invalid input: {message}"` where `{message}` is `error.message`.
+
+**Input/Trigger:** `InvalidInputError(message="module_id must be a non-empty string")`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Invalid input: module_id must be a non-empty string")], isError=True)`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-006: Map CallDepthExceededError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-006 |
+| **Title** | Map apcore CallDepthExceededError to MCP internal safety error |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises `CallDepthExceededError`, the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Call depth limit exceeded"`. The call chain details shall NOT be included in the MCP response.
+
+**Input/Trigger:** `CallDepthExceededError(depth=33, max_depth=32, call_chain=[...])`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Call depth limit exceeded")], isError=True)`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-007: Map CircularCallError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-007 |
+| **Title** | Map apcore CircularCallError to MCP internal safety error |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises `CircularCallError`, the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Circular call detected"`. The module_id and call chain details shall NOT be included in the MCP response.
+
+**Input/Trigger:** `CircularCallError(module_id="a.module", call_chain=["a.module", "b.module", "a.module"])`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Circular call detected")], isError=True)`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-008: Map CallFrequencyExceededError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-008 |
+| **Title** | Map apcore CallFrequencyExceededError to MCP internal safety error |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises `CallFrequencyExceededError`, the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Call frequency limit exceeded"`.
+
+**Input/Trigger:** `CallFrequencyExceededError(module_id="spammy.module", count=4, max_repeat=3, call_chain=[...])`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Call frequency limit exceeded")], isError=True)`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-009: Map unexpected exceptions to sanitized MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-009 |
+| **Title** | Map unexpected exceptions to generic MCP internal error |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises any exception that is NOT a subclass of `ModuleError`, the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Internal error occurred"`. The original exception message, class name, and stack trace shall NOT be included in the MCP response. The full exception shall be logged at ERROR level via the `apcore_mcp` logger with the complete stack trace for debugging.
+
+**Input/Trigger:** Any `Exception` not inheriting from `ModuleError` (e.g., `RuntimeError("disk full")`, `KeyError("missing_key")`).
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Internal error occurred")], isError=True)`.
+
+**Boundary Conditions:**
+- `RuntimeError` with message: Response contains only "Internal error occurred".
+- `TypeError` with message: Response contains only "Internal error occurred".
+- `OSError` with message: Response contains only "Internal error occurred".
+
+**Error Conditions:** None (this requirement defines the catch-all error path).
+
+---
+
+#### FR-ERROR-010: Map unrecognized ModuleError subclasses to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-010 |
+| **Title** | Map unrecognized ModuleError subclasses to generic module error |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** When `Executor.call_async()` raises a `ModuleError` subclass not explicitly mapped by FR-ERROR-001 through FR-ERROR-008 (e.g., future error types added to apcore), the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Module error: {error.code}"`.
+
+**Input/Trigger:** A `ModuleError` subclass not in the explicit mapping table (e.g., `ConfigError`, `SchemaNotFoundError`).
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Module error: {code}")], isError=True)` where `{code}` is the `error.code` attribute.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-011: All MCP error responses set isError=True
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-011 |
+| **Title** | Every error response sets isError=True in CallToolResult |
+| **Priority** | P0 |
+| **Traces to** | F-004 |
+
+**Description:** Every `CallToolResult` produced by the `ErrorMapper.to_mcp_error()` method shall have `isError=True`. No error response shall ever have `isError=False`.
+
+**Input/Trigger:** Any exception passed to `ErrorMapper.to_mcp_error()`.
+
+**Expected Output:** `CallToolResult` with `isError=True`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-012: Map ExecutionCancelledError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-012 |
+| **Title** | Map apcore ExecutionCancelledError to retryable MCP error |
+| **Priority** | P1 |
+| **Traces to** | F-004 |
+
+**Description:** When an `ExecutionCancelledError` is raised during tool execution (e.g., due to streaming cancellation by the client), the `ErrorMapper` shall produce a `CallToolResult` with `isError=True` and text `"Execution was cancelled"`. The AI guidance fields shall include `retryable=True` and `aiGuidance="The execution was cancelled, likely by the client. The operation can be retried."`.
+
+**Input/Trigger:** `ExecutionCancelledError` raised during `Executor.call_async()` or `Executor.stream()`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Execution was cancelled")], isError=True)` with `_meta.retryable=True`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-013: Map ConfigEnvMapConflictError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-013 |
+| **Title** | Map apcore ConfigEnvMapConflictError to MCP error |
+| **Priority** | P1 |
+| **Traces to** | F-004 |
+
+**Description:** When `ConfigEnvMapConflictError` is raised (two Config Bus namespaces claim the same env var), the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Config env map conflict: {env_var}"`.
+
+**Input/Trigger:** `ConfigEnvMapConflictError(env_var="APCORE_MCP_PORT", owner="other_ns")`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Config env map conflict: APCORE_MCP_PORT")], isError=True)`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-014: Map PipelineAbortError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-014 |
+| **Title** | Map apcore PipelineAbortError to MCP error |
+| **Priority** | P1 |
+| **Traces to** | F-004 |
+
+**Description:** When `PipelineAbortError` is raised (a pipeline step aborts execution), the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Pipeline aborted at step: {step_name}"`. The step's `explanation` field, if present, is appended.
+
+**Input/Trigger:** `PipelineAbortError(step="acl_check", explanation="Access denied by rule #3")`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Pipeline aborted at step: acl_check — Access denied by rule #3")], isError=True)`.
+
+**Boundary Conditions:**
+- `explanation` is None → only step name included.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-015: Map StepNotFoundError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-015 |
+| **Title** | Map apcore StepNotFoundError to MCP error |
+| **Priority** | P1 |
+| **Traces to** | F-004 |
+
+**Description:** When `StepNotFoundError` is raised (a referenced pipeline step does not exist), the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Pipeline step not found: {message}"`.
+
+**Input/Trigger:** `StepNotFoundError("Step 'custom_auth' not found in strategy")`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Pipeline step not found: Step 'custom_auth' not found in strategy")], isError=True)`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ERROR-016: Map VersionIncompatibleError to MCP error
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ERROR-016 |
+| **Title** | Map apcore VersionIncompatibleError to MCP error |
+| **Priority** | P1 |
+| **Traces to** | F-004 |
+
+**Description:** When `VersionIncompatibleError` is raised (module version negotiation fails), the `ErrorMapper` shall return an error response dict with `isError=True` whose `message` is `"Version incompatible: {message}"`.
+
+**Input/Trigger:** `VersionIncompatibleError("Requested v2.0 but module provides v1.x")`.
+
+**Expected Output:** `CallToolResult(content=[TextContent(type="text", text="Version incompatible: Requested v2.0 but module provides v1.x")], isError=True)`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+### 3.5 FR-SERVER: MCP Server Requirements
+
+---
+
+#### FR-SERVER-001: serve() launches MCP Server with stdio transport by default
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-001 |
+| **Title** | serve() starts MCP Server with stdio transport as default |
+| **Priority** | P0 |
+| **Traces to** | F-005, F-006 |
+
+**Description:** Calling `serve(registry)` with no `transport` parameter shall start an MCP Server using stdio transport (reading from stdin, writing to stdout). The default transport value shall be `"stdio"`.
+
+**Input/Trigger:** `serve(registry)` or `serve(registry, transport="stdio")`.
+
+**Expected Output:** An MCP Server starts, reads MCP protocol messages from stdin, writes responses to stdout, and blocks until the connection is closed.
+
+**Boundary Conditions:**
+- stdin/stdout redirected (e.g., by Claude Desktop subprocess): Server communicates via the redirected streams.
+
+**Error Conditions:**
+- stdio streams cannot be opened: Raise `RuntimeError`.
+
+---
+
+#### FR-SERVER-002: serve() launches MCP Server with Streamable HTTP transport
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-002 |
+| **Title** | serve() starts MCP Server with Streamable HTTP transport |
+| **Priority** | P0 |
+| **Traces to** | F-005, F-007 |
+
+**Description:** Calling `serve(registry, transport="streamable-http", host=<host>, port=<port>)` shall start an MCP Server listening on the specified host and port using the MCP Streamable HTTP transport protocol.
+
+**Input/Trigger:** `serve(registry, transport="streamable-http", host="0.0.0.0", port=8000)`.
+
+**Expected Output:** An HTTP server starts on the specified host:port, accepts MCP protocol requests over HTTP, and blocks until shut down.
+
+**Boundary Conditions:**
+- `host="127.0.0.1"` (default): Server listens only on localhost.
+- `host="0.0.0.0"`: Server listens on all network interfaces.
+- `port=8000` (default): Server listens on port 8000.
+- `port=1` (minimum): Server attempts to bind to port 1.
+- `port=65535` (maximum): Server attempts to bind to port 65535.
+
+**Error Conditions:**
+- Port already in use: Raise `OSError`.
+- Port outside range [1, 65535]: Raise `ValueError` with message "Port must be between 1 and 65535, got {port}".
+- Host is empty string: Raise `ValueError` with message "Host must not be empty".
+
+---
+
+#### FR-SERVER-003: serve() launches MCP Server with SSE transport
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-003 |
+| **Title** | serve() starts MCP Server with SSE transport (deprecated) |
+| **Priority** | P1 |
+| **Traces to** | F-005, F-010 |
+
+**Description:** Calling `serve(registry, transport="sse", host=<host>, port=<port>)` shall start an MCP Server using the Server-Sent Events transport for backward compatibility with older MCP clients. A deprecation warning shall be logged at WARNING level on startup.
+
+**Input/Trigger:** `serve(registry, transport="sse", host="0.0.0.0", port=8000)`.
+
+**Expected Output:** An SSE-based MCP Server starts on the specified host:port. A WARNING-level log message "SSE transport is deprecated; use streamable-http instead" is emitted.
+
+**Boundary Conditions:** Same host/port boundaries as FR-SERVER-002.
+
+**Error Conditions:** Same as FR-SERVER-002.
+
+---
+
+#### FR-SERVER-004: serve() configures server name and version
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-004 |
+| **Title** | serve() accepts name and version parameters |
+| **Priority** | P0 |
+| **Traces to** | F-005 |
+
+**Description:** The `serve()` function shall accept optional `name` (str, default `"apcore-mcp"`) and `version` (str or None, default None) parameters. These values shall be reported to MCP clients during protocol initialization. When `version` is `None`, the package version from `apcore_mcp.__version__` shall be used.
+
+**Input/Trigger:** `serve(registry, name="my-tools", version="2.0.0")`.
+
+**Expected Output:** The MCP Server reports `name="my-tools"` and `version="2.0.0"` during client initialization.
+
+**Boundary Conditions:**
+- `name` max length: 255 characters.
+- `name` minimum: 1 character (non-empty).
+- `version=None`: Uses `apcore_mcp.__version__`.
+- `version=""`: Raises `ValueError`.
+
+**Error Conditions:**
+- Empty `name` (`""`): Raise `ValueError` with message "name must not be empty".
+- `name` exceeding 255 characters: Raise `ValueError` with message "name must not exceed 255 characters".
+- Empty `version` (`""`): Raise `ValueError` with message "version must not be empty".
+
+---
+
+#### FR-SERVER-005: serve() blocks until server shutdown
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-005 |
+| **Title** | serve() blocks the calling thread until server shuts down |
+| **Priority** | P0 |
+| **Traces to** | F-005 |
+
+**Description:** The `serve()` function shall block the calling thread/coroutine until the MCP Server is shut down (via SIGINT, SIGTERM, parent process exit for stdio, or explicit shutdown). Control shall not return to the caller until the server has fully stopped.
+
+**Input/Trigger:** `serve(registry)` call.
+
+**Expected Output:** Function blocks. Returns `None` when server shuts down.
+
+**Boundary Conditions:**
+- SIGINT received: Graceful shutdown, function returns.
+- SIGTERM received: Graceful shutdown, function returns.
+- stdio parent process exits: Connection closed, function returns.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-SERVER-006: serve() with empty registry starts server with zero tools
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-006 |
+| **Title** | serve() starts server with zero tools for empty registry and logs warning |
+| **Priority** | P0 |
+| **Traces to** | F-005 |
+
+**Description:** When `serve()` is called with a `Registry` containing zero registered modules, the MCP Server shall start with an empty tool list. A WARNING-level log message shall be emitted: "No modules registered; server starting with zero tools".
+
+**Input/Trigger:** `serve(registry)` where `registry.count == 0`.
+
+**Expected Output:** Server starts. MCP clients that call `tools/list` receive an empty list `[]`. Warning logged.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-SERVER-007: serve() validates transport parameter
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-007 |
+| **Title** | serve() rejects unknown transport values |
+| **Priority** | P0 |
+| **Traces to** | F-005 |
+
+**Description:** The `serve()` function shall validate the `transport` parameter against the allowed values: `"stdio"`, `"streamable-http"`, `"sse"`. Comparison shall be case-insensitive (normalized to lowercase). Any other value shall raise `ValueError`.
+
+**Input/Trigger:** `serve(registry, transport="websocket")`.
+
+**Expected Output:** `ValueError` raised with message "Unknown transport: 'websocket'. Must be one of: stdio, streamable-http, sse".
+
+**Boundary Conditions:**
+- `transport="STDIO"`: Accepted (case-insensitive).
+- `transport="Streamable-HTTP"`: Accepted (case-insensitive).
+- `transport=""`: Raises `ValueError`.
+- `transport="http"`: Raises `ValueError` (not an exact match).
+
+**Error Conditions:**
+- Unknown transport value: Raise `ValueError`.
+
+---
+
+#### FR-SERVER-008: serve() validates tags parameter
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-008 |
+| **Title** | serve() validates tags filter parameter |
+| **Priority** | P1 -- Implemented |
+| **Traces to** | F-018 |
+
+**Description:** The `serve()` function shall accept an optional `tags` parameter (`list[str] | None`, default `None`). When provided, only modules with ALL specified tags shall be exposed as MCP tools. Each tag string must be non-empty.
+
+**Input/Trigger:** `serve(registry, tags=["public", "stable"])`.
+
+**Expected Output:** Only modules possessing both tags "public" and "stable" appear in the MCP tool list.
+
+**Boundary Conditions:**
+- `tags=None`: All modules exposed (no filtering).
+- `tags=[]`: All modules exposed (empty filter matches all).
+- `tags=["nonexistent"]`: Zero tools exposed.
+
+**Error Conditions:**
+- Any tag is empty string: Raise `ValueError` with message "Tag values must not be empty".
+
+---
+
+#### FR-SERVER-009: serve() validates prefix parameter
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-009 |
+| **Title** | serve() validates prefix filter parameter |
+| **Priority** | P1 -- Implemented |
+| **Traces to** | F-018 |
+
+**Description:** The `serve()` function shall accept an optional `prefix` parameter (`str | None`, default `None`). When provided, only modules whose `module_id` starts with the prefix shall be exposed as MCP tools.
+
+**Input/Trigger:** `serve(registry, prefix="api.")`.
+
+**Expected Output:** Only modules whose IDs start with "api." appear in the MCP tool list.
+
+**Boundary Conditions:**
+- `prefix=None`: All modules exposed.
+- `prefix="x."`: Only modules with IDs starting with "x." are exposed.
+- `prefix="nonexistent."`: Zero tools exposed.
+
+**Error Conditions:**
+- `prefix=""` (empty string): Raise `ValueError` with message "prefix must not be empty".
+
+---
+
+#### FR-SERVER-010: serve() configures log level
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-010 |
+| **Title** | serve() accepts log_level parameter |
+| **Priority** | P1 -- Implemented |
+| **Traces to** | F-016 |
+
+**Description:** The `serve()` function shall accept an optional `log_level` parameter (`str | None`, default `None`). When provided, it shall configure logging via `logging.basicConfig(level=...)` to set the log level. Log level configuration is also available via the CLI `--log-level` option.
+
+**Input/Trigger:** `serve(registry, log_level="DEBUG")`.
+
+**Expected Output:** The `apcore_mcp` logger is configured at DEBUG level.
+
+**Boundary Conditions:**
+- `log_level=None`: No change to logging configuration.
+- `log_level="DEBUG"`: DEBUG level set.
+- `log_level="INFO"`: INFO level set.
+- `log_level="WARNING"`: WARNING level set.
+- `log_level="ERROR"`: ERROR level set.
+- Case-insensitive: `"debug"` accepted.
+
+**Error Conditions:**
+- Unknown log level: Raise `ValueError` with message "Unknown log level: '{level}'. Must be one of: DEBUG, INFO, WARNING, ERROR".
+
+---
+
+#### FR-SERVER-011: MCP Server registers tools from all registry modules
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-011 |
+| **Title** | MCP Server tool list contains one tool per registered module |
+| **Priority** | P0 |
+| **Traces to** | F-001, F-005 |
+
+**Description:** When the MCP Server starts, it shall iterate over all modules in the Registry (respecting any tag/prefix filters), obtain each module's `ModuleDescriptor` via `registry.get_definition(module_id)`, build an MCP `Tool` object from it, and register all tools. An MCP client sending a `tools/list` request shall receive a list with exactly one tool per eligible module.
+
+**Input/Trigger:** MCP `tools/list` request.
+
+**Expected Output:** A list of `Tool` objects. Each tool has:
+- `name` equal to the apcore `module_id`.
+- `description` equal to the apcore module `description`.
+- `inputSchema` is an independent copy of the runtime input schema, preserving references, optionality and defaults; normalize only an absent or object-compatible root type to object (section 7.1).
+- `annotations` equal to the mapped annotations (per FR-ANNOT-001 through FR-ANNOT-006).
+
+**Boundary Conditions:**
+- Registry with 1 module: Tool list has 1 entry.
+- Registry with 100 modules: Tool list has 100 entries.
+- `get_definition()` returns `None` for a module_id (race condition): Skip that module, log warning.
+
+**Error Conditions:**
+- An input schema declaration is malformed or explicitly excludes an object root: Skip that module, log warning, register remaining modules.
+
+---
+
+#### FR-SERVER-012: async_serve() returns embeddable ASGI application
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-SERVER-012 |
+| **Title** | async_serve() yields a Starlette ASGI app for embedding |
+| **Priority** | P1 |
+| **Traces to** | F-005 |
+
+**Description:** The `async_serve()` function shall be an async context manager that yields a Starlette ASGI application configured with MCP Streamable HTTP transport, Tool Explorer (if enabled), health endpoint, and authentication middleware. The caller is responsible for binding the application to a host and port. This enables embedding apcore-mcp within a larger ASGI application.
+
+**Input/Trigger:** `async with async_serve(registry, explorer=True) as app: ...`
+
+**Expected Output:** A Starlette application instance with all MCP routes mounted. The application is usable until the context manager exits.
+
+**Boundary Conditions:**
+- No transport parameter (always Streamable HTTP for embedded use).
+- All serve() options except `transport`, `host`, `port` are supported.
+
+**Error Conditions:**
+- Invalid registry/executor: `TypeError` raised.
+
+---
+
+### 3.6 FR-TRANSPORT: Transport Requirements
+
+---
+
+#### FR-TRANSPORT-001: stdio transport reads from stdin and writes to stdout
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRANSPORT-001 |
+| **Title** | stdio transport uses stdin/stdout for MCP communication |
+| **Priority** | P0 |
+| **Traces to** | F-006 |
+
+**Description:** When transport is `"stdio"`, the MCP Server shall read MCP protocol messages from standard input and write responses to standard output. This enables Claude Desktop and other MCP clients to launch the server as a subprocess and communicate via pipes.
+
+**Input/Trigger:** `serve(registry, transport="stdio")`.
+
+**Expected Output:** Server reads from `sys.stdin` and writes to `sys.stdout` using MCP protocol framing.
+
+**Boundary Conditions:**
+- stdin is a pipe (subprocess): Normal operation.
+- stdin is a TTY (interactive terminal): Normal operation (for debugging).
+
+**Error Conditions:**
+- stdin stream closed unexpectedly: Server shuts down gracefully.
+
+---
+
+#### FR-TRANSPORT-002: stdio transport handles graceful shutdown on parent exit
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRANSPORT-002 |
+| **Title** | stdio server shuts down when parent process terminates |
+| **Priority** | P0 |
+| **Traces to** | F-006 |
+
+**Description:** When the parent process (e.g., Claude Desktop) terminates or closes the stdio pipes, the MCP Server shall detect the closed connection and shut down gracefully without raising unhandled exceptions.
+
+**Input/Trigger:** Parent process exits or closes stdin.
+
+**Expected Output:** Server shuts down. `serve()` returns normally.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-TRANSPORT-003: Streamable HTTP transport binds to configurable host and port
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRANSPORT-003 |
+| **Title** | Streamable HTTP transport accepts host and port configuration |
+| **Priority** | P0 |
+| **Traces to** | F-007 |
+
+**Description:** The Streamable HTTP transport shall bind to the address specified by the `host` parameter (default `"127.0.0.1"`) and the port specified by the `port` parameter (default `8000`).
+
+**Input/Trigger:** `serve(registry, transport="streamable-http", host="0.0.0.0", port=9000)`.
+
+**Expected Output:** HTTP server listens on `0.0.0.0:9000`.
+
+**Boundary Conditions:**
+- `host="127.0.0.1"`: Localhost only.
+- `host="0.0.0.0"`: All interfaces.
+- `port=1`: Minimum valid port.
+- `port=65535`: Maximum valid port.
+
+**Error Conditions:**
+- Port in use: `OSError` propagated.
+- Port < 1 or > 65535: `ValueError` raised (per FR-SERVER-002).
+
+---
+
+#### FR-TRANSPORT-004: SSE transport marked as deprecated
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRANSPORT-004 |
+| **Title** | SSE transport emits deprecation warning on startup |
+| **Priority** | P1 |
+| **Traces to** | F-010 |
+
+**Description:** When the SSE transport is selected, the server shall log a WARNING-level message: "SSE transport is deprecated; use streamable-http instead". The SSE transport shall otherwise function identically to Streamable HTTP in terms of host/port configuration.
+
+**Input/Trigger:** `serve(registry, transport="sse")`.
+
+**Expected Output:** Warning logged. SSE server starts normally.
+
+**Boundary Conditions:** Same as FR-TRANSPORT-003.
+
+**Error Conditions:** Same as FR-TRANSPORT-003.
+
+---
+
+#### FR-TRANSPORT-005: host and port parameters ignored for stdio transport
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRANSPORT-005 |
+| **Title** | host and port are ignored when transport is stdio |
+| **Priority** | P0 |
+| **Traces to** | F-006 |
+
+**Description:** When `transport="stdio"`, the `host` and `port` parameters shall be ignored without raising errors, even if explicitly provided.
+
+**Input/Trigger:** `serve(registry, transport="stdio", host="0.0.0.0", port=9000)`.
+
+**Expected Output:** stdio transport starts. host and port values are silently ignored.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+### 3.7 FR-OPENAI: OpenAI Converter Requirements
+
+---
+
+#### FR-OPENAI-001: to_openai_tools() returns list of OpenAI tool definition dicts
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAI-001 |
+| **Title** | to_openai_tools() returns list of correctly structured OpenAI tool dicts |
+| **Priority** | P0 |
+| **Traces to** | F-008 |
+
+**Description:** The `to_openai_tools()` function shall return a `list[dict[str, Any]]` where each dict represents one OpenAI tool definition. Each dict shall have the structure:
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "<normalized_module_id>",
+    "description": "<module_description>",
+    "parameters": { <JSON Schema from input_schema> }
+  }
+}
+```
+
+**Input/Trigger:** `to_openai_tools(registry)`.
+
+**Expected Output:** A list with one dict per registered module.
+
+**Boundary Conditions:**
+- Empty registry: Return `[]`.
+- Registry with 1 module: Return list with 1 dict.
+- Registry with 100 modules: Return list with 100 dicts.
+
+**Error Conditions:**
+- Schema conversion fails for one module: Skip that module, log warning, include remaining modules.
+
+---
+
+#### FR-OPENAI-002: Normalize module IDs for OpenAI function name compatibility
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAI-002 |
+| **Title** | Replace dots with hyphens in OpenAI function names |
+| **Priority** | P0 |
+| **Traces to** | F-008 |
+
+**Description:** The `ModuleIDNormalizer.normalize()` method shall replace all `.` (dot) characters in apcore module IDs with `-` (hyphen) to comply with OpenAI function name constraints (`^[a-zA-Z0-9_-]+$`). The `denormalize()` method shall reverse this transformation.
+
+**Input/Trigger:** `normalize("image.resize")`.
+
+**Expected Output:** `"image-resize"`.
+
+**Boundary Conditions:**
+- Module ID with no dots (e.g., `"simple"`): Return unchanged.
+- Module ID with multiple dots (e.g., `"comfyui.workflow.execute"`): Return `"comfyui-workflow-execute"`.
+- Module ID with existing underscores (e.g., `"my_module.resize"`): Return `"my_module-resize"`.
+- Module ID with hyphens (e.g., `"my-module.resize"`): Reject with validation error. Hyphens are prohibited in canonical module IDs per PROTOCOL_SPEC (reserved for dot-to-hyphen normalization).
+
+**Error Conditions:**
+- Module ID containing hyphens: Raise validation error (hyphens are reserved for MCP/OpenAI tool name normalization).
+
+---
+
+#### FR-OPENAI-003: Apply OpenAI strict mode to tool definitions
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAI-003 |
+| **Title** | to_openai_tools() with strict=True applies strict mode schema rules |
+| **Priority** | P1 |
+| **Traces to** | F-012 |
+
+**Description:** When `to_openai_tools(registry, strict=True)` is called, each tool definition shall include `"strict": true` in the `"function"` dict, and the schema shall be transformed to meet OpenAI strict mode requirements:
+1. Set `"additionalProperties": false` on all object types.
+2. Make all properties required (add all property names to `"required"` array).
+3. Optional properties (those not in the original `"required"`) become nullable (`"type": [<original>, "null"]`).
+4. Strip `x-*` extension fields.
+5. Remove `"default"` values.
+6. Recurse into nested objects, array items, and `oneOf`/`anyOf`/`allOf` branches.
+
+**Input/Trigger:** `to_openai_tools(registry, strict=True)`.
+
+**Expected Output:** Each tool dict has `"function": {"strict": true, ...}` and the `"parameters"` schema follows strict mode rules.
+
+**Boundary Conditions:**
+- `strict=False` (default): No `"strict"` key in function dict. Schema not transformed.
+- Schema already has `"additionalProperties": false`: No change needed for that property.
+- Schema with no optional properties: All properties already required; no nullable conversion needed.
+- Schema with deeply nested objects: Strict mode rules applied recursively.
+
+**Error Conditions:**
+- Schema uses `"additionalProperties": true` intentionally: Log WARNING that schema may be incompatible with strict mode.
+
+---
+
+#### FR-OPENAI-004: Embed annotations in OpenAI tool descriptions
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAI-004 |
+| **Title** | to_openai_tools() with embed_annotations=True appends annotation suffix |
+| **Priority** | P1 |
+| **Traces to** | F-011 |
+
+**Description:** When `to_openai_tools(registry, embed_annotations=True)` is called, each tool's `"description"` shall have the annotation suffix (from FR-ANNOT-007) appended. When `embed_annotations=False` (default), descriptions shall not be modified.
+
+**Input/Trigger:** `to_openai_tools(registry, embed_annotations=True)`.
+
+**Expected Output:** Each tool's description becomes `"{original_description}\n\n[Annotations: ...]"` for modules with non-default annotations.
+
+**Boundary Conditions:**
+- Module with all default annotations: Description unchanged (suffix is empty string).
+- Module with `annotations=None`: Description unchanged.
+- `embed_annotations=False`: Descriptions never modified.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-OPENAI-005: to_openai_tools() has zero dependency on openai package
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAI-005 |
+| **Title** | to_openai_tools() produces plain dicts without openai package dependency |
+| **Priority** | P0 |
+| **Traces to** | F-008 |
+
+**Description:** The `to_openai_tools()` function shall return plain Python `dict` objects. It shall not import or depend on the `openai` package at runtime. The returned dicts shall be directly passable to `openai.chat.completions.create(tools=...)` without transformation.
+
+**Input/Trigger:** `to_openai_tools(registry)`.
+
+**Expected Output:** `list[dict[str, Any]]` containing only Python built-in types (dict, list, str, int, float, bool, None).
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-OPENAI-006: to_openai_tools() with tag filtering
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAI-006 |
+| **Title** | to_openai_tools() filters modules by tags |
+| **Priority** | P2 |
+| **Traces to** | F-017 |
+
+**Description:** When `to_openai_tools(registry, tags=["image"])` is called, only modules possessing all specified tags shall be included in the returned list. Tag filtering shall use `Registry.list(tags=tags)`.
+
+**Input/Trigger:** `to_openai_tools(registry, tags=["image"])`.
+
+**Expected Output:** List containing only tool dicts for modules with the "image" tag.
+
+**Boundary Conditions:**
+- `tags=None`: All modules included.
+- `tags=["nonexistent"]`: Empty list returned.
+- Multiple tags: Modules must have ALL tags.
+
+**Error Conditions:**
+- Empty tag string in list: Raise `ValueError`.
+
+---
+
+#### FR-OPENAI-007: to_openai_tools() with prefix filtering
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAI-007 |
+| **Title** | to_openai_tools() filters modules by ID prefix |
+| **Priority** | P2 |
+| **Traces to** | F-017 |
+
+**Description:** When `to_openai_tools(registry, prefix="comfyui.")` is called, only modules whose `module_id` starts with the specified prefix shall be included.
+
+**Input/Trigger:** `to_openai_tools(registry, prefix="comfyui.")`.
+
+**Expected Output:** List containing only tool dicts for modules whose IDs start with "comfyui.".
+
+**Boundary Conditions:**
+- `prefix=None`: All modules included.
+- `prefix="nonexistent."`: Empty list returned.
+- Combined with tags: Both filters applied (intersection).
+
+**Error Conditions:**
+- Empty prefix string: Raise `ValueError`.
+
+---
+
+### 3.8 FR-CLI: CLI Requirements
+
+---
+
+#### FR-CLI-001: python -m apcore_mcp starts MCP server
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-CLI-001 |
+| **Title** | CLI entry point starts MCP server from extensions directory |
+| **Priority** | P0 |
+| **Traces to** | F-009 |
+
+**Description:** Running `python -m apcore_mcp --extensions-dir ./extensions` shall create a `Registry`, call `registry.discover()` to load modules from the specified directory, and call `serve(registry)` with the configured transport.
+
+**Input/Trigger:** `python -m apcore_mcp --extensions-dir ./extensions`.
+
+**Expected Output:** MCP Server starts with stdio transport (default), all discovered modules registered as tools.
+
+**Boundary Conditions:**
+- Extensions directory with 0 modules: Server starts with zero tools, warning logged (per FR-SERVER-006).
+- Extensions directory with 100 modules: All modules registered.
+
+**Error Conditions:**
+- `--extensions-dir` not provided: argparse error, exit code 2.
+
+---
+
+#### FR-CLI-002: --extensions-dir flag specifies extensions directory
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-CLI-002 |
+| **Title** | CLI --extensions-dir flag specifies module discovery directory |
+| **Priority** | P0 |
+| **Traces to** | F-009 |
+
+**Description:** The `--extensions-dir` flag shall specify the filesystem path to the apcore extensions directory. The path must exist and be a readable directory.
+
+**Input/Trigger:** `python -m apcore_mcp --extensions-dir /path/to/extensions`.
+
+**Expected Output:** Registry created with `extensions_dir="/path/to/extensions"`.
+
+**Boundary Conditions:**
+- Absolute path: Accepted.
+- Relative path: Accepted (resolved relative to CWD).
+- Path with spaces: Accepted (shell quoting responsibility).
+
+**Error Conditions:**
+- Path does not exist: Print error "Error: extensions directory does not exist: {path}" to stderr, exit code 1.
+- Path is a file (not directory): Print error "Error: extensions path is not a directory: {path}" to stderr, exit code 1.
+
+---
+
+#### FR-CLI-003: --transport flag selects transport protocol
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-CLI-003 |
+| **Title** | CLI --transport flag selects MCP transport |
+| **Priority** | P0 |
+| **Traces to** | F-009 |
+
+**Description:** The `--transport` flag shall accept values `stdio`, `streamable-http`, and `sse`. Default is `stdio`.
+
+**Input/Trigger:** `python -m apcore_mcp --extensions-dir ./ext --transport streamable-http`.
+
+**Expected Output:** Server starts with Streamable HTTP transport.
+
+**Boundary Conditions:**
+- `--transport` not specified: Default to `stdio`.
+- `--transport stdio`: stdio transport.
+- `--transport streamable-http`: Streamable HTTP transport.
+- `--transport sse`: SSE transport.
+
+**Error Conditions:**
+- Unknown transport value: argparse error with choices message, exit code 2.
+
+---
+
+#### FR-CLI-004: --host and --port flags configure network transports
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-CLI-004 |
+| **Title** | CLI --host and --port flags configure bind address |
+| **Priority** | P0 |
+| **Traces to** | F-009 |
+
+**Description:** The `--host` flag (default `"127.0.0.1"`) and `--port` flag (default `8000`) shall configure the bind address for HTTP-based transports. They are ignored for stdio transport.
+
+**Input/Trigger:** `python -m apcore_mcp --extensions-dir ./ext --transport streamable-http --host 0.0.0.0 --port 9000`.
+
+**Expected Output:** Server starts on `0.0.0.0:9000`.
+
+**Boundary Conditions:**
+- `--port 1`: Minimum valid port.
+- `--port 65535`: Maximum valid port.
+
+**Error Conditions:**
+- `--port 0`: Print error "Error: port must be between 1 and 65535" to stderr, exit code 1.
+- `--port 70000`: Print error "Error: port must be between 1 and 65535" to stderr, exit code 1.
+- `--port abc` (non-integer): argparse error, exit code 2.
+
+---
+
+#### FR-CLI-005: --name and --version flags configure server identity
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-CLI-005 |
+| **Title** | CLI --name and --version flags configure MCP server identity |
+| **Priority** | P0 |
+| **Traces to** | F-009 |
+
+**Description:** The `--name` flag (default `"apcore-mcp"`, max 255 chars) and `--version` flag (default: package version) shall configure the server name and version reported to MCP clients.
+
+**Input/Trigger:** `python -m apcore_mcp --extensions-dir ./ext --name "my-tools" --version "1.0.0"`.
+
+**Expected Output:** Server reports name="my-tools" and version="1.0.0".
+
+**Boundary Conditions:**
+- `--name` not specified: Default `"apcore-mcp"`.
+- `--version` not specified: Default from package version.
+
+**Error Conditions:**
+- `--name ""`: Print error "Error: server name must not be empty" to stderr, exit code 1.
+- `--name` exceeding 255 chars: Print error, exit code 1.
+
+---
+
+#### FR-CLI-006: --log-level flag configures logging verbosity
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-CLI-006 |
+| **Title** | CLI --log-level flag sets logging level |
+| **Priority** | P1 |
+| **Traces to** | F-009, F-016 |
+
+**Description:** The `--log-level` flag shall accept values `DEBUG`, `INFO`, `WARNING`, `ERROR` (default `INFO`).
+
+**Input/Trigger:** `python -m apcore_mcp --extensions-dir ./ext --log-level DEBUG`.
+
+**Expected Output:** Logging configured at DEBUG level.
+
+**Boundary Conditions:**
+- Not specified: Default `INFO`.
+
+**Error Conditions:**
+- Unknown level: argparse error with choices message, exit code 2.
+
+---
+
+#### FR-CLI-007: --help flag displays usage information
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-CLI-007 |
+| **Title** | CLI --help flag displays complete usage information |
+| **Priority** | P0 |
+| **Traces to** | F-009 |
+
+**Description:** The `--help` flag shall display usage information including all available flags, their types, defaults, and descriptions, then exit with code 0.
+
+**Input/Trigger:** `python -m apcore_mcp --help`.
+
+**Expected Output:** Usage text printed to stdout, exit code 0.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-CLI-008: CLI exit codes
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-CLI-008 |
+| **Title** | CLI uses specific exit codes for different failure modes |
+| **Priority** | P0 |
+| **Traces to** | F-009 |
+
+**Description:** The CLI shall use the following exit codes:
+- `0`: Normal shutdown (SIGINT, SIGTERM, or parent process exit).
+- `1`: Invalid arguments (non-existent directory, invalid port range, empty name).
+- `2`: Startup failure (port in use, permission denied) or argparse error.
+
+**Input/Trigger:** Various failure scenarios.
+
+**Expected Output:** Appropriate exit code.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+### 3.9 FR-DYNAMIC: Dynamic Registration Requirements
+
+---
+
+#### FR-DYNAMIC-001: Reflect new module registration in MCP tool list
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-DYNAMIC-001 |
+| **Title** | New module registration adds MCP tool at runtime |
+| **Priority** | P1 |
+| **Traces to** | F-015 |
+
+**Description:** When a module is registered via `registry.register(module_id, module)` after `serve()` has started, the `RegistryListener` shall detect the `"register"` event, obtain the `ModuleDescriptor`, build an MCP `Tool` object, and add it to the active tool list. Subsequent `tools/list` requests from MCP clients shall include the new tool.
+
+**Input/Trigger:** `registry.register("new.tool", module_instance)` while server is running.
+
+**Expected Output:** The MCP tool list includes `"new.tool"` on the next `tools/list` request.
+
+**Boundary Conditions:**
+- Module registered before server starts: Included in initial tool list (not this requirement).
+- Multiple modules registered in rapid succession: All are added.
+
+**Error Conditions:**
+- `get_definition()` returns `None` (race condition): Log warning, do not add tool, do not crash server.
+- `build_tool()` raises `ValueError`: Log warning, do not add tool, do not crash server.
+
+---
+
+#### FR-DYNAMIC-002: Reflect module unregistration in MCP tool list
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-DYNAMIC-002 |
+| **Title** | Module unregistration removes MCP tool at runtime |
+| **Priority** | P1 |
+| **Traces to** | F-015 |
+
+**Description:** When a module is unregistered via `registry.unregister(module_id)` after `serve()` has started, the `RegistryListener` shall detect the `"unregister"` event and remove the corresponding tool from the active tool list. Subsequent `tools/list` requests shall not include the removed tool. Tool calls to the removed tool shall return a "Module not found" error.
+
+**Input/Trigger:** `registry.unregister("old.tool")` while server is running.
+
+**Expected Output:** The MCP tool list no longer includes `"old.tool"`.
+
+**Boundary Conditions:**
+- Unregister a module_id not in the tools dict: Silently ignore.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-DYNAMIC-003: Send MCP tool list changed notification
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-DYNAMIC-003 |
+| **Title** | Notify MCP clients of tool list changes |
+| **Priority** | P1 |
+| **Traces to** | F-015 |
+
+**Description:** After a tool is added or removed from the active tool list, the `RegistryListener` shall trigger an MCP `notifications/tools/list_changed` notification to connected clients (if the MCP SDK supports this capability). Clients receiving this notification shall re-fetch the tool list.
+
+**Input/Trigger:** Tool added or removed from the active list.
+
+**Expected Output:** MCP `notifications/tools/list_changed` sent to connected clients.
+
+**Boundary Conditions:**
+- MCP client does not support the notification: Notification is sent; client ignores it (no error).
+- No clients connected: Notification is a no-op.
+
+**Error Conditions:**
+- Notification send failure: Log warning, do not crash server.
+
+---
+
+#### FR-DYNAMIC-004: Thread-safe tool list updates
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-DYNAMIC-004 |
+| **Title** | Tool list updates are thread-safe |
+| **Priority** | P1 |
+| **Traces to** | F-015 |
+
+**Description:** The internal tools dictionary in `RegistryListener` shall be protected by a `threading.Lock`. All reads (from `list_tools` handler on the async event loop thread) and writes (from Registry callbacks on potentially different threads) shall acquire the lock before accessing the dictionary.
+
+**Input/Trigger:** Concurrent tool list read (MCP `tools/list` request) and write (registry event callback).
+
+**Expected Output:** No data corruption. Reads always see a consistent snapshot.
+
+**Boundary Conditions:**
+- High-frequency register/unregister: All operations serialized via lock.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-REG-NOTIFY-001: Emit list_changed on register/unregister
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-REG-NOTIFY-001 |
+| **Title** | Emit MCP list_changed on Registry register/unregister |
+| **Priority** | P1 |
+| **Traces to** | F-015 |
+
+**Description:** After the tool collection is mutated by a `register` or `unregister` event, the listener SHALL emit `notifications/tools/list_changed` to connected MCP clients. Failed sync (e.g., `build_tool()` raises) MUST NOT emit.
+
+**Expected Output:** One notification per effective state change.
+**Error Conditions:** Per-session send failure is logged and does not block other sessions.
+
+---
+
+#### FR-REG-NOTIFY-002: Debounce bulk changes within 100ms
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-REG-NOTIFY-002 |
+| **Title** | Coalesce rapid register/unregister events |
+| **Priority** | P1 |
+| **Traces to** | F-015 |
+
+**Description:** Multiple register/unregister events within a 100ms quiet window SHALL be coalesced into a single `notifications/tools/list_changed` per session.
+
+**Expected Output:** At most one notification per session per 100ms quiet window.
+
+---
+
+#### FR-REG-NOTIFY-003: Per-session ACL filter and transport fan-out
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-REG-NOTIFY-003 |
+| **Title** | Apply ACL filter; stdio single-session vs HTTP multi-session |
+| **Priority** | P1 |
+| **Traces to** | F-015 |
+
+**Description:** Notifications SHALL be filtered per session using the same ACL used for `tools/list`; if no changed tools are visible to a session, suppress. stdio transport delivers to the single active session; HTTP transport fans out to all active sessions with per-session ACL evaluation. Disconnected sessions are dropped silently.
+
+**Error Conditions:** Individual session failures logged; other sessions unaffected.
+
+---
+
+### 3.10 FR-LOG: Logging Requirements
+
+---
+
+#### FR-LOG-001: Log tool count and transport on server startup
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-LOG-001 |
+| **Title** | Log registered tool count and transport type at server startup |
+| **Priority** | P1 |
+| **Traces to** | F-016 |
+
+**Description:** When the MCP Server starts, a log message at INFO level shall be emitted with the format: "apcore-mcp server started: {count} tools registered, transport={transport}".
+
+**Input/Trigger:** `serve()` completes server initialization.
+
+**Expected Output:** INFO log: "apcore-mcp server started: 5 tools registered, transport=stdio".
+
+**Boundary Conditions:**
+- Zero tools: "apcore-mcp server started: 0 tools registered, transport=stdio".
+
+**Error Conditions:** None.
+
+---
+
+#### FR-LOG-002: Log each tool call at DEBUG level
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-LOG-002 |
+| **Title** | Log tool call name at DEBUG level |
+| **Priority** | P1 |
+| **Traces to** | F-016 |
+
+**Description:** When a tool call is received by the `ExecutionRouter`, a DEBUG-level log message shall be emitted with format: "Tool call: {tool_name}".
+
+**Input/Trigger:** MCP `tools/call` request received.
+
+**Expected Output:** DEBUG log: "Tool call: image.resize".
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-LOG-003: Log tool call errors at ERROR level
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-LOG-003 |
+| **Title** | Log tool call errors with type and message at ERROR level |
+| **Priority** | P1 |
+| **Traces to** | F-016 |
+
+**Description:** When a tool call results in an error, an ERROR-level log message shall be emitted with format: "Tool call error: {tool_name} - {error_type}: {error_message}". For unexpected exceptions (non-`ModuleError`), the full stack trace shall also be logged.
+
+**Input/Trigger:** Any error during tool execution.
+
+**Expected Output:** ERROR log: "Tool call error: image.resize - SchemaValidationError: Input validation failed".
+
+**Boundary Conditions:**
+- `ModuleError` subclass: Log error type and message.
+- Non-`ModuleError` exception: Log error type, message, AND full stack trace.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-LOG-004: Use apcore_mcp logger namespace
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-LOG-004 |
+| **Title** | All log messages use the apcore_mcp logger namespace |
+| **Priority** | P1 |
+| **Traces to** | F-016 |
+
+**Description:** All log messages emitted by apcore-mcp shall use loggers under the `apcore_mcp` namespace (e.g., `apcore_mcp`, `apcore_mcp.server.router`, `apcore_mcp.adapters.errors`). This enables users to configure log levels for apcore-mcp independently of other packages.
+
+**Input/Trigger:** Any logging operation within apcore-mcp.
+
+**Expected Output:** Logger name starts with `apcore_mcp`.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-LOG-005: Log verbosity controllable via standard Python logging
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-LOG-005 |
+| **Title** | Logging verbosity configurable via Python logging module |
+| **Priority** | P1 |
+| **Traces to** | F-016 |
+
+**Description:** apcore-mcp shall not configure any log handlers or formatters by default (following Python library best practice). Users shall be able to control logging verbosity by configuring the `apcore_mcp` logger via standard Python `logging` module APIs. The `serve()` function's `log_level` parameter (FR-SERVER-010) provides a convenience shortcut.
+
+**Input/Trigger:** `logging.getLogger("apcore_mcp").setLevel(logging.DEBUG)`.
+
+**Expected Output:** All DEBUG and above messages from apcore-mcp are emitted.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+### 3.11 FR-FILTER: Module Filtering Requirements
+
+---
+
+#### FR-FILTER-001: Filter MCP tools by tags in serve()
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-FILTER-001 |
+| **Title** | serve() exposes only modules matching tag filter |
+| **Priority** | P2 |
+| **Traces to** | F-018 |
+
+**Description:** When `serve(registry, tags=["public"])` is called, only modules possessing ALL specified tags shall be registered as MCP tools. Modules not matching the filter shall not appear in `tools/list` responses and calls to them shall return "Module not found" errors.
+
+**Input/Trigger:** `serve(registry, tags=["public"])`.
+
+**Expected Output:** Tool list contains only modules with "public" tag.
+
+**Boundary Conditions:**
+- No modules match: Zero tools registered, warning logged.
+- All modules match: All tools registered.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-FILTER-002: Filter MCP tools by prefix in serve()
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-FILTER-002 |
+| **Title** | serve() exposes only modules matching prefix filter |
+| **Priority** | P2 |
+| **Traces to** | F-018 |
+
+**Description:** When `serve(registry, prefix="api.")` is called, only modules whose `module_id` starts with `"api."` shall be registered as MCP tools.
+
+**Input/Trigger:** `serve(registry, prefix="api.")`.
+
+**Expected Output:** Tool list contains only modules with IDs starting with "api.".
+
+**Boundary Conditions:**
+- No modules match: Zero tools, warning logged.
+- Prefix matches all: All tools registered.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-FILTER-003: Combine tag and prefix filters
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-FILTER-003 |
+| **Title** | Tag and prefix filters combine as intersection |
+| **Priority** | P2 |
+| **Traces to** | F-017, F-018 |
+
+**Description:** When both `tags` and `prefix` parameters are provided (to `serve()` or `to_openai_tools()`), the filters shall be combined as a logical AND (intersection). Only modules matching BOTH the tag filter AND the prefix filter shall be included.
+
+**Input/Trigger:** `serve(registry, tags=["public"], prefix="api.")`.
+
+**Expected Output:** Only modules with "public" tag AND IDs starting with "api.".
+
+**Boundary Conditions:**
+- One filter matches no modules: Result is empty.
+- Both filters match different sets: Result is their intersection.
+
+**Error Conditions:** None.
+
+---
+
+### 3.12 FR-HEALTH: Health Check Requirements
+
+---
+
+#### FR-HEALTH-001: Expose /health endpoint on HTTP transports
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-HEALTH-001 |
+| **Title** | HTTP health check endpoint returns server status |
+| **Priority** | P2 |
+| **Traces to** | F-019 |
+
+**Description:** When the MCP Server runs with Streamable HTTP or SSE transport, a `GET /health` endpoint shall be available that returns HTTP 200 with a JSON body containing:
+- `"status"`: string, always `"ok"`.
+- `"module_count"`: integer, number of currently registered tools.
+- `"uptime_seconds"`: float, seconds since server start.
+
+**Input/Trigger:** HTTP `GET /health` request.
+
+**Expected Output:** HTTP 200, `Content-Type: application/json`, body: `{"status": "ok", "module_count": 5, "uptime_seconds": 123.45}`.
+
+**Boundary Conditions:**
+- Server just started (< 1 second uptime): `uptime_seconds` is a small positive float.
+- Zero tools registered: `module_count=0`.
+- Transport is stdio: Endpoint not available (not applicable).
+
+**Error Conditions:** None. The health endpoint shall always return HTTP 200 if the server is running.
+
+---
+
+#### FR-HEALTH-002: Health endpoint requires no authentication
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-HEALTH-002 |
+| **Title** | Health endpoint accessible without authentication |
+| **Priority** | P2 |
+| **Traces to** | F-019 |
+
+**Description:** The `/health` endpoint shall not require any authentication or authorization. It shall be accessible to any HTTP client.
+
+**Input/Trigger:** Unauthenticated `GET /health` request.
+
+**Expected Output:** HTTP 200 response (same as FR-HEALTH-001).
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+### 3.13 FR-RESOURCE: MCP Resource Requirements
+
+---
+
+#### FR-RESOURCE-001: Expose module documentation as MCP Resources
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-RESOURCE-001 |
+| **Title** | Modules with documentation exposed as MCP Resources |
+| **Priority** | P2 |
+| **Traces to** | F-020 |
+
+**Description:** Modules with a non-empty `documentation` field in their `ModuleDescriptor` shall be exposed as MCP Resources. Each resource shall be named `docs://{module_id}` and contain the documentation text as plain text content.
+
+**Input/Trigger:** MCP `resources/list` or `resources/read` request.
+
+**Expected Output:**
+- `resources/list`: Returns list of resources, one per module with documentation.
+- `resources/read` for `docs://image.resize`: Returns the documentation text.
+
+**Boundary Conditions:**
+- Module with `documentation=None`: No resource generated.
+- Module with `documentation=""` (empty string): No resource generated.
+- Module with non-empty documentation: Resource generated with URI `docs://{module_id}`.
+
+**Error Conditions:**
+- Read request for non-existent resource URI: Return MCP error "Resource not found".
+
+---
+
+#### FR-RESOURCE-002: Modules without documentation do not generate resources
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-RESOURCE-002 |
+| **Title** | No MCP Resource for modules lacking documentation |
+| **Priority** | P2 |
+| **Traces to** | F-020 |
+
+**Description:** Modules whose `ModuleDescriptor.documentation` is `None` or empty string `""` shall NOT produce an MCP Resource entry. Only modules with substantive documentation content shall appear in the resource list.
+
+**Input/Trigger:** Module with `documentation=None` or `documentation=""`.
+
+**Expected Output:** No resource entry for this module in `resources/list` response.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-STREAM-001: Streaming tool execution via notifications/progress
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-STREAM-001 |
+| **Title** | Streaming tool execution via notifications/progress |
+| **Priority** | P1 |
+
+**Description:** When ALL of these conditions are met:
+1. The Executor implements a `stream()` method
+2. The client provides `_meta.progressToken` in the `tools/call` request
+3. The module descriptor has `annotations.streaming = true`
+
+Then the server SHALL:
+1. Call `executor.stream(toolName, args)` instead of `executor.call(toolName, args)`
+2. For each yielded chunk, send `notifications/progress` with:
+   - `progressToken`: the client-provided token
+   - `progress`: monotonically increasing integer (1, 2, 3, ...)
+   - `message`: JSON-serialized chunk content
+3. After iteration completes, return a standard `CallToolResult` with the accumulated complete result
+
+When ANY condition is not met, fall back to normal atomic `executor.call()`.
+
+**Boundary Conditions:**
+- `progressToken` not provided: Normal atomic execution.
+- Executor has no `stream()`: Normal atomic execution.
+- Stream yields zero chunks: Return empty accumulated result `{}`.
+- Stream throws mid-iteration: Map error via `ErrorMapper`, return error result.
+
+---
+
+### 3.14 FR-EXT: Extension Helpers
+
+Extension helpers provide convenient wrappers for MCP-specific protocol features that module implementations can use during tool execution. These helpers abstract MCP protocol details so that module code does not need to interact with the MCP SDK directly.
+
+---
+
+#### FR-EXT-001: report_progress() sends MCP progress notifications
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXT-001 |
+| **Title** | report_progress() sends MCP progress notifications to the client |
+| **Priority** | P1 |
+| **Traces to** | F-005 |
+
+**Description:** The `report_progress(context, progress, total=None, message=None)` helper function shall send an MCP `notifications/progress` notification to the connected client. The `context` parameter is the MCP server request context (made available to module execution via the apcore context pipeline). The `progress` parameter is a numeric value indicating current progress. The optional `total` parameter indicates the total expected value (enabling percentage calculation). The optional `message` parameter provides a human-readable progress description.
+
+This function is a no-op (silently does nothing) when invoked outside an MCP context (e.g., when the module is called directly via `Executor.call()` without an MCP server).
+
+**Signature:**
+```python
+async def report_progress(
+    context: Any,
+    progress: float,
+    total: float | None = None,
+    message: str | None = None,
+) -> None: ...
+```
+
+**Input/Trigger:** Module implementation calls `await report_progress(context, 50, total=100, message="Processing image...")` during execution.
+
+**Expected Output:** MCP `notifications/progress` notification sent to the client with `progress=50`, `total=100`, and `message="Processing image..."`.
+
+**Boundary Conditions:**
+- `total=None`: Progress notification sent without total (client cannot compute percentage).
+- `message=None`: Progress notification sent without message text.
+- No active MCP context (e.g., direct Executor call): No-op, no error raised.
+- `progress` > `total`: Allowed (client may clamp or ignore).
+
+**Error Conditions:**
+- Silently no-ops when context has no MCP progress callback. No validation on progress value.
+
+---
+
+#### FR-EXT-002: elicit() solicits user input via MCP elicitation
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXT-002 |
+| **Title** | elicit() solicits user input from the MCP client |
+| **Priority** | P1 |
+| **Traces to** | F-005 |
+
+**Description:** The `elicit(context, message, requested_schema=None)` helper function shall send an MCP elicitation request to the connected client, soliciting user input. The `context` parameter is the MCP server request context. The `message` parameter is a human-readable prompt displayed to the user. The optional `requested_schema` parameter is a JSON Schema dict describing the expected shape of the user's response.
+
+The function returns the client's elicitation response. If the MCP client does not support elicitation or the user declines, the function returns `None`.
+
+Returns `None` when called outside MCP context (graceful no-op).
+
+**Signature:**
+```python
+async def elicit(
+    context: Any,
+    message: str,
+    requested_schema: dict[str, Any] | None = None,
+) -> Any | None: ...
+```
+
+**Input/Trigger:** Module implementation calls `await elicit(context, "Please confirm deletion", {"type": "object", "properties": {"confirmed": {"type": "boolean"}}})` during execution.
+
+**Expected Output:** MCP elicitation request sent to client. Returns the user's response dict (e.g., `{"confirmed": True}`) or `None` if declined/unsupported.
+
+**Boundary Conditions:**
+- `requested_schema=None`: Client presents a free-form input prompt.
+- Client does not support elicitation: Returns `None`.
+- User declines or cancels: Returns `None`.
+- Empty `message` (`""`): Allowed. No validation is performed on the message parameter.
+
+**Error Conditions:**
+- Called outside MCP context: Returns `None` (graceful no-op).
+
+---
+
+#### FR-EXT-003: MCP_PROGRESS_KEY and MCP_ELICIT_KEY constants
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXT-003 |
+| **Title** | Module-level constants for MCP context keys |
+| **Priority** | P1 |
+| **Traces to** | F-005 |
+
+**Description:** The `apcore_mcp` package shall export two string constants used as keys for storing MCP protocol objects in the apcore execution context:
+
+- `MCP_PROGRESS_KEY` -- The context key under which the MCP progress reporting capability is stored. Used internally by `report_progress()` to retrieve the progress notification sender from the execution context.
+- `MCP_ELICIT_KEY` -- The context key under which the MCP elicitation capability is stored. Used internally by `elicit()` to retrieve the elicitation sender from the execution context.
+
+These constants allow advanced users to access the underlying MCP protocol objects directly when the helper functions do not cover their use case, while providing a stable, documented key name.
+
+**Values:**
+```python
+MCP_PROGRESS_KEY: str = "_mcp_progress"
+MCP_ELICIT_KEY: str = "_mcp_elicit"
+```
+
+**Boundary Conditions:**
+- Constants are module-level and immutable (plain `str`).
+- Importing these constants does not require an active MCP server.
+
+**Error Conditions:** None.
+
+---
+
+### 3.15 FR-EXPLORER: MCP Tool Explorer Requirements
+
+The MCP Tool Explorer is an optional, built-in browser UI that allows developers to browse, inspect, and test MCP tools. It is only available with HTTP-based transports and must be explicitly enabled.
+
+---
+
+#### FR-EXPLORER-001: Serve Explorer UI when explorer=True
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXPLORER-001 |
+| **Title** | Serve Explorer HTML UI at `explorer_prefix` when enabled |
+| **Priority** | P2 |
+| **Traces to** | F-026 |
+
+**Description:** When `explorer=True` is passed to `serve()` (or `--explorer` on CLI) and the transport is HTTP-based (Streamable HTTP or SSE), the server SHALL mount a self-contained HTML page at `GET /explorer/` (or the configured `explorer_prefix`) that lists all registered tools with their descriptions and annotations. The `explorer_prefix` parameter is configurable (default `/explorer`).
+
+**Input/Trigger:** `serve(registry, transport="streamable-http", explorer=True)`
+
+**Expected Output:** `GET /explorer/` returns HTTP 200 with `Content-Type: text/html` containing the Explorer UI.
+
+**Boundary Conditions:**
+- `explorer=True` with stdio transport: Explorer is silently ignored (no HTTP server).
+- `explorer=False` (default): `GET /explorer/` is not mounted; server behaves as before.
+
+---
+
+#### FR-EXPLORER-002: JSON tool list endpoint
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXPLORER-002 |
+| **Title** | GET /explorer/tools returns JSON array of tool summaries |
+| **Priority** | P2 |
+| **Traces to** | F-026 |
+
+**Description:** When the Explorer is enabled, `GET /explorer/tools` SHALL return a JSON array where each element contains `name` (string), `description` (string), and `annotations` (object with hint booleans).
+
+**Expected Output:**
+```json
+[
+  {
+    "name": "image-resize",
+    "description": "Resize an image to specified dimensions",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  }
+]
+```
+
+---
+
+#### FR-EXPLORER-003: JSON tool detail endpoint
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXPLORER-003 |
+| **Title** | GET /explorer/tools/<name> returns full tool detail with inputSchema |
+| **Priority** | P2 |
+| **Traces to** | F-026 |
+
+**Description:** When the Explorer is enabled, `GET /explorer/tools/<name>` SHALL return a JSON object with full tool metadata including `name`, `description`, `annotations`, and `inputSchema`. Returns HTTP 404 if the tool name is not found.
+
+---
+
+#### FR-EXPLORER-004: Tool execution endpoint with allow_execute guard
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXPLORER-004 |
+| **Title** | POST /explorer/tools/<name>/call executes a tool via the Executor pipeline |
+| **Priority** | P2 |
+| **Traces to** | F-026 |
+
+**Description:** When the Explorer is enabled and `allow_execute=True`, `POST /explorer/tools/<name>/call` SHALL accept a JSON body as tool input, execute the tool through the full Executor pipeline (ACL, validation, middleware), and return the result as JSON. When `allow_execute=False` (default), this endpoint SHALL return HTTP 403.
+
+**Expected Output (success):**
+```json
+{"result": {"width": 800, "height": 600}}
+```
+
+**Error Conditions:**
+- `allow_execute=False`: HTTP 403 with `{"error": "Tool execution is disabled"}`.
+- Tool not found: HTTP 404 with `{"error": "Tool 'foo' not found"}`.
+- Validation failure: HTTP 400 with `{"error": "Input validation failed: ..."}`.
+- Execution error: HTTP 500 with `{"error": "..."}`.
+
+---
+
+#### FR-EXPLORER-005: Self-contained HTML asset with no external dependencies
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXPLORER-005 |
+| **Title** | Explorer HTML/JS is a single self-contained file |
+| **Priority** | P2 |
+| **Traces to** | F-026 |
+
+**Description:** The Explorer UI SHALL be a single HTML file with inline CSS and JavaScript, with no external CDN dependencies. This file is language-agnostic and can be shared across all `apcore-mcp-{lang}` implementations. Each language implementation embeds this file as a static asset in its package.
+
+---
+
+#### FR-EXPLORER-006: Configurable explorer_prefix parameter
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXPLORER-006 |
+| **Title** | `explorer_prefix` parameter configurable with default `/explorer` |
+| **Priority** | P2 |
+| **Traces to** | F-026 |
+
+**Description:** The `serve()` function SHALL accept an `explorer_prefix` parameter (default `/explorer`) that controls the URL prefix under which all Explorer endpoints are mounted. When set to a custom value (e.g., `/custom`), endpoints SHALL be available at `GET /custom/`, `GET /custom/tools`, `GET /custom/tools/<name>`, and `POST /custom/tools/<name>/call`.
+
+**Input/Trigger:** `serve(registry, transport="streamable-http", explorer=True, explorer_prefix="/custom")`
+
+**Expected Output:** All Explorer endpoints are mounted under `/custom/` instead of the default `/explorer/`.
+
+**Boundary Conditions:**
+- Default value is `/explorer`.
+- Prefix must start with `/`.
+- Trailing slash is normalized (both `/explorer` and `/explorer/` are accepted).
+
+### 3.16 FR-AUTH: JWT Authentication Requirements
+
+#### FR-AUTH-001: Authenticator Protocol
+
+**Description:** A `@runtime_checkable` Protocol `Authenticator` defines the interface for pluggable authentication backends.
+
+**Interface:**
+```
+async Authenticator.authenticate(headers: dict[str, str]) -> Identity | None
+```
+
+**Behavior:** Async. Accepts lowercase header keys. Returns `Identity` on success, `None` on failure. Must not raise exceptions. (Unified across Python/TypeScript/Rust per JWT-1: Python's `Authenticator.authenticate` is now `async`; legacy sync implementations are bridged transparently via the `call_authenticator(auth, headers)` helper which detects coroutine returns.)
+
+---
+
+#### FR-AUTH-002: JWTAuthenticator
+
+**Description:** Built-in JWT Bearer token authenticator using a JWT validation library (e.g., PyJWT for Python, jsonwebtoken for TypeScript).
+
+**Configuration:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `key` | `str` | (required) | Secret key or public key for verification |
+| `algorithms` | `list[str]` | `["HS256"]` | Allowed JWT algorithms |
+| `audience` | `str \| None` | `None` | Expected `aud` claim |
+| `issuer` | `str \| None` | `None` | Expected `iss` claim |
+| `claim_mapping` | `ClaimMapping` | `ClaimMapping()` | Maps JWT claims to Identity fields |
+| `require_claims` | `list[str]` | `["sub"]` | Claims that must be present |
+
+**ClaimMapping fields:** `id_claim="sub"`, `type_claim="type"`, `roles_claim="roles"`, `attrs_claims=None`.
+
+**Behavior:**
+1. `JWTAuthenticator.authenticate` is **async** (post-JWT-1) — `async def authenticate(headers: dict[str, str]) -> Identity | None` in Python; `async authenticate(headers: Record<string, string>): Promise<Identity | null>` in TypeScript; `async fn authenticate(&self, headers: &HashMap<String, String>) -> Option<Identity>` in Rust.
+2. Extracts Bearer token from `Authorization` header (case-insensitive prefix).
+3. Decodes and validates token using a JWT library, with a 30-second clock-skew leeway (post-JWT-3).
+4. Maps claims to `Identity(id, type, roles, attrs)`.
+5. Returns `None` on any error (expired, bad signature, missing claims) -- never leaks token content.
+
+---
+
+#### FR-AUTH-003: AuthMiddleware
+
+**Description:** ASGI middleware that validates requests and bridges identity to MCP handler via `ContextVar`.
+
+**Configuration:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `app` | ASGI app | (required) | The wrapped application |
+| `authenticator` | `Authenticator` | (required) | Authentication backend |
+| `exempt_paths` | `set[str]` | `{"/health", "/metrics"}` | Paths that bypass auth |
+| `exempt_prefixes` | `set[str]` | `{}` | Path prefixes that bypass auth |
+| `require_auth` | `bool` | `True` | If False, unauthenticated requests proceed without identity |
+
+**Behavior:**
+1. Non-HTTP scopes (WebSocket, lifespan) pass through without authentication.
+2. Exempt paths pass through without authentication.
+3. Extracts headers from ASGI scope, calls `authenticator.authenticate(headers)`.
+4. On success: sets `auth_identity_var` ContextVar, forwards request, resets in `finally`.
+5. On failure + `require_auth=True`: returns 401 JSON with `WWW-Authenticate: Bearer`.
+6. On failure + `require_auth=False`: forwards without identity (permissive mode).
+
+---
+
+#### FR-AUTH-004: Identity Pipeline Integration
+
+**Description:** The authenticated identity flows from middleware through factory to router to Context.
+
+**Data Flow:**
+1. `AuthMiddleware` sets `auth_identity_var: ContextVar[Identity | None]`.
+2. `MCPServerFactory.handle_call_tool` reads `auth_identity_var.get()`, adds to `extra["identity"]`.
+3. `ExecutionRouter.handle_call` extracts `identity = extra.get("identity")`, passes to `Context.create(identity=identity)`.
+4. `Executor.call_async()` receives Context with Identity -- ACL conditions (`identity_types`, `roles`) are now effective.
+
+---
+
+#### FR-AUTH-005: serve() and MCPServer authenticator Parameter
+
+**Description:** Both `serve()` and `MCPServer.__init__()` accept an optional `authenticator` parameter. When provided with an HTTP transport, `AuthMiddleware` is applied to the Starlette app.
+
+**Behavior:**
+1. `authenticator` is ignored for stdio transport (no HTTP layer).
+2. For HTTP transports, middleware list is built as `[(AuthMiddleware, {"authenticator": authenticator})]` and passed to transport manager.
+
+---
+
+#### FR-AUTH-006: CLI JWT Flags
+
+**Description:** The CLI entry point provides flags for JWT configuration.
+
+**Flags:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--jwt-secret` | `str` | `None` | JWT secret key; enables JWT auth when set |
+| `--jwt-algorithm` | `str` | `"HS256"` | JWT algorithm |
+| `--jwt-audience` | `str` | `None` | Expected audience claim |
+| `--jwt-issuer` | `str` | `None` | Expected issuer claim |
+| `--jwt-key-file` | `path` | `None` | Path to PEM key file for JWT verification (Python only) |
+| `--jwt-require-auth` / `--no-jwt-require-auth` | `bool` | `True` | Require JWT auth; `False` enables permissive mode |
+| `--exempt-paths` | `str` | `None` | Comma-separated paths exempt from auth |
+
+**Behavior:** When `--jwt-secret` (or `--jwt-key-file` in Python, or `APCORE_JWT_SECRET` env var) is provided, a `JWTAuthenticator` is created and passed to `serve(authenticator=...)`. Key resolution order: `--jwt-key-file` → `--jwt-secret` → `APCORE_JWT_SECRET` env var.
+
+---
+
+#### FR-AUTH-007: Explorer Authentication
+
+**Description:** Explorer endpoints have a dual auth pattern: browsing is exempt from middleware, but tool execution enforces auth independently.
+
+**Behavior:**
+1. Explorer GET endpoints (page, tool list, tool detail) are exempt from auth middleware via `exempt_prefixes`.
+2. Explorer POST `/explorer/tools/<name>/call` authenticates per-request when `authenticator` is provided to the Explorer handler.
+3. On auth failure, returns 401 JSON with `WWW-Authenticate: Bearer` header.
+4. On auth success, sets `auth_identity_var` ContextVar for identity injection into the execution context.
+5. When no authenticator is configured, tool execution proceeds without authentication.
+
+---
+
+### 3.17 FR-APPROVAL: Approval System Requirements (F-028)
+
+---
+
+#### FR-APPROVAL-001: ElicitationApprovalHandler
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-APPROVAL-001 |
+| **Title** | ElicitationApprovalHandler bridges MCP elicitation to apcore approval system |
+| **Priority** | P2 |
+| **Traces to** | F-028 |
+
+**Description:** `ElicitationApprovalHandler` implements the `ApprovalHandler` protocol. It extracts the MCP elicit callback from `context.data[MCP_ELICIT_KEY]`, builds an approval message containing `moduleId`, `description`, and `arguments`, calls the elicit callback, and maps the response action to an `ApprovalResult`.
+
+**Input/Trigger:** `requestApproval(request: ApprovalRequest)` called by the Executor approval gate.
+
+**Expected Output:**
+- `action == "accept"` → `ApprovalResult(status="approved")`
+- Any other action → `ApprovalResult(status="rejected", reason="User action: {action}")`
+- No context/callback → `ApprovalResult(status="rejected", reason="No context available...")`
+- Callback throws → `ApprovalResult(status="rejected", reason="Elicitation request failed")`
+
+**Boundary Conditions:**
+- `context` is null or missing `data` → returns rejected
+- Elicit callback is absent from `data` → returns rejected
+- Elicit callback returns null → returns rejected
+- `description` is null → substituted with empty string in message
+
+**Error Conditions:** Never throws. All failure paths return rejected `ApprovalResult`.
+
+---
+
+#### FR-APPROVAL-002: Approval Error Codes
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-APPROVAL-002 |
+| **Title** | Three approval error codes added to ERROR_CODES / ErrorCodes |
+| **Priority** | P2 |
+| **Traces to** | F-028 |
+
+**Description:** `APPROVAL_DENIED`, `APPROVAL_TIMEOUT`, `APPROVAL_PENDING` are added to the error code constants. `ErrorMapper` handles each with specific behavior.
+
+**Input/Trigger:** ModuleError with code matching an approval error code.
+
+**Expected Output:**
+- `APPROVAL_PENDING`: Details narrowed to `{"approvalId": ...}` only. If no `approval_id`/`approvalId` in details, details set to null.
+- `APPROVAL_TIMEOUT`: `retryable: true` set on response. Details passed through.
+- `APPROVAL_DENIED`: `reason` extracted from details. If present, details set to `{"reason": ...}`. Otherwise details passed through.
+
+**Boundary Conditions:**
+- `APPROVAL_PENDING` with no `approval_id` key → `details: null`
+- `APPROVAL_DENIED` with no `reason` key → original details passed through
+- AI guidance fields from the error are also extracted and attached
+
+**Error Conditions:** None.
+
+---
+
+#### FR-APPROVAL-003: CLI --approval Flag
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-APPROVAL-003 |
+| **Title** | CLI --approval flag with four modes |
+| **Priority** | P2 |
+| **Traces to** | F-028 |
+
+**Description:** The CLI accepts `--approval <mode>` with choices: `elicit`, `auto-approve`, `always-deny`, `off` (default). The handler is passed to `serve()` as `approval_handler`/`approvalHandler`.
+
+**Input/Trigger:** CLI argument `--approval <mode>`.
+
+**Expected Output:**
+- `elicit` → `ElicitationApprovalHandler()` instance
+- `auto-approve` → `AutoApproveHandler()` from upstream `apcore`/`apcore-js`
+- `always-deny` → `AlwaysDenyHandler()` from upstream `apcore`/`apcore-js`
+- `off` → no handler (undefined/None)
+
+**Boundary Conditions:**
+- Invalid mode value → error with valid choices listed
+- `auto-approve`/`always-deny` when upstream library doesn't export the handler → descriptive error
+
+**Error Conditions:** Exits with error for invalid mode or missing upstream exports.
+
+---
+
+### 3.18 FR-AIGUIDANCE: AI Guidance & Intent Requirements (F-029, F-030, F-031)
+
+---
+
+#### FR-AIGUIDANCE-001: AI Guidance Field Extraction
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-AIGUIDANCE-001 |
+| **Title** | ErrorMapper extracts AI guidance fields from ModuleError and maps to camelCase |
+| **Priority** | P2 |
+| **Traces to** | F-029 |
+
+**Description:** `ErrorMapper._attachAiGuidance()` reads `retryable`, `ai_guidance`, `user_fixable`, `suggestion` from the error object and writes them as `retryable`, `aiGuidance`, `userFixable`, `suggestion` (camelCase) on the MCP error response. Fields that are null/undefined or already set on the response are skipped.
+
+**Input/Trigger:** Any ModuleError processed through `toMcpError()` (except internal/sanitized errors).
+
+**Expected Output:** Non-null AI guidance fields appear as camelCase keys on the response dict/object.
+
+**Boundary Conditions:**
+- All four fields absent → no guidance fields on response
+- Field already set (e.g., `retryable: true` on APPROVAL_TIMEOUT) → not overwritten
+- Python reads snake_case from apcore, writes camelCase. TypeScript reads/writes camelCase.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-AIGUIDANCE-002: AI Guidance in Error Text
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-AIGUIDANCE-002 |
+| **Title** | Router appends AI guidance JSON to error text for agent parsing |
+| **Priority** | P2 |
+| **Traces to** | F-029 |
+
+**Description:** `ExecutionRouter._buildErrorText(errorInfo)` builds a text string from the error message. If any guidance fields are present (`retryable`, `aiGuidance`, `userFixable`, `suggestion`), they are collected into an object and JSON-stringified, then appended to the message with a `\n\n` separator.
+
+**Input/Trigger:** Error response from ErrorMapper passed to `_buildErrorText()`.
+
+**Expected Output:**
+- With guidance: `"Error message\n\n{\"retryable\":true,\"aiGuidance\":\"...\"}"``
+- Without guidance: `"Error message"` (plain, no JSON appendix)
+
+**Boundary Conditions:**
+- Empty guidance object (all fields undefined) → plain message, no JSON
+- Guidance keys use camelCase in both Python and TypeScript output
+
+**Error Conditions:** None.
+
+---
+
+#### FR-AIGUIDANCE-003: AI Intent Metadata in Tool Descriptions
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-AIGUIDANCE-003 |
+| **Title** | MCPServerFactory appends AI intent metadata from descriptor.metadata to descriptions |
+| **Priority** | P2 |
+| **Traces to** | F-030 |
+
+**Description:** `MCPServerFactory.buildTool()` reads `descriptor.metadata` for keys `x-when-to-use`, `x-when-not-to-use`, `x-common-mistakes`, `x-workflow-hints`. For each key with a non-empty string value, a labeled line is generated and appended to the tool description.
+
+**Input/Trigger:** `buildTool(descriptor)` where `descriptor.metadata` contains one or more intent keys.
+
+**Expected Output:** Description extended with `\n\n` separator followed by labeled lines:
+```
+Original description
+
+When To Use: ...
+When Not To Use: ...
+Common Mistakes: ...
+Workflow Hints: ...
+```
+
+**Boundary Conditions:**
+- No metadata → description unchanged
+- Non-string values (number, null, array) → silently ignored
+- Empty string values → treated as falsy, ignored
+
+**Error Conditions:** None.
+
+---
+
+#### FR-AIGUIDANCE-004: Streaming Annotation in Description Suffix
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-AIGUIDANCE-004 |
+| **Title** | AnnotationMapper includes streaming field in description suffix |
+| **Priority** | P2 |
+| **Traces to** | F-031 |
+
+**Description:** `AnnotationMapper.toDescriptionSuffix()` includes `streaming=true` when `annotations.streaming` differs from the default value (`false`). The `streaming` field is added to the defaults dict with value `false`.
+
+**Input/Trigger:** `toDescriptionSuffix(annotations)` where `annotations.streaming == true`.
+
+**Expected Output:** `streaming=true` appended to the `[Annotations: ...]` suffix.
+
+**Boundary Conditions:**
+- `streaming == false` (default) → not included in suffix
+- `annotations == null` → empty string returned (unchanged behavior)
+
+**Error Conditions:** None.
+
+---
+
+### 3.19 FR-STRATEGY: Pipeline Strategy Requirements (F-036)
+
+---
+
+#### FR-STRATEGY-001: serve() accepts strategy parameter
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-STRATEGY-001 |
+| **Title** | serve() accepts pipeline strategy parameter |
+| **Priority** | P1 |
+| **Traces to** | F-036 |
+
+**Description:** `serve()` shall accept an optional `strategy: str | None` parameter. When a `Registry` is provided (not an `Executor`), the strategy name is passed to `Executor(registry, strategy=strategy)`. Valid values: `"standard"`, `"internal"`, `"testing"`, `"performance"`, `"minimal"`, `None` (defaults to `"standard"`).
+
+**Input/Trigger:** `serve(registry, strategy="testing")`.
+
+**Expected Output:** Executor created with the `"testing"` preset strategy (no ACL, approval, or call-chain guard steps).
+
+**Boundary Conditions:**
+- `strategy=None` → uses `"standard"` (full 11-step pipeline).
+- `serve(executor, strategy="testing")` → logs WARNING "strategy parameter ignored when Executor is provided"; uses the Executor's own strategy.
+- Invalid strategy name → raises `ValueError` with message listing valid choices.
+
+**Error Conditions:**
+- `ValueError` for invalid strategy names.
+
+---
+
+#### FR-STRATEGY-002: async_serve() accepts strategy parameter
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-STRATEGY-002 |
+| **Title** | async_serve() accepts pipeline strategy parameter |
+| **Priority** | P1 |
+| **Traces to** | F-036 |
+
+**Description:** `async_serve()` shall accept the same `strategy` parameter as `serve()` with identical behavior.
+
+**Input/Trigger:** `async with async_serve(registry, strategy="performance") as app: ...`
+
+**Expected Output:** Executor created with the `"performance"` preset strategy (no middleware steps).
+
+**Boundary Conditions:** Same as FR-STRATEGY-001.
+
+**Error Conditions:** Same as FR-STRATEGY-001.
+
+---
+
+#### FR-STRATEGY-003: CLI --strategy flag
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-STRATEGY-003 |
+| **Title** | CLI accepts --strategy flag for pipeline strategy selection |
+| **Priority** | P1 |
+| **Traces to** | F-036 |
+
+**Description:** The CLI shall accept `--strategy {standard,internal,testing,performance}`. The selected strategy is passed to `serve()`. Default: `standard`.
+
+**Input/Trigger:** `python -m apcore_mcp --extensions-dir ./modules --strategy testing`.
+
+**Expected Output:** Server starts with the testing strategy.
+
+**Boundary Conditions:**
+- Omitted → default `"standard"`.
+- Invalid value → argparse error with valid choices, exit code 2.
+
+**Error Conditions:** argparse validation error.
+
+---
+
+#### FR-STRATEGY-004: Config Bus mcp.pipeline.strategy
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-STRATEGY-004 |
+| **Title** | Config Bus mcp.pipeline.strategy for strategy selection |
+| **Priority** | P2 |
+| **Traces to** | F-036, F-033 |
+
+**Description:** When no `strategy` parameter is provided to `serve()` or CLI, the strategy shall be read from Config Bus key `mcp.pipeline.strategy`. Explicit parameter or CLI flag overrides Config Bus value.
+
+**Input/Trigger:** `apcore.yaml` with `mcp: { pipeline: { strategy: "internal" } }`.
+
+**Expected Output:** Executor created with `"internal"` strategy when no explicit parameter.
+
+**Boundary Conditions:**
+- Config Bus key missing → uses `"standard"`.
+- CLI `--strategy` overrides Config Bus value.
+
+**Error Conditions:** Invalid Config Bus value → `ValueError` at startup.
+
+---
+
+### 3.20 FR-TRACE: Pipeline Observability Requirements (F-037)
+
+---
+
+#### FR-TRACE-001: ExecutionRouter uses call_async_with_trace() when trace enabled
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRACE-001 |
+| **Title** | ExecutionRouter uses call_async_with_trace() in trace mode |
+| **Priority** | P2 |
+| **Traces to** | F-037 |
+
+**Description:** When `serve(trace=True)`, the `ExecutionRouter` shall call `Executor.call_async_with_trace(module_id, inputs)` instead of `call_async()`, capturing the returned `PipelineTrace` alongside the output dict.
+
+**Input/Trigger:** Tool call with trace mode enabled.
+
+**Expected Output:** Both output dict and `PipelineTrace` captured.
+
+**Boundary Conditions:**
+- `trace=False` (default) → uses `call_async()` with no trace overhead.
+
+**Error Conditions:** Same as standard `call_async()` error handling.
+
+---
+
+#### FR-TRACE-002: Trace data in CallToolResult _meta
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRACE-002 |
+| **Title** | PipelineTrace included in MCP response _meta.trace |
+| **Priority** | P2 |
+| **Traces to** | F-037 |
+
+**Description:** When trace mode is enabled, the `CallToolResult` shall include `_meta.trace` containing: `strategy_name` (str), `total_duration_ms` (float), and `steps` (list of `{name, duration_ms, skipped, skip_reason}`).
+
+**Input/Trigger:** Successful tool call with trace mode enabled.
+
+**Expected Output:**
+```json
+{
+  "_meta": {
+    "trace": {
+      "strategy_name": "standard",
+      "total_duration_ms": 42.5,
+      "steps": [
+        {"name": "context_creation", "duration_ms": 0.3, "skipped": false, "skip_reason": null},
+        {"name": "call_chain_guard", "duration_ms": 0.1, "skipped": false, "skip_reason": null}
+      ]
+    }
+  }
+}
+```
+
+**Boundary Conditions:**
+- Skipped steps include `skip_reason` (`"no_match"`, `"dry_run"`, `"error_ignored"`).
+- Trace data excludes input/output values (security).
+
+**Error Conditions:** None (trace is best-effort; errors in trace formatting do not affect tool result).
+
+---
+
+#### FR-TRACE-003: Trace data in Explorer execution response
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRACE-003 |
+| **Title** | Explorer execution response includes PipelineTrace |
+| **Priority** | P2 |
+| **Traces to** | F-037, F-026 |
+
+**Description:** When Explorer is enabled with `allow_execute=True` and trace mode is enabled, the `POST /explorer/tools/<name>/call` response JSON shall include a `trace` key with the `PipelineTrace` data.
+
+**Input/Trigger:** `POST /explorer/tools/image.resize/call` with trace mode enabled.
+
+**Expected Output:** JSON response with `result` and `trace` keys.
+
+**Boundary Conditions:**
+- Trace mode disabled → no `trace` key in response.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-TRACE-004: Trace data sent to MetricsCollector
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-TRACE-004 |
+| **Title** | Per-step timing reported to MetricsCollector |
+| **Priority** | P2 |
+| **Traces to** | F-037, F-022 |
+
+**Description:** When `metrics_collector` is provided and trace mode is enabled, per-step `duration_ms` values from `PipelineTrace` shall be reported to the collector as metric events.
+
+**Input/Trigger:** Tool call with trace mode and metrics_collector both enabled.
+
+**Expected Output:** Metric events emitted per step: `apcore_mcp.pipeline.step.duration_ms{step="context_creation"} = 0.3`.
+
+**Boundary Conditions:**
+- `metrics_collector` is `None` → no-op.
+- Trace mode disabled → no metrics emitted (call_async discards trace).
+
+**Error Conditions:** MetricsCollector exceptions logged at WARNING; do not fail tool call.
+
+---
+
+### 3.21 FR-REDACT: Output Redaction Requirements (F-038)
+
+---
+
+#### FR-REDACT-001: ExecutionRouter applies redact_sensitive() before serialization
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-REDACT-001 |
+| **Title** | Sensitive output fields redacted before MCP serialization |
+| **Priority** | P1 |
+| **Traces to** | F-038 |
+
+**Description:** When `redact_output=True` (default), the `ExecutionRouter` shall call `redact_sensitive(output, output_schema)` on the module output dict before `json.dumps()` serialization. Fields marked with `x-sensitive: true` in the module's `output_schema` shall have their values replaced with `"***REDACTED***"`.
+
+**Input/Trigger:** Module output `{"token": "secret123", "status": "ok"}` with `output_schema.properties.token["x-sensitive"] = true`.
+
+**Expected Output:** MCP response text: `{"token": "***REDACTED***", "status": "ok"}`.
+
+**Boundary Conditions:**
+- Empty `output_schema` `{}` → still passed to `redact_sensitive()`. No field is redacted *by schema* (there is nothing marked `x-sensitive`), but the prefix rule of FR-REDACT-002 still applies: `_secret_*` keys are masked. Do not read this row as "redaction is skipped".
+- Module with no `output_schema` at all (the schema map has no entry for the tool) → redaction is skipped entirely and the output is returned unchanged.
+- Nested objects → recursive schema traversal.
+
+**Error Conditions:** Redaction failure (malformed schema) → log WARNING, return unredacted output (fail-open for availability, log for audit).
+
+---
+
+#### FR-REDACT-002: _secret_ prefix keys redacted
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-REDACT-002 |
+| **Title** | Keys matching _secret_* prefix redacted regardless of schema |
+| **Priority** | P1 |
+| **Traces to** | F-038 |
+
+**Description:** Output dict keys matching the pattern `_secret_*` shall have their values replaced with `"***REDACTED***"` regardless of whether the `output_schema` marks them as sensitive.
+
+**Input/Trigger:** Output `{"_secret_api_key": "sk-abc123", "count": 5}`.
+
+**Expected Output:** `{"_secret_api_key": "***REDACTED***", "count": 5}`.
+
+**Boundary Conditions:**
+- Only top-level and nested keys matching `_secret_*` prefix are affected.
+- `redact_output=False` → no redaction of any kind.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-REDACT-003: serve() and async_serve() accept redact_output parameter
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-REDACT-003 |
+| **Title** | serve() and async_serve() accept redact_output parameter |
+| **Priority** | P1 |
+| **Traces to** | F-038 |
+
+**Description:** Both `serve()` and `async_serve()` shall accept `redact_output: bool = True`. When `True`, output redaction is applied. When `False`, output is serialized as-is.
+
+**Input/Trigger:** `serve(registry, redact_output=False)`.
+
+**Expected Output:** No output redaction performed; sensitive fields pass through to MCP client.
+
+**Boundary Conditions:**
+- Default is `True` (secure by default).
+
+**Error Conditions:** None.
+
+---
+
+### 3.22 FR-PREFLIGHT: Preflight Validation Requirements (F-039)
+
+---
+
+#### FR-PREFLIGHT-001: ExecutionRouter.validate_tool() method
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-PREFLIGHT-001 |
+| **Title** | ExecutionRouter provides validate_tool() for dry-run validation |
+| **Priority** | P2 |
+| **Traces to** | F-039 |
+
+**Description:** `ExecutionRouter` shall provide `validate_tool(tool_name, arguments)`, which calls `Executor.validate(module_id, inputs)` and **projects the upstream `PreflightResult` into a plain dict** — `{valid: bool, checks: [{check, passed, error, warnings}], requires_approval: bool}` — with per-check pass/fail for module_id, call_chain, acl and schema. `PreflightResult` is an apcore type; no SDK re-exports it and no bridge method returns it. Python's `validate_tool` is **synchronous**; TypeScript's `validateTool` and Rust's `validate_tool` are async. When the executor does not implement `validate()` at all, all three return `{valid: true, checks: [], requires_approval: false}` — a validate-less executor has nothing to object to.
+
+**Input/Trigger:** `router.validate_tool("image.resize", {"width": 800})`.
+
+**Expected Output:** `{"valid": True, "checks": [...], "requires_approval": False}`.
+
+**Boundary Conditions:**
+- Non-existent module → `{"valid": False, "checks": [{"check": "module_lookup", "passed": False, ...}]}`.
+- Invalid inputs → `{"valid": False, "checks": [..., {"check": "schema", "passed": False, "error": {...}}]}`.
+
+**Error Conditions:** Unexpected exceptions → caught and returned as failed check.
+
+---
+
+#### FR-PREFLIGHT-002: Explorer validate endpoint
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-PREFLIGHT-002 |
+| **Title** | Explorer POST /validate endpoint for dry-run validation |
+| **Priority** | P2 |
+| **Traces to** | F-039, F-026 |
+
+**Description:** When Explorer is enabled, `POST /explorer/tools/<name>/validate` shall accept a JSON body with tool arguments, call `validate_tool()`, and return its projected dict as JSON.
+
+**Input/Trigger:** `POST /explorer/tools/image.resize/validate` with body `{"width": "not_a_number"}`.
+
+**Expected Output:** HTTP 200 with JSON `{"valid": false, "checks": [...], "requires_approval": false}`.
+
+**Boundary Conditions:**
+- Available when `explorer=True` regardless of `allow_execute` setting (validation is read-only).
+- Explorer disabled → 404.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-PREFLIGHT-003: Validation executes only pure steps
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-PREFLIGHT-003 |
+| **Title** | Preflight validation executes no side-effect steps |
+| **Priority** | P2 |
+| **Traces to** | F-039 |
+
+**Description:** `Executor.validate()` uses `dry_run=True` which skips all `pure=False` steps (approval_gate, middleware_before, execute, middleware_after). Only pure steps execute: context_creation, call_chain_guard, module_lookup, acl_check, input_validation, output_validation, return_result.
+
+**Input/Trigger:** `validate_tool()` on a module with side effects in its `execute()`.
+
+**Expected Output:** No module execution occurs; only schema and ACL checks are performed.
+
+**Boundary Conditions:** None.
+
+**Error Conditions:** None.
+
+---
+
+### 3.23 FR-YAMLPIPE: YAML Pipeline Configuration Requirements (F-040)
+
+---
+
+#### FR-YAMLPIPE-001: Config Bus mcp.pipeline section parsed at startup
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-YAMLPIPE-001 |
+| **Title** | mcp.pipeline Config Bus section configures pipeline strategy |
+| **Priority** | P2 |
+| **Traces to** | F-040, F-033 |
+
+**Description:** At startup, apcore-mcp shall check for a `mcp.pipeline` section in the Config Bus. When present, it shall call `build_strategy_from_config(pipeline_config, registry=..., config=..., acl=..., ...)` to build a custom `ExecutionStrategy`. This strategy is used for all tool calls.
+
+**Input/Trigger:** `apcore.yaml`:
+```yaml
+mcp:
+  pipeline:
+    remove: ["acl_check"]
+    configure:
+      input_validation:
+        timeout_ms: 5000
+```
+
+**Expected Output:** Pipeline strategy with ACL step removed and input_validation timeout set to 5000ms.
+
+**Boundary Conditions:**
+- `mcp.pipeline` absent → default strategy used.
+- When both `strategy` parameter and `mcp.pipeline` are present, YAML pipeline config takes precedence (WARNING logged).
+
+**Error Conditions:** Invalid pipeline config → `ValueError` at startup with descriptive message.
+
+---
+
+#### FR-YAMLPIPE-002: Pipeline step removal via YAML
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-YAMLPIPE-002 |
+| **Title** | YAML pipeline config supports step removal |
+| **Priority** | P2 |
+| **Traces to** | F-040 |
+
+**Description:** The `remove` key in `mcp.pipeline` shall accept a list of step names to remove from the pipeline. Only removable steps can be removed (`removable=True`); attempting to remove a non-removable step (e.g., `context_creation`, `execute`) raises `StepNotRemovableError`.
+
+**Input/Trigger:** `mcp.pipeline.remove: ["acl_check", "approval_gate"]`.
+
+**Expected Output:** Pipeline without ACL check and approval gate steps.
+
+**Boundary Conditions:**
+- Empty `remove` list → no steps removed.
+- Non-existent step name → `StepNotFoundError`.
+
+**Error Conditions:** `StepNotRemovableError`, `StepNotFoundError`.
+
+---
+
+#### FR-YAMLPIPE-003: Pipeline step configuration override via YAML
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-YAMLPIPE-003 |
+| **Title** | YAML pipeline config supports step field overrides |
+| **Priority** | P2 |
+| **Traces to** | F-040 |
+
+**Description:** The `configure` key in `mcp.pipeline` shall accept a dict of step names to configuration overrides. Supported override fields: `timeout_ms`, `ignore_errors`, `match_modules`.
+
+**Input/Trigger:** `mcp.pipeline.configure: { execute: { timeout_ms: 10000 } }`.
+
+**Expected Output:** Execute step timeout overridden to 10000ms.
+
+**Boundary Conditions:**
+- Unknown step name → `StepNotFoundError`.
+- Unknown config field → ignored with WARNING log.
+
+**Error Conditions:** `StepNotFoundError`.
+
+---
+
+### 3.24 FR-EXTRAANNOT: Annotation Metadata Passthrough Requirements (F-041)
+
+---
+
+#### FR-EXTRAANNOT-001: AnnotationMapper reads mcp_ prefixed keys from extra
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXTRAANNOT-001 |
+| **Title** | mcp_ prefixed keys from annotations.extra flow to tool description |
+| **Priority** | P2 |
+| **Traces to** | F-041 |
+
+**Description:** The `AnnotationMapper` shall read `ModuleAnnotations.extra` keys prefixed with `mcp_`, strip the prefix, and append them to the tool description suffix as labeled lines (e.g., `\ncategory: image`).
+
+**Input/Trigger:** `annotations = ModuleAnnotations(extra={"mcp_category": "image", "mcp_cost": "high", "internal_flag": "x"})`.
+
+**Expected Output:** Description suffix includes `\ncategory: image\ncost: high`. The key `internal_flag` is ignored (no `mcp_` prefix).
+
+**Boundary Conditions:**
+- Empty `extra` or no `mcp_` keys → no change to description.
+- Non-string values → silently ignored.
+- `annotations` is `None` → no change.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-EXTRAANNOT-002: Explorer displays extra annotation metadata
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-EXTRAANNOT-002 |
+| **Title** | Explorer tool detail view shows mcp_ extra metadata |
+| **Priority** | P2 |
+| **Traces to** | F-041, F-026 |
+
+**Description:** The MCP Tool Explorer detail view for a tool shall display any `mcp_` extra annotation metadata as labeled fields.
+
+**Input/Trigger:** Tool with `annotations.extra = {"mcp_category": "image"}`.
+
+**Expected Output:** Explorer detail shows `category: image` in the annotations section.
+
+**Boundary Conditions:**
+- No `mcp_` keys → annotations section shows standard fields only.
+
+**Error Conditions:** None.
+
+---
+
+### 3.25 FR-ACL: ACL Builder Requirements (F-052, F-053)
+
+#### FR-ACL-001: Reject a pattern array outside PROTOCOL_SPEC §6.2.1's closed shape
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ACL-001 |
+| **Title** | `mcp.acl` refuses an operand-less, empty-string or off-index-operator pattern array |
+| **Priority** | P0 |
+| **Traces to** | F-052 |
+
+**Description:** `build_acl_from_config` shall refuse every `callers` / `targets` value outside §6.2.1's closed shape: an empty array, `["$or"]`, `["$not"]`, `["$not", p1, p2, …]`, an array containing an empty pattern string, and an array carrying `$or` or `$not` at any index other than 0. Rejection shall occur at build time, before `serve()` binds a transport. Detection of a reserved token is by string equality only — a pattern that merely begins with `$` (`$orders.*`) is an ordinary pattern and shall load.
+
+**Input/Trigger:** `mcp.acl.rules[0].targets = ["$not", "secrets.a", "secrets.b"]`.
+
+**Expected Output:** A startup error whose message begins `mcp.acl.rules[0] ` and preserves apcore's §6.2.1 reason after the prefix.
+
+**Boundary Conditions:**
+- `["$or", "a"]` — exactly one operand — is accepted. The rule is *at least* one, not at least two.
+- `["$orders.*"]` is accepted.
+- A non-list `callers` (e.g. the bare string `"admin.*"`) is a §6.1.4.1 *type* fault, not a shape fault: it is not refused at the door, and apcore classifies the rule UNEVALUABLE at `check()` time.
+
+**Error Conditions:**
+- Rejection raises the bridge's own documented type (`ValueError` / `Error` / `ConfigError`), never apcore's `ACLRuleError` raw — see FR-ACL-003.
+
+---
+
+#### FR-ACL-002: Per-rule validation follows §6.2.1's normative order
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ACL-002 |
+| **Title** | `effect` → `approval` → `callers` → `targets`, with `default_effect` ahead of every rule |
+| **Priority** | P0 |
+| **Traces to** | F-052 |
+
+**Description:** For a rule faulty on more than one axis, `build_acl_from_config` shall report the first fault in §6.2.1's order — `effect`, then `approval`, then `callers`, then `targets` — with the rule index dominating all three, and shall judge `default_effect` ahead of the rule list entirely. The Config-Bus-only unknown-key check remains ahead of all four, having no apcore counterpart. All three bridges currently run `callers` → `targets` → `effect` → `approval`, the reverse.
+
+**Input/Trigger:** `{callers: [], targets: ["*"], effect: "Allow"}`.
+
+**Expected Output:** The rule is refused for its `effect`, not its `callers`.
+
+**Boundary Conditions:**
+- A document wrong in both `default_effect` and rule 0 is refused for the `default_effect`.
+
+**Error Conditions:** None beyond the rejection itself.
+
+---
+
+#### FR-ACL-003: An apcore rejection is re-raised with the rule index and the bridge's error type
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ACL-003 |
+| **Title** | Wrap `ACLRuleError` rather than letting it escape |
+| **Priority** | P0 |
+| **Traces to** | F-052 |
+
+**Description:** `build_acl_from_config` shall catch `ACLRuleError` raised from `ACLRule(...)` and from the `ACL(...)` constructor and re-raise it in the bridge's own error type, prefixed `mcp.acl.rules[i] ` (rule-scoped) or `mcp.acl ` (section-scoped), preserving apcore's message verbatim after the prefix and chaining the original as the cause. apcore's own message names the type (`where="ACLRule"`), which is correct there — a rule under construction has no position — and unusable in a multi-rule YAML block. In Python, `ACLRuleError` extends `ModuleError`, not `ValueError`, so an unwrapped escape also breaks the builder's documented error type.
+
+**Input/Trigger:** Any §6.2.1 fault, or a `deny` + `approval: required` pair (§6.1.6 rule 2).
+
+**Expected Output:** `ValueError` (Python) / `Error` (TypeScript) / `ConfigError` (Rust), message prefixed with the rule index, `__cause__` / `cause` / `source` set to apcore's error.
+
+**Boundary Conditions:**
+- Rust already wraps; this requirement makes Python and TypeScript match rather than changing Rust.
+
+**Error Conditions:** None.
+
+---
+
+#### FR-ACL-004: Tier-2 never-matches findings are reported at startup
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-ACL-004 |
+| **Title** | Call `ACL.validate_rules()` after assembly and WARN on each finding |
+| **Priority** | P1 |
+| **Traces to** | F-053 |
+
+**Description:** When an ACL is attached, `serve()` / `async_serve()` shall call `validate_rules()` once the registry is fully assembled and log each finding at WARNING, naming the rule index, the field, and apcore's reason verbatim. Findings are diagnostics, never enforcement (PROTOCOL_SPEC §6.1.3): a finding shall not fail startup, and an exception raised by `validate_rules()` shall be caught, logged, and shall not abort startup — the same handling FR-SERVER's unprotected-control-surface guard applies to `governance_state()`. The call is deferred to `serve()` rather than made at build time because `validate_rules()` also reports unregistered `conditions` handler keys, and handler registration legitimately happens after discovery.
+
+**Input/Trigger:** `mcp.acl.rules[0].targets = ["$not", "*"]`.
+
+**Expected Output:** One WARNING naming rule 0 and `targets`; the server starts, and the rule decides exactly as it did before.
+
+**Boundary Conditions:**
+- No ACL attached: the call is skipped silently.
+- `targets: ["@external"]` — the caller-side sentinel used as a target pattern — is also a finding; the same value in `callers` is not.
+
+**Error Conditions:** None. Never fatal.
+
+---
+
+### 3.26 FR-OPENAPI: OpenAPI Backend Requirements (F-054, F-055)
+
+#### FR-OPENAPI-001: Build a Registry from an OpenAPI 3.0/3.1 document
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAPI-001 |
+| **Title** | `openapi_backend(spec, …)` composes the toolkit's scanner and HTTP proxy writer |
+| **Priority** | P1 |
+| **Traces to** | F-054 |
+
+**Description:** `openapi_backend` shall accept a URL, a filesystem path, or an already-parsed document and return a populated `Registry`, by calling apcore-toolkit's `load_spec` (unless handed a parsed document), `OpenAPIScanner.scan`, and `HTTPProxyRegistryWriter.write`, in that order, forwarding the scanner's `transform_operation` / `transform_module` / `derive_module_id` hooks verbatim in the toolkit's documented invocation order. The bridge shall implement no scanning, no `module_id` derivation, and no request shaping of its own; any behaviour difference between the three bridges that is not a difference in the toolkit is a defect.
+
+**Input/Trigger:** `--from-openapi https://api.example.com/openapi.json`.
+
+**Expected Output:** A `Registry` with one module per operation. Every scanned module carries `metadata.http_method` (uppercase), `metadata.url_path`, and `metadata.openapi.*` at the `ScannedModule` level; whether that survives into the registered descriptor's `metadata` (readable via `get_definition`) is Rust-only — Rust's writer builds a full `ModuleDescriptor` and preserves it, Python's and TypeScript's both drop it (upstream apcore-toolkit inconsistency; see `docs/features/openapi-backend.md` § Known cross-language divergences).
+
+**Boundary Conditions:**
+- Zero operations: WARNING logged, empty registry returned, server starts (consistent with FR-SERVER-006).
+- A string source is taken verbatim; no candidate paths are probed.
+
+**Error Conditions:**
+- Not OpenAPI 3.0.x/3.1.x, unparseable, or unreachable: fatal.
+- No `base_url` option and no absolute `servers[0].url`: fatal.
+- apcore-toolkit absent (Python only): fatal, with an actionable `install 'apcore-mcp[openapi]'` message rather than an `ImportError` traceback.
+
+---
+
+#### FR-OPENAPI-002: The scanner's module_id is registered as emitted, then reaches both protocol surfaces unchanged
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAPI-002 |
+| **Title** | Registered as emitted; MCP tool name verbatim; OpenAI function name dash-normalized |
+| **Priority** | P1 |
+| **Traces to** | F-054 |
+
+**Description:** The bridge shall register each module under the `module_id` apcore-toolkit's `OpenAPIScanner.scan` returns, apply no projection or other rewrite of its own, and install no hook of its own in the scan. That ID shall reach MCP as the tool name verbatim, dots retained, and OpenAI as the dash-normalized form. `display.mcp.alias` continues to override the MCP name per module.
+
+The bridge relies on the toolkit for the alphabet. Since apcore-toolkit 0.13.0 (NFR-COMPAT-002) the scanner normalises every emitted `module_id` into apcore's Canonical ID alphabet, `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$` — the pattern apcore's registry enforces at `Registry.register` and again at `Executor.call`: camelCase is split into words (`listPets` → `list_pets`, `getHTTPResponse` → `get_http_response`), every character outside `[A-Za-z0-9_.]` becomes `_`, an ID that is already legal is never rewritten, and the **final** ID is normalised after `base_path_prefix` and the `derive_module_id` / `transform_module` hooks and before the scanner's own `deduplicate_ids`. The one shape normalisation cannot repair is skipped per FR-OPENAPI-008.
+
+**Input/Trigger:** `GET /users/{user_id}` with no `operationId`.
+
+**Expected Output:** `module_id` `users.user_id.get`; MCP tool `users.user_id.get`; OpenAI function `users-user_id-get`.
+
+**Boundary Conditions:**
+- `operationId: listPets` → `list_pets` on both surfaces.
+- `GET /pets/{petId}` → `pets.pet_id.get`; OpenAI `pets-pet_id-get`.
+- `GET /pet-store/items` → `pet_store.items.get`; the OpenAI form is `pet_store-items-get` — dash-normalization replaces the **dots only**, so the underscore that replaced the hyphen survives.
+- `listPets` and `list-pets` in one document → `list_pets` and `list_pets_2`, the second carrying the scanner's rename warning; the collision never reaches FR-OPENAPI-006.
+- `prefix: PetStore` → `pet_store.list_pets`, `pet_store.users.user_id.get`.
+- A caller-supplied hook returning `MyThing` → `my_thing`, registered, not skipped.
+- An `operationId` that is already legal (FastAPI's `read_item_items__item_id__get`) → used as it is.
+- Empty path → `root.<method>`.
+
+**Error Conditions:** None — an ID the registry would still refuse is a skip (FR-OPENAPI-008), not an error.
+
+---
+
+#### FR-OPENAPI-003: Scan warnings and write failures reach the operator
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAPI-003 |
+| **Title** | Report every `ScannedModule.warnings` entry and every failed `WriteResult` |
+| **Priority** | P1 |
+| **Traces to** | F-054 |
+
+**Description:** Each `ScannedModule.warnings` entry shall be logged at WARNING naming the module ID, and each failed `WriteResult` at ERROR naming the module ID, without preventing the remaining modules from registering. An unresolvable or external `$ref` produces a tool with an incomplete schema, and an LLM will call it regardless — silence here is the failure mode.
+
+**Input/Trigger:** A document containing `$ref: "https://other.example.com/schemas.json#/Pet"`.
+
+**Expected Output:** WARNING naming the module and the unfetched reference; the server starts.
+
+**Boundary Conditions:**
+- A duplicate ID renamed within a single scan (`_2` suffix) carries its own warning and is reported the same way.
+- A derived ID colliding with one already in the registry is **not** an individual failure and shall never be logged-and-skipped: it is caught before any write by FR-OPENAPI-006.
+
+**Error Conditions:** None — individual schema/proxy construction failures are non-fatal. Collisions are fatal under FR-OPENAPI-006.
+
+---
+
+#### FR-OPENAPI-004: A prefix is mandatory in a mixed-source deployment
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAPI-004 |
+| **Title** | Refuse to start when an OpenAPI backend is combined with another source and no prefix is given |
+| **Priority** | P1 |
+| **Traces to** | F-055 |
+
+**Description:** `OpenAPIScanner` deduplicates IDs within one scan only; it knows nothing about modules already in the registry, and since apcore 0.22.0 a duplicate registration is rejected immediately with `InvalidInputError(code=DUPLICATE_MODULE_ID)`. When an OpenAPI backend is configured alongside any other backend source, `prefix` (the scanner's `base_path_prefix`) shall be required and the bridge shall refuse to start without it. When the OpenAPI backend is the only source, `prefix` is optional.
+
+A prefix **reduces the probability** of a collision and does not eliminate one — nothing prevents an extensions directory from already carrying a `petstore.*` module. It is a naming-hygiene requirement, not the collision defence; the defence is FR-OPENAPI-006, and the two shall both hold.
+
+**Input/Trigger:** `--extensions-dir ./extensions --from-openapi ./openapi.json` with no `--openapi-prefix`.
+
+**Expected Output:** Fatal startup error naming `--openapi-prefix` / `mcp.openapi.prefix`.
+
+**Boundary Conditions:**
+- `--from-openapi` alone: starts without a prefix.
+
+**Error Conditions:** As above.
+
+---
+
+#### FR-OPENAPI-005: Warn when write-method modules register with no ACL attached
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAPI-005 |
+| **Title** | The approval gate is silent on scanned modules; say so at startup |
+| **Priority** | P1 |
+| **Traces to** | F-055 |
+
+**Description:** apcore-toolkit infers annotations from the HTTP method alone — `GET` readonly+cacheable, `HEAD`/`OPTIONS` readonly, `PUT` idempotent, `DELETE` destructive, and `POST`/`PATCH`/`TRACE` nothing at all — and never infers `requires_approval`. Every OpenAPI-scanned module therefore arrives with `requires_approval = false`, so the approval gate fires for none of them, including a `POST` that moves money. When an OpenAPI backend registers any module whose method is in `{POST, PUT, PATCH, DELETE}`, the bridge shall emit a prominent, non-fatal startup WARNING naming the count and the three mitigations (an ACL rule carrying `approval: required`, `gate_destructive` on the `ExecutionPolicy`, or a `transform_module` hook setting the annotation), **unless** one of the three suppression conditions below holds.
+
+The warning shall report the **absence of an approval path, never the presence of protection**, following the rule apcore states on `GovernanceState.unprotected_control_surface`: *"a wired ACL that permits every call still yields `False`."* `governance_state().acl_configured` shall therefore **not** suppress it. `default_effect: allow`, an ACL whose `targets` never match the scanned modules, and an ACL that allows without carrying `approval: required` anywhere each leave every write operation ungated while satisfying "an ACL is attached".
+
+**Input/Trigger:** A document with three `POST` operations.
+
+**Expected Output:** One WARNING naming the count and the three mitigations; the server starts.
+
+**Boundary Conditions:**
+- Suppressed only when (a) no module with a method in `{POST, PUT, PATCH, DELETE}` was registered, (b) every such module declares `requires_approval` itself — reachable only via a `transform_module` hook, since the scanner never infers it, or (c) `mcp.openapi.acknowledge_unapproved_writes: true` records an explicit operator decision.
+- An ACL is attached and at least one rule carries `approval: required`: the message is downgraded in wording (an approval path exists; whether its `targets` cover these modules is a match-relation question) but still emitted. Whether a rule matches is exactly the predicate FR-ACL-004's tier 2 declines to close, and a predicate that cannot be closed shall not silence a safety warning.
+- `governance_state().builtin_approval_gate_wired` is `false` (the `internal`, `testing` and `minimal` strategies remove the gate): the message is escalated, because neither a module-level `requires_approval` nor an ACL rule's `approval: required` can fire.
+- A read-only document (`GET` / `HEAD` / `OPTIONS` only): no warning.
+
+**Error Conditions:** None. Never fatal.
+
+
+#### FR-OPENAPI-006: Module-ID collisions are caught by a pre-write preflight and are fatal
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAPI-006 |
+| **Title** | Intersect the full derived-ID set against the registry before the first write; fail atomically |
+| **Priority** | P0 |
+| **Traces to** | F-055 |
+
+**Description:** After the scan and **before** `HTTPProxyRegistryWriter.write` is called, the bridge shall intersect the complete set of module IDs it is about to write — the scanner's emitted IDs, less any skipped per FR-OPENAPI-008 — against the IDs already present in the target registry and, on a non-empty intersection, fail startup naming **every** colliding ID — not the first — having written nothing. apcore-toolkit's writers report per-module outcomes as `WriteResult`s and do not raise, so without this preflight a duplicate registration would surface as one failed `WriteResult`, be logged at ERROR under FR-OPENAPI-003, and leave the server running with a **partial registry**: a tool advertised by the document, absent from `tools/list`, with the operator told only by one log line. The escalation from per-module report to fatal is the bridge's decision to make, not the writer's.
+
+The set of derived IDs is fully known at this point and the check is a set intersection, so atomicity costs nothing. Within-document duplicates never reach this check — the scanner already renames them `_2`, `_3`, … with a warning.
+
+**Input/Trigger:** `--extensions-dir ./extensions --from-openapi ./openapi.json --openapi-prefix petstore`, where the extensions directory already registers `petstore.pets.get`.
+
+**Expected Output:** Fatal startup error naming `petstore.pets.get` and every other colliding ID. No module from the OpenAPI document is registered.
+
+**Boundary Conditions:**
+- Two colliding IDs: both are named in one message. An implementation that reports only the first forces the operator through one restart per collision.
+- Empty intersection: no error, and the writer proceeds normally.
+- Single-source deployment: the check still runs — the target registry may be non-empty for other reasons — and is simply expected to find nothing.
+
+**Error Conditions:**
+- `ValueError` (Python) / `Error` (TypeScript) / `ConfigError` (Rust). Fatal; the server does not start.
+
+---
+
+#### FR-OPENAPI-007: `mcp.openapi.spec` is path-typed and the bridge owns its handling
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAPI-007 |
+| **Title** | URL verbatim; relative path against `project_root`; empty value discarded |
+| **Priority** | P1 |
+| **Traces to** | F-054 |
+
+**Description:** `mcp.openapi.spec` is the `mcp` namespace's first path-typed configuration key. apcore 0.30.0 declared the closed path-typed key set (PROTOCOL_SPEC §9.2.1) and the project-root resolution base (§9.2.2), but neither reaches a consumer namespace: `Config.path_typed_keys()` returns a hardcoded tuple of apcore's own keys and does not consult a namespace registered through `Config.register_namespace`, and the §9.2.1 requirement-5 empty-value discard is gated on that same fixed set. The bridge shall therefore implement three rules itself:
+
+1. A value beginning `http://` or `https://` is a URL, used verbatim — never path-resolved and never made absolute. The discriminator is the scheme prefix, not an inference from the string's shape.
+2. A set-but-empty value — from `APCORE_MCP_OPENAPI_SPEC=` or from `spec: ""` — shall be discarded with a WARNING, and resolution shall fall through to the next configuration tier. It shall never be joined to a base, which is what silently yields the working directory.
+3. A relative filesystem path shall resolve against `Config.project_root` (apcore 0.30.0), not the process CWD and not the OpenAPI document's own directory.
+
+Rule 3 adopts §9.2.2's **target** semantics rather than the 1.x semantics apcore's own four keys keep. §9.2.2 forbids early adoption for those keys because they have deployed configurations relying on today's bases and §13.2's two-minor deprecation window applies; `mcp.openapi.spec` has never shipped, so its deployed population is empty and there is nothing to deprecate. The documented consequence: for the whole apcore 1.x line, under §9.14 discovery tier 1 with a configuration file outside CWD, `mcp.openapi.spec` and `acl.root` resolve relative values against different bases. Under tiers 2-5 they coincide.
+
+**Input/Trigger:** `APCORE_MCP_OPENAPI_SPEC=` exported over a config file declaring `spec: ./openapi.json`.
+
+**Expected Output:** WARNING that the variable is set but empty and is being ignored; the file-tier value `./openapi.json` is used, resolved against `Config.project_root`.
+
+**Boundary Conditions:**
+- `spec: "https://api.example.com/openapi.json"` — used verbatim; no resolution of any kind.
+- An absolute filesystem path — used verbatim; `project_root` is not consulted.
+- Tiers 2-5, where `project_root` equals CWD: rule 3 is observationally identical to CWD resolution.
+
+**Error Conditions:**
+- All tiers empty or absent after the discard: the ordinary "no `spec` configured" fatal error from FR-OPENAPI-001, not a path error.
+
+---
+
+#### FR-OPENAPI-008: A module ID normalisation cannot make legal skips the operation loudly
+
+| Field | Value |
+|-------|-------|
+| **ID** | FR-OPENAPI-008 |
+| **Title** | Skip, warn, and keep serving the rest |
+| **Priority** | P1 |
+| **Traces to** | F-054 |
+
+**Description:** After `OpenAPIScanner.scan` returns, the bridge shall skip every module whose emitted `module_id` has a dot-separated segment that is not a full match of `^[a-z][a-z0-9_]*$`, and emit a WARNING naming that emitted ID and the offending segment. The remaining modules shall still register.
+
+Normalisation leaves exactly two such shapes: a segment beginning with a digit — `v1.2fa.post` from `POST /v1/2fa`, or `operationId: 3ds` — and an empty ID, which only a hook can produce. The scanner does not repair them, because repairing means **inventing** a name; it emits the module with a legality warning appended. The bridge is what would hand that module to a registry that refuses it, so the decision to skip is the bridge's, and the operator has `derive_module_id` and `transform_module` to name the operation explicitly. Skipping rather than failing: one unnameable operation shall not cost the whole server.
+
+The check shall run on the ID `scan` returned — after normalisation and deduplication, so a warning names `3ds_2`, not `3ds` — and **not** inside `transform_module`, which runs before the scanner's final normalisation and would see IDs that are about to become legal (`PetStore.list_pets`, `MyThing`). It shall run before the collision preflight (FR-OPENAPI-006) and before `HTTPProxyRegistryWriter.write`, so a skipped module is neither a collision nor a failed `WriteResult`. The skip WARNING supersedes the module's scan warnings, the toolkit's legality warning among them; they are not logged beside it.
+
+The scanner's own legality warning names the same ID and segment, so a WARNING alone does not prove the skip: the observable that does is that no ERROR-level record names the module — a module handed to the writer with an illegal ID becomes a failed `WriteResult` (`INVALID_MODULE_ID`), logged at ERROR per FR-OPENAPI-003.
+
+**Input/Trigger:** A document carrying `POST /v1/2fa` and `GET /pets` (`operationId: listPets`).
+
+**Expected Output:** One WARNING naming `v1.2fa.post` and the segment `2fa`; no ERROR naming `v1.2fa.post`; `list_pets` registers and is served.
+
+**Boundary Conditions:**
+- Every operation skipped: the zero-module WARNING of FR-OPENAPI-001 also fires, and the server still starts.
+- A caller-supplied `derive_module_id` or `transform_module` whose output normalises to a legal ID (`MyThing` → `my_thing`): no skip, no warning.
+- A hook producing `Pets.2Fa`: the scanner emits `pets.2_fa`, and the warning names `pets.2_fa` and `2_fa`, not the hook's spelling.
+
+**Error Conditions:** None. Never fatal.
+
+---
+
+## 4. Specific Requirements -- Non-Functional Requirements
+
+### 4.1 NFR-PERF: Performance Requirements
+
+---
+
+#### NFR-PERF-001: Schema conversion time for 100 modules
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-PERF-001 |
+| **Title** | Schema conversion completes within 100ms for 100 modules |
+| **Target** | < 100 milliseconds |
+| **Measurement** | Benchmark: time `MCPServerFactory.build_tools(registry)` with a registry of 100 modules, each with a 10-property input schema |
+| **Traces to** | F-001 |
+
+**Description:** Converting 100 apcore module schemas to MCP Tool definitions shall complete in less than 100 milliseconds on a standard development machine (4-core CPU, 16GB RAM).
+
+---
+
+#### NFR-PERF-002: Tool call routing overhead
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-PERF-002 |
+| **Title** | Tool call routing adds less than 5ms overhead |
+| **Target** | < 5 milliseconds added beyond Executor.call_async() time |
+| **Measurement** | Benchmark: measure time from `handle_call()` entry to return, subtract time spent in `Executor.call_async()`. Average over 1000 calls. |
+| **Traces to** | F-003 |
+
+**Description:** The apcore-mcp routing layer (argument parsing, executor dispatch, output serialization, error mapping) shall add less than 5 milliseconds of latency beyond the time spent in the apcore Executor pipeline.
+
+---
+
+#### NFR-PERF-003: Memory overhead for 100 tools
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-PERF-003 |
+| **Title** | Memory overhead below 10MB for 100 registered tools |
+| **Target** | < 10 MB |
+| **Measurement** | Memory profiling: measure process memory before and after registering 100 tools with typical schemas |
+| **Traces to** | F-001, F-005 |
+
+**Description:** The memory consumed by 100 MCP Tool definition objects (including their JSON Schema dicts) shall not exceed 10 megabytes.
+
+---
+
+#### NFR-PERF-004: Concurrent HTTP connection handling
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-PERF-004 |
+| **Title** | Support 10+ simultaneous MCP client connections over HTTP |
+| **Target** | >= 10 concurrent connections |
+| **Measurement** | Load test: 10 concurrent MCP clients each sending tool calls simultaneously; all receive correct responses |
+| **Traces to** | F-007 |
+
+**Description:** When using Streamable HTTP transport, the server shall handle at least 10 simultaneous MCP client connections without errors or response degradation. Concurrency handling is delegated to the MCP SDK's HTTP server implementation.
+
+---
+
+#### NFR-PERF-005: Trace mode overhead
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-PERF-005 |
+| **Title** | Trace mode adds less than 2ms overhead per tool call |
+| **Target** | < 2ms additional latency when trace=True vs trace=False |
+| **Measurement** | Benchmark: compare `call_async_with_trace()` vs `call_async()` latency with a no-op module |
+| **Traces to** | F-037 |
+
+**Description:** The overhead of capturing `PipelineTrace` (trace mode enabled) versus discarding it (trace mode disabled) shall be less than 2ms per tool call. This ensures trace mode is viable for development use without significant performance impact.
+
+---
+
+### 4.2 NFR-SEC: Security Requirements
+
+---
+
+#### NFR-SEC-001: ACL enforcement delegated to apcore Executor
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-SEC-001 |
+| **Title** | All access control enforced via apcore Executor ACL |
+| **Target** | 100% of tool calls pass through Executor ACL check |
+| **Measurement** | Code review: verify no code path bypasses Executor.call_async() for tool execution |
+| **Traces to** | F-003, F-014 |
+
+**Description:** apcore-mcp shall not implement any custom authentication or authorization mechanism. All access control shall be delegated to the apcore Executor's built-in ACL. Every tool call shall pass through `Executor.call_async()` which performs ACL checking at step 4 of its pipeline.
+
+---
+
+#### NFR-SEC-002: Error responses do not leak sensitive data
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-SEC-002 |
+| **Title** | No stack traces, caller IDs, or internal paths in MCP error responses |
+| **Target** | Zero sensitive data in any error response |
+| **Measurement** | Security review: test all error paths and verify response content. Automated tests asserting absence of stack traces, file paths, caller IDs. |
+| **Traces to** | F-004 |
+
+**Description:** MCP error responses shall not contain: (a) Python stack traces, (b) internal file paths, (c) `caller_id` values from ACL errors, (d) exception class names for unexpected errors, (e) any data marked `x-sensitive` in apcore schemas. Full error details shall only appear in server-side logs.
+
+---
+
+#### NFR-SEC-003: No sensitive data in MCP tool definitions
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-SEC-003 |
+| **Title** | Tool definitions do not expose sensitive schema metadata |
+| **Target** | Zero `x-sensitive` markers exposed to MCP clients |
+| **Measurement** | Review: verify tool `inputSchema` does not include implementation-private schema extensions |
+| **Traces to** | F-001 |
+
+**Description:** MCP Tool `inputSchema` and OpenAI `parameters` shall faithfully reproduce the JSON Schema from apcore modules. The `x-sensitive` extension on individual fields is metadata for server-side redaction; it may appear in schemas (as it describes the field's nature) but the actual sensitive data values shall never appear in error messages or logs.
+
+---
+
+#### NFR-SEC-004: Output redaction coverage
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-SEC-004 |
+| **Title** | 100% of x-sensitive output fields redacted when redact_output=True |
+| **Target** | Zero sensitive field values pass through to MCP clients when redaction enabled |
+| **Measurement** | Security test: create modules with x-sensitive output fields and _secret_ prefix keys; verify all are redacted in MCP responses |
+| **Traces to** | F-038 |
+
+**Description:** When `redact_output=True` (default), every output field marked with `x-sensitive: true` in the module's `output_schema` and every key matching the `_secret_*` prefix shall have its value replaced with `"***REDACTED***"` before transmission to the MCP client. No sensitive field value shall ever appear in MCP responses, logs, or error messages.
+
+---
+
+### 4.3 NFR-REL: Reliability Requirements
+
+---
+
+#### NFR-REL-001: Graceful shutdown on SIGINT/SIGTERM
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-REL-001 |
+| **Title** | Server shuts down gracefully on termination signals |
+| **Target** | Clean shutdown within 5 seconds of signal receipt |
+| **Measurement** | Integration test: send SIGINT to running server, verify `serve()` returns within 5 seconds and no resources are leaked |
+| **Traces to** | F-005, F-006 |
+
+**Description:** Upon receiving SIGINT or SIGTERM, the MCP Server shall stop accepting new connections, complete any in-flight tool calls (up to 5-second grace period), and shut down the transport cleanly. The `serve()` function shall return normally.
+
+---
+
+#### NFR-REL-002: Single module failure does not prevent server start
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-REL-002 |
+| **Title** | Malformed module schema does not block other tool registrations |
+| **Target** | Server starts with N-1 tools when 1 of N modules has invalid schema |
+| **Measurement** | Unit test: register 5 modules, one with circular $ref; verify server starts with 4 tools |
+| **Traces to** | F-001, F-005 |
+
+**Description:** If schema conversion fails for one module during server startup (e.g., circular `$ref`), that module shall be skipped with a WARNING log, and the remaining modules shall be registered as tools. The server shall not fail to start due to a single module's schema error.
+
+---
+
+#### NFR-REL-003: Thread-safe tool list access
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-REL-003 |
+| **Title** | Concurrent tool list access does not cause data corruption |
+| **Target** | Zero data races under concurrent access |
+| **Measurement** | Stress test: concurrent tool calls and registry modifications; verify no exceptions or inconsistent states |
+| **Traces to** | F-015 |
+
+**Description:** The tools dictionary in `RegistryListener` shall be protected by a `threading.Lock` to prevent data races between the async event loop thread (reading tools for `tools/list`) and Registry callback threads (writing tools on `register`/`unregister`).
+
+---
+
+### 4.4 NFR-MAINT: Maintainability Requirements
+
+---
+
+#### NFR-MAINT-001: Core logic size limit
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-MAINT-001 |
+| **Title** | Core logic under 1,200 lines of code |
+| **Target** | 500-1,200 lines (excluding tests and documentation) |
+| **Measurement** | `cloc src/apcore_mcp/ --exclude-dir=tests` |
+| **Traces to** | PRD Section 5.3 |
+
+**Description:** The total lines of code in `src/apcore_mcp/` (excluding tests and documentation) shall not exceed 1,200 lines. This enforces the thin adapter design principle.
+
+---
+
+#### NFR-MAINT-002: Test coverage target
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-MAINT-002 |
+| **Title** | Test coverage at or above 90% |
+| **Target** | >= 90% line coverage |
+| **Measurement** | `pytest --cov=apcore_mcp --cov-report=term` |
+| **Traces to** | PRD Section 5.3 |
+
+**Description:** Automated tests shall achieve at least 90% line coverage on all code in `src/apcore_mcp/`. Coverage shall be measured using `pytest-cov`.
+
+---
+
+#### NFR-MAINT-003: Full type annotations on public APIs
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-MAINT-003 |
+| **Title** | All public functions and methods have complete type annotations |
+| **Target** | 100% of public APIs annotated |
+| **Measurement** | `mypy src/apcore_mcp/ --strict` passes with zero errors |
+| **Traces to** | PRD Section 7.2 |
+
+**Description:** All public functions (`serve()`, `to_openai_tools()`), all public class methods, and all public class attributes shall have complete Python type annotations compatible with `mypy --strict` and `pyright`.
+
+---
+
+#### NFR-MAINT-004: Logging standards
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-MAINT-004 |
+| **Title** | Consistent logging format and namespace usage |
+| **Target** | All modules use `apcore_mcp.*` logger namespace |
+| **Measurement** | Code review: verify every `logging.getLogger()` call uses `__name__` or explicit `apcore_mcp.*` name |
+| **Traces to** | F-016 |
+
+**Description:** Every Python module in apcore-mcp shall obtain its logger via `logging.getLogger(__name__)`, which produces logger names under the `apcore_mcp` namespace. No module shall use the root logger or a logger outside the `apcore_mcp` hierarchy.
+
+---
+
+### 4.5 NFR-COMPAT: Compatibility Requirements
+
+---
+
+#### NFR-COMPAT-001: Python version compatibility
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-COMPAT-001 |
+| **Title** | Compatible with Python 3.11 and above |
+| **Target** | Python >= 3.11 |
+| **Measurement** | CI test matrix: Python 3.11, 3.12, 3.13 |
+| **Traces to** | PRD Section 8.3 |
+
+**Description:** apcore-mcp shall be compatible with Python 3.11, 3.12, and 3.13. The `pyproject.toml` shall declare `requires-python = ">=3.11"`.
+
+---
+
+#### NFR-COMPAT-002: apcore SDK version compatibility
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-COMPAT-002 |
+| **Title** | Compatible with apcore >= 0.32.0 |
+| **Target** | apcore >= 0.32.0, apcore-toolkit >= 0.14.0 |
+| **Measurement** | Full SDK suites against published dependency releases |
+| **Traces to** | PRD Section 8.3 |
+
+**Description:** All three SDKs shall declare the same dependency floors:
+`apcore>=0.32.0` (Python), `apcore-js>=0.32.0` (TypeScript), `apcore = ">=0.32"`
+(Rust), and `apcore-toolkit>=0.14.0` (Rust `">=0.14"`). TypeScript requires Node.js
+20+, matching its dependencies. `mcp-embedded-ui>=0.5.0` is unchanged.
+
+**apcore 0.32.0 compatibility:** ErrorMapper reads canonical JSON Pointer `path`
+before legacy `field` and preserves `{path, keyword, message}` entries in the wire
+`details`. The Python MCP factory reads the source streaming annotation because
+apcore's MCP exporter now places streaming in `_meta`, rather than `annotations`.
+Timeout cancellation, preflight collection, gate-provider binding and logging
+redaction remain delegated to apcore.
+
+**apcore-toolkit 0.14.0 compatibility:** The bridge does not call the toolkit's
+pure-data BindingLoader, so its stricter structural validation requires no bridge
+code adaptation. Application binding files loaded by apcore must still satisfy the
+runtime loader's stricter contract. Toolkit 0.14.0 also requires apcore 0.32.0.
+
+**Historical capability floor:** Toolkit 0.13.0 first emitted OpenAPI module IDs in
+apcore's Canonical ID alphabet. FR-OPENAPI-002 registers those IDs without a bridge
+projection; below 0.13.0 camelCase or hyphenated operation IDs would be refused.
+
+The floors have four distinct justifications and shall not be collapsed into one. **apcore 0.29.0 is the correctness floor:** it closes the shape of an ACL `callers` / `targets` array at every entry point (PROTOCOL_SPEC §6.2.1), and on 0.28.0 the shapes it rejects load silently and leave the rule inert — a `deny` rule under `default_effect: allow` permits the call it names. **apcore-toolkit 0.11.0 is the capability floor:** `OpenAPIScanner` does not exist below it, and it is where the Rust `HTTPProxyRegistryWriter` stopped rejecting `HEAD` / `OPTIONS` / `TRACE` before any network call. **apcore-toolkit 0.11.1 changes no toolkit API**; it exists to raise its own apcore floor. **apcore 0.30.0 is therefore forced transitively**, and is independently required by FR-OPENAPI-007, which resolves `mcp.openapi.spec` against `Config.project_root` — an accessor 0.30.0 introduces.
+
+apcore 0.30.0 is otherwise out of scope for this bridge: its §5.12.6 binding-discovery contract, `bindings.dir` / `bindings.pattern` defaults, `target_id` → `target` binding-field repair and regenerated `config_key_governance.json` all concern apcore's `Config` / `BindingLoader` layer, and no bridge references `extensions.root`, `acl.root`, `schema.root`, `bindings.dir`, `bindings.pattern`, apcore's `BindingLoader`, or `project_root` today. Its §9.2.2 path-resolution change is a deprecation phase that keeps 1.x semantics exactly. In Python apcore-toolkit remains an extra rather than a runtime dependency — `apcore-mcp[markdown]` for rich descriptions and `apcore-mcp[openapi]` (which resolves `apcore-toolkit[http-proxy]`) for the OpenAPI Backend; TypeScript and Rust depend on it unconditionally. Note the upper bound was dropped: pin `<1.0` only if a breaking 1.0 is announced. Version **0.19.0** was the floor that first made the current feature set buildable — the AsyncTaskManager primitives (F-043 Async Task Bridge), W3C TraceContext propagation (FR-EXTMGR / FR-OBSERVABILITY chains), the 12-field ModuleAnnotations dataclass (annotation passthrough — F-041), and the dependency/binding error classes consumed by EM-3 USER_FIXABLE error dispatch. Prior features carried forward: Pipeline v2 delegation (`PipelineEngine.run()`), call-chain guard rename (`safety_check` → `call_chain_guard`), corrected step order (middleware before input validation), Step metadata fields, YAML pipeline configuration, sensitive field redaction utility, Config Bus namespace registration (§9.4), Error Formatter Registry (§8.8), dot-namespaced event types (§9.16), Context `ContextKey[T]`, ACL condition handlers, and `Annotations.extra`.
+
+---
+
+#### NFR-COMPAT-003: MCP SDK version compatibility
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-COMPAT-003 |
+| **Title** | Compatible with MCP Python SDK >= 1.0.0 |
+| **Target** | mcp >= 1.0.0, < 2.0 |
+| **Measurement** | Integration tests against latest mcp SDK release |
+| **Traces to** | PRD Section 8.3 |
+
+**Description:** apcore-mcp shall declare a dependency on `mcp>=1.0.0,<2.0` and shall be tested against the latest release within that range.
+
+---
+
+#### NFR-COMPAT-004: MCP client compatibility
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-COMPAT-004 |
+| **Title** | Verified with Claude Desktop and at least one additional MCP client |
+| **Target** | >= 2 verified MCP clients |
+| **Measurement** | Manual integration testing with Claude Desktop and Cursor (or another MCP client) |
+| **Traces to** | PRD Section 5.3 |
+
+**Description:** apcore-mcp shall be verified working with Claude Desktop (stdio transport) and at least one additional MCP client (e.g., Cursor, Windsurf) before release.
+
+---
+
+### 4.6 NFR-PORT: Portability Requirements
+
+---
+
+#### NFR-PORT-001: OS compatibility
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-PORT-001 |
+| **Title** | Compatible with macOS, Linux, and Windows |
+| **Target** | All three major desktop platforms |
+| **Measurement** | CI test matrix: macOS (latest), Ubuntu (latest), Windows (latest) |
+| **Traces to** | General portability requirement |
+
+**Description:** apcore-mcp shall function correctly on macOS, Linux, and Windows. No platform-specific system calls or dependencies shall be used.
+
+---
+
+#### NFR-PORT-002: No platform-specific dependencies
+
+| Field | Value |
+|-------|-------|
+| **ID** | NFR-PORT-002 |
+| **Title** | Zero platform-specific package dependencies |
+| **Target** | All dependencies are pure Python or cross-platform |
+| **Measurement** | Review `pyproject.toml` dependencies for platform markers |
+| **Traces to** | General portability requirement |
+
+**Description:** All runtime dependencies of apcore-mcp (`apcore`, `mcp`) shall be cross-platform Python packages. No platform-conditional dependencies shall be declared.
+
+---
+
+## 5. Use Cases
+
+### UC-001: Start MCP Server via serve()
+
+| Field | Value |
+|-------|-------|
+| **Use Case ID** | UC-001 |
+| **Title** | Start MCP Server via Python serve() call |
+| **Primary Actor** | Module Developer (Maya) |
+| **Traces to FRs** | FR-SERVER-001, FR-SERVER-004, FR-SERVER-005, FR-SERVER-006, FR-SERVER-011, FR-SCHEMA-001, FR-ANNOT-001 through FR-ANNOT-006 |
+
+**Preconditions:**
+1. apcore-mcp is installed (`pip install apcore-mcp`).
+2. An apcore `Registry` exists with at least one registered module.
+
+**Main Success Scenario:**
+1. Developer creates a `Registry` and calls `registry.discover()`.
+2. Developer calls `serve(registry)`.
+3. System validates the `registry` parameter is a `Registry` instance.
+4. System creates a default `Executor(registry)`.
+5. System iterates over all modules via `registry.list()`.
+6. For each module, system calls `registry.get_definition(module_id)` and builds an MCP `Tool` via `SchemaConverter` and `AnnotationMapper`.
+7. System creates an MCP Server with name `"apcore-mcp"` and package version.
+8. System registers `list_tools` and `call_tool` handlers on the server.
+9. System starts stdio transport.
+10. System logs: "apcore-mcp server started: N tools registered, transport=stdio".
+11. System blocks until shutdown signal received.
+12. System returns `None`.
+
+**Alternative Flows:**
+- **A1: HTTP transport**: At step 2, developer calls `serve(registry, transport="streamable-http", port=9000)`. Steps 9-10 use Streamable HTTP transport instead of stdio.
+- **A2: Executor passthrough**: At step 2, developer passes an `Executor` instance. Step 4 is skipped; the provided Executor is used directly.
+- **A3: Custom server name**: At step 2, developer passes `name="my-tools"`. Step 7 uses the custom name.
+
+**Exception Flows:**
+- **E1: Invalid parameter type**: At step 3, the parameter is neither `Registry` nor `Executor`. System raises `TypeError`. Flow terminates.
+- **E2: Invalid transport**: At step 2, `transport="websocket"`. System raises `ValueError`. Flow terminates.
+- **E3: Port in use**: At step 9 (HTTP transport), the port is occupied. System raises `OSError`. Flow terminates.
+- **E4: Schema conversion failure**: At step 6, one module has circular `$ref`. System logs warning, skips that module, continues with remaining modules.
+
+**Postconditions:**
+1. MCP Server was running and accepting connections during its lifetime.
+2. All valid modules were registered as MCP tools.
+3. Server has shut down cleanly.
+
+---
+
+### UC-002: MCP Client discovers tools
+
+| Field | Value |
+|-------|-------|
+| **Use Case ID** | UC-002 |
+| **Title** | MCP Client discovers available tools |
+| **Primary Actor** | AI Agent Builder (Alex) |
+| **Traces to FRs** | FR-SERVER-011, FR-SCHEMA-001, FR-ANNOT-001 through FR-ANNOT-006 |
+
+**Preconditions:**
+1. MCP Server is running (UC-001 completed successfully).
+2. An MCP client is connected to the server.
+
+**Main Success Scenario:**
+1. MCP client sends `tools/list` request.
+2. Server invokes `list_tools` handler.
+3. Handler returns the list of `Tool` objects built during server startup.
+4. Client receives a list where each tool has `name`, `description`, `inputSchema`, and `annotations`.
+5. Client displays the tools to the user or AI model.
+
+**Alternative Flows:**
+- **A1: Empty registry**: At step 3, the list is empty. Client receives `[]`.
+- **A2: After dynamic registration**: The tool list includes tools added after server start (per FR-DYNAMIC-001).
+
+**Exception Flows:** None. The `tools/list` operation does not fail under normal conditions.
+
+**Postconditions:**
+1. Client has an accurate list of available tools with schemas and annotations.
+
+---
+
+### UC-003: MCP Client calls a tool (success)
+
+| Field | Value |
+|-------|-------|
+| **Use Case ID** | UC-003 |
+| **Title** | MCP Client successfully invokes a tool |
+| **Primary Actor** | AI Agent Builder (Alex) |
+| **Traces to FRs** | FR-EXEC-001, FR-EXEC-002, FR-EXEC-003, FR-EXEC-004 |
+
+**Preconditions:**
+1. MCP Server is running with at least one tool registered.
+2. An MCP client has discovered the tools (UC-002).
+
+**Main Success Scenario:**
+1. MCP client sends `tools/call` request with `name="image.resize"` and `arguments={"width": 800, "height": 600}`.
+2. Server invokes `call_tool` handler.
+3. Handler delegates to `ExecutionRouter.handle_call("image.resize", {"width": 800, "height": 600})`.
+4. Router calls `Executor.call_async("image.resize", {"width": 800, "height": 600})`.
+5. Executor delegates to `PipelineEngine.run()` which executes the full 11-step pipeline (context, call-chain guard, lookup, ACL, approval gate, middleware before, input validation, execute, output validation, middleware after, return).
+6. Module returns `{"status": "ok", "path": "/out/resized.png"}`.
+7. Router serializes output to JSON: `'{"status":"ok","path":"/out/resized.png"}'`.
+8. Router returns `CallToolResult(content=[TextContent(type="text", text=<json>)], isError=False)`.
+9. Client receives successful result.
+
+**Alternative Flows:**
+- **A1: Async module**: At step 5, the module's `execute()` is a coroutine. Executor calls it directly (no thread bridging needed).
+- **A2: Empty arguments**: At step 1, `arguments={}`. Router passes empty dict to Executor.
+
+**Exception Flows:** See UC-004.
+
+**Postconditions:**
+1. Module executed successfully with full pipeline.
+2. Client received JSON-serialized output.
+
+---
+
+### UC-004: MCP Client calls a tool (error)
+
+| Field | Value |
+|-------|-------|
+| **Use Case ID** | UC-004 |
+| **Title** | MCP Client tool call returns an error |
+| **Primary Actor** | AI Agent Builder (Alex) |
+| **Traces to FRs** | FR-ERROR-001 through FR-ERROR-011, FR-EXEC-007 |
+
+**Preconditions:**
+1. MCP Server is running.
+2. An MCP client sends a tool call that triggers an error condition.
+
+**Main Success Scenario (SchemaValidationError):**
+1. Client sends `tools/call` with `name="image.resize"` and `arguments={"width": "not_a_number"}`.
+2. Router calls `Executor.call_async()`.
+3. Executor raises `SchemaValidationError` at pipeline step 7 (input_validation).
+4. Router catches the error, delegates to `ErrorMapper.to_mcp_error()`.
+5. ErrorMapper formats field-level errors: "Schema validation failed:\n  /width: Input should be a valid integer".
+6. Router returns `CallToolResult(isError=True, content=[TextContent(text=<error_message>)])`.
+7. Client receives error response.
+
+**Alternative Flows:**
+- **A1: ModuleNotFoundError**: Client calls non-existent tool `"foo.bar"`. Response: "Module not found: foo.bar".
+- **A2: ACLDeniedError**: Executor ACL denies the call. Response: "Access denied" (no caller_id leaked).
+- **A3: ModuleTimeoutError**: Module exceeds timeout. Response: "Module timed out after 30000ms".
+- **A4: Unexpected Exception**: Module raises `RuntimeError`. Response: "Internal error occurred". Full trace logged at ERROR level.
+
+**Exception Flows:** None. All errors are caught and returned as `CallToolResult`.
+
+**Postconditions:**
+1. Error response sent to client with `isError=True`.
+2. For unexpected errors, full stack trace logged server-side.
+3. No sensitive data leaked to client.
+
+---
+
+### UC-005: Export OpenAI tools
+
+| Field | Value |
+|-------|-------|
+| **Use Case ID** | UC-005 |
+| **Title** | Export apcore Registry as OpenAI tool definitions |
+| **Primary Actor** | Module Developer (Maya) |
+| **Traces to FRs** | FR-OPENAI-001 through FR-OPENAI-005, FR-SCHEMA-004 |
+
+**Preconditions:**
+1. apcore-mcp is installed.
+2. An apcore `Registry` exists with registered modules.
+
+**Main Success Scenario:**
+1. Developer calls `to_openai_tools(registry)`.
+2. System validates the parameter is a `Registry` or `Executor`.
+3. System iterates over all modules via `registry.list()`.
+4. For each module, system obtains `ModuleDescriptor` and converts to OpenAI dict.
+5. Module ID is normalized (dots replaced with `-`).
+6. Schema is converted (same $ref inlining as MCP path).
+7. System returns `list[dict]`.
+8. Developer passes result to `openai.chat.completions.create(tools=tools)`.
+
+**Alternative Flows:**
+- **A1: With annotations**: Developer calls `to_openai_tools(registry, embed_annotations=True)`. Annotation suffix appended to descriptions.
+- **A2: With strict mode**: Developer calls `to_openai_tools(registry, strict=True)`. Schemas transformed for strict mode, `"strict": true` added.
+- **A3: With filtering**: Developer calls `to_openai_tools(registry, tags=["image"], prefix="comfyui.")`. Only matching modules included.
+
+**Exception Flows:**
+- **E1: Invalid parameter type**: `TypeError` raised.
+- **E2: Schema conversion failure for one module**: Module skipped with warning, others included.
+
+**Postconditions:**
+1. Developer has a list of OpenAI-compatible tool dicts.
+2. Dicts are directly usable with OpenAI API.
+
+---
+
+### UC-006: Start MCP Server via CLI
+
+| Field | Value |
+|-------|-------|
+| **Use Case ID** | UC-006 |
+| **Title** | Start MCP Server via command-line interface |
+| **Primary Actor** | AI Agent Builder (Alex) |
+| **Traces to FRs** | FR-CLI-001 through FR-CLI-008 |
+
+**Preconditions:**
+1. apcore-mcp is installed.
+2. An extensions directory exists with apcore module files.
+
+**Main Success Scenario:**
+1. User runs `python -m apcore_mcp --extensions-dir ./extensions`.
+2. CLI parses arguments.
+3. CLI validates `--extensions-dir` exists and is a directory.
+4. CLI creates `Registry(extensions_dir="./extensions")`.
+5. CLI calls `registry.discover()`.
+6. CLI calls `serve(registry, transport="stdio")`.
+7. Server starts and blocks.
+8. User terminates with Ctrl+C.
+9. Server shuts down, CLI exits with code 0.
+
+**Alternative Flows:**
+- **A1: HTTP transport**: User adds `--transport streamable-http --port 9000`. Server starts on HTTP.
+- **A2: Custom name and log level**: User adds `--name "my-tools" --log-level DEBUG`.
+
+**Exception Flows:**
+- **E1: Directory not found**: CLI prints error to stderr, exits code 1.
+- **E2: Port in use**: Server fails to start, CLI exits code 2.
+- **E3: Invalid arguments**: argparse prints error, CLI exits code 2.
+- **E4: No modules discovered**: Warning logged, server starts with zero tools.
+
+**Postconditions:**
+1. Server ran and shut down cleanly.
+2. Exit code reflects the outcome.
+
+---
+
+### UC-007: Dynamic module registration
+
+| Field | Value |
+|-------|-------|
+| **Use Case ID** | UC-007 |
+| **Title** | Add module to registry while MCP server is running |
+| **Primary Actor** | Module Developer (Maya) |
+| **Traces to FRs** | FR-DYNAMIC-001 through FR-DYNAMIC-004 |
+
+**Preconditions:**
+1. MCP Server is running (UC-001 completed).
+2. An MCP client is connected.
+
+**Main Success Scenario:**
+1. Developer calls `registry.register("new.tool", module_instance)`.
+2. Registry emits "register" event.
+3. `RegistryListener._on_register()` callback fires.
+4. Listener obtains `ModuleDescriptor` via `registry.get_definition("new.tool")`.
+5. Listener builds MCP `Tool` via `MCPServerFactory.build_tool()`.
+6. Listener adds tool to internal tools dict (under lock).
+7. Listener triggers `notifications/tools/list_changed`.
+8. MCP client re-fetches tool list and sees "new.tool".
+
+**Alternative Flows:**
+- **A1: Unregister module**: Developer calls `registry.unregister("old.tool")`. Listener removes tool from dict, sends notification.
+
+**Exception Flows:**
+- **E1: get_definition returns None**: Listener logs warning, does not add tool.
+- **E2: build_tool raises ValueError**: Listener logs warning, does not add tool.
+
+**Postconditions:**
+1. MCP tool list updated to reflect registry state.
+2. MCP client notified of change.
+
+---
+
+### UC-008: OpenAI tools with strict mode
+
+| Field | Value |
+|-------|-------|
+| **Use Case ID** | UC-008 |
+| **Title** | Export OpenAI tool definitions with strict mode enabled |
+| **Primary Actor** | AI Agent Builder (Alex) |
+| **Traces to FRs** | FR-OPENAI-003 |
+
+**Preconditions:**
+1. apcore-mcp is installed.
+2. Registry has modules with JSON Schema input schemas.
+
+**Main Success Scenario:**
+1. Developer calls `to_openai_tools(registry, strict=True)`.
+2. System iterates over modules.
+3. For each module, system converts schema and applies strict mode transformations:
+   a. Sets `additionalProperties: false` on all object types.
+   b. Makes all properties required.
+   c. Converts optional properties to nullable types.
+   d. Strips `x-*` extensions and `default` values.
+4. System adds `"strict": true` to each function definition dict.
+5. System returns the list.
+6. Developer uses result with `openai.chat.completions.create(tools=tools)`.
+7. OpenAI model produces outputs exactly matching the schema.
+
+**Alternative Flows:**
+- **A1: strict=False**: No strict mode transformations applied. No `"strict"` key in output.
+
+**Exception Flows:**
+- **E1: Schema incompatible with strict mode**: WARNING logged (e.g., "Schema for module 'x' uses additionalProperties: true, which is incompatible with strict mode"). Tool is still included with transformations applied.
+
+**Postconditions:**
+1. All tool definitions have `"strict": true`.
+2. Schemas are strict-mode-compliant.
+
+---
+
+## 6. CRUD Matrix
+
+| Entity | Create | Read | Update | Delete |
+|--------|--------|------|--------|--------|
+| **MCP Tool** | Created from `ModuleDescriptor` during `serve()` startup (FR-SERVER-011) or dynamic registration (FR-DYNAMIC-001) | Listed by MCP clients via `tools/list` (UC-002) | Updated when module is re-registered after unregister (FR-DYNAMIC-001/002) | Removed on module unregister (FR-DYNAMIC-002) |
+| **OpenAI Tool Definition** | Created by `to_openai_tools()` on each call (FR-OPENAI-001) | Returned to caller as list[dict] (UC-005) | N/A (stateless, re-created on each call) | N/A (garbage collected after caller discards) |
+| **MCP Server** | Created by `serve()` (FR-SERVER-001/002/003) | N/A | N/A | Destroyed on shutdown (FR-SERVER-005, NFR-REL-001) |
+| **Registry Listener** | Created during `serve()` initialization (FR-DYNAMIC-001) | N/A | N/A | Stopped on server shutdown |
+| **CallToolResult** | Created per tool call (FR-EXEC-001/002 or FR-ERROR-*) | Returned to MCP client (UC-003/004) | N/A | N/A (transient per request) |
+| **Health Response** | Created per /health request (FR-HEALTH-001) | Returned to HTTP client | N/A | N/A (transient per request) |
+| **MCP Resource** | Created from module documentation (FR-RESOURCE-001) | Read by MCP client via `resources/read` | Updated if module documentation changes (dynamic) | Removed if module unregistered |
+
+---
+
+## 7. Data Dictionary
+
+### 7.1 MCP Tool Definition
+
+| Field | Type | Source | Description |
+|-------|------|--------|-------------|
+| `name` | `str` | `ModuleDescriptor.module_id` | MCP tool name, equals the apcore module ID (dot notation preserved) |
+| `description` | `str` | `ModuleDescriptor.description` | Human-readable tool description |
+| `inputSchema` | `dict[str, Any]` | Independent copy of `ModuleDescriptor.input_schema`; only object root normalized | Preserve runtime optionality, nullability, defaults, references and additional-property policy |
+| `outputSchema` | `dict[str, Any]` | Object-root `ModuleDescriptor.output_schema`, preserving references and constraints | Optional; next SDK release, modern clients and synchronous tools only |
+| `annotations` | `ToolAnnotations` | `ModuleDescriptor.annotations` via AnnotationMapper | Behavioral hints: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` |
+
+**MCP input semantics (issue #20):** `inputSchema` is a deep copy of the descriptor's
+runtime schema with only its object root normalized. Preserve optionality, required
+checks, explicit nullability, defaults, free-form objects, explicit additional-property
+policies and local references. No OpenAI strict projection or null-placeholder
+translation is applied. Preflight and execution consume the unchanged arguments;
+turning `validate_inputs` on must not alter accepted inputs or successful results.
+See `features/mcp-server-factory.md` and `mcp_input_contract.json` for the contract.
+
+### 7.2 OpenAI Tool Definition
+
+| Field | Type | Source | Description |
+|-------|------|--------|-------------|
+| `type` | `str` | Constant | Always `"function"` |
+| `function.name` | `str` | `ModuleDescriptor.module_id` via ModuleIDNormalizer | Normalized module ID (dots replaced with `-`) |
+| `function.description` | `str` | `ModuleDescriptor.description` (+ optional annotation suffix) | Tool description, optionally with annotation metadata appended |
+| `function.parameters` | `dict[str, Any]` | `ModuleDescriptor.input_schema` after $ref inlining | JSON Schema for function parameters |
+| `function.strict` | `bool` | Only present when `strict=True` | OpenAI strict mode flag (only included when enabled) |
+
+### 7.3 MCP CallToolResult (Success)
+
+| Field | Type | Value | Description |
+|-------|------|-------|-------------|
+| `content` | `list[TextContent]` | `[TextContent(type="text", text=<json_output>)]` | JSON-serialized module output |
+| `isError` | `bool` | `False` | Indicates success |
+| `structuredContent` | `dict[str, Any]` | Decoded already-redacted JSON text | Optional; next SDK release, modern clients only; must conform to advertised `outputSchema` |
+
+The next SDK release follows the complete [structured tool result contract](features/mcp-server-factory.md#structured-tool-results-next-sdk-release). Legacy clients receive no new fields. Validation failures after redaction become payload-free tool errors, including when a sensitive field's `const`, `enum`, or type no longer accepts the redaction marker.
+
+### 7.4 MCP CallToolResult (Error)
+
+| Field | Type | Value | Description |
+|-------|------|-------|-------------|
+| `content` | `list[TextContent]` | `[TextContent(type="text", text=<error_message>)]` | Human-readable error message |
+| `isError` | `bool` | `True` | Indicates error |
+
+### 7.5 Error Message Format by Error Type
+
+| apcore Error | Message Format | Example |
+|-------------|----------------|---------|
+| `ModuleNotFoundError` | `"Module not found: {module_id}"` | `"Module not found: image.resize"` |
+| `SchemaValidationError` | `"Schema validation failed:\n  {path}: {message}"` | `"Schema validation failed:\n  /width: Input should be a valid integer"` |
+| `ACLDeniedError` | `"Access denied"` | `"Access denied"` |
+| `ModuleTimeoutError` | `"Module timed out after {timeout_ms}ms"` | `"Module timed out after 30000ms"` |
+| `InvalidInputError` | `"Invalid input: {message}"` | `"Invalid input: module_id must be non-empty"` |
+| `CallDepthExceededError` | `"Call depth limit exceeded"` | `"Call depth limit exceeded"` |
+| `CircularCallError` | `"Circular call detected"` | `"Circular call detected"` |
+| `CallFrequencyExceededError` | `"Call frequency limit exceeded"` | `"Call frequency limit exceeded"` |
+| Other `ModuleError` | `"Module error: {code}"` | `"Module error: CONFIG_INVALID"` |
+| Non-`ModuleError` Exception | `"Internal error occurred"` | `"Internal error occurred"` |
+
+### 7.6 Health Check Response
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `str` | Always `"ok"` |
+| `module_count` | `int` | Number of currently registered tools |
+| `uptime_seconds` | `float` | Seconds since server start |
+
+### 7.7 CLI Argument Specification
+
+| Argument | Type | Required | Default | Constraints | Description |
+|----------|------|----------|---------|-------------|-------------|
+| `--extensions-dir` | `str` (path) | Yes | N/A | Must exist, must be directory | Path to apcore extensions directory |
+| `--transport` | `str` (choice) | No | `"stdio"` | One of: `stdio`, `streamable-http`, `sse` | MCP transport protocol |
+| `--host` | `str` | No | `"127.0.0.1"` | Non-empty | Bind address for HTTP transports |
+| `--port` | `int` | No | `8000` | 1-65535 | Bind port for HTTP transports |
+| `--name` | `str` | No | `"apcore-mcp"` | Non-empty, max 255 chars | Server name |
+| `--version` | `str` | No | Package version | Non-empty | Server version |
+| `--log-level` | `str` (choice) | No | `"INFO"` | One of: `DEBUG`, `INFO`, `WARNING`, `ERROR` | Log verbosity |
+| `--help` | flag | No | N/A | N/A | Show help and exit |
+
+### 7.8 serve() Parameter Specification
+
+> **Partial table — constraints only.** The rows below detail validation constraints for the
+> transport, identity, lifecycle and exposure parameters. They are **not** the full parameter list:
+> `serve()` takes 37 keyword parameters at 0.17.2. §8.1.1 carries the complete signature and is
+> authoritative; `features/mcp-server-factory.md` groups the same set by concern. Do not implement
+> against this table alone.
+
+| Parameter | Type | Required | Default | Constraints | Description |
+|-----------|------|----------|---------|-------------|-------------|
+| `registry_or_executor` | `Registry \| Executor` | Yes | N/A | Must be instance of Registry or Executor | Module source and execution engine |
+| `transport` | `str` | No | `"stdio"` | One of: `"stdio"`, `"streamable-http"`, `"sse"` (case-insensitive) | Transport protocol |
+| `host` | `str` | No | `"127.0.0.1"` | Non-empty | Bind address (ignored for stdio) |
+| `port` | `int` | No | `8000` | 1-65535 | Bind port (ignored for stdio) |
+| `name` | `str` | No | `"apcore-mcp"` | Non-empty, max 255 chars | Server name for MCP clients |
+| `version` | `str \| None` | No | `None` | Non-empty if provided | Server version (None = package version) |
+| `on_startup` | `Callable[[], None] \| None` | No | `None` | Must be callable or None | Optional async callback invoked after server starts |
+| `on_shutdown` | `Callable[[], None] \| None` | No | `None` | Must be callable or None | Optional async callback invoked before server stops |
+| `dynamic` | `bool` | No | `False` | N/A | Enable dynamic module discovery at runtime |
+| `validate_inputs` | `bool` | No | `False` | N/A | Enable input schema validation |
+| `tags` | `list[str] \| None` | No | `None` | Each tag non-empty | Tag filter for module selection |
+| `prefix` | `str \| None` | No | `None` | Non-empty if provided | Prefix filter for module selection |
+| `log_level` | `str \| None` | No | `None` | One of: `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"` | Log level for apcore_mcp logger |
+
+### 7.9 to_openai_tools() Parameter Specification
+
+| Parameter | Type | Required | Default | Constraints | Description |
+|-----------|------|----------|---------|-------------|-------------|
+| `registry_or_executor` | `Registry \| Executor` | Yes | N/A | Must be instance of Registry or Executor | Module source |
+| `embed_annotations` | `bool` | No | `False` | N/A | Append annotation metadata to descriptions |
+| `strict` | `bool` | No | `False` (Python) / `True` (TypeScript, Rust) | N/A | Enable OpenAI strict mode. **The default is not uniform**: Python's `to_openai_tools()` defaults to `False`, TypeScript's `toOpenaiTools()` to `True`, and Rust's `to_openai_tools(embed_annotations, strict)` takes it positionally with no default (documented call sites pass `true`). The same registry therefore yields permissive schemas from Python and strict ones from the other two. Pass the value explicitly in portable code. |
+| `tags` | `list[str] \| None` | No | `None` | Each tag non-empty | Tag filter |
+| `prefix` | `str \| None` | No | `None` | Non-empty if provided | Prefix filter |
+
+---
+
+## 8. Interface Requirements
+
+### 8.1 Python API Interface
+
+#### 8.1.1 serve() Function
+
+**Module:** `apcore_mcp`
+
+**Signature (complete, 0.17.2 — 37 parameters):**
+```python
+def serve(
+    registry_or_executor: Registry | Executor,
+    *,
+    # transport / bind
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    # identity
+    name: str = "apcore-mcp",
+    version: str | None = None,
+    # lifecycle
+    on_startup: Callable[[], None] | None = None,
+    on_shutdown: Callable[[], None] | None = None,
+    # exposure
+    tags: list[str] | None = None,
+    prefix: str | None = None,
+    log_level: str | None = None,
+    dynamic: bool = False,
+    validate_inputs: bool = False,
+    metrics_collector: MetricsExporter | bool | None = None,
+    # explorer
+    explorer: bool = False,
+    explorer_prefix: str = "/explorer",
+    allow_execute: bool = False,
+    explorer_title: str = "APCore MCP Explorer",
+    explorer_project_name: str | None = "apcore-mcp",
+    explorer_project_url: str | None = "https://github.com/aiperceivable/apcore-mcp-python",
+    # auth
+    authenticator: Authenticator | None = None,
+    require_auth: bool = True,
+    exempt_paths: set[str] | None = None,      # set, not list; None -> {"/health", "/metrics"}
+    # approval (Phase A + Phase B)
+    approval_handler: ApprovalHandler | None = None,
+    approval_store: ApprovalStore | None = None,
+    approval_notify: Callable[[dict], None] | None = None,
+    # output
+    output_formatter: Callable[[dict], str] | None = None,
+    output_format: str | None = None,
+    strategy: str | None = None,
+    redact_output: bool = True,
+    trace: bool = False,
+    # pipeline
+    middleware: list[Middleware] | None = None,   # singular; `middlewares` is not accepted
+    acl: ACL | None = None,
+    observability: bool = False,
+    # async tasks (F-043)
+    async_tasks: bool = True,
+    async_max_concurrent: int = 10,
+    async_max_tasks: int = 1000,
+) -> None: ...
+```
+
+**Behavior:** Blocks until server shutdown. Returns `None`.
+
+**Not accepted:** `extensions`, `schema_converter`, `annotation_mapper`, `error_mapper` — the
+Extension Bridge (F-042 / EB-2) is unimplemented in every SDK. See `features/extension-bridge.md`.
+
+**Exceptions:** `TypeError`, `ValueError`, `OSError`.
+
+#### 8.1.1a async_serve() Function
+
+**Module:** `apcore_mcp`
+
+**Signature:**
+```python
+async def async_serve(
+    registry_or_executor: Registry | Executor,
+    *,
+    # Identical to serve() minus the six parameters that only make sense when
+    # this function owns the process: transport, host, port, on_startup, on_shutdown.
+    # 32 parameters at 0.17.2.
+    name: str = "apcore-mcp",
+    version: str | None = None,
+    tags: list[str] | None = None,
+    prefix: str | None = None,
+    log_level: str | None = None,
+    dynamic: bool = False,
+    validate_inputs: bool = False,
+    metrics_collector: MetricsExporter | bool | None = None,
+    explorer: bool = False,
+    explorer_prefix: str = "/explorer",
+    allow_execute: bool = False,
+    explorer_title: str = "APCore MCP Explorer",
+    explorer_project_name: str | None = "apcore-mcp",
+    explorer_project_url: str | None = "https://github.com/aiperceivable/apcore-mcp-python",
+    authenticator: Authenticator | None = None,
+    require_auth: bool = True,
+    exempt_paths: set[str] | None = None,
+    approval_handler: ApprovalHandler | None = None,
+    approval_store: ApprovalStore | None = None,
+    approval_notify: Callable[[dict], None] | None = None,
+    output_formatter: Callable[[dict], str] | None = None,
+    output_format: str | None = None,
+    strategy: str | None = None,
+    trace: bool = False,
+    redact_output: bool = True,
+    middleware: list[Middleware] | None = None,
+    acl: ACL | None = None,
+    observability: bool = False,
+    async_tasks: bool = True,
+    async_max_concurrent: int = 10,
+    async_max_tasks: int = 1000,
+) -> AsyncIterator[Starlette]: ...
+```
+
+**Behavior:** Async context manager that yields a Starlette ASGI application for embedding in a larger server. Does not bind to a port — the caller is responsible for running the app.
+
+**Exceptions:** `TypeError`, `ValueError`.
+
+#### 8.1.2 to_openai_tools() Function
+
+**Module:** `apcore_mcp`
+
+**Signature:**
+```python
+def to_openai_tools(
+    registry_or_executor: Registry | Executor,
+    *,
+    embed_annotations: bool = False,
+    strict: bool = False,
+    tags: list[str] | None = None,
+    prefix: str | None = None,
+) -> list[dict[str, Any]]: ...
+```
+
+**Behavior:** Pure function. No side effects. Returns list of dicts.
+
+**Exceptions:** `TypeError`, `ValueError`.
+
+#### 8.1.3 report_progress() Function
+
+**Module:** `apcore_mcp`
+
+**Signature:**
+```python
+async def report_progress(
+    context: Any,
+    progress: float,
+    total: float | None = None,
+    message: str | None = None,
+) -> None: ...
+```
+
+**Behavior:** Sends an MCP `notifications/progress` notification. Silently no-ops when context has no MCP progress callback. No validation on progress value.
+
+**Exceptions:** None.
+
+#### 8.1.4 elicit() Function
+
+**Module:** `apcore_mcp`
+
+**Signature:**
+```python
+async def elicit(
+    context: Any,
+    message: str,
+    requested_schema: dict[str, Any] | None = None,
+) -> Any | None: ...
+```
+
+**Behavior:** Sends an MCP elicitation request and returns the user's response, or `None` if declined/unsupported.
+
+**Exceptions:** None. Returns `None` when called outside MCP context (graceful no-op).
+
+#### 8.1.5 Extension Helper Constants
+
+**Module:** `apcore_mcp`
+
+```python
+MCP_PROGRESS_KEY: str = "_mcp_progress"
+MCP_ELICIT_KEY: str = "_mcp_elicit"
+```
+
+**Behavior:** Module-level string constants. No side effects on import.
+
+### 8.2 CLI Interface
+
+**Entry points:**
+- `python -m apcore_mcp [OPTIONS]`
+- `apcore-mcp [OPTIONS]` (via `pyproject.toml` script entry point)
+
+**Arguments:** See Section 7.7.
+
+**Exit codes:** 0 (success), 1 (invalid arguments), 2 (startup failure / argparse error).
+
+### 8.3 MCP Protocol Interface
+
+#### 8.3.1 Tool Listing
+
+**MCP Method:** `tools/list`
+
+**Request:** No parameters.
+
+**Response:** List of `Tool` objects, each with `name`, `description`, `inputSchema`, and `annotations`.
+
+#### 8.3.2 Tool Calling
+
+**MCP Method:** `tools/call`
+
+**Request:**
+- `name`: string -- tool name (= apcore module_id).
+- `arguments`: object -- tool arguments dict.
+
+**Response:** `CallToolResult` with `content` (list of `TextContent`) and `isError` (boolean).
+
+#### 8.3.3 Tool List Changed Notification
+
+**MCP Method:** `notifications/tools/list_changed`
+
+**Direction:** Server -> Client.
+
+**Trigger:** Module registered or unregistered from the Registry at runtime.
+
+#### 8.3.4 Resource Listing (P2)
+
+**MCP Method:** `resources/list`
+
+**Response:** List of resources with URI pattern `docs://{module_id}`.
+
+#### 8.3.5 Resource Reading (P2)
+
+**MCP Method:** `resources/read`
+
+**Request:** Resource URI.
+
+**Response:** Documentation text content.
+
+### 8.4 apcore SDK Interface (Consumed APIs)
+
+#### 8.4.1 Registry API
+
+| Method / Property | Used By | Purpose |
+|-------------------|---------|---------|
+| `Registry(extensions_dir=...)` | CLI module | Create registry for module discovery |
+| `registry.discover()` | CLI module | Discover and register modules from directory |
+| `registry.list(tags=None, prefix=None)` | MCPServerFactory, OpenAIConverter | Get list of module IDs with optional filtering |
+| `registry.get_definition(module_id)` | MCPServerFactory, OpenAIConverter, RegistryListener | Get ModuleDescriptor for schema and annotation data |
+| `registry.on("register", callback)` | RegistryListener | Subscribe to module registration events |
+| `registry.on("unregister", callback)` | RegistryListener | Subscribe to module unregistration events |
+| `registry.count` | Logging, health check | Get number of registered modules |
+
+#### 8.4.2 Executor API
+
+| Method / Property | Used By | Purpose |
+|-------------------|---------|---------|
+| `Executor(registry, ...)` | serve() (when Registry passed) | Create default executor |
+| `executor.call_async(module_id, inputs, context=None)` | ExecutionRouter | Execute tool calls through full pipeline |
+| `executor.registry` | serve(), to_openai_tools() (when Executor passed) | Extract registry for tool discovery |
+
+#### 8.4.3 ModuleDescriptor Fields
+
+| Field | Type | Used For |
+|-------|------|----------|
+| `module_id` | `str` | MCP tool name, OpenAI function name (normalized) |
+| `description` | `str` | MCP tool description, OpenAI function description |
+| `input_schema` | `dict[str, Any]` | MCP inputSchema, OpenAI parameters |
+| `output_schema` | `dict[str, Any]` | MCP structured output |
+| `annotations` | `ModuleAnnotations \| None` | MCP tool annotations, OpenAI annotation suffix |
+| `documentation` | `str \| None` | MCP Resource content |
+| `tags` | `list[str]` | Module filtering |
+
+#### 8.4.4 Error Hierarchy
+
+| Error Class | Error Code | Mapped To |
+|-------------|-----------|-----------|
+| `ModuleError` (base) | varies | Generic module error |
+| `ModuleNotFoundError` | `MODULE_NOT_FOUND` | "Module not found: {id}" |
+| `SchemaValidationError` | `SCHEMA_VALIDATION_ERROR` | Field-level error details |
+| `ACLDeniedError` | `ACL_DENIED` | "Access denied" |
+| `ModuleTimeoutError` | `MODULE_TIMEOUT` | "Module timed out after {ms}ms" |
+| `InvalidInputError` | `GENERAL_INVALID_INPUT` | "Invalid input: {message}" |
+| `CallDepthExceededError` | `CALL_DEPTH_EXCEEDED` | "Call depth limit exceeded" |
+| `CircularCallError` | `CIRCULAR_CALL` | "Circular call detected" |
+| `CallFrequencyExceededError` | `CALL_FREQUENCY_EXCEEDED` | "Call frequency limit exceeded" |
+| `ExecutionCancelledError` | `EXECUTION_CANCELLED` | "Execution was cancelled" |
+
+---
+
+## 9. Traceability Matrix
+
+### 9.1 PRD Feature to FR Traceability
+
+| PRD Feature | Description | FRs | NFRs | Use Cases |
+|-------------|-------------|-----|------|-----------|
+| F-001 | Registry-to-MCP Schema Mapping | FR-SCHEMA-001, FR-SCHEMA-002, FR-SCHEMA-003, FR-SCHEMA-006, FR-SERVER-011 | NFR-PERF-001, NFR-PERF-003 | UC-001, UC-002 |
+| F-002 | Annotation-to-MCP Mapping | FR-ANNOT-001, FR-ANNOT-002, FR-ANNOT-003, FR-ANNOT-004, FR-ANNOT-005, FR-ANNOT-006 | -- | UC-001, UC-002 |
+| F-003 | MCP Execution Routing | FR-EXEC-001, FR-EXEC-002, FR-EXEC-003, FR-EXEC-004, FR-EXEC-007 | NFR-PERF-002, NFR-SEC-001 | UC-003, UC-004 |
+| F-004 | MCP Error Mapping | FR-ERROR-001 through FR-ERROR-012 | NFR-SEC-002 | UC-004 |
+| F-005 | serve() Function | FR-SERVER-001 through FR-SERVER-012 | NFR-REL-001, NFR-REL-002 | UC-001 |
+| F-006 | stdio Transport | FR-TRANSPORT-001, FR-TRANSPORT-002, FR-TRANSPORT-005 | -- | UC-001, UC-006 |
+| F-007 | Streamable HTTP Transport | FR-TRANSPORT-003, FR-SERVER-002 | NFR-PERF-004 | UC-001 |
+| F-008 | to_openai_tools() Function | FR-OPENAI-001, FR-OPENAI-002, FR-OPENAI-005, FR-SCHEMA-004 | -- | UC-005 |
+| F-009 | CLI Entry Point | FR-CLI-001 through FR-CLI-008 | -- | UC-006 |
+| F-010 | SSE Transport (Backward Compat) | FR-SERVER-003, FR-TRANSPORT-004 | -- | UC-001 |
+| F-011 | OpenAI Annotation Embedding | FR-ANNOT-007, FR-OPENAI-004 | -- | UC-005 |
+| F-012 | OpenAI Strict Mode | FR-OPENAI-003 | -- | UC-008 |
+| F-013 | Structured Output Responses | FR-SCHEMA-005, FR-EXEC-002 | -- | UC-003 |
+| F-014 | Executor Passthrough | FR-EXEC-005, FR-EXEC-006 | NFR-SEC-001 | UC-001, UC-005 |
+| F-015 | Dynamic Tool Registration | FR-DYNAMIC-001 through FR-DYNAMIC-004 | NFR-REL-003 | UC-007 |
+| F-016 | Logging and Observability | FR-LOG-001 through FR-LOG-005, FR-SERVER-010 | NFR-MAINT-004 | UC-001 |
+| F-017 | to_openai_tools() Filtering | FR-OPENAI-006, FR-OPENAI-007, FR-FILTER-003 | -- | UC-005 |
+| F-018 | serve() Module Filtering | FR-SERVER-008, FR-SERVER-009, FR-FILTER-001, FR-FILTER-002, FR-FILTER-003 | -- | UC-001 |
+| F-019 | Health Check Endpoint | FR-HEALTH-001, FR-HEALTH-002 | -- | -- |
+| F-020 | MCP Resource Exposure | FR-RESOURCE-001, FR-RESOURCE-002 | -- | -- |
+| F-026 | MCP Tool Explorer | FR-EXPLORER-001 through FR-EXPLORER-006 | -- | -- |
+| F-027 | JWT Authentication | FR-AUTH-001 through FR-AUTH-007 | NFR-SEC-001 | -- |
+| F-028 | Approval System | FR-APPROVAL-001, FR-APPROVAL-002, FR-APPROVAL-003 | -- | -- |
+| F-029 | AI Guidance Fields | (no FR — covered by tech-design only) | -- | -- |
+| F-030 | AI Intent Metadata | (no FR — covered by tech-design only) | -- | -- |
+| F-031 | Streaming Annotations | (no FR — covered by tech-design only) | -- | -- |
+| F-032 | Custom Output Formatter | (no FR — covered by tech-design only) | -- | -- |
+| F-033 | Config Bus Namespace | (no FR — covered by tech-design only) | -- | -- |
+| F-034 | Error Formatter Registry | (no FR — covered by tech-design only) | -- | -- |
+| F-035 | Dot-Namespaced Events | (no FR — covered by tech-design only) | -- | -- |
+| F-036 | Pipeline Strategy | FR-STRATEGY-001, FR-STRATEGY-002, FR-STRATEGY-003, FR-STRATEGY-004 | -- | -- |
+| F-037 | Trace Exposure | FR-TRACE-001, FR-TRACE-002, FR-TRACE-003, FR-TRACE-004 | -- | -- |
+| F-038 | Output Redaction | FR-REDACT-001, FR-REDACT-002, FR-REDACT-003 | -- | -- |
+| F-039 | Preflight Validation | FR-PREFLIGHT-001, FR-PREFLIGHT-002, FR-PREFLIGHT-003 | -- | -- |
+| F-040 | YAML Pipeline Config | FR-YAMLPIPE-001, FR-YAMLPIPE-002, FR-YAMLPIPE-003 | -- | -- |
+| F-041 | Annotation Metadata Passthrough | (no FR — covered by tech-design only) | -- | -- |
+| F-042 | Extension Bridge | FR-EXTMGR-001, FR-EXTMGR-002, FR-EXTMGR-003 | -- | -- |
+| F-043 | Async Task Bridge | FR-ASYNC-001, FR-ASYNC-002, FR-ASYNC-003, FR-ASYNC-004, FR-ASYNC-005, FR-ASYNC-006 | -- | -- |
+| F-044 | Bidirectional Cancellation | FR-CANCEL-001, FR-CANCEL-002, FR-CANCEL-003, FR-CANCEL-004 | -- | -- |
+| F-045 | Decorator Metadata Mapping | §10.3 (SHALL statements; no numbered FR) | -- | -- |
+| F-046 | Custom Middleware Injection | §10.3 (SHALL statements; no numbered FR) | -- | -- |
+| F-052 | `mcp.acl` Pattern-Array Shape Closure | FR-ACL-001, FR-ACL-002, FR-ACL-003 | NFR-COMPAT-002, NFR-SEC-001 | -- |
+| F-053 | ACL Tier-2 Startup Diagnostic | FR-ACL-004 | NFR-COMPAT-002 | -- |
+| F-054 | OpenAPI Backend | FR-OPENAPI-001, FR-OPENAPI-002, FR-OPENAPI-003, FR-OPENAPI-007, FR-OPENAPI-008 | NFR-COMPAT-002 | UC-001, UC-006 |
+| F-055 | OpenAPI Governance Guards | FR-OPENAPI-004, FR-OPENAPI-005, FR-OPENAPI-006 | NFR-SEC-001 | -- |
+
+### 9.2 FR to PRD Feature Reverse Traceability
+
+| FR ID | PRD Feature(s) |
+|-------|----------------|
+| FR-SCHEMA-001 | F-001 |
+| FR-SCHEMA-002 | F-001 |
+| FR-SCHEMA-003 | F-001 |
+| FR-SCHEMA-004 | F-008 |
+| FR-SCHEMA-005 | F-013 |
+| FR-SCHEMA-006 | F-001 |
+| FR-ANNOT-001 | F-002 |
+| FR-ANNOT-002 | F-002 |
+| FR-ANNOT-003 | F-002 |
+| FR-ANNOT-004 | F-002 |
+| FR-ANNOT-005 | F-002 |
+| FR-ANNOT-006 | F-002 |
+| FR-ANNOT-007 | F-011 |
+| FR-EXEC-001 | F-003 |
+| FR-EXEC-002 | F-003, F-013 |
+| FR-EXEC-003 | F-003 |
+| FR-EXEC-004 | F-003 |
+| FR-EXEC-005 | F-014 |
+| FR-EXEC-006 | F-014 |
+| FR-EXEC-007 | F-003, F-004 |
+| FR-ERROR-001 | F-004 |
+| FR-ERROR-002 | F-004 |
+| FR-ERROR-003 | F-004 |
+| FR-ERROR-004 | F-004 |
+| FR-ERROR-005 | F-004 |
+| FR-ERROR-006 | F-004 |
+| FR-ERROR-007 | F-004 |
+| FR-ERROR-008 | F-004 |
+| FR-ERROR-009 | F-004 |
+| FR-ERROR-010 | F-004 |
+| FR-ERROR-011 | F-004 |
+| FR-ERROR-012 | F-004 |
+| FR-SERVER-001 | F-005, F-006 |
+| FR-SERVER-002 | F-005, F-007 |
+| FR-SERVER-003 | F-005, F-010 |
+| FR-SERVER-004 | F-005 |
+| FR-SERVER-005 | F-005 |
+| FR-SERVER-006 | F-005 |
+| FR-SERVER-007 | F-005 |
+| FR-SERVER-008 | F-018 |
+| FR-SERVER-009 | F-018 |
+| FR-SERVER-010 | F-016 |
+| FR-SERVER-011 | F-001, F-005 |
+| FR-SERVER-012 | F-005 |
+| FR-TRANSPORT-001 | F-006 |
+| FR-TRANSPORT-002 | F-006 |
+| FR-TRANSPORT-003 | F-007 |
+| FR-TRANSPORT-004 | F-010 |
+| FR-TRANSPORT-005 | F-006 |
+| FR-OPENAI-001 | F-008 |
+| FR-OPENAI-002 | F-008 |
+| FR-OPENAI-003 | F-012 |
+| FR-OPENAI-004 | F-011 |
+| FR-OPENAI-005 | F-008 |
+| FR-OPENAI-006 | F-017 |
+| FR-OPENAI-007 | F-017 |
+| FR-CLI-001 | F-009 |
+| FR-CLI-002 | F-009 |
+| FR-CLI-003 | F-009 |
+| FR-CLI-004 | F-009 |
+| FR-CLI-005 | F-009 |
+| FR-CLI-006 | F-009, F-016 |
+| FR-CLI-007 | F-009 |
+| FR-CLI-008 | F-009 |
+| FR-DYNAMIC-001 | F-015 |
+| FR-DYNAMIC-002 | F-015 |
+| FR-DYNAMIC-003 | F-015 |
+| FR-DYNAMIC-004 | F-015 |
+| FR-REG-NOTIFY-001 | F-015 |
+| FR-REG-NOTIFY-002 | F-015 |
+| FR-REG-NOTIFY-003 | F-015 |
+| FR-LOG-001 | F-016 |
+| FR-LOG-002 | F-016 |
+| FR-LOG-003 | F-016 |
+| FR-LOG-004 | F-016 |
+| FR-LOG-005 | F-016 |
+| FR-FILTER-001 | F-018 |
+| FR-FILTER-002 | F-018 |
+| FR-FILTER-003 | F-017, F-018 |
+| FR-HEALTH-001 | F-019 |
+| FR-HEALTH-002 | F-019 |
+| FR-RESOURCE-001 | F-020 |
+| FR-RESOURCE-002 | F-020 |
+| FR-EXPLORER-001 | F-026 |
+| FR-EXPLORER-002 | F-026 |
+| FR-EXPLORER-003 | F-026 |
+| FR-EXPLORER-004 | F-026 |
+| FR-EXPLORER-005 | F-026 |
+| FR-EXPLORER-006 | F-026 |
+| FR-AUTH-001 | F-027 |
+| FR-AUTH-002 | F-027 |
+| FR-AUTH-003 | F-027 |
+| FR-AUTH-004 | F-027 |
+| FR-AUTH-005 | F-027 |
+| FR-AUTH-006 | F-027 |
+| FR-AUTH-007 | F-027 |
+| FR-APPROVAL-001 | F-028 |
+| FR-APPROVAL-002 | F-028 |
+| FR-APPROVAL-003 | F-028 |
+| FR-STRATEGY-001 | F-036 |
+| FR-STRATEGY-002 | F-036 |
+| FR-STRATEGY-003 | F-036 |
+| FR-STRATEGY-004 | F-036 |
+| FR-TRACE-001 | F-037 |
+| FR-TRACE-002 | F-037 |
+| FR-TRACE-003 | F-037 |
+| FR-TRACE-004 | F-037 |
+| FR-REDACT-001 | F-038 |
+| FR-REDACT-002 | F-038 |
+| FR-REDACT-003 | F-038 |
+| FR-PREFLIGHT-001 | F-039 |
+| FR-PREFLIGHT-002 | F-039 |
+| FR-PREFLIGHT-003 | F-039 |
+| FR-YAMLPIPE-001 | F-040 |
+| FR-YAMLPIPE-002 | F-040 |
+| FR-YAMLPIPE-003 | F-040 |
+| FR-EXTMGR-001 | F-042 |
+| FR-EXTMGR-002 | F-042 |
+| FR-EXTMGR-003 | F-042 |
+| FR-ASYNC-001 | F-043 |
+| FR-ASYNC-002 | F-043 |
+| FR-ASYNC-003 | F-043 |
+| FR-ASYNC-004 | F-043 |
+| FR-ASYNC-005 | F-043 |
+| FR-ASYNC-006 | F-043 |
+| FR-CANCEL-001 | F-044 |
+| FR-CANCEL-002 | F-044 |
+| FR-CANCEL-003 | F-044 |
+| FR-CANCEL-004 | F-044 |
+
+---
+
+### FR-ASYNC: Async Task Bridge
+
+The following requirements define the MCP-layer bridge onto apcore's `AsyncTaskManager`. All six trace to **F-043**.
+
+#### FR-ASYNC-001: Submit async-hinted module calls to AsyncTaskManager
+
+**Description:** When a tool-call target module's descriptor carries an async hint (`metadata.async == true` or `annotations.extra["mcp_async"] == "true"`), the Async Task Bridge shall route the call through `AsyncTaskManager.submit(module_id, inputs, context)` instead of `Executor.call_async()`, and shall return `{"task_id": str, "status": "pending"}` immediately without awaiting module completion.
+**Priority:** P1. **Traces to:** F-043.
+
+#### FR-ASYNC-002: Query task status via meta-tool
+
+**Description:** The server shall register a reserved meta-tool `__apcore_task_status` that accepts `{task_id: str}` and returns the current `TaskInfo` projection (task_id, module_id, status, submitted_at, started_at, completed_at). Unknown ids shall surface as `ASYNC_TASK_NOT_FOUND` via the Error Mapper.
+**Priority:** P1. **Traces to:** F-043.
+
+#### FR-ASYNC-003: Cancel tasks via meta-tool
+
+**Description:** The server shall register `__apcore_task_cancel` which invokes `AsyncTaskManager.cancel(task_id)` and returns `{task_id, cancelled: bool}`. Cancellation shall be cooperative via the context's `CancelToken` when available.
+**Priority:** P1. **Traces to:** F-043.
+
+#### FR-ASYNC-004: List tasks via meta-tool
+
+**Description:** The server shall register `__apcore_task_list` which accepts an optional `status` filter (`pending|running|completed|failed|cancelled`) and returns `{tasks: TaskInfo[]}` by delegating to `AsyncTaskManager.list_tasks(status)`.
+**Priority:** P2. **Traces to:** F-043.
+
+#### FR-ASYNC-005: Retrieve terminal results through status tool
+
+**Description:** When a task is in terminal state, `__apcore_task_status` shall include `result` (JSON-serialised, passed through the same redactor used by the Execution Router) for `completed` tasks and `error` (mapped via Error Mapper) for `failed` tasks. Non-terminal statuses shall omit both fields.
+**Priority:** P1. **Traces to:** F-043.
+
+#### FR-ASYNC-006: Emit progress notifications for running tasks
+
+**Description:** When the original `tools/call` request carries `_meta.progressToken`, the bridge shall emit MCP `notifications/progress` events for each progress event reported through the execution context and one final event upon terminal transition. Progress sink failures shall be logged at `warning` level and must not fail the underlying task.
+**Priority:** P2. **Traces to:** F-043.
+
+---
+
+## 10. Appendix
+
+### 10.1 Glossary
+
+See Section 1.3 for complete definitions of all terms, acronyms, and abbreviations used in this document.
+
+### 10.2 References
+
+See Section 1.4 for all referenced documents and specifications.
+
+### 10.3 apcore API Surface Used by apcore-mcp
+
+The following apcore-python APIs are consumed by apcore-mcp. Verified against source code at `/Users/tercel/WorkSpace/aiperceivable/apcore-python/src/apcore/`.
+
+```python
+# Registry (apcore.registry.registry.Registry)
+registry = Registry(extensions_dir="./extensions")
+registry.discover() -> int
+registry.list(tags=None, prefix=None) -> list[str]
+registry.get(module_id) -> module | None
+registry.get_definition(module_id) -> ModuleDescriptor | None
+registry.iter() -> Iterator[tuple[str, Any]]
+registry.on("register", callback)  # callback(module_id: str, module: Any)
+registry.on("unregister", callback)
+registry.count -> int
+registry.module_ids -> list[str]
+
+# Executor (apcore.executor.Executor)
+executor = Executor(registry, middlewares=None, acl=None, config=None)
+executor.call(module_id, inputs, context=None) -> dict
+executor.call_async(module_id, inputs, context=None) -> dict  # async
+executor.registry -> Registry
+
+# ModuleDescriptor (apcore.registry.types.ModuleDescriptor)
+@dataclass
+class ModuleDescriptor:
+    module_id: str
+    name: str | None
+    description: str
+    documentation: str | None
+    input_schema: dict[str, Any]       # JSON Schema from Pydantic model_json_schema()
+    output_schema: dict[str, Any]      # JSON Schema
+    version: str = "1.0.0"
+    tags: list[str] = field(default_factory=list)
+    annotations: ModuleAnnotations | None = None
+    examples: list[ModuleExample] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+# ModuleAnnotations (apcore.module.ModuleAnnotations)
+@dataclass(frozen=True)
+class ModuleAnnotations:
+    readonly: bool = False
+    destructive: bool = False
+    idempotent: bool = False
+    requires_approval: bool = False
+    open_world: bool = True
+    streaming: bool = False
+    cacheable: bool = False
+    paginated: bool = False
+    cache_ttl: int | None = None
+    cache_key_fields: list[str] | None = None
+    pagination_style: str | None = None
+
+# Error hierarchy (apcore.errors)
+# Base: ModuleError(code, message, details, cause, trace_id)
+ModuleNotFoundError(module_id: str)                         # code="MODULE_NOT_FOUND"
+SchemaValidationError(message, errors: list[dict])          # code="SCHEMA_VALIDATION_ERROR"
+ACLDeniedError(caller_id: str | None, target_id: str)      # code="ACL_DENIED"
+ModuleTimeoutError(module_id: str, timeout_ms: int)         # code="MODULE_TIMEOUT"
+InvalidInputError(message: str)                             # code="GENERAL_INVALID_INPUT"
+CallDepthExceededError(depth, max_depth, call_chain)        # code="CALL_DEPTH_EXCEEDED"
+CircularCallError(module_id, call_chain)                    # code="CIRCULAR_CALL"
+CallFrequencyExceededError(module_id, count, max_repeat, call_chain)  # code="CALL_FREQUENCY_EXCEEDED"
+ExecutionCancelledError(module_id: str)                              # code="EXECUTION_CANCELLED"
+```
+
+### 10.3.x Decorator Metadata & Middleware Injection
+
+**FR-META-001** — Decorator Examples Projection
+The Annotation Mapper SHALL project `ModuleDescriptor.examples` into the MCP `Tool.description` as an `Examples:` section rendered as a bullet list, emitting at most three bullets and truncating the remainder. When `examples` is absent or empty, no section is appended. (Source: F-045)
+
+**FR-META-002** — Decorator Tags Projection
+The Annotation Mapper SHALL project `ModuleDescriptor.tags` onto the MCP `Tool` as a `keywords` list (and derived `category` hint where applicable). When `tags` is `None` or empty, the fields SHALL be omitted. (Source: F-045)
+
+**FR-META-003** — Decorator Version & Documentation URL Projection
+The Annotation Mapper SHALL emit `ModuleDescriptor.version` as `_meta.version` and `ModuleDescriptor.documentation_url` as `_meta.documentationUrl` on the MCP `Tool`. Absent fields SHALL be omitted rather than emitted as empty values. (Source: F-045)
+
+**FR-MW-INJECT-001** — serve() Middleware Parameter
+The `serve()` public API SHALL accept an optional `middlewares: list[Middleware] | None = None` parameter. Entries SHALL be `apcore.middleware.Middleware` instances; invalid entries SHALL cause a configuration error before server start. (Source: F-046)
+
+**FR-MW-INJECT-002** — Middleware Ordering & Pass-Through
+User-supplied middlewares SHALL be installed on the `ExecutionRouter`/`Executor` **after** all built-in middlewares (logging, tracing, approval, redaction). When the parameter is `None` or empty, built-in behavior SHALL remain unchanged. (Source: F-046)
+
+### 10.4 Requirement Counts Summary
+
+| Category | Count |
+|----------|-------|
+| FR-SCHEMA | 6 |
+| FR-ANNOT | 7 |
+| FR-EXEC | 7 |
+| FR-ERROR | 12 |
+| FR-SERVER | 12 |
+| FR-TRANSPORT | 5 |
+| FR-OPENAI | 7 |
+| FR-CLI | 8 |
+| FR-DYNAMIC | 4 |
+| FR-LOG | 5 |
+| FR-FILTER | 3 |
+| FR-HEALTH | 2 |
+| FR-RESOURCE | 2 |
+| FR-EXPLORER | 6 |
+| **Total FRs** | **86** |
+| NFR-PERF | 4 |
+| NFR-SEC | 3 |
+| NFR-REL | 3 |
+| NFR-MAINT | 4 |
+| NFR-COMPAT | 4 |
+| NFR-PORT | 2 |
+| **Total NFRs** | **20** |
+| **Grand Total** | **106** |
+
+---
+
+## 11. Bidirectional Cancellation Requirements
+
+These requirements formalize the integration between the MCP `notifications/cancelled` protocol message and apcore's cooperative `CancelToken` model. They are implemented by the Execution Router with support from the Transport Manager. Tech-design reference: **F-044**.
+
+### Shipped in v0.14.0
+
+#### FR-CANCEL-001: Cancellation Token Lifecycle (partial — shipped)
+
+The Execution Router **SHOULD** allocate a `CancelToken` for inbound tool calls and attach it to the execution `Context` where supported. As of v0.14.0, Rust ships full per-call CancelToken plumbing via `set_cancel_handler` / `notify_cancel`; Python ships transport-session level cancel forwarding via `transport_session_var` (ContextVar) wired by `serve()`/`async_serve()`. TypeScript ships `setAsyncTaskBridge` with analogous session-level wiring. *(planned 0.15.0)* The full cross-SDK per-call `Dict[call_id -> CancelToken]` map with `finally`-block release is a 0.15.0 roadmap item.
+
+### Planned for 0.15.0
+
+#### FR-CANCEL-001 (full): Cancellation Token Lifecycle (planned 0.15.0)
+
+The Execution Router **SHOULD** *(planned 0.15.0)* allocate a fresh `CancelToken` for every inbound tool call, attach it to the `Context` via `Context.create(cancel_token=token)`, register it in a `call_id -> CancelToken` map guarded by a lock, and remove the entry in a `finally` block on completion to prevent leaks.
+
+#### FR-CANCEL-002: Inbound Cancellation Handling (planned 0.15.0)
+
+The Transport Manager **SHOULD** *(planned 0.15.0)* forward `notifications/cancelled` (with `requestId` and optional `reason`) to `ExecutionRouter.cancel(call_id, reason)` on all transports (stdio, streamable-http, sse). The router **SHOULD** invoke `token.cancel()` and, when apcore >= 0.19 is available, also `executor.cancel(call_id)`. A `mcp.call.cancelled` observability event **SHOULD** be emitted with the reason.
+
+#### FR-CANCEL-003: Race Case Semantics (planned 0.15.0)
+
+The router **SHOULD** *(planned 0.15.0)* handle three race cases deterministically:
+1. **Before-start** — cancel received before token registration: store a tombstone and raise `ExecutionCancelledError` immediately when the entry handler runs, without invoking the module.
+2. **After-complete** — cancel received after entry removal: no-op, logged at `debug`.
+3. **Concurrent duplicate cancels** — absorbed idempotently via the thread-safe `CancelToken.cancel()` contract.
+
+#### FR-CANCEL-004: Error Mapping and Response (partially shipped)
+
+The router **MUST** (already shipped in v0.14.0) catch `ExecutionCancelledError` raised in the pipeline and forward it to the Error Mapper, which **MUST** emit JSON-RPC error `-32800` ("Request cancelled") per the MCP spec with internal code `EXECUTION_CANCELLED`. The `CallToolResult` **MUST NOT** be returned for a cancelled `requestId`. *(planned 0.15.0)* The active `CancelToken` **SHOULD** be propagated across `asyncio.to_thread()` and nested calls via a `ContextVar` once the per-call CancelToken map ships.
+
+---
+
+## 12. Extension Manager Integration Requirements
+
+These requirements formalize how apcore-mcp consumes apcore's `ExtensionManager` (see `apcore/docs/features/extension-system.md`) via the Extension Bridge. Tech-design reference: **F-042**.
+
+### FR-EXTMGR-001: serve() Accepts ExtensionManager
+
+The `serve()` public API **MUST** accept an optional `extensions: ExtensionManager | None = None` parameter. When provided, apcore-mcp **MUST** invoke `extensions.apply(registry, executor)` exactly once during server construction, before any MCP built-in middleware is installed, so that user-registered discoverers, module validators, ACLs, approval handlers, span exporters, and middleware are wired onto the Executor and Registry. When `None`, no wiring occurs and the server uses built-in defaults only.
+
+### FR-EXTMGR-002: Adapter Hook Resolution Precedence
+
+apcore-mcp **MUST** resolve each MCP-specific adapter hook (`schema_converter`, `annotation_mapper`, `error_mapper`) using a three-tier precedence: (1) explicit `serve()` keyword argument, (2) `ExtensionManager.get("mcp_schema_converter" | "mcp_annotation_mapper" | "mcp_error_mapper")`, (3) built-in default. When tiers (1) and (2) both supply a non-null value for the same hook, tier (1) **MUST** win and a WARNING **MUST** be logged. Each resolved adapter **MUST** satisfy its protocol; a `TypeError` **MUST** be raised before any transport socket is opened.
+
+### FR-EXTMGR-003: Load Order Guarantee
+
+The Extension Bridge **MUST** enforce the load sequence: (1) extension registrations visible on the Executor (satisfied by apcore's own `Executor`/`ExtensionManager` integration — no literal `apply()` call required, per the EB-1 withdrawal noted in `docs/features/extension-bridge.md` Status §), (2) built-in MCP middleware installation, (3) adapter hook binding, (4) protocol handler registration. User middleware registered via the `middleware` extension point **MUST** be installed before built-in middleware (tracing, redaction, preflight) so that built-ins sit closest to the module boundary. When `serve()` is called with an `Executor` rather than a `Registry`, the bridge **MUST NOT** re-trigger extension application (apcore already applied them at Executor construction); duplicate application attempts detected via an internal sentinel **MUST** emit a WARNING but **MUST NOT** raise.
+
+---
+
+*End of Software Requirements Specification*

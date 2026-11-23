@@ -1,0 +1,106 @@
+{
+  "description": "MCP factories preserve the module runtime input contract, normalize only the object root, and keep dot-namespaced tool names and annotation hints. OpenAI strict projection belongs exclusively to the OpenAI converter.",
+  "entry_point": "MCPServerFactory.build_tool(descriptor)",
+  "spec": "srs-apcore-mcp.md#7.1",
+  "test_cases": [
+    {
+      "id": "basic_module_mapping",
+      "description": "Dot notation is preserved in the MCP tool name. Hyphenation belongs to the OpenAI function-name normalizer (see openai_tool_mapping.json), not here.",
+      "input_module": {
+        "module_id": "executor.email.send_email",
+        "description": "Send an email via SMTP",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "to": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "to"
+          ]
+        },
+        "annotations": {
+          "readonly": false,
+          "cacheable": false
+        }
+      },
+      "expected_mcp_tool": {
+        "name": "executor.email.send_email",
+        "description": "Send an email via SMTP",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "to": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "to"
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      }
+    },
+    {
+      "id": "x_extensions_survive_the_mcp_schema",
+      "description": "The MCP path passes the input schema through; it does not promote x-llm-description or strip x- extensions. Both of those belong to the OpenAI strict conversion. Pins the boundary between the two paths.",
+      "input_module": {
+        "module_id": "data.query",
+        "description": "Run a query",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "sql": {
+              "type": "string",
+              "description": "Short desc",
+              "x-llm-description": "Long AI-specific description",
+              "x-sensitive": true
+            }
+          }
+        }
+      },
+      "expected_mcp_tool": {
+        "name": "data.query",
+        "description": "Run a query",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "sql": {
+              "type": "string",
+              "description": "Short desc",
+              "x-llm-description": "Long AI-specific description",
+              "x-sensitive": true
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        }
+      }
+    }
+  ],
+  "known_gaps": [
+    {
+      "id": "f041_mcp_description_passthrough",
+      "spec": "prd-apcore-mcp.md#F-041",
+      "status": "unimplemented_consistently",
+      "description": "F-041 acceptance criteria 1 and 5 say mcp_-prefixed keys from annotations.extra reach the MCP tool description and the Explorer detail view. In all three bridges AnnotationMapper.to_description_suffix() is called only from the OpenAI converter, never from build_tool(), so the MCP description never carries them. The three implementations agree, so this is a spec-versus-implementation gap rather than cross-language divergence. Covered on the OpenAI path by openai_tool_mapping.json#mcp_prefix_reaches_the_description."
+    }
+  ],
+  "contract_version": "2.0"
+}
