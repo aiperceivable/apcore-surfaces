@@ -1,0 +1,5019 @@
+//! APCoreMCP — unified bridge class.
+//!
+//! Provides builder-pattern construction and the main `serve` / `async_serve`
+//! entry points that wire an apcore registry+executor to an MCP server.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use axum::Router;
+use serde_json::Value;
+
+use apcore::approval::ApprovalHandler;
+use apcore::executor::Executor;
+use apcore::registry::registry::Registry;
+
+use crate::auth::protocol::Authenticator;
+use crate::config;
+use crate::converters::openai::OpenAIConverter;
+use crate::explorer::{create_explorer_mount, ExplorerConfig, ToolInfo};
+use crate::server::factory::MCPServerFactory;
+use crate::server::listener::RegistryListener;
+use crate::server::router::{ExecutionRouter, ExecutorError, OutputFormatter};
+use crate::server::server::{MCPServer, ServerHandler};
+use crate::server::transport::{MetricsExporter, TransportManager};
+use crate::server::types::{InitializationOptions, Tool};
+
+// ---- BackendSource enum -----------------------------------------------------
+
+/// Describes the source of the apcore backend.
+///
+/// This replaces the Python polymorphic `str | Path | Registry | Executor`
+/// constructor parameter with a typed enum.
+///
+/// # Examples
+///
+/// ```
+/// use apcore_mcp::apcore_mcp::BackendSource;
+/// use std::path::PathBuf;
+///
+/// // From a string path
+/// let source: BackendSource = "./extensions".into();
+///
+/// // From a PathBuf
+/// let source: BackendSource = PathBuf::from("./extensions").into();
+/// ```
+#[derive(Debug)]
+pub enum BackendSource {
+    /// Path to an extensions directory. A [`Registry`] will be created
+    /// and [`discover()`](Registry::discover) called automatically.
+    ExtensionsDir(PathBuf),
+    /// A pre-built [`Registry`] instance.
+    Registry(Arc<Registry>),
+    /// A pre-built [`Executor`] instance (which contains its own registry).
+    Executor(Arc<Executor>),
+}
+
+impl From<&str> for BackendSource {
+    fn from(s: &str) -> Self {
+        BackendSource::ExtensionsDir(PathBuf::from(s))
+    }
+}
+
+impl From<String> for BackendSource {
+    fn from(s: String) -> Self {
+        BackendSource::ExtensionsDir(PathBuf::from(s))
+    }
+}
+
+impl From<PathBuf> for BackendSource {
+    fn from(p: PathBuf) -> Self {
+        BackendSource::ExtensionsDir(p)
+    }
+}
+
+impl From<Arc<Registry>> for BackendSource {
+    fn from(r: Arc<Registry>) -> Self {
+        BackendSource::Registry(r)
+    }
+}
+
+impl From<Arc<Executor>> for BackendSource {
+    fn from(e: Arc<Executor>) -> Self {
+        BackendSource::Executor(e)
+    }
+}
+
+// ---- APCoreMCPError ---------------------------------------------------------
+
+/// Errors that can occur during APCoreMCP construction or operation.
+#[derive(Debug, thiserror::Error)]
+pub enum APCoreMCPError {
+    /// The server name must not be empty.
+    #[error("name must not be empty")]
+    EmptyName,
+
+    /// The server name exceeds the maximum length of 255 characters.
+    #[error("name exceeds maximum length of 255: {0}")]
+    NameTooLong(usize),
+
+    /// Tag values must not be empty strings.
+    #[error("tag values must not be empty")]
+    EmptyTag,
+
+    /// The prefix must not be empty when provided.
+    #[error("prefix must not be empty")]
+    EmptyPrefix,
+
+    /// The specified log level is not recognized.
+    #[error("unknown log level: {0:?}. Valid: [\"CRITICAL\", \"DEBUG\", \"ERROR\", \"INFO\", \"WARNING\"]")]
+    InvalidLogLevel(String),
+
+    /// The explorer prefix must start with '/'.
+    #[error("explorer_prefix must start with '/'")]
+    InvalidExplorerPrefix,
+
+    /// Failed to resolve the backend (registry/executor) from the source.
+    #[error("backend resolution failed: {0}")]
+    BackendResolution(String),
+
+    /// Invalid configuration value (e.g. malformed Config Bus entry).
+    #[error("config error: {0}")]
+    Config(String),
+
+    /// Unknown transport type.
+    #[error("Unknown transport: {0:?}. Expected 'stdio', 'streamable-http', or 'sse'.")]
+    UnknownTransport(String),
+
+    /// A server runtime error.
+    #[error("server error: {0}")]
+    ServerError(String),
+
+    /// OpenAI conversion error.
+    #[error("openai conversion error: {0}")]
+    ConverterError(#[from] crate::converters::openai::ConverterError),
+}
+
+// ---- APCoreMCPConfig --------------------------------------------------------
+
+/// Configuration for the APCoreMCP bridge.
+///
+/// Matches the Python `APCoreMCP.__init__` parameters. Use [`Default::default()`]
+/// for sensible defaults, then override fields as needed.
+#[derive(Debug, Clone)]
+pub struct APCoreMCPConfig {
+    /// MCP server name (max 255 chars).
+    pub name: String,
+    /// MCP server version. `None` defaults to the crate version.
+    pub version: Option<String>,
+    /// Transport type: "stdio", "streamable-http", or "sse".
+    pub transport: String,
+    /// Host address for HTTP-based transports.
+    pub host: String,
+    /// Port number for HTTP-based transports.
+    pub port: u16,
+    /// Filter modules by tags. Only modules with ALL specified tags are exposed.
+    pub tags: Option<Vec<String>>,
+    /// Filter modules by ID prefix.
+    pub prefix: Option<String>,
+    /// Log level for the apcore_mcp logger (e.g. "DEBUG", "INFO").
+    pub log_level: Option<String>,
+    /// Validate tool inputs against schemas before execution.
+    pub validate_inputs: bool,
+    /// Redact sensitive (`x-sensitive`) fields from tool outputs before
+    /// returning them to the client. Defaults to `true` (secure by default);
+    /// the convenience [`ServeConfig`]/[`AsyncServeConfig`] expose this as a
+    /// three-state `Option<bool>` where `None` keeps this default. [M-2]
+    pub redact_output: bool,
+    /// If true, unauthenticated requests receive 401.
+    pub require_auth: bool,
+    /// Exact paths that bypass authentication.
+    pub exempt_paths: Option<HashSet<String>>,
+    /// Enable the browser-based Tool Explorer UI (HTTP only).
+    pub explorer: bool,
+    /// URL prefix for the explorer.
+    pub explorer_prefix: String,
+    /// Page title shown in the explorer browser tab and heading.
+    pub explorer_title: String,
+    /// Optional project name shown in the explorer footer.
+    pub explorer_project_name: Option<String>,
+    /// Optional project URL linked in the explorer footer.
+    pub explorer_project_url: Option<String>,
+    /// Allow tool execution from the explorer UI.
+    pub allow_execute: bool,
+    /// Optional built-in output format name ("json", "csv", "jsonl").
+    /// When set, automatically uses the corresponding formatter from `apcore-toolkit`.
+    pub output_format: crate::server::router::OutputFormat,
+    /// Pipeline execution strategy preset (e.g. "standard", "internal", "testing").
+    pub strategy: Option<String>,
+    /// Enable pipeline trace mode. When true, tool responses include
+    /// pipeline trace data (strategy name, duration, steps).
+    pub trace: bool,
+    /// Enable the built-in observability middleware stack.
+    ///
+    /// When `true`, the builder constructs a shared apcore
+    /// [`MetricsCollector`](apcore::observability::metrics::MetricsCollector)
+    /// plus [`UsageCollector`](apcore::observability::usage::UsageCollector)
+    /// and installs the corresponding middleware on the executor. The
+    /// metrics collector is also exposed at `/metrics` (Prometheus) and the
+    /// usage collector at `/usage` (JSON summaries).
+    pub observability: bool,
+}
+
+impl Default for APCoreMCPConfig {
+    fn default() -> Self {
+        Self {
+            name: "apcore-mcp".to_string(),
+            version: None,
+            transport: "stdio".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8000,
+            tags: None,
+            prefix: None,
+            log_level: None,
+            validate_inputs: false,
+            redact_output: true,
+            require_auth: true,
+            exempt_paths: None,
+            explorer: false,
+            explorer_prefix: "/explorer".to_string(),
+            explorer_title: "APCore MCP Explorer".to_string(),
+            explorer_project_name: Some("apcore-mcp".to_string()),
+            explorer_project_url: Some(
+                "https://github.com/aiperceivable/apcore-mcp-rust".to_string(),
+            ),
+            allow_execute: false,
+            output_format: crate::server::router::OutputFormat::Json,
+            strategy: None,
+            trace: false,
+            observability: false,
+        }
+    }
+}
+
+// ---- Valid log levels -------------------------------------------------------
+
+const VALID_LOG_LEVELS: &[&str] = &["CRITICAL", "DEBUG", "ERROR", "INFO", "WARNING"];
+
+// ---- Executor adapter -------------------------------------------------------
+
+/// Adapts `apcore::Executor` to the [`crate::server::router::Executor`] trait
+/// so that `ExecutionRouter` can dispatch MCP tool calls through it.
+struct ApcoreExecutorAdapter {
+    inner: Arc<Executor>,
+    /// Optional resolved pipeline strategy override. When set, trace-path
+    /// calls (`call_with_trace`) run under this strategy instead of the
+    /// executor default. [L-3]
+    strategy: Option<Arc<apcore::ExecutionStrategy>>,
+}
+
+#[async_trait::async_trait]
+impl crate::server::router::Executor for ApcoreExecutorAdapter {
+    async fn call_async(
+        &self,
+        module_id: &str,
+        inputs: &Value,
+        _context: Option<&Value>,
+        version_hint: Option<&str>,
+    ) -> Result<Value, ExecutorError> {
+        self.inner
+            .call(module_id, inputs.clone(), None, version_hint)
+            .await
+            .map_err(|e| ExecutorError::Execution {
+                code: format!("{:?}", e.code),
+                message: e.to_string(),
+                details: None,
+            })
+    }
+
+    async fn call_with_trace(
+        &self,
+        module_id: &str,
+        inputs: &Value,
+        _context: Option<&Value>,
+        version_hint: Option<&str>,
+    ) -> Option<Result<(Value, Value), ExecutorError>> {
+        // Delegates to apcore::Executor::call_with_trace. As of apcore 0.22.0
+        // the trace variant accepts `version_hint` (4th arg) and a `strategy`
+        // override (5th arg). We forward the resolved version_hint and, when a
+        // pipeline strategy preset was configured on the builder, the resolved
+        // strategy override so trace-path calls honour it. [L-3]
+        let strategy_ref = self.strategy.as_deref();
+        let result = self
+            .inner
+            .call_with_trace(module_id, inputs.clone(), None, version_hint, strategy_ref)
+            .await;
+        Some(match result {
+            Ok((out, trace)) => {
+                let trace_json = serde_json::to_value(&trace).unwrap_or(Value::Null);
+                Ok((out, trace_json))
+            }
+            Err(e) => Err(ExecutorError::Execution {
+                code: format!("{:?}", e.code),
+                message: e.to_string(),
+                details: None,
+            }),
+        })
+    }
+
+    /// Forward the caller's typed apcore `Context` into the executor.
+    ///
+    /// `call_async` and `call_with_trace` above pass `None` for the context,
+    /// which makes apcore fabricate an anonymous `@external` one. Everything
+    /// the router put in the real context was therefore discarded before the
+    /// pipeline ran — including the elicit call id the approval gate needs to
+    /// prompt a human, which is why interactive approval could never work on a
+    /// CLI-launched server (apexe#29).
+    ///
+    /// Passing the context through is what preserves the shared `Context.data`
+    /// map: apcore clones the context into the `PipelineContext` and on into
+    /// the `ApprovalRequest`, and `Context`'s `Clone`/`child` both `Arc::clone`
+    /// that map rather than copying it.
+    async fn call_typed(
+        &self,
+        module_id: &str,
+        inputs: &Value,
+        context: &apcore::Context<Value>,
+        version_hint: Option<&str>,
+        want_trace: bool,
+    ) -> Option<Result<(Value, Option<Value>), ExecutorError>> {
+        let to_executor_error = |e: apcore::errors::ModuleError| ExecutorError::Execution {
+            code: format!("{:?}", e.code),
+            message: e.to_string(),
+            details: None,
+        };
+        if want_trace {
+            let strategy_ref = self.strategy.as_deref();
+            return Some(
+                self.inner
+                    .call_with_trace(
+                        module_id,
+                        inputs.clone(),
+                        Some(context),
+                        version_hint,
+                        strategy_ref,
+                    )
+                    .await
+                    .map(|(out, trace)| {
+                        (
+                            out,
+                            Some(serde_json::to_value(&trace).unwrap_or(Value::Null)),
+                        )
+                    })
+                    .map_err(to_executor_error),
+            );
+        }
+        Some(
+            self.inner
+                .call(module_id, inputs.clone(), Some(context), version_hint)
+                .await
+                .map(|out| (out, None))
+                .map_err(to_executor_error),
+        )
+    }
+
+    /// Look up the descriptor-default `version_hint` for the spec's
+    /// 3-source cascade. [A-D-006]
+    fn version_hint_default(&self, module_id: &str) -> Option<String> {
+        // apcore 0.22.0: get_definition() now returns
+        // Result<Option<ModuleDescriptor>, ModuleError>; treat a lookup error
+        // the same as "no descriptor" for this best-effort default resolution.
+        self.inner
+            .registry()
+            .get_definition(module_id)
+            .ok()
+            .flatten()
+            .and_then(|desc| desc.metadata.get("version_hint").cloned())
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+    }
+}
+
+// ---- APCoreMCP struct -------------------------------------------------------
+
+/// The main MCP bridge. Wraps an apcore registry and executor, exposing
+/// them as MCP tools over the configured transport.
+pub struct APCoreMCP {
+    config: APCoreMCPConfig,
+    /// User-supplied registry for tool discovery. `None` when backend is
+    /// an Executor (tool discovery goes through `executor.registry()`).
+    standalone_registry: Option<Arc<Registry>>,
+    executor: Arc<Executor>,
+    /// Optional authenticator for HTTP transport auth middleware.
+    authenticator: Option<Arc<dyn Authenticator>>,
+    metrics_collector: Option<Arc<dyn MetricsExporter>>,
+    /// Auto-instantiated apcore metrics collector (when `observability=true`).
+    auto_metrics: Option<Arc<apcore::observability::metrics::MetricsCollector>>,
+    /// Auto-instantiated apcore usage collector (when `observability=true`).
+    auto_usage: Option<Arc<apcore::observability::usage::UsageCollector>>,
+    /// Reserved — accepted by builder but not yet passed to
+    /// `ExecutionRouter::new_with_formatter` (requires converting to
+    /// `Arc<dyn Fn>` or taking `&mut self`).
+    #[allow(dead_code)]
+    output_formatter: Option<OutputFormatter>,
+    /// Phase B approval handler. When present, `build_server_components`
+    /// instantiates an [`ApprovalBridge`](crate::server::approval_bridge::ApprovalBridge)
+    /// and advertises the `__apcore_approval_check` meta-tool. [H-1]
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    /// Retained Phase B approval store (when configured via
+    /// [`approval_store`](APCoreMCPBuilder::approval_store)). Kept so the
+    /// serve entry points can start its TTL sweep
+    /// ([`ApprovalStore::start_sweep`]). [H-1]
+    approval_store: Option<Arc<dyn crate::approval_store::ApprovalStore>>,
+    /// Pre-resolved pipeline execution strategy (from builder/Config Bus).
+    /// Threaded into the executor adapter so trace-path calls honour it. [L-3]
+    resolved_strategy: Option<Arc<apcore::ExecutionStrategy>>,
+}
+
+/// Project a tool list down to the entries shown in the Explorer UI,
+/// dropping reserved `__apcore_*` meta-tools (F-043 AsyncTaskBridge). The
+/// meta-tools remain in the MCP `tools/list` response — only the human-
+/// facing UI hides them, since their multi-step submit/status/cancel/list
+/// flow does not fit a one-form-per-tool layout.
+///
+/// Annotations are carried across so the UI can render its hint badges — the
+/// destructive-tool warning in particular, on the surface that also offers
+/// direct execution. The Python bridge hands the MCP tool objects to the
+/// shared UI library verbatim and gets this for free; Rust has to project
+/// them onto [`ToolInfo`] explicitly.
+fn filter_explorer_tools(tools: &[Tool]) -> Vec<ToolInfo> {
+    tools
+        .iter()
+        .filter(|t| {
+            !t.name
+                .starts_with(crate::server::async_task_bridge::META_TOOL_PREFIX)
+        })
+        .map(|t| ToolInfo {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+            annotations: t
+                .annotations
+                .as_ref()
+                .and_then(|a| serde_json::to_value(a).ok()),
+        })
+        .collect()
+}
+
+impl APCoreMCP {
+    /// Create a new builder.
+    pub fn builder() -> APCoreMCPBuilder {
+        APCoreMCPBuilder::default()
+    }
+
+    // -- Property accessors ---------------------------------------------------
+
+    /// Internal helper — returns the registry for tool discovery.
+    fn reg(&self) -> &Registry {
+        match &self.standalone_registry {
+            Some(reg) => reg,
+            None => self.executor.registry(),
+        }
+    }
+
+    /// Returns a reference to the underlying registry.
+    pub fn registry(&self) -> &Registry {
+        self.reg()
+    }
+
+    /// Returns a reference to the underlying executor.
+    pub fn executor(&self) -> &Arc<Executor> {
+        &self.executor
+    }
+
+    /// Create a RegistryListener if dynamic mode is enabled, leaving the
+    /// caller responsible for invoking `listener.start(registry, factory)`
+    /// once the `Arc<Registry>` and `Arc<MCPServerFactory>` are both
+    /// available downstream of the build pipeline.
+    ///
+    /// `RegistryListener::start` now accepts `Arc<Registry>` (post-A-D-002),
+    /// so wiring no longer requires `&mut Registry`; this function returns
+    /// the unstarted listener so the build site can decide ordering.
+    fn maybe_start_listener(dynamic: bool) -> Option<RegistryListener> {
+        if dynamic {
+            let listener = RegistryListener::new();
+            tracing::info!(
+                "Dynamic mode: RegistryListener created — caller must invoke \
+                 listener.start(registry, factory) to begin processing events"
+            );
+            Some(listener)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the currently registered tool names (module IDs), filtered
+    /// by the configured tags and prefix.
+    pub fn tools(&self) -> Vec<String> {
+        let tags_refs: Option<Vec<&str>> = self
+            .config
+            .tags
+            .as_ref()
+            .map(|t| t.iter().map(|s| s.as_str()).collect());
+        let tags_slice: Option<&[&str]> = tags_refs.as_deref();
+        let prefix = self.config.prefix.as_deref();
+        self.reg()
+            .list(tags_slice, prefix, None)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    // -- build_server_components ----------------------------------------------
+
+    /// Build the shared MCP server components used by `serve()` and `async_serve()`.
+    ///
+    /// Returns `(MCPServer, ExecutionRouter, Vec<Tool>, InitializationOptions, version)`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn build_server_components(
+        &self,
+    ) -> Result<
+        (
+            MCPServer,
+            Arc<ExecutionRouter>,
+            Vec<Tool>,
+            InitializationOptions,
+            String,
+            Option<Arc<crate::server::async_task_bridge::AsyncTaskBridge>>,
+        ),
+        APCoreMCPError,
+    > {
+        let version = self
+            .config
+            .version
+            .clone()
+            .unwrap_or_else(|| crate::VERSION.to_string());
+
+        let factory = MCPServerFactory::new();
+        let mut server = factory
+            .create_server(&self.config.name, &version)
+            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?;
+
+        // Build filtered tool definitions
+        let tags_refs: Option<Vec<&str>> = self
+            .config
+            .tags
+            .as_ref()
+            .map(|t| t.iter().map(|s| s.as_str()).collect());
+        let tags_slice: Option<&[&str]> = tags_refs.as_deref();
+        let prefix = self.config.prefix.as_deref();
+        let tools = factory
+            .build_tools(self.reg(), tags_slice, prefix)
+            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?;
+
+        // Build output schema map for output redaction.
+        let output_schema_map: std::collections::HashMap<String, Value> = {
+            let module_ids = self.reg().list(tags_slice, prefix, None);
+            let mut map = std::collections::HashMap::new();
+            for module_id in module_ids {
+                if let Ok(Some(descriptor)) = self.reg().get_definition(&module_id) {
+                    if !descriptor.output_schema.is_null() {
+                        map.insert(module_id.to_string(), descriptor.output_schema.clone());
+                    }
+                }
+            }
+            map
+        };
+
+        // [A-D-031] Async-hinted classification is now done dynamically by
+        // the bridge at call time (`bridge.is_async_module_registered_self`),
+        // so we no longer pre-populate a static `async_ids` set. The
+        // pre-fix set was frozen at startup and stale on registry
+        // mutations.
+        use crate::server::async_task_bridge::AsyncTaskBridge;
+
+        // Build an AsyncTaskBridge backed by the same executor.
+        let bridge = Arc::new(
+            AsyncTaskBridge::new(Arc::clone(&self.executor))
+                .with_output_schemas(output_schema_map.clone()),
+        );
+
+        // Append the four `__apcore_task_*` meta-tools to the tool list so
+        // clients see them in `tools/list`.
+        let mut tools = tools;
+        MCPServerFactory::append_meta_tools(&mut tools);
+
+        // [H-1] Phase B approvals: when an approval handler is configured,
+        // instantiate the ApprovalBridge and advertise the
+        // `__apcore_approval_check` meta-tool so MCP clients can poll the
+        // status of pending approval requests.
+        let approval_bridge = self.approval_handler.as_ref().map(|handler| {
+            MCPServerFactory::append_approval_meta_tools(&mut tools);
+            Arc::new(crate::server::approval_bridge::ApprovalBridge::new(
+                Arc::clone(handler),
+            ))
+        });
+
+        // Create execution router backed by the real apcore Executor, and
+        // wire in the async bridge.
+        let adapter = ApcoreExecutorAdapter {
+            inner: Arc::clone(&self.executor),
+            strategy: self.resolved_strategy.clone(),
+        };
+        let mut router_builder =
+            ExecutionRouter::new(Box::new(adapter), self.config.validate_inputs, None)
+                .with_redact_output(self.config.redact_output)
+                .with_output_format(self.config.output_format)
+                .with_trace(self.config.trace)
+                .with_output_schemas(output_schema_map)
+                .with_async_bridge(Arc::clone(&bridge));
+        if let Some(ref approval_bridge) = approval_bridge {
+            router_builder = router_builder.with_approval_bridge(Arc::clone(approval_bridge));
+        }
+        let router = Arc::new(router_builder);
+
+        // Register handlers
+        factory.register_handlers(&mut server, tools.clone(), Arc::clone(&router));
+
+        // Register resource handlers. Reads dispatch through `router` so the
+        // system.* resources added by #15(a) get the same ACL / approval /
+        // redaction path a tools/call gets.
+        factory.register_resource_handlers(&mut server, self.reg(), Arc::clone(&router));
+
+        // Which management surfaces (aiperceivable/apcore-mcp#16) this
+        // server instance actually exposes, for the `com.aiperceivable/
+        // management` initialize extension. Scanned with `visibility:
+        // ["public", "hidden"]` — the same conservative choice
+        // `Executor::governance_state` makes — so a control module
+        // registered non-discoverable is still reported as present, since
+        // it is still callable by id.
+        let all_ids = self.reg().list(None, None, Some(&["public", "hidden"]));
+        let management = crate::server::factory::ManagementCapabilities {
+            health: all_ids.iter().any(|id| id.starts_with("system.health.")),
+            usage: all_ids.iter().any(|id| id.starts_with("system.usage.")),
+            manifest: all_ids.iter().any(|id| id.starts_with("system.manifest.")),
+            control: all_ids.iter().any(|id| id.starts_with("system.control.")),
+        };
+
+        // Build init options
+        let init_options =
+            factory.build_init_options(&server, &self.config.name, &version, Some(management));
+
+        // [aiperceivable/apcore-mcp#15(b)] Warn — loudly, but do not refuse
+        // to start — when system.control.* is registered and reachable with
+        // no recognised gate protecting it. Executor assembly (ACL, approval
+        // handler, strategy) is complete by this point and no transport has
+        // started listening yet.
+        self.warn_if_control_surface_unprotected();
+
+        // FR-ACL-004 / PROTOCOL_SPEC §6.2.1 tier 2: rules that load cleanly
+        // and can protect nothing. Same placement as the check above — the
+        // ACL is fully assembled and no transport has started listening yet.
+        self.warn_acl_rules_that_protect_nothing();
+
+        Ok((server, router, tools, init_options, version, Some(bridge)))
+    }
+
+    /// Log a loud, actionable warning for each `ACL::validate_rules()`
+    /// finding — a `callers` / `targets` pattern array that closed §6.2.1's
+    /// shape but still matches no legal module ID (e.g. `["$not", "*"]`),
+    /// leaving the rule inert. Diagnostics only (PROTOCOL_SPEC §6.1.3): a
+    /// finding never fails startup and never changes what the rule decides.
+    ///
+    /// Field names are `RuleValidationFinding`'s real ones —
+    /// `rule_index` / `condition_path` / `condition_key` / `effect`. There is
+    /// no free-text reason field; the message is built here, matching the
+    /// Python and TypeScript bridges' wording exactly.
+    fn warn_acl_rules_that_protect_nothing(&self) {
+        let Some(acl) = self.executor.acl.as_ref() else {
+            return;
+        };
+        for finding in acl.validate_rules() {
+            let key_suffix = finding
+                .condition_key
+                .as_deref()
+                .map(|k| format!(" ({k})"))
+                .unwrap_or_default();
+            tracing::warn!(
+                "mcp.acl.rules[{}] '{}'{}: this pattern is well-formed but matches no legal \
+                 module ID, so the '{}' rule protects nothing. It still loads and still changes \
+                 no decision (PROTOCOL_SPEC §6.1.3) — rewrite the pattern or remove the rule.",
+                finding.rule_index,
+                finding.condition_path,
+                key_suffix,
+                finding.effect,
+            );
+        }
+    }
+
+    /// Log a loud, actionable warning when `system.control.*` modules are
+    /// registered but no recognised built-in gate protects them
+    /// (aiperceivable/apcore-mcp#15(b), aiperceivable/apcore-mcp-rust#6).
+    ///
+    /// Reads `Executor::governance_state()` — a pure accessor added in
+    /// apcore 0.28.0 (apcore#97) that reports what is actually wired into
+    /// the running pipeline, not merely what fields are set. This is a
+    /// warning only: it never refuses to start, since a deployment may be
+    /// relying on a custom step or an upstream gateway this accessor cannot
+    /// see (see `GovernanceState::unprotected_control_surface`'s own docs).
+    fn warn_if_control_surface_unprotected(&self) {
+        let governance = self.executor.governance_state();
+        if !governance.unprotected_control_surface {
+            return;
+        }
+
+        let mut missing = Vec::new();
+        if !governance.acl_configured {
+            missing.push("no ACL is configured (mcp.acl is empty or unset)".to_string());
+        } else if !governance.builtin_acl_gate_wired {
+            missing.push(
+                "an ACL is configured, but the built-in ACL gate is not wired into the \
+                 execution strategy"
+                    .to_string(),
+            );
+        }
+        if !governance.approval_handler_configured && !governance.policy_strict {
+            missing.push(
+                "no approval handler is configured and the execution policy is not strict"
+                    .to_string(),
+            );
+        }
+        if !governance.all_control_modules_require_approval {
+            missing
+                .push("not every system.control.* module declares requires_approval".to_string());
+        }
+
+        tracing::error!(
+            "\n\
+             ============================================================\n\
+             UNPROTECTED MANAGEMENT SURFACE (aiperceivable/apcore-mcp#15)\n\
+             system.control.* modules are registered (update_config /\n\
+             reload_module / toggle_feature), but no recognised gate is\n\
+             wired to protect them:\n\
+             {}\n\
+             Any caller that can reach this server can reconfigure, reload,\n\
+             or toggle apcore modules with NO authorization check.\n\
+             \n\
+             Fix at least one of:\n\
+             - Configure `mcp.acl` with a rule gating `system.control.*`\n\
+               (see `acl_builder`'s module doc for the reference template)\n\
+               AND ensure the execution strategy wires the built-in ACL gate.\n\
+             - Attach an ApprovalHandler, or set a strict ExecutionPolicy,\n\
+               so every system.control.* call is put to a human.\n\
+             ============================================================",
+            missing
+                .iter()
+                .map(|reason| format!("  - {reason}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Build an [`ExplorerConfig`] from the given tools and explorer parameters.
+    ///
+    /// Hides reserved `__apcore_*` meta-tools from the Explorer UI — they are
+    /// protocol-level operations meant for programmatic MCP clients, not for
+    /// the form-driven Explorer UX. They remain advertised via `tools/list`.
+    /// Mirrors apcore-mcp-python's `__init__.py` which builds a parallel
+    /// `explorer_tools` list excluding meta-tools.
+    #[allow(clippy::too_many_arguments)]
+    fn build_explorer_config(
+        &self,
+        tools: &[Tool],
+        router: &Arc<ExecutionRouter>,
+        prefix: &str,
+        allow_execute: bool,
+        title: &str,
+        project_name: Option<&str>,
+        project_url: Option<&str>,
+    ) -> ExplorerConfig {
+        let tool_infos = filter_explorer_tools(tools);
+
+        let mut config = ExplorerConfig::new(tool_infos)
+            .explorer_prefix(prefix)
+            .allow_execute(allow_execute)
+            .title(title);
+
+        if let Some(name) = project_name {
+            config = config.project_name(name);
+        }
+        if let Some(url) = project_url {
+            config = config.project_url(url);
+        }
+
+        // Wire handle_call if allow_execute is enabled
+        if allow_execute {
+            let router_clone = Arc::clone(router);
+            config.handle_call = Some(Arc::new(move |name, args| {
+                let r = Arc::clone(&router_clone);
+                Box::pin(async move {
+                    let (content_items, is_error, error_type) =
+                        r.handle_call(&name, &args, None).await;
+                    // Convert ContentItem to Value for the explorer
+                    let values: Vec<serde_json::Value> = content_items
+                        .into_iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "type": item.content_type,
+                                "text": item.data
+                            })
+                        })
+                        .collect();
+                    (values, is_error, error_type)
+                })
+            }));
+        }
+
+        config
+    }
+
+    /// Synchronously start the MCP server (blocks the current thread).
+    ///
+    /// Creates a new Tokio runtime and runs the server transport loop.
+    /// The transport is determined by `config.transport`:
+    /// - `"stdio"` — standard I/O transport
+    /// - `"streamable-http"` — HTTP-based streamable transport
+    /// - `"sse"` — Server-Sent Events transport
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within an active Tokio runtime (e.g. inside
+    /// `#[tokio::main]`).  Use [`serve_async`](Self::serve_async) for async
+    /// contexts, or [`async_serve`](Self::async_serve) to obtain a router
+    /// instead of running the transport.
+    pub fn serve(&self) -> Result<(), APCoreMCPError> {
+        self.serve_with_options(self.serve_options_from_config())
+    }
+
+    /// Build [`ServeOptions`] from the configuration the builder captured.
+    ///
+    /// The explorer setters on [`APCoreMCPBuilder`] (`include_explorer`,
+    /// `path_prefix`, `explorer_title`, `explorer_project_name`,
+    /// `explorer_project_url`, `allow_execute`) write to `self.config`, while
+    /// `serve_with_options` reads explorer settings from its options argument.
+    /// The no-options entry points bridge the two — passing
+    /// `ServeOptions::default()` instead silently dropped every
+    /// builder-configured explorer flag, including the CLI's `--explorer`,
+    /// `--explorer-prefix`, `--explorer-title` and `--allow-execute`.
+    fn serve_options_from_config(&self) -> ServeOptions {
+        ServeOptions {
+            explorer: ExplorerOptions {
+                explorer: self.config.explorer,
+                explorer_prefix: self.config.explorer_prefix.clone(),
+                explorer_title: self.config.explorer_title.clone(),
+                explorer_project_name: self.config.explorer_project_name.clone(),
+                explorer_project_url: self.config.explorer_project_url.clone(),
+                allow_execute: self.config.allow_execute,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Synchronously start the MCP server with custom options (blocks the current thread).
+    ///
+    /// `opts.explorer` REPLACES the explorer configuration held on the builder;
+    /// use [`serve`](Self::serve) to run with that configuration instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within an active Tokio runtime; use
+    /// [`serve_with_options_async`](Self::serve_with_options_async) there.
+    pub fn serve_with_options(&self, opts: ServeOptions) -> Result<(), APCoreMCPError> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?
+            .block_on(self.serve_with_options_async(opts))
+    }
+
+    /// Start the MCP server on the caller's Tokio runtime and run until shutdown.
+    ///
+    /// The async counterpart of [`serve`](Self::serve): it borrows the ambient
+    /// runtime rather than constructing one, so it is safe to call from inside
+    /// `#[tokio::main]` or any other async context. Like `serve`, it runs with
+    /// the explorer configuration held on the builder.
+    pub async fn serve_async(&self) -> Result<(), APCoreMCPError> {
+        self.serve_with_options_async(self.serve_options_from_config())
+            .await
+    }
+
+    /// Start the MCP server with custom options on the caller's Tokio runtime.
+    pub async fn serve_with_options_async(&self, opts: ServeOptions) -> Result<(), APCoreMCPError> {
+        crate::stdio::scope(
+            self.config.transport.eq_ignore_ascii_case("stdio"),
+            self.serve_with_options_inner(opts),
+        )
+        .await
+        .map_err(|error| APCoreMCPError::ServerError(error.to_string()))?
+    }
+
+    async fn serve_with_options_inner(&self, opts: ServeOptions) -> Result<(), APCoreMCPError> {
+        // Validate explorer prefix if explorer is enabled
+        if opts.explorer.explorer && !opts.explorer.explorer_prefix.starts_with('/') {
+            return Err(APCoreMCPError::InvalidExplorerPrefix);
+        }
+
+        let transport = self.config.transport.to_lowercase();
+        if !["stdio", "streamable-http", "sse"].contains(&transport.as_str()) {
+            return Err(APCoreMCPError::UnknownTransport(
+                self.config.transport.clone(),
+            ));
+        }
+
+        let (server, router, tools, init_options, version, async_bridge) =
+            self.build_server_components()?;
+
+        tracing::info!(
+            "Starting MCP server '{}' v{} with {} tools via {}",
+            self.config.name,
+            version,
+            tools.len(),
+            transport,
+        );
+
+        let effective_metrics: Option<Arc<dyn MetricsExporter>> =
+            self.metrics_collector.clone().or_else(|| {
+                self.auto_metrics
+                    .clone()
+                    .map(|m| m as Arc<dyn MetricsExporter>)
+            });
+        let mut transport_manager = TransportManager::new(effective_metrics);
+        transport_manager.set_module_count(tools.len());
+        if let Some(ref usage) = self.auto_usage {
+            let exporter: Arc<dyn crate::server::transport::UsageExporter> = usage.clone();
+            transport_manager.set_usage_exporter(Some(exporter));
+        }
+        // Join SDK-owned disconnect/cancellation work before releasing stdout.
+        // Vec<JoinHandle> deliberately detaches on a cancelled serving future;
+        // each task then retains the stdout lease through its own cleanup.
+        let cancellation_tasks = Arc::new(Mutex::new(Vec::new()));
+        if let Some(ref bridge) = async_bridge {
+            let bridge_weak = Arc::downgrade(bridge);
+            let cancellation_tasks = cancellation_tasks.clone();
+            let output_lease = crate::stdio::cleanup_lease();
+            transport_manager.set_cancel_handler(Some(Arc::new(move |session_id: &str| {
+                if let Some(b) = bridge_weak.upgrade() {
+                    let session_id = session_id.to_string();
+                    let output_lease = output_lease.clone();
+                    let task = tokio::spawn(async move {
+                        let _output_lease = output_lease;
+                        let n = b.cancel_session_tasks(&session_id).await;
+                        if n > 0 {
+                            tracing::info!(
+                                "Cancelled {n} async task(s) for session {session_id} on client disconnect"
+                            );
+                        }
+                    });
+                    let mut tasks = cancellation_tasks.lock().unwrap_or_else(|poison| poison.into_inner());
+                    tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+                    tasks.push(task);
+                }
+            })));
+        }
+        let transport_manager = Arc::new(transport_manager);
+
+        // Build the McpHandler from the server's registered handlers and
+        // install the async-task cancel bridge so that MCP
+        // `notifications/cancelled` triggers cooperative task cancellation.
+        let mut server_handler = ServerHandler::from_server(&server, init_options)
+            .ok_or_else(|| APCoreMCPError::ServerError("no tool handlers registered".into()))?;
+        if let Some(ref bridge) = async_bridge {
+            let bridge_weak = Arc::downgrade(bridge);
+            let cancellation_tasks = cancellation_tasks.clone();
+            let output_lease = crate::stdio::cleanup_lease();
+            server_handler = server_handler.with_cancel_handler(Arc::new(move |key: &str| {
+                if let Some(b) = bridge_weak.upgrade() {
+                    // Cancel any task whose session_key matches, plus also
+                    // try treating the key as a direct task_id.
+                    let key = key.to_string();
+                    let output_lease = output_lease.clone();
+                    let task = tokio::spawn(async move {
+                        let _output_lease = output_lease;
+                        let n = b.cancel_session_tasks(&key).await;
+                        if n == 0 {
+                            // Best-effort direct-cancel fallback on client
+                            // disconnect; a store error here has no caller
+                            // left to report it to (apcore 0.31.0, D-81).
+                            let _ = b.cancel(&key).await;
+                        }
+                    });
+                    let mut tasks = cancellation_tasks
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+                    tasks.push(task);
+                }
+            }));
+        }
+        let handler: Arc<dyn crate::server::transport::McpHandler> = Arc::new(server_handler);
+
+        // Build explorer router if enabled on HTTP transport.
+        let explorer_router = if opts.explorer.explorer && transport != "stdio" {
+            let explorer_config = self.build_explorer_config(
+                &tools,
+                &router,
+                &opts.explorer.explorer_prefix,
+                opts.explorer.allow_execute,
+                &opts.explorer.explorer_title,
+                opts.explorer.explorer_project_name.as_deref(),
+                opts.explorer.explorer_project_url.as_deref(),
+            );
+            tracing::info!("Explorer UI mounted at {}", opts.explorer.explorer_prefix);
+            Some(create_explorer_mount(explorer_config))
+        } else {
+            None
+        };
+
+        let _listener = Self::maybe_start_listener(opts.dynamic);
+
+        if let Some(ref on_startup) = opts.on_startup {
+            on_startup();
+        }
+
+        let mut approval_sweep = None;
+        let result = async {
+            use crate::server::transport::HttpAuthConfig;
+            // [H-1] Start the approval store TTL sweep, if configured.
+            if let Some(ref store) = self.approval_store {
+                if let Some(task) = store.start_sweep() {
+                    approval_sweep = Some(crate::stdio::BackgroundTask::new(task));
+                    tracing::info!("Approval store TTL sweep started");
+                }
+            }
+            match transport.as_str() {
+                "streamable-http" => transport_manager
+                    .run_streamable_http_with_auth(
+                        Arc::clone(&handler),
+                        &self.config.host,
+                        self.config.port,
+                        explorer_router,
+                        HttpAuthConfig {
+                            authenticator: self.authenticator.clone(),
+                            require_auth: self.config.require_auth,
+                            explorer_prefix: if opts.explorer.explorer {
+                                Some(opts.explorer.explorer_prefix.clone())
+                            } else {
+                                None
+                            },
+                            exempt_paths: self.config.exempt_paths.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| APCoreMCPError::ServerError(e.to_string())),
+                #[allow(deprecated)]
+                "sse" => transport_manager
+                    .run_sse_with_auth(
+                        Arc::clone(&handler),
+                        &self.config.host,
+                        self.config.port,
+                        explorer_router,
+                        HttpAuthConfig {
+                            authenticator: self.authenticator.clone(),
+                            require_auth: self.config.require_auth,
+                            explorer_prefix: if opts.explorer.explorer {
+                                Some(opts.explorer.explorer_prefix.clone())
+                            } else {
+                                None
+                            },
+                            exempt_paths: self.config.exempt_paths.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| APCoreMCPError::ServerError(e.to_string())),
+                _ => {
+                    // stdio
+                    transport_manager
+                        .run_stdio(&*handler)
+                        .await
+                        .map_err(|e| APCoreMCPError::ServerError(e.to_string()))
+                }
+            }
+        }
+        .await;
+
+        if let Some(sweep) = approval_sweep {
+            sweep.stop().await;
+        }
+        let cleanup_tasks = std::mem::take(
+            &mut *cancellation_tasks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
+        for task in cleanup_tasks {
+            if let Err(error) = task.await {
+                tracing::error!("async cancellation cleanup failed: {error}");
+            }
+        }
+        let shutdown_result = if let Some(ref bridge) = async_bridge {
+            bridge
+                .shutdown()
+                .await
+                .map_err(|error| APCoreMCPError::ServerError(error.to_string()))
+        } else {
+            Ok(())
+        };
+        crate::stdio::drain_registered().await;
+
+        if let Some(ref on_shutdown) = opts.on_shutdown {
+            on_shutdown();
+        }
+
+        result.and(shutdown_result)
+    }
+
+    /// Asynchronously build the MCP server and return an axum [`Router`] for embedding.
+    ///
+    /// This is the async equivalent of [`serve`](Self::serve), but instead of
+    /// blocking it returns the built router so callers can mount it in their own
+    /// server infrastructure.
+    pub async fn async_serve(&self, opts: AsyncServeOptions) -> Result<Router, APCoreMCPError> {
+        // Validate explorer prefix
+        if opts.explorer.explorer && !opts.explorer.explorer_prefix.starts_with('/') {
+            return Err(APCoreMCPError::InvalidExplorerPrefix);
+        }
+
+        let (server, router, tools, init_options, version, async_bridge) =
+            self.build_server_components()?;
+
+        tracing::info!(
+            "Building MCP app '{}' v{} with {} tools",
+            self.config.name,
+            version,
+            tools.len(),
+        );
+
+        let _listener = Self::maybe_start_listener(opts.dynamic);
+
+        // [H-1] Start the approval store TTL sweep, if configured.
+        if let Some(ref store) = self.approval_store {
+            if store.start_sweep().is_some() {
+                tracing::info!("Approval store TTL sweep started");
+            }
+        }
+
+        // Build the transport manager with optional auto-wired observability
+        // exporters.
+        let effective_metrics: Option<Arc<dyn MetricsExporter>> =
+            self.metrics_collector.clone().or_else(|| {
+                self.auto_metrics
+                    .clone()
+                    .map(|m| m as Arc<dyn MetricsExporter>)
+            });
+        let mut transport_manager = TransportManager::new(effective_metrics);
+        transport_manager.set_module_count(tools.len());
+        if let Some(ref usage) = self.auto_usage {
+            let exporter: Arc<dyn crate::server::transport::UsageExporter> = usage.clone();
+            transport_manager.set_usage_exporter(Some(exporter));
+        }
+        if let Some(ref bridge) = async_bridge {
+            let bridge_weak = Arc::downgrade(bridge);
+            transport_manager.set_cancel_handler(Some(Arc::new(move |session_id: &str| {
+                if let Some(b) = bridge_weak.upgrade() {
+                    let session_id = session_id.to_string();
+                    tokio::spawn(async move {
+                        b.cancel_session_tasks(&session_id).await;
+                    });
+                }
+            })));
+        }
+        let transport_manager = Arc::new(transport_manager);
+        // router/bridge are kept alive via the ServerHandler built below
+        // (the ExecutionRouter is captured by the server's call_tool handler).
+        let _ = &router;
+
+        // [H-3] Build the MCP handler from the server's registered handlers
+        // and install the async-task cancel bridge, mirroring
+        // `serve_with_options`. The handler is then mounted under `/mcp` so the
+        // returned Router actually serves MCP traffic — not just /health,
+        // /metrics, /usage.
+        let mut server_handler = ServerHandler::from_server(&server, init_options)
+            .ok_or_else(|| APCoreMCPError::ServerError("no tool handlers registered".into()))?;
+        if let Some(ref bridge) = async_bridge {
+            let bridge_weak = Arc::downgrade(bridge);
+            server_handler = server_handler.with_cancel_handler(Arc::new(move |key: &str| {
+                if let Some(b) = bridge_weak.upgrade() {
+                    let key = key.to_string();
+                    tokio::spawn(async move {
+                        let n = b.cancel_session_tasks(&key).await;
+                        if n == 0 {
+                            // Best-effort direct-cancel fallback on client
+                            // disconnect; a store error here has no caller
+                            // left to report it to (apcore 0.31.0, D-81).
+                            let _ = b.cancel(&key).await;
+                        }
+                    });
+                }
+            }));
+        }
+        let handler: Arc<dyn crate::server::transport::McpHandler> = Arc::new(server_handler);
+
+        // Build the app router with `/health`, `/metrics`, `/usage`, and the
+        // nested `/mcp` endpoint wired to the MCP handler.
+        let mut app = transport_manager.build_streamable_http_app(Arc::clone(&handler), None);
+
+        // Mount explorer if enabled
+        if opts.explorer.explorer {
+            let explorer_config = self.build_explorer_config(
+                &tools,
+                &router,
+                &opts.explorer.explorer_prefix,
+                opts.explorer.allow_execute,
+                &opts.explorer.explorer_title,
+                opts.explorer.explorer_project_name.as_deref(),
+                opts.explorer.explorer_project_url.as_deref(),
+            );
+            let explorer_router = create_explorer_mount(explorer_config);
+            app = app.merge(explorer_router);
+            tracing::info!("Explorer UI mounted at {}", opts.explorer.explorer_prefix);
+        }
+
+        // Apply auth middleware if authenticator is configured.
+        let app = crate::server::transport::apply_auth_layer(
+            app,
+            crate::server::transport::HttpAuthConfig {
+                authenticator: self.authenticator.clone(),
+                require_auth: self.config.require_auth,
+                explorer_prefix: if opts.explorer.explorer {
+                    Some(opts.explorer.explorer_prefix.clone())
+                } else {
+                    None
+                },
+                exempt_paths: self.config.exempt_paths.clone(),
+            },
+        );
+
+        Ok(app)
+    }
+
+    /// Convert the current registry contents into OpenAI-compatible tool definitions.
+    ///
+    /// Delegates to [`OpenAIConverter::convert_registry`], passing through the
+    /// configured `tags` and `prefix` filters.
+    ///
+    /// # Arguments
+    /// * `embed_annotations` - If true, append annotation hints to descriptions.
+    /// * `strict` - If true, enable OpenAI strict mode on schemas.
+    pub fn to_openai_tools(
+        &self,
+        embed_annotations: bool,
+        strict: bool,
+    ) -> Result<Vec<Value>, APCoreMCPError> {
+        let converter = OpenAIConverter::new();
+
+        // Build a JSON registry object from our Registry
+        let registry_json = self.build_registry_json();
+
+        let tags_refs: Option<Vec<&str>> = self
+            .config
+            .tags
+            .as_ref()
+            .map(|t| t.iter().map(|s| s.as_str()).collect());
+        let tags_slice: Option<&[&str]> = tags_refs.as_deref();
+        let prefix = self.config.prefix.as_deref();
+
+        let tools = converter.convert_registry_json(
+            &registry_json,
+            embed_annotations,
+            strict,
+            tags_slice,
+            prefix,
+        )?;
+
+        tracing::debug!("Converted {} tools to OpenAI format", tools.len());
+        Ok(tools)
+    }
+
+    /// Build a JSON representation of the registry suitable for [`OpenAIConverter`].
+    ///
+    /// Returns a JSON object `{ "module_id": { "description": "...", "input_schema": {...}, "annotations": {...}, "tags": [...] }, ... }`.
+    fn build_registry_json(&self) -> Value {
+        let mut module_ids = self.reg().list(None, None, None);
+        // Explicit sort required after apcore-toolkit 0.7.0 enabled
+        // serde_json/preserve_order: Map now preserves insertion order
+        // instead of alphabetical (BTreeMap) ordering.
+        module_ids.sort();
+        let mut map = serde_json::Map::new();
+
+        for module_id in module_ids {
+            if let Ok(Some(descriptor)) = self.reg().get_definition(&module_id) {
+                // apcore 0.27: `describe()` is now fallible and returns a
+                // markdown envelope (see `factory.rs`). `ModuleError` derives
+                // `Serialize`, so leaving the call here would still have
+                // compiled and silently written `{"Ok": "..."}` into the
+                // converter's registry JSON. Read the descriptor's own
+                // summary, which is what this map documented all along.
+                let description = descriptor.description.clone();
+                let annotations_json =
+                    serde_json::to_value(&descriptor.annotations).unwrap_or(Value::Null);
+                let tags_json: Vec<Value> = descriptor
+                    .tags
+                    .iter()
+                    .map(|t| Value::String(t.clone()))
+                    .collect();
+
+                let entry = serde_json::json!({
+                    "description": description,
+                    "input_schema": descriptor.input_schema,
+                    "output_schema": descriptor.output_schema,
+                    "annotations": annotations_json,
+                    "tags": tags_json,
+                });
+                map.insert(module_id.to_string(), entry);
+            }
+        }
+
+        Value::Object(map)
+    }
+}
+
+// ---- ExplorerOptions --------------------------------------------------------
+
+/// Shared explorer configuration for [`ServeOptions`] and [`AsyncServeOptions`].
+#[derive(Debug, Clone)]
+pub struct ExplorerOptions {
+    /// Enable the browser-based Tool Explorer UI.
+    pub explorer: bool,
+    /// URL prefix for the explorer.
+    pub explorer_prefix: String,
+    /// Page title shown in the explorer browser tab and heading.
+    pub explorer_title: String,
+    /// Optional project name shown in the explorer footer.
+    pub explorer_project_name: Option<String>,
+    /// Optional project URL linked in the explorer footer.
+    pub explorer_project_url: Option<String>,
+    /// Allow tool execution from the explorer UI.
+    pub allow_execute: bool,
+}
+
+impl Default for ExplorerOptions {
+    fn default() -> Self {
+        Self {
+            explorer: false,
+            explorer_prefix: "/explorer".to_string(),
+            explorer_title: "MCP Tool Explorer".to_string(),
+            explorer_project_name: None,
+            explorer_project_url: None,
+            allow_execute: false,
+        }
+    }
+}
+
+// ---- ServeOptions -----------------------------------------------------------
+
+/// Options for [`APCoreMCP::serve_with_options`].
+#[derive(Default)]
+pub struct ServeOptions {
+    /// Callback invoked after setup, before the transport starts.
+    pub on_startup: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Callback invoked after the transport completes (even on error).
+    pub on_shutdown: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Explorer UI configuration.
+    pub explorer: ExplorerOptions,
+    /// Enable dynamic mode: start a RegistryListener that keeps the MCP
+    /// tool list in sync with runtime registry changes.
+    pub dynamic: bool,
+}
+
+impl std::fmt::Debug for ServeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeOptions")
+            .field("on_startup", &self.on_startup.as_ref().map(|_| "..."))
+            .field("on_shutdown", &self.on_shutdown.as_ref().map(|_| "..."))
+            .field("explorer", &self.explorer)
+            .field("dynamic", &self.dynamic)
+            .finish()
+    }
+}
+
+// ---- AsyncServeOptions ------------------------------------------------------
+
+/// Options for [`APCoreMCP::async_serve`].
+#[derive(Debug, Default)]
+pub struct AsyncServeOptions {
+    /// Explorer UI configuration.
+    pub explorer: ExplorerOptions,
+    /// Enable dynamic mode: start a RegistryListener that keeps the MCP
+    /// tool list in sync with runtime registry changes.
+    pub dynamic: bool,
+}
+
+// ---- APCoreMCPBuilder -------------------------------------------------------
+
+/// Builder for [`APCoreMCP`].
+#[derive(Default)]
+pub struct APCoreMCPBuilder {
+    pub config: APCoreMCPConfig,
+    backend: Option<BackendSource>,
+    authenticator: Option<Arc<dyn Authenticator>>,
+    metrics_collector: Option<Arc<dyn MetricsExporter>>,
+    output_formatter: Option<OutputFormatter>,
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    approval_store: Option<Arc<dyn crate::approval_store::ApprovalStore>>,
+    approval_notify_callback: Option<crate::adapters::approval::ApprovalNotifyCallback>,
+    /// apcore `Middleware` instances to install via `executor.use_middleware()`
+    /// after the backend Executor is resolved. Appended to any middleware
+    /// declared under Config Bus key `mcp.middleware`.
+    middleware: Vec<Box<dyn apcore::Middleware>>,
+    /// Optional apcore `ACL` to install via `executor.set_acl()` after the
+    /// backend Executor is resolved. When `None`, Config Bus `mcp.acl` is
+    /// consulted instead. Caller-supplied ACL takes precedence over Config Bus.
+    acl: Option<apcore::ACL>,
+}
+
+impl APCoreMCPBuilder {
+    /// Set the backend source (required).
+    pub fn backend(mut self, source: impl Into<BackendSource>) -> Self {
+        self.backend = Some(source.into());
+        self
+    }
+
+    /// Set the MCP server name.
+    pub fn name(mut self, name: &str) -> Self {
+        self.config.name = name.to_string();
+        self
+    }
+
+    /// Set the MCP server version.
+    pub fn version(mut self, version: &str) -> Self {
+        self.config.version = Some(version.to_string());
+        self
+    }
+
+    /// Set the tag filter.
+    pub fn tags(mut self, tags: Vec<String>) -> Self {
+        self.config.tags = Some(tags);
+        self
+    }
+
+    /// Set the prefix filter.
+    pub fn prefix(mut self, prefix: &str) -> Self {
+        self.config.prefix = Some(prefix.to_string());
+        self
+    }
+
+    /// Set the log level.
+    pub fn log_level(mut self, level: &str) -> Self {
+        self.config.log_level = Some(level.to_string());
+        self
+    }
+
+    /// Set the transport type.
+    pub fn transport(mut self, transport: &str) -> Self {
+        self.config.transport = transport.to_string();
+        self
+    }
+
+    /// Set the host address.
+    pub fn host(mut self, host: &str) -> Self {
+        self.config.host = host.to_string();
+        self
+    }
+
+    /// Set the port number.
+    pub fn port(mut self, port: u16) -> Self {
+        self.config.port = port;
+        self
+    }
+
+    /// Set whether to validate tool inputs.
+    pub fn validate_inputs(mut self, validate: bool) -> Self {
+        self.config.validate_inputs = validate;
+        self
+    }
+
+    /// Set whether to redact sensitive fields from tool outputs.
+    pub fn redact_output(mut self, redact: bool) -> Self {
+        self.config.redact_output = redact;
+        self
+    }
+
+    /// Set the built-in output format.
+    ///
+    /// Supports "json", "csv", and "jsonl". Automatically integrates
+    /// with `apcore-toolkit`.
+    pub fn output_format(mut self, format: crate::server::router::OutputFormat) -> Self {
+        self.config.output_format = format;
+        self
+    }
+
+    /// Set whether authentication is required.
+    pub fn require_auth(mut self, require: bool) -> Self {
+        self.config.require_auth = require;
+        self
+    }
+
+    /// Set the authenticator for HTTP transport authentication.
+    pub fn authenticator<A: Authenticator + 'static>(mut self, auth: A) -> Self {
+        self.authenticator = Some(Arc::new(auth));
+        self
+    }
+
+    /// Set the authenticator via an already-`Arc`-wrapped trait object.
+    ///
+    /// Use this when you hold an `Arc<dyn Authenticator>` (e.g. from
+    /// [`ServeConfig::authenticator`]) rather than a concrete type.
+    pub fn authenticator_arc(mut self, auth: Arc<dyn Authenticator>) -> Self {
+        self.authenticator = Some(auth);
+        self
+    }
+
+    /// Set the metrics collector.
+    pub fn metrics_collector(mut self, collector: Arc<dyn MetricsExporter>) -> Self {
+        self.metrics_collector = Some(collector);
+        self
+    }
+
+    /// Set the output formatter.
+    ///
+    /// **Note:** Reserved — not yet wired into the execution router.
+    pub fn output_formatter(mut self, formatter: OutputFormatter) -> Self {
+        self.output_formatter = Some(formatter);
+        self
+    }
+
+    /// Set the Phase B approval handler directly.
+    ///
+    /// When set, `build()` retains the handler and `build_server_components`
+    /// instantiates an [`ApprovalBridge`](crate::server::approval_bridge::ApprovalBridge),
+    /// advertising the `__apcore_approval_check` meta-tool so MCP clients can
+    /// poll pending approvals. Prefer [`approval_store`](Self::approval_store)
+    /// for the storage-backed handler with an optional notify callback. [H-1]
+    pub fn approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
+        self.approval_handler = Some(handler);
+        self
+    }
+
+    /// Configure Phase B async approvals backed by the given store.
+    ///
+    /// At `build()` time a [`StorageBackedApprovalHandler`] is created from
+    /// this store and stored as the `approval_handler`. Combine with
+    /// [`approval_notify`] to attach an out-of-band notification callback.
+    ///
+    /// [`StorageBackedApprovalHandler`]: crate::adapters::approval::StorageBackedApprovalHandler
+    pub fn approval_store(mut self, store: Arc<dyn crate::approval_store::ApprovalStore>) -> Self {
+        self.approval_store = Some(store);
+        self
+    }
+
+    /// Attach a notification callback for Phase B approvals.
+    ///
+    /// The callback receives `(approval_id, module_id, arguments)` and can
+    /// send an out-of-band notification (e.g. Slack, email). Only takes effect
+    /// when [`approval_store`] is also set.
+    ///
+    /// [`approval_store`]: APCoreMCPBuilder::approval_store
+    pub fn approval_notify<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(String, String, serde_json::Value) + Send + Sync + 'static,
+    {
+        self.approval_notify_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Install a middleware instance on the Executor via `use_middleware()`.
+    ///
+    /// Call multiple times to stack middleware. Middleware loaded from Config
+    /// Bus `mcp.middleware` is applied first, then builder-supplied middleware
+    /// in call order. Chain execution order inside the pipeline is controlled
+    /// by `Middleware.priority`, not registration order.
+    pub fn middleware(mut self, mw: Box<dyn apcore::Middleware>) -> Self {
+        self.middleware.push(mw);
+        self
+    }
+
+    /// Install a batch of middleware instances in order.
+    pub fn middleware_batch(
+        mut self,
+        mws: impl IntoIterator<Item = Box<dyn apcore::Middleware>>,
+    ) -> Self {
+        self.middleware.extend(mws);
+        self
+    }
+
+    /// Install an ACL on the Executor during `build()`.
+    ///
+    /// Overrides any ACL declared under Config Bus key `mcp.acl`. Applied
+    /// after the backend Executor is resolved via `executor.set_acl()`,
+    /// which uses interior mutability (apcore >= 0.18.2), so it works with
+    /// a shared `Arc<Executor>`.
+    pub fn acl(mut self, acl: apcore::ACL) -> Self {
+        self.acl = Some(acl);
+        self
+    }
+
+    /// Set exempt paths for authentication bypass.
+    pub fn exempt_paths(mut self, paths: HashSet<String>) -> Self {
+        self.config.exempt_paths = Some(paths);
+        self
+    }
+
+    /// Enable the explorer UI.
+    pub fn include_explorer(mut self, include: bool) -> Self {
+        self.config.explorer = include;
+        self
+    }
+
+    /// Set the explorer URL prefix.
+    pub fn path_prefix(mut self, prefix: &str) -> Self {
+        self.config.explorer_prefix = prefix.to_string();
+        self
+    }
+
+    /// Set the explorer page title.
+    pub fn explorer_title(mut self, title: &str) -> Self {
+        self.config.explorer_title = title.to_string();
+        self
+    }
+
+    /// Set the explorer project name.
+    pub fn explorer_project_name(mut self, name: &str) -> Self {
+        self.config.explorer_project_name = Some(name.to_string());
+        self
+    }
+
+    /// Set the explorer project URL.
+    pub fn explorer_project_url(mut self, url: &str) -> Self {
+        self.config.explorer_project_url = Some(url.to_string());
+        self
+    }
+
+    /// Set whether tool execution is allowed from the explorer UI.
+    pub fn allow_execute(mut self, allow: bool) -> Self {
+        self.config.allow_execute = allow;
+        self
+    }
+
+    /// Set the pipeline execution strategy.
+    pub fn strategy(mut self, name: &str) -> Self {
+        self.config.strategy = Some(name.to_string());
+        self
+    }
+
+    /// Enable or disable pipeline trace mode.
+    ///
+    /// When enabled, tool responses include pipeline trace data
+    /// (strategy name, duration, steps) if the executor supports it.
+    pub fn trace(mut self, enable: bool) -> Self {
+        self.config.trace = enable;
+        self
+    }
+
+    /// Enable or disable the built-in observability stack.
+    ///
+    /// When enabled, the builder auto-instantiates apcore's
+    /// `MetricsCollector` + `UsageCollector` and installs the matching
+    /// middleware on the executor. Metrics are exposed at `/metrics`
+    /// (Prometheus text format) and usage summaries at `/usage` (JSON).
+    ///
+    /// Caller-supplied `metrics_collector` (via
+    /// [`APCoreMCPBuilder::metrics_collector`]) takes precedence for the
+    /// `/metrics` endpoint, preserving back-compat with custom trait
+    /// object exporters.
+    pub fn observability(mut self, enable: bool) -> Self {
+        self.config.observability = enable;
+        self
+    }
+
+    /// Async counterpart to [`build`](Self::build) — the only entry point
+    /// that resolves `mcp.openapi.spec` from the Config Bus alone, with no
+    /// backend given (PRD F-054 Acceptance Criterion 1).
+    ///
+    /// `build()` is deliberately synchronous — it matches every other
+    /// language's constructor shape and every OTHER Config Bus section
+    /// (`mcp.acl`, `mcp.middleware`) is pure, synchronous, in-memory parsing.
+    /// `mcp.openapi` is not: resolving it means fetching and parsing a
+    /// document, and `apcore-toolkit-rust`'s `load_spec` is built on async
+    /// `reqwest`, with no synchronous fallback (unlike Python's `httpx.get`,
+    /// which blocks synchronously by choice and is why Python's plain,
+    /// synchronous `__init__` can do this same resolution inline). A caller
+    /// with no explicit backend and no CLI flag, relying purely on
+    /// `mcp.openapi.spec` in `apcore.yaml`, must call `build_async` — calling
+    /// the plain `build()` in that situation still returns
+    /// `APCoreMCPError::BackendResolution`, exactly as before this method
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error [`build`](Self::build) can raise, plus
+    /// [`APCoreMCPError::Config`] when `mcp.openapi.spec` cannot be fetched
+    /// or parsed.
+    pub async fn build_async(mut self) -> Result<APCoreMCP, APCoreMCPError> {
+        if self.backend.is_none() {
+            if let Some(openapi_config) = crate::config::get_openapi_config() {
+                let registry = crate::openapi_backend::build_openapi_backend_from_config(
+                    &openapi_config,
+                    Arc::new(Registry::new()),
+                    false,
+                )
+                .await?;
+                self.backend = Some(BackendSource::Registry(registry));
+            }
+        }
+        self.build()
+    }
+
+    /// Consume the builder and produce an [`APCoreMCP`] instance.
+    ///
+    /// Validates all inputs matching Python validation order, then resolves
+    /// the backend into a registry and executor.
+    pub fn build(self) -> Result<APCoreMCP, APCoreMCPError> {
+        // Validate name.
+        //
+        // The 255 bound counts CHARACTERS, not UTF-8 bytes: `str::len()` made a
+        // 100-character CJK name measure 300 and fail here, while Python
+        // (code points) and TypeScript (UTF-16 units) both accept it. Same
+        // counting unit as `MCPServerFactory::create_server`. [A-D-FA-3]
+        if self.config.name.is_empty() {
+            return Err(APCoreMCPError::EmptyName);
+        }
+        let name_len = self.config.name.chars().count();
+        if name_len > 255 {
+            return Err(APCoreMCPError::NameTooLong(name_len));
+        }
+
+        // Validate tags
+        if let Some(ref tags) = self.config.tags {
+            for tag in tags {
+                if tag.is_empty() {
+                    return Err(APCoreMCPError::EmptyTag);
+                }
+            }
+        }
+
+        // Validate prefix
+        if let Some(ref prefix) = self.config.prefix {
+            if prefix.is_empty() {
+                return Err(APCoreMCPError::EmptyPrefix);
+            }
+        }
+
+        // Validate log level
+        if let Some(ref level) = self.config.log_level {
+            let upper = level.to_uppercase();
+            if !VALID_LOG_LEVELS.contains(&upper.as_str()) {
+                return Err(APCoreMCPError::InvalidLogLevel(level.clone()));
+            }
+        }
+
+        // Register MCP config namespace and error formatter (idempotent)
+        crate::config::register_mcp_namespace();
+        crate::adapters::errors::register_mcp_formatter();
+
+        // F-040: Load pipeline strategy from YAML config if present.
+        // The "mcp.pipeline" section in the Config Bus takes precedence over
+        // the builder's `strategy` parameter.
+        let _resolved_strategy: Option<String> = {
+            let yaml_pipeline: Option<Value> = crate::config::get_pipeline_config();
+            match (&yaml_pipeline, &self.config.strategy) {
+                (Some(pipeline_val), Some(builder_strategy)) => {
+                    let yaml_strategy = pipeline_val
+                        .get("strategy")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(ref ys) = yaml_strategy {
+                        tracing::warn!(
+                            "YAML pipeline config strategy '{}' overrides builder strategy '{}'",
+                            ys,
+                            builder_strategy
+                        );
+                    }
+                    yaml_strategy.or_else(|| Some(builder_strategy.clone()))
+                }
+                (Some(pipeline_val), None) => {
+                    let yaml_strategy = pipeline_val
+                        .get("strategy")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(ref ys) = yaml_strategy {
+                        tracing::info!("Pipeline strategy from YAML config: {}", ys);
+                    }
+                    yaml_strategy
+                }
+                (None, Some(ref strategy)) => {
+                    tracing::info!("Pipeline execution strategy: {}", strategy);
+                    Some(strategy.clone())
+                }
+                (None, None) => None,
+            }
+        };
+
+        // Resolve backend into (registry, executor) pair.
+        let backend = self.backend.ok_or_else(|| {
+            APCoreMCPError::BackendResolution("backend source is required".to_string())
+        })?;
+
+        let (standalone_registry, mut executor) = match backend {
+            BackendSource::ExtensionsDir(path) => {
+                // [L-1] Runtime directory discovery has a structural limitation
+                // in Rust: modules are compiled in at build time (unlike
+                // Python/TS where `Registry.discover(dir)` imports module files
+                // at runtime). apcore's `Registry::discover` invokes the
+                // discoverer with empty roots and `register_discovered` is
+                // private, so a directory path cannot be threaded through the
+                // public API to register executable modules. We therefore build
+                // an empty Registry + Executor and warn, rather than failing
+                // outright — callers that genuinely need discovered modules
+                // should construct a `Registry`/`Executor` themselves (wiring a
+                // `DefaultDiscoverer` with their own module factory) and pass it
+                // via [`BackendSource::Registry`] or [`BackendSource::Executor`].
+                tracing::warn!(
+                    "ExtensionsDir backend ('{}'): Rust modules are compiled in at \
+                     build time; runtime directory discovery is not supported via the \
+                     apcore public API. Building an empty registry. Pass a pre-built \
+                     Registry or Executor for non-empty backends.",
+                    path.display()
+                );
+                let registry = Arc::new(Registry::new());
+                let executor = Arc::new(Executor::new(
+                    Arc::clone(&registry),
+                    apcore::config::Config::default(),
+                ));
+                (Some(registry), executor)
+            }
+            BackendSource::Registry(reg) => {
+                // [L-1] `Executor::new` accepts `impl Into<Arc<Registry>>`, and
+                // `Arc<Registry>` satisfies that bound, so a pre-built shared
+                // registry can be wrapped into an Executor directly. The
+                // registry is shared (not cloned), so tool discovery and
+                // execution observe the same module set. (The previous
+                // "Registry is not Clone" limitation no longer applies — sharing
+                // via `Arc` sidesteps it.)
+                let executor = Arc::new(Executor::new(
+                    Arc::clone(&reg),
+                    apcore::config::Config::default(),
+                ));
+                (Some(reg), executor)
+            }
+            BackendSource::Executor(exec) => (None, exec),
+        };
+
+        // ── Install middleware (Config Bus entries first, then builder) ──
+        let config_value = crate::config::get_middleware_config();
+        let config_middleware =
+            crate::middleware_builder::build_middleware_from_config(config_value.as_ref())?;
+        for mw in config_middleware {
+            executor.use_middleware(mw).map_err(|e| {
+                APCoreMCPError::Config(format!("failed to install Config Bus middleware: {e}"))
+            })?;
+        }
+        for mw in self.middleware {
+            executor.use_middleware(mw).map_err(|e| {
+                APCoreMCPError::Config(format!("failed to install middleware: {e}"))
+            })?;
+        }
+
+        // ── Install ACL (caller-supplied wins; else Config Bus) ───────────
+        let effective_acl = match self.acl {
+            Some(a) => Some(a),
+            None => {
+                let cfg_value = crate::config::get_acl_config();
+                crate::acl_builder::build_acl_from_config(cfg_value.as_ref())?
+            }
+        };
+        if let Some(acl) = effective_acl {
+            // `Executor::set_acl` requires `&mut self`. The resolved executor is
+            // held in an `Arc`; if no other strong/weak references exist we can
+            // safely obtain a `&mut` via `Arc::get_mut`. When the caller has
+            // already shared the `Arc` elsewhere, we cannot install the ACL
+            // without breaking aliasing, so we surface a config-time error
+            // rather than silently dropping it.
+            match Arc::get_mut(&mut executor) {
+                Some(exec_mut) => exec_mut.set_acl(acl),
+                None => {
+                    return Err(APCoreMCPError::Config(
+                        "failed to install ACL: Executor Arc is already shared — \
+                         install the ACL on the Executor before passing it to \
+                         APCoreMCPBuilder::backend()"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+
+        // ── Auto-wire observability middleware ────────────────────────
+        //
+        // When `observability=true`, auto-instantiate the apcore
+        // MetricsCollector + UsageCollector and install the matching
+        // middleware on the executor. The collectors are retained for
+        // later exposure at `/metrics` and `/usage`.
+        let (auto_metrics, auto_usage) = if self.config.observability {
+            use apcore::observability::metrics::{MetricsCollector, MetricsMiddleware};
+            use apcore::observability::usage::{UsageCollector, UsageMiddleware};
+
+            let metrics = Arc::new(MetricsCollector::new());
+            let usage = Arc::new(UsageCollector::new());
+
+            executor
+                .use_middleware(Box::new(MetricsMiddleware::new((*metrics).clone())))
+                .map_err(|e| {
+                    APCoreMCPError::Config(format!("failed to install MetricsMiddleware: {e}"))
+                })?;
+            executor
+                .use_middleware(Box::new(UsageMiddleware::new((*usage).clone())))
+                .map_err(|e| {
+                    APCoreMCPError::Config(format!("failed to install UsageMiddleware: {e}"))
+                })?;
+            tracing::info!(
+                "Observability middleware auto-wired (MetricsMiddleware + UsageMiddleware)"
+            );
+            (Some(metrics), Some(usage))
+        } else {
+            (None, None)
+        };
+
+        // Build approval handler: approval_store takes precedence over approval_handler.
+        // The store (when supplied) is retained so the serve entry points can
+        // start its TTL sweep. [H-1]
+        let retained_store = self.approval_store.clone();
+        let approval_handler = if let Some(store) = self.approval_store {
+            use crate::adapters::approval::StorageBackedApprovalHandler;
+            let mut handler = StorageBackedApprovalHandler::new(store);
+            if let Some(cb) = self.approval_notify_callback {
+                handler = handler.with_notify(move |id, module, args| cb(id, module, args));
+            }
+            Some(Arc::new(handler) as Arc<dyn ApprovalHandler>)
+        } else {
+            self.approval_handler
+        };
+
+        // [L-3] Resolve the strategy preset by name (when set) so it can be
+        // threaded into execution. Unknown names surface a warning and are
+        // ignored (the executor keeps its default strategy) rather than
+        // failing the build.
+        let resolved_strategy: Option<Arc<apcore::ExecutionStrategy>> =
+            _resolved_strategy.as_deref().and_then(|name| {
+                match apcore::executor::resolve_strategy_by_name(name) {
+                    Ok(strat) => {
+                        tracing::info!("Pipeline execution strategy resolved: {}", name);
+                        Some(Arc::new(strat))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Ignoring unknown pipeline strategy '{}': {}", name, e);
+                        None
+                    }
+                }
+            });
+
+        Ok(APCoreMCP {
+            config: self.config,
+            standalone_registry,
+            executor,
+            authenticator: self.authenticator,
+            metrics_collector: self.metrics_collector,
+            auto_metrics,
+            auto_usage,
+            output_formatter: self.output_formatter,
+            approval_handler,
+            approval_store: retained_store,
+            resolved_strategy,
+        })
+    }
+}
+
+// ---- Top-level convenience functions ----------------------------------------
+
+/// Configuration for the convenience [`serve`] function.
+///
+/// Extended to cover the key fields from Python's `serve()` signature.
+/// Fields with no direct Rust type use `Option<serde_json::Value>` as
+/// a placeholder with a TODO comment. [D1-001]
+#[derive(Clone)]
+pub struct ServeConfig {
+    /// MCP server name.
+    pub name: String,
+    /// MCP server version. `None` defaults to the crate version.
+    pub version: Option<String>,
+    /// Transport type: "stdio", "streamable-http", or "sse".
+    pub transport: String,
+    /// Host address for HTTP-based transports.
+    pub host: String,
+    /// Port number for HTTP-based transports.
+    pub port: u16,
+    /// Filter modules by tags.
+    pub tags: Option<Vec<String>>,
+    /// Filter modules by ID prefix.
+    pub prefix: Option<String>,
+    /// Log level for the apcore_mcp logger.
+    pub log_level: Option<String>,
+    /// Validate tool inputs against schemas before execution.
+    pub validate_inputs: bool,
+    /// Pipeline execution strategy preset.
+    pub strategy: Option<String>,
+    // ---- Fields added for Python parity [D1-001] ----------------------------
+    /// JWT authenticator for HTTP transports.
+    pub authenticator: Option<std::sync::Arc<dyn crate::auth::protocol::Authenticator>>,
+    /// Whether authentication is required (forwarded to authenticator/middleware).
+    pub require_auth: Option<bool>,
+    /// HTTP paths that bypass authentication.
+    pub exempt_paths: Option<Vec<String>>,
+    /// Whether to redact sensitive (`x-sensitive`) fields from tool output.
+    ///
+    /// Three-state semantics — `None` is **not** "redaction off": [M-2]
+    /// - `None` (default): defer to the builder default, which is `true`
+    ///   (redaction **enabled**). The convenience function only calls
+    ///   `builder.redact_output(..)` when this is `Some`, so leaving it `None`
+    ///   keeps the secure-by-default behaviour.
+    /// - `Some(true)`: explicitly enable redaction.
+    /// - `Some(false)`: explicitly **disable** redaction (sensitive fields are
+    ///   returned to the client verbatim).
+    pub redact_output: Option<bool>,
+    /// Built-in output format.
+    pub output_format: Option<crate::server::router::OutputFormat>,
+    /// Observability configuration.
+    pub observability: Option<serde_json::Value>,
+    // ---- [M-1] Config-surface alignment with the builder -------------------
+    /// Enable pipeline trace mode (responses include strategy/duration/steps).
+    pub trace: Option<bool>,
+    /// Optional custom output formatter closure (shareable variant).
+    pub output_formatter: Option<crate::server::router::SharedOutputFormatter>,
+    /// Enable the browser-based Tool Explorer UI (HTTP transports).
+    pub explorer: Option<bool>,
+    /// URL prefix for the explorer.
+    pub explorer_prefix: Option<String>,
+    /// Page title shown in the explorer browser tab and heading (branding).
+    pub explorer_title: Option<String>,
+    /// Optional project name shown in the explorer footer (branding).
+    pub explorer_project_name: Option<String>,
+    /// Optional project URL linked in the explorer footer (branding).
+    pub explorer_project_url: Option<String>,
+    /// Allow tool execution from the explorer UI.
+    pub allow_execute: Option<bool>,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            name: "apcore-mcp".to_string(),
+            version: None,
+            transport: "stdio".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8000,
+            tags: None,
+            prefix: None,
+            log_level: None,
+            validate_inputs: false,
+            strategy: None,
+            authenticator: None,
+            require_auth: None,
+            exempt_paths: None,
+            redact_output: None,
+            output_format: None,
+            observability: None,
+            trace: None,
+            output_formatter: None,
+            explorer: None,
+            explorer_prefix: None,
+            explorer_title: None,
+            explorer_project_name: None,
+            explorer_project_url: None,
+            allow_execute: None,
+        }
+    }
+}
+
+/// Configuration for the convenience [`async_serve`] function.
+///
+/// Extended to mirror Python's `async_serve()` signature (~25 fields). [D1-002]
+#[derive(Clone)]
+pub struct AsyncServeConfig {
+    /// MCP server name.
+    pub name: String,
+    /// MCP server version. `None` defaults to the crate version.
+    pub version: Option<String>,
+    /// Filter modules by tags.
+    pub tags: Option<Vec<String>>,
+    /// Filter modules by ID prefix.
+    pub prefix: Option<String>,
+    /// Log level for the apcore_mcp logger.
+    pub log_level: Option<String>,
+    /// Validate tool inputs against schemas before execution.
+    pub validate_inputs: bool,
+    /// Pipeline execution strategy preset.
+    pub strategy: Option<String>,
+    // ---- Fields added for Python parity [D1-002] ----------------------------
+    /// JWT authenticator for HTTP transports.
+    pub authenticator: Option<std::sync::Arc<dyn crate::auth::protocol::Authenticator>>,
+    /// Whether authentication is required.
+    pub require_auth: Option<bool>,
+    /// HTTP paths that bypass authentication.
+    pub exempt_paths: Option<Vec<String>>,
+    /// Whether to redact sensitive (`x-sensitive`) fields from tool output.
+    ///
+    /// Three-state semantics — `None` is **not** "redaction off": [M-2]
+    /// - `None` (default): defer to the builder default, which is `true`
+    ///   (redaction **enabled**). The convenience function only calls
+    ///   `builder.redact_output(..)` when this is `Some`, so leaving it `None`
+    ///   keeps the secure-by-default behaviour.
+    /// - `Some(true)`: explicitly enable redaction.
+    /// - `Some(false)`: explicitly **disable** redaction (sensitive fields are
+    ///   returned to the client verbatim).
+    pub redact_output: Option<bool>,
+    /// Built-in output format.
+    pub output_format: Option<crate::server::router::OutputFormat>,
+    /// Observability configuration.
+    pub observability: Option<serde_json::Value>,
+    // ---- [M-1] Config-surface alignment with the builder -------------------
+    /// Enable pipeline trace mode (responses include strategy/duration/steps).
+    pub trace: Option<bool>,
+    /// Optional custom output formatter closure (shareable variant).
+    pub output_formatter: Option<crate::server::router::SharedOutputFormatter>,
+    /// Enable the browser-based Tool Explorer UI.
+    pub explorer: Option<bool>,
+    /// URL prefix for the explorer.
+    pub explorer_prefix: Option<String>,
+    /// Page title shown in the explorer browser tab and heading (branding).
+    pub explorer_title: Option<String>,
+    /// Optional project name shown in the explorer footer (branding).
+    pub explorer_project_name: Option<String>,
+    /// Optional project URL linked in the explorer footer (branding).
+    pub explorer_project_url: Option<String>,
+    /// Allow tool execution from the explorer UI.
+    pub allow_execute: Option<bool>,
+}
+
+impl Default for AsyncServeConfig {
+    fn default() -> Self {
+        Self {
+            name: "apcore-mcp".to_string(),
+            version: None,
+            tags: None,
+            prefix: None,
+            log_level: None,
+            validate_inputs: false,
+            strategy: None,
+            authenticator: None,
+            require_auth: None,
+            exempt_paths: None,
+            redact_output: None,
+            output_format: None,
+            observability: None,
+            trace: None,
+            output_formatter: None,
+            explorer: None,
+            explorer_prefix: None,
+            explorer_title: None,
+            explorer_project_name: None,
+            explorer_project_url: None,
+            allow_execute: None,
+        }
+    }
+}
+
+/// Configuration for the convenience [`to_openai_tools`] function.
+#[derive(Debug, Clone, Default)]
+pub struct OpenAIToolsConfig {
+    /// Embed annotation metadata in tool descriptions.
+    pub embed_annotations: bool,
+    /// Add `strict: true` for OpenAI Structured Outputs.
+    pub strict: bool,
+    /// Filter modules by tags.
+    pub tags: Option<Vec<String>>,
+    /// Filter modules by ID prefix.
+    pub prefix: Option<String>,
+}
+
+/// Convenience: build and serve in one call (blocking).
+///
+/// Constructs an [`APCoreMCP`] internally from the given backend source
+/// and config, then calls [`APCoreMCP::serve`].
+pub fn serve(backend: impl Into<BackendSource>, config: ServeConfig) -> Result<(), APCoreMCPError> {
+    // [D9-003] Apply caller-wins precedence: caller `ServeConfig` field →
+    // Config Bus → hardcoded `ServeConfig::default()`. We can only detect
+    // "caller did not set this field" by comparing to the default value.
+    // Callers who pass `ServeConfig { name: "x".into(), ..ServeConfig::default() }`
+    // and set `APCORE_MCP_PORT=9000` in env will see port resolve to 9000.
+    let defaults = ServeConfig::default();
+    // The default transport can be overridden by discovery itself. Protect
+    // discovery conservatively until that decision is known; explicit HTTP/SSE
+    // callers never redirect stdout during discovery.
+    let bus = crate::stdio::scope_sync(
+        config.transport.eq_ignore_ascii_case("stdio"),
+        config::get_scalar_config,
+    )
+    .map_err(|error| APCoreMCPError::ServerError(error.to_string()))?;
+    let transport = if config.transport != defaults.transport {
+        config.transport.clone()
+    } else {
+        bus.transport.unwrap_or(config.transport.clone())
+    };
+    crate::stdio::scope_sync(transport.eq_ignore_ascii_case("stdio"), || {
+        let host = if config.host != defaults.host {
+            config.host.clone()
+        } else {
+            bus.host.unwrap_or(config.host.clone())
+        };
+        let port = if config.port != defaults.port {
+            config.port
+        } else {
+            bus.port.unwrap_or(config.port)
+        };
+        let name = if config.name != defaults.name {
+            config.name.clone()
+        } else {
+            bus.name.unwrap_or(config.name.clone())
+        };
+        let validate_inputs = if config.validate_inputs != defaults.validate_inputs {
+            config.validate_inputs
+        } else {
+            bus.validate_inputs.unwrap_or(config.validate_inputs)
+        };
+        let log_level = config.log_level.clone().or(bus.log_level);
+
+        let mut builder = APCoreMCP::builder()
+            .backend(backend)
+            .name(&name)
+            .transport(&transport)
+            .host(&host)
+            .port(port)
+            .validate_inputs(validate_inputs);
+
+        if let Some(version) = config.version.as_deref() {
+            builder = builder.version(version);
+        }
+        if let Some(tags) = config.tags {
+            builder = builder.tags(tags);
+        }
+        if let Some(prefix) = config.prefix.as_deref() {
+            builder = builder.prefix(prefix);
+        }
+        if let Some(level) = log_level.as_deref() {
+            builder = builder.log_level(level);
+        }
+        if let Some(strategy) = config.strategy.as_deref() {
+            builder = builder.strategy(strategy);
+        }
+
+        // Forward previously-ignored ServeConfig fields to the builder.
+        if let Some(auth) = config.authenticator {
+            builder = builder.authenticator_arc(auth);
+        }
+        // [D9-003] require_auth: caller's Some wins; bus fills None.
+        if let Some(rq) = config.require_auth.or(bus.require_auth) {
+            builder = builder.require_auth(rq);
+        }
+        if let Some(paths) = config.exempt_paths {
+            builder = builder.exempt_paths(paths.into_iter().collect());
+        }
+        if let Some(redact) = config.redact_output {
+            builder = builder.redact_output(redact);
+        }
+        // [D9-003] output_format is caller-only. Default is Json (handled by the
+        // builder). [A-013] It is deliberately NOT read from the Config Bus —
+        // Python and TypeScript publish no such key, see `config::mcp_defaults`.
+        if let Some(fmt) = config.output_format {
+            builder = builder.output_format(fmt);
+        }
+        // observability — extract bool from `true`/`false` or `{ "enabled": bool }`
+        // shapes and forward to APCoreMCPBuilder::observability(bool). Matches
+        // apcore-mcp-python serve(observability: bool) parity. [D1-001]
+        if let Some(obs) = config.observability.as_ref() {
+            let enabled = obs
+                .as_bool()
+                .or_else(|| obs.get("enabled").and_then(|v| v.as_bool()))
+                .unwrap_or(true);
+            builder = builder.observability(enabled);
+        }
+
+        // [M-1] Forward newly-aligned ServeConfig fields to the builder.
+        if let Some(trace) = config.trace {
+            builder = builder.trace(trace);
+        }
+        if let Some(formatter) = config.output_formatter.clone() {
+            builder = builder
+                .output_formatter(crate::server::router::shared_to_output_formatter(formatter));
+        }
+
+        // [M-1] Build ServeOptions so explorer/branding flags configured on the
+        // convenience ServeConfig actually take effect (serve_with_options reads
+        // explorer from ServeOptions, not from the builder config).
+        let opts = ServeOptions {
+            explorer: ExplorerOptions {
+                explorer: config.explorer.unwrap_or(false),
+                explorer_prefix: config
+                    .explorer_prefix
+                    .clone()
+                    .unwrap_or_else(|| "/explorer".to_string()),
+                explorer_title: config
+                    .explorer_title
+                    .clone()
+                    .unwrap_or_else(|| "MCP Tool Explorer".to_string()),
+                explorer_project_name: config.explorer_project_name.clone(),
+                explorer_project_url: config.explorer_project_url.clone(),
+                allow_execute: config.allow_execute.unwrap_or(false),
+            },
+            ..Default::default()
+        };
+
+        let mcp = builder.build()?;
+        mcp.serve_with_options(opts)
+    })
+    .map_err(|error| APCoreMCPError::ServerError(error.to_string()))?
+}
+
+/// Convenience: build and serve in one call (async).
+///
+/// Constructs an [`APCoreMCP`] internally from the given backend source
+/// and config, then calls [`APCoreMCP::async_serve`].
+pub async fn async_serve(
+    backend: impl Into<BackendSource>,
+    config: AsyncServeConfig,
+) -> Result<Router, APCoreMCPError> {
+    // [D9-003] Same caller-wins precedence as serve(). async_serve does not
+    // bind a transport (returns an axum Router), so transport/host/port are
+    // not part of the resolved set here.
+    let bus = config::get_scalar_config();
+    let defaults = AsyncServeConfig::default();
+    let name = if config.name != defaults.name {
+        config.name.clone()
+    } else {
+        bus.name.unwrap_or(config.name.clone())
+    };
+    let validate_inputs = if config.validate_inputs != defaults.validate_inputs {
+        config.validate_inputs
+    } else {
+        bus.validate_inputs.unwrap_or(config.validate_inputs)
+    };
+    let log_level = config.log_level.clone().or(bus.log_level);
+
+    let mut builder = APCoreMCP::builder()
+        .backend(backend)
+        .name(&name)
+        .validate_inputs(validate_inputs);
+
+    if let Some(version) = config.version.as_deref() {
+        builder = builder.version(version);
+    }
+    if let Some(tags) = config.tags {
+        builder = builder.tags(tags);
+    }
+    if let Some(prefix) = config.prefix.as_deref() {
+        builder = builder.prefix(prefix);
+    }
+    if let Some(level) = log_level.as_deref() {
+        builder = builder.log_level(level);
+    }
+    if let Some(strategy) = config.strategy.as_deref() {
+        builder = builder.strategy(strategy);
+    }
+
+    // Forward previously-ignored AsyncServeConfig fields to the builder.
+    if let Some(auth) = config.authenticator {
+        builder = builder.authenticator_arc(auth);
+    }
+    // [D9-003] require_auth: caller's Some wins; bus fills None.
+    if let Some(rq) = config.require_auth.or(bus.require_auth) {
+        builder = builder.require_auth(rq);
+    }
+    if let Some(paths) = config.exempt_paths {
+        builder = builder.exempt_paths(paths.into_iter().collect());
+    }
+    if let Some(redact) = config.redact_output {
+        builder = builder.redact_output(redact);
+    }
+    // [D9-003] output_format is caller-only; see serve() and [A-013].
+    if let Some(fmt) = config.output_format {
+        builder = builder.output_format(fmt);
+    }
+    // observability — extract bool and forward; matches Python parity. [D1-002]
+    if let Some(obs) = config.observability.as_ref() {
+        let enabled = obs
+            .as_bool()
+            .or_else(|| obs.get("enabled").and_then(|v| v.as_bool()))
+            .unwrap_or(true);
+        builder = builder.observability(enabled);
+    }
+
+    // [M-1] Forward newly-aligned AsyncServeConfig fields to the builder.
+    if let Some(trace) = config.trace {
+        builder = builder.trace(trace);
+    }
+    if let Some(formatter) = config.output_formatter.clone() {
+        builder =
+            builder.output_formatter(crate::server::router::shared_to_output_formatter(formatter));
+    }
+
+    // [M-1] Build AsyncServeOptions so explorer/branding flags take effect.
+    let opts = AsyncServeOptions {
+        explorer: ExplorerOptions {
+            explorer: config.explorer.unwrap_or(false),
+            explorer_prefix: config
+                .explorer_prefix
+                .clone()
+                .unwrap_or_else(|| "/explorer".to_string()),
+            explorer_title: config
+                .explorer_title
+                .clone()
+                .unwrap_or_else(|| "MCP Tool Explorer".to_string()),
+            explorer_project_name: config.explorer_project_name.clone(),
+            explorer_project_url: config.explorer_project_url.clone(),
+            allow_execute: config.allow_execute.unwrap_or(false),
+        },
+        ..Default::default()
+    };
+
+    let mcp = builder.build()?;
+    mcp.async_serve(opts).await
+}
+
+/// Convenience: convert a registry to OpenAI tool definitions without starting a server.
+///
+/// Constructs an [`APCoreMCP`] internally from the given backend source,
+/// then calls [`APCoreMCP::to_openai_tools`].
+pub fn to_openai_tools(
+    backend: impl Into<BackendSource>,
+    config: OpenAIToolsConfig,
+) -> Result<Vec<Value>, APCoreMCPError> {
+    let mut builder = APCoreMCP::builder().backend(backend);
+
+    if let Some(tags) = config.tags {
+        builder = builder.tags(tags);
+    }
+    if let Some(prefix) = config.prefix.as_deref() {
+        builder = builder.prefix(prefix);
+    }
+
+    let mcp = builder.build()?;
+    mcp.to_openai_tools(config.embed_annotations, config.strict)
+}
+
+// ---- Tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use apcore::config::Config;
+    use apcore::module::{Module, ModuleAnnotations};
+    use apcore::registry::ModuleDescriptor;
+    use serde_json::json;
+
+    // -- Test helpers ---------------------------------------------------------
+
+    /// Mock module for testing.
+    struct MockModule {
+        desc: String,
+    }
+
+    impl MockModule {
+        fn new(desc: &str) -> Self {
+            Self {
+                desc: desc.to_string(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Module for MockModule {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "properties": {"q": {"type": "string"}}})
+        }
+        fn output_schema(&self) -> Value {
+            json!({})
+        }
+        fn description(&self) -> &str {
+            &self.desc
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &apcore::context::Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            Ok(json!({}))
+        }
+    }
+
+    struct ReferencedSensitiveModule {
+        draft_seven: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Module for ReferencedSensitiveModule {
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn output_schema(&self) -> Value {
+            let definitions = if self.draft_seven {
+                "definitions"
+            } else {
+                "$defs"
+            };
+            let sensitive_ref = format!("#/{definitions}/Sensitive");
+            let child_ref = if self.draft_seven {
+                "child"
+            } else {
+                "child#scoped"
+            };
+            let mut child = json!({"$id":"child","$anchor":"scoped","type":"object",
+                "properties":{"value":{"$ref":sensitive_ref}}});
+            child[definitions] = json!({"Sensitive":{"type":"string","x-sensitive":true}});
+            let mut schema = json!({"type":"object","$id":"apcore://test/reference",
+                "properties":{"message":{"$ref":sensitive_ref},"payload":{"$ref":child_ref},
+                    "rows":{"type":"array","items":{"$ref":format!("#/{definitions}/Row")}},
+                    "public":{"type":"string"}}});
+            schema[definitions] = json!({"Sensitive":{"type":"string","x-sensitive":true},
+                "Child":child,"Row":{"type":"object","properties":{
+                    "message":{"$ref":sensitive_ref},"label":{"type":"string"}}}});
+            let prefix = json!([{"$ref":sensitive_ref},{"type":"string"}]);
+            schema["$schema"] = json!(if self.draft_seven {
+                "http://json-schema.org/draft-07/schema#"
+            } else {
+                "https://json-schema.org/draft/2020-12/schema"
+            });
+            schema["properties"]["positional"] = if self.draft_seven {
+                json!({"type":"array","items":prefix,"additionalItems":{"$ref":sensitive_ref}})
+            } else {
+                json!({"type":"array","prefixItems":prefix,"items":{"$ref":sensitive_ref}})
+            };
+            schema
+        }
+        fn description(&self) -> &str {
+            "Return referenced sensitive fields"
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _context: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            Ok(
+                json!({"message":"reference-canary", "positional":["positional-reference-canary","visible","tail-reference-canary"], "payload":{"value":"scoped-reference-canary"}, "rows":[{"message":"nested-reference-canary","label":"visible"}],"public":"visible"}),
+            )
+        }
+    }
+
+    fn referenced_sensitive_http_app(draft_seven: bool) -> axum::Router {
+        let registry = Arc::new(Registry::new());
+        let module = ReferencedSensitiveModule { draft_seven };
+        let descriptor = ModuleDescriptor {
+            module_id: "demo.reference".into(),
+            name: None,
+            description: module.description().into(),
+            documentation: None,
+            input_schema: module.input_schema(),
+            output_schema: module.output_schema(),
+            version: "1.0.0".into(),
+            tags: vec![],
+            annotations: Some(ModuleAnnotations::default()),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register("demo.reference", Box::new(module), descriptor)
+            .unwrap();
+        let executor = Arc::new(Executor::new(registry, Arc::new(Config::default())));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(executor))
+            .build()
+            .unwrap();
+        let (server, _, _, options, _, _) = mcp.build_server_components().unwrap();
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+        Arc::new(TransportManager::new(None)).build_streamable_http_app(Arc::new(handler), None)
+    }
+
+    async fn referenced_sensitive_http_request(
+        app: &axum::Router,
+        version: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", version)
+            .body(Body::from(
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_governed_mcp_redacts_referenced_sensitive_output() {
+        for draft_seven in [false, true] {
+            let app = referenced_sensitive_http_app(draft_seven);
+            for version in ["2024-11-05", "2025-03-26", "2025-06-18"] {
+                let initialize = referenced_sensitive_http_request(&app,version,"initialize",json!({
+                "protocolVersion":version,"capabilities":{},"clientInfo":{"name":"legacy-client","version":"1"}
+            })).await;
+                assert_eq!(initialize["result"]["protocolVersion"], version);
+                assert_eq!(
+                    initialize["result"]["serverInfo"]["version"],
+                    env!("CARGO_PKG_VERSION")
+                );
+                let listing =
+                    referenced_sensitive_http_request(&app, version, "tools/list", json!({})).await;
+                let tool = listing["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == "demo.reference")
+                    .unwrap();
+                assert_eq!(tool.get("outputSchema").is_some(), version == "2025-06-18");
+                let response = referenced_sensitive_http_request(
+                    &app,
+                    version,
+                    "tools/call",
+                    json!({
+                        "name":"demo.reference","arguments":{}
+                    }),
+                )
+                .await;
+                let result = &response["result"];
+                assert_eq!(result["isError"], false);
+                let text: Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(text["message"], apcore::executor::REDACTED_VALUE);
+                assert_eq!(text["payload"]["value"], apcore::executor::REDACTED_VALUE);
+                assert_eq!(text["rows"][0]["message"], apcore::executor::REDACTED_VALUE);
+                assert_eq!(text["rows"][0]["label"], "visible");
+                assert_eq!(text["public"], "visible");
+                assert_eq!(
+                    text["positional"],
+                    json!([
+                        apcore::executor::REDACTED_VALUE,
+                        "visible",
+                        apcore::executor::REDACTED_VALUE
+                    ])
+                );
+                assert!(!response.to_string().contains("reference-canary"));
+                if version == "2025-06-18" {
+                    assert_eq!(result["structuredContent"], text);
+                } else {
+                    assert!(result.get("structuredContent").is_none());
+                }
+            }
+        }
+    }
+
+    /// Create a test registry with the given modules.
+    fn make_test_registry(modules: Vec<(&str, &str, Vec<String>)>) -> Registry {
+        let registry = Registry::new();
+        for (name, desc, tags) in modules {
+            let module = Box::new(MockModule::new(desc));
+            let descriptor = ModuleDescriptor {
+                module_id: name.to_string(),
+                name: None,
+                description: desc.to_string(),
+                documentation: None,
+                input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+                output_schema: json!({}),
+                version: "1.0.0".to_string(),
+                tags,
+                annotations: Some(ModuleAnnotations::default()),
+                examples: vec![],
+                metadata: std::collections::HashMap::new(),
+                display: None,
+                sunset_date: None,
+                dependencies: vec![],
+                enabled: true,
+            };
+            registry
+                .register_internal(name, module, descriptor)
+                .unwrap();
+        }
+        registry
+    }
+
+    /// Create a test APCoreMCP with default config and an empty registry.
+    fn make_test_apcore_mcp() -> APCoreMCP {
+        let registry = Arc::new(make_test_registry(vec![]));
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        APCoreMCP {
+            config: APCoreMCPConfig::default(),
+            standalone_registry: Some(registry),
+            executor,
+            authenticator: None,
+            metrics_collector: None,
+            auto_metrics: None,
+            auto_usage: None,
+            output_formatter: None,
+            approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
+        }
+    }
+
+    /// Create a test APCoreMCP with a specific version.
+    fn make_test_apcore_mcp_with_version(version: &str) -> APCoreMCP {
+        let registry = Arc::new(make_test_registry(vec![]));
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        APCoreMCP {
+            config: APCoreMCPConfig {
+                version: Some(version.to_string()),
+                ..Default::default()
+            },
+            standalone_registry: Some(registry),
+            executor,
+            authenticator: None,
+            metrics_collector: None,
+            auto_metrics: None,
+            auto_usage: None,
+            output_formatter: None,
+            approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
+        }
+    }
+
+    /// Create a test APCoreMCP with populated registry and tag filter.
+    fn make_test_apcore_mcp_with_tags(tags: Vec<String>) -> APCoreMCP {
+        let registry = Arc::new(make_test_registry(vec![
+            ("mod.public", "Public module", vec!["public".to_string()]),
+            ("mod.private", "Private module", vec!["private".to_string()]),
+            (
+                "mod.both",
+                "Both module",
+                vec!["public".to_string(), "private".to_string()],
+            ),
+        ]));
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        APCoreMCP {
+            config: APCoreMCPConfig {
+                tags: Some(tags),
+                ..Default::default()
+            },
+            standalone_registry: Some(registry),
+            executor,
+            authenticator: None,
+            metrics_collector: None,
+            auto_metrics: None,
+            auto_usage: None,
+            output_formatter: None,
+            approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
+        }
+    }
+
+    /// Create a test APCoreMCP with populated registry and prefix filter.
+    fn make_test_apcore_mcp_with_prefix(prefix: &str) -> APCoreMCP {
+        let registry = Arc::new(make_test_registry(vec![
+            ("my_tool.a", "Tool A", vec![]),
+            ("my_tool.b", "Tool B", vec![]),
+            ("other.c", "Tool C", vec![]),
+        ]));
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        APCoreMCP {
+            config: APCoreMCPConfig {
+                prefix: Some(prefix.to_string()),
+                ..Default::default()
+            },
+            standalone_registry: Some(registry),
+            executor,
+            authenticator: None,
+            metrics_collector: None,
+            auto_metrics: None,
+            auto_usage: None,
+            output_formatter: None,
+            approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
+        }
+    }
+
+    /// Create a test APCoreMCP with populated registry (no filters).
+    fn make_test_apcore_mcp_with_modules() -> APCoreMCP {
+        let registry = Arc::new(make_test_registry(vec![
+            ("mod.a", "Module A", vec!["api".to_string()]),
+            ("mod.b", "Module B", vec!["internal".to_string()]),
+        ]));
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        APCoreMCP {
+            config: APCoreMCPConfig::default(),
+            standalone_registry: Some(registry),
+            executor,
+            authenticator: None,
+            metrics_collector: None,
+            auto_metrics: None,
+            auto_usage: None,
+            output_formatter: None,
+            approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
+        }
+    }
+
+    // -- BackendSource tests --------------------------------------------------
+
+    #[test]
+    fn from_string_creates_extensions_dir() {
+        let source: BackendSource = "./extensions".into();
+        assert!(matches!(source, BackendSource::ExtensionsDir(_)));
+    }
+
+    #[test]
+    fn from_pathbuf_creates_extensions_dir() {
+        let source: BackendSource = PathBuf::from("./extensions").into();
+        assert!(matches!(source, BackendSource::ExtensionsDir(_)));
+    }
+
+    #[test]
+    fn from_str_ref_creates_extensions_dir() {
+        let source = BackendSource::from("./my-ext");
+        if let BackendSource::ExtensionsDir(p) = source {
+            assert_eq!(p, PathBuf::from("./my-ext"));
+        } else {
+            panic!("expected ExtensionsDir");
+        }
+    }
+
+    #[test]
+    fn from_owned_string_creates_extensions_dir() {
+        let source = BackendSource::from(String::from("./exts"));
+        if let BackendSource::ExtensionsDir(p) = source {
+            assert_eq!(p, PathBuf::from("./exts"));
+        } else {
+            panic!("expected ExtensionsDir");
+        }
+    }
+
+    #[test]
+    fn from_arc_registry_creates_registry_variant() {
+        let reg = Arc::new(Registry::new());
+        let source = BackendSource::from(reg.clone());
+        assert!(matches!(source, BackendSource::Registry(_)));
+    }
+
+    #[test]
+    fn from_arc_executor_creates_executor_variant() {
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let source = BackendSource::from(exec.clone());
+        assert!(matches!(source, BackendSource::Executor(_)));
+    }
+
+    #[test]
+    fn backend_source_is_debug() {
+        let source: BackendSource = "./ext".into();
+        let debug_str = format!("{:?}", source);
+        assert!(debug_str.contains("ExtensionsDir"));
+    }
+
+    // -- APCoreMCPConfig tests ------------------------------------------------
+
+    #[test]
+    fn default_config_has_expected_values() {
+        let cfg = APCoreMCPConfig::default();
+        assert_eq!(cfg.name, "apcore-mcp");
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 8000);
+        assert_eq!(cfg.transport, "stdio");
+        assert!(!cfg.validate_inputs);
+        assert!(cfg.version.is_none());
+        assert!(cfg.tags.is_none());
+        assert!(cfg.prefix.is_none());
+        assert!(cfg.require_auth);
+        assert!(!cfg.allow_execute);
+    }
+
+    #[test]
+    fn config_explorer_defaults() {
+        let cfg = APCoreMCPConfig::default();
+        assert!(!cfg.explorer);
+        assert_eq!(cfg.explorer_prefix, "/explorer");
+        assert_eq!(cfg.explorer_title, "APCore MCP Explorer");
+        assert_eq!(cfg.explorer_project_name.as_deref(), Some("apcore-mcp"));
+        assert_eq!(
+            cfg.explorer_project_url.as_deref(),
+            Some("https://github.com/aiperceivable/apcore-mcp-rust")
+        );
+        assert!(!cfg.allow_execute);
+    }
+
+    #[test]
+    fn config_is_clone() {
+        let cfg = APCoreMCPConfig::default();
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg.name, cfg2.name);
+    }
+
+    // -- APCoreMCPError tests -------------------------------------------------
+
+    #[test]
+    fn error_display_empty_name() {
+        let err = APCoreMCPError::EmptyName;
+        assert!(err.to_string().contains("name"));
+    }
+
+    #[test]
+    fn error_display_name_too_long() {
+        let err = APCoreMCPError::NameTooLong(300);
+        assert!(err.to_string().contains("255"));
+    }
+
+    #[test]
+    fn error_display_empty_tag() {
+        let err = APCoreMCPError::EmptyTag;
+        assert!(err.to_string().contains("tag"));
+    }
+
+    #[test]
+    fn error_display_invalid_log_level() {
+        let err = APCoreMCPError::InvalidLogLevel("VERBOSE".into());
+        assert!(err.to_string().contains("VERBOSE"));
+    }
+
+    #[test]
+    fn error_display_empty_prefix() {
+        let err = APCoreMCPError::EmptyPrefix;
+        assert!(err.to_string().contains("prefix"));
+    }
+
+    #[test]
+    fn error_display_invalid_explorer_prefix() {
+        let err = APCoreMCPError::InvalidExplorerPrefix;
+        assert!(err.to_string().contains("explorer_prefix"));
+    }
+
+    #[test]
+    fn error_display_backend_resolution() {
+        let err = APCoreMCPError::BackendResolution("not found".into());
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn error_display_server_error() {
+        let err = APCoreMCPError::ServerError("bind failed".into());
+        assert!(err.to_string().contains("bind failed"));
+    }
+
+    #[test]
+    fn error_is_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(APCoreMCPError::EmptyName);
+        assert!(err.to_string().contains("name"));
+    }
+
+    // -- Builder pattern tests (Task 4) ---------------------------------------
+
+    #[test]
+    fn builder_requires_backend() {
+        let result = APCoreMCP::builder().build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_rejects_empty_name() {
+        let result = APCoreMCP::builder().backend("./ext").name("").build();
+        assert!(matches!(result, Err(APCoreMCPError::EmptyName)));
+    }
+
+    #[test]
+    fn builder_rejects_name_over_255() {
+        let long = "a".repeat(256);
+        let result = APCoreMCP::builder().backend("./ext").name(&long).build();
+        assert!(matches!(result, Err(APCoreMCPError::NameTooLong(256))));
+    }
+
+    /// The 255 bound counts CHARACTERS, not UTF-8 bytes.
+    ///
+    /// Same defect class as A-D-FA-3 in `MCPServerFactory::create_server`, on
+    /// the path the CLI actually takes: a 100-character CJK name measures 300
+    /// bytes and was rejected here while Python (code points) and TypeScript
+    /// (UTF-16 units) both accept it.
+    #[test]
+    fn builder_accepts_multibyte_name_under_the_char_limit() {
+        // Escape form keeps this source file ASCII-only (apdev check-chars).
+        let name: String = "\u{670D}".repeat(100);
+        assert_eq!(name.len(), 300, "fixture must be multi-byte");
+        let result = APCoreMCP::builder().backend("./ext").name(&name).build();
+        assert!(
+            !matches!(result, Err(APCoreMCPError::NameTooLong(_))),
+            "a 100-character name is within the 255-character limit"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_empty_tag() {
+        let result = APCoreMCP::builder()
+            .backend("./ext")
+            .tags(vec!["".to_string()])
+            .build();
+        assert!(matches!(result, Err(APCoreMCPError::EmptyTag)));
+    }
+
+    #[test]
+    fn builder_rejects_empty_prefix() {
+        let result = APCoreMCP::builder().backend("./ext").prefix("").build();
+        assert!(matches!(result, Err(APCoreMCPError::EmptyPrefix)));
+    }
+
+    #[test]
+    fn builder_rejects_invalid_log_level() {
+        let result = APCoreMCP::builder()
+            .backend("./ext")
+            .log_level("VERBOSE")
+            .build();
+        assert!(matches!(result, Err(APCoreMCPError::InvalidLogLevel(_))));
+    }
+
+    #[test]
+    fn builder_accepts_valid_log_levels() {
+        for level in &["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] {
+            let result = APCoreMCP::builder()
+                .backend("./ext")
+                .log_level(level)
+                .build();
+            // May fail on backend resolution, but not on log level validation
+            if let Err(e) = &result {
+                assert!(!matches!(e, APCoreMCPError::InvalidLogLevel(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn builder_sets_all_config_fields() {
+        let builder = APCoreMCP::builder()
+            .name("test-server")
+            .version("1.0.0")
+            .tags(vec!["public".into()])
+            .prefix("my_")
+            .transport("streamable-http")
+            .host("0.0.0.0")
+            .port(9000)
+            .validate_inputs(true)
+            .require_auth(false);
+        assert_eq!(builder.config.name, "test-server");
+        assert_eq!(builder.config.version, Some("1.0.0".to_string()));
+        assert_eq!(builder.config.tags, Some(vec!["public".to_string()]));
+        assert_eq!(builder.config.prefix, Some("my_".to_string()));
+        assert_eq!(builder.config.transport, "streamable-http");
+        assert_eq!(builder.config.host, "0.0.0.0");
+        assert_eq!(builder.config.port, 9000);
+        assert!(builder.config.validate_inputs);
+        assert!(!builder.config.require_auth);
+    }
+
+    #[test]
+    fn builder_with_registry_backend_succeeds() {
+        // [L-1] A pre-built `Arc<Registry>` is now a supported backend: it is
+        // shared into an Executor via `Executor::new(Arc<Registry>, ..)`.
+        let reg = Arc::new(make_test_registry(vec![("mod.a", "Module A", vec![])]));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Registry(reg))
+            .build()
+            .expect("Registry backend must build");
+        // Tool discovery goes through the shared registry.
+        assert!(mcp.tools().iter().any(|t| t == "mod.a"));
+    }
+
+    #[test]
+    fn builder_with_extensions_dir_builds_empty_backend() {
+        // [L-1] ExtensionsDir cannot load compiled-in Rust modules at runtime;
+        // it builds an empty backend with a warning rather than erroring.
+        let mcp = APCoreMCP::builder()
+            .backend("./nonexistent-extensions")
+            .build()
+            .expect("ExtensionsDir must build an empty backend");
+        assert!(mcp.tools().is_empty());
+    }
+
+    #[test]
+    fn builder_with_executor_backend_succeeds() {
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let result = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .build();
+        // Executor backend: stored registry is a placeholder (empty),
+        // tool discovery uses executor.registry() via reg().
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_resolves_known_strategy() {
+        // [L-3] A known strategy preset must resolve and be retained on the
+        // built APCoreMCP so the trace path can apply it.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .strategy("testing")
+            .build()
+            .expect("build should succeed");
+        assert!(
+            mcp.resolved_strategy.is_some(),
+            "known strategy 'testing' must resolve to an ExecutionStrategy"
+        );
+    }
+
+    #[test]
+    fn builder_ignores_unknown_strategy() {
+        // [L-3] An unknown strategy name is logged and ignored rather than
+        // failing the build (executor keeps its default strategy).
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .strategy("does-not-exist")
+            .build()
+            .expect("unknown strategy must not fail the build");
+        assert!(
+            mcp.resolved_strategy.is_none(),
+            "unknown strategy must resolve to None"
+        );
+    }
+
+    #[test]
+    fn builder_with_approval_store_advertises_meta_tool() {
+        // [H-1] When an approval store is configured, the built server's tool
+        // list must include the __apcore_approval_check meta-tool.
+        use crate::approval_store::InMemoryApprovalStore;
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .approval_store(store)
+            .build()
+            .expect("build should succeed");
+        assert!(mcp.approval_handler.is_some(), "handler must be built");
+        assert!(mcp.approval_store.is_some(), "store must be retained");
+        let (_server, _router, tools, _init, _ver, _bridge) =
+            mcp.build_server_components().expect("components");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"__apcore_approval_check"),
+            "approval meta-tool must be advertised; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn builder_without_approval_store_omits_meta_tool() {
+        // [H-1] Without an approval handler, the approval meta-tool must NOT
+        // be advertised.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .build()
+            .expect("build should succeed");
+        let (_server, _router, tools, _init, _ver, _bridge) =
+            mcp.build_server_components().expect("components");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"__apcore_approval_check"),
+            "approval meta-tool must be absent without a handler"
+        );
+    }
+
+    // -- Middleware support tests (Phase 1.1) ----------------------------------
+
+    #[test]
+    fn builder_middleware_setter_installs_on_executor() {
+        use apcore::RetryMiddleware;
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec.clone()))
+            .middleware(Box::new(RetryMiddleware::new(Default::default())))
+            .build()
+            .expect("build should succeed");
+        let names = exec.middlewares();
+        assert!(
+            names.iter().any(|n| n == "retry"),
+            "expected 'retry' in executor middlewares, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn builder_middleware_batch_installs_all_in_order() {
+        use apcore::{LoggingMiddleware, RetryMiddleware};
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec.clone()))
+            .middleware_batch(vec![
+                Box::new(RetryMiddleware::new(Default::default())) as Box<dyn apcore::Middleware>,
+                Box::new(LoggingMiddleware::new(true, true, true)) as Box<dyn apcore::Middleware>,
+            ])
+            .build()
+            .expect("build should succeed");
+        let names = exec.middlewares();
+        assert!(
+            names.iter().any(|n| n == "retry") && names.iter().any(|n| n == "logging"),
+            "expected both 'retry' and 'logging', got {names:?}"
+        );
+    }
+
+    // -- ACL support tests (Phase 1.2) -----------------------------------------
+
+    #[test]
+    fn builder_acl_setter_installs_on_executor() {
+        use apcore::{ACLRule, ACL};
+        // apcore 0.19.0: `Executor::set_acl` takes `&mut self`. To install an
+        // ACL through `APCoreMCPBuilder`, the backend Executor Arc must be
+        // unique — do NOT hold a clone across the call to `build()`. The
+        // builder surfaces this as a `Config` error; we verify the happy path
+        // here by inspecting the MCP instance's executor.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let acl = ACL::new(
+            vec![ACLRule::new(
+                vec!["role:admin".to_string()],
+                vec!["sys.*".to_string()],
+                "allow",
+            )],
+            "deny",
+            None,
+        );
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .acl(acl)
+            .build()
+            .expect("build should succeed");
+        let installed = mcp.executor().acl.as_ref();
+        assert!(installed.is_some(), "expected ACL on executor");
+        assert_eq!(installed.unwrap().rules().len(), 1);
+    }
+
+    // ── FR-ACL-004 / §6.2.1 tier 2: rules that load cleanly and can protect
+    // nothing. Before this fix, this bridge had no implementation at all —
+    // zero hits for validate_rules/never_matches/tier-2 anywhere in src/,
+    // tests/, or CHANGELOG.md. This test proves both that the diagnostic
+    // fires and that its message uses RuleValidationFinding's real field
+    // names (rule_index/condition_path/condition_key/effect — there is no
+    // free-text reason field), which is the same shape bug that made the
+    // Python bridge's already-wired warning render as `'?': ` before this
+    // sync pass fixed it too.
+
+    /// A `MakeWriter` that appends every write into a shared buffer, so a
+    /// test can assert on `tracing::warn!` output without a global
+    /// subscriber leaking into other tests.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn build_server_components_warns_on_inert_acl_rule_with_real_field_names() {
+        use apcore::{ACLRule, ACL};
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(Arc::clone(&buffer)))
+            .with_ansi(false)
+            .finish();
+
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        // ["$not", "*"] has legal §6.2.1 arity (exactly one operand) and
+        // matches nothing — the identical fail-open the shape closure alone
+        // does not catch, which is exactly what tier 2 exists to report.
+        let acl = ACL::new(
+            vec![ACLRule::new(
+                vec!["*".to_string()],
+                vec!["$not".to_string(), "*".to_string()],
+                "deny",
+            )],
+            "allow",
+            None,
+        );
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .acl(acl)
+            .build()
+            .expect("build should succeed");
+
+        tracing::subscriber::with_default(subscriber, || {
+            mcp.build_server_components().expect("components");
+        });
+
+        let output = String::from_utf8(buffer.lock().expect("capture buffer lock").clone())
+            .expect("captured tracing output must be valid UTF-8");
+        assert!(
+            output.contains("mcp.acl.rules[0]"),
+            "expected a tier-2 warning naming the rule; got: {output}"
+        );
+        assert!(
+            output.contains("'targets'"),
+            "expected the condition_path; got: {output}"
+        );
+        assert!(
+            output.contains("'deny' rule protects nothing"),
+            "expected the effect and reason; got: {output}"
+        );
+        assert!(
+            !output.contains("'?'"),
+            "the exact prior bug: a missing field defaulting to '?'; got: {output}"
+        );
+    }
+
+    #[test]
+    fn build_server_components_is_silent_when_every_acl_rule_matches_something() {
+        use apcore::{ACLRule, ACL};
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(Arc::clone(&buffer)))
+            .with_ansi(false)
+            .finish();
+
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let acl = ACL::new(
+            vec![ACLRule::new(
+                vec!["*".to_string()],
+                vec!["*".to_string()],
+                "allow",
+            )],
+            "deny",
+            None,
+        );
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .acl(acl)
+            .build()
+            .expect("build should succeed");
+
+        tracing::subscriber::with_default(subscriber, || {
+            mcp.build_server_components().expect("components");
+        });
+
+        let output = String::from_utf8(buffer.lock().expect("capture buffer lock").clone())
+            .expect("captured tracing output must be valid UTF-8");
+        assert!(
+            !output.contains("mcp.acl.rules"),
+            "expected no tier-2 warning; got: {output}"
+        );
+    }
+
+    #[test]
+    fn builder_without_acl_leaves_executor_acl_unset() {
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec.clone()))
+            .build()
+            .expect("build should succeed");
+        // Note: Config Bus `mcp.acl` may be read here. Assert only the
+        // caller-did-not-set-ACL path — if tests are run with a config file
+        // that defines acl, this assertion is skipped.
+        if crate::config::get_acl_config().is_none() {
+            assert!(exec.acl.is_none(), "expected no ACL when none supplied");
+        }
+    }
+
+    // -- Struct and accessor tests (Task 5) -----------------------------------
+
+    #[test]
+    fn registry_returns_arc_ref() {
+        let mcp = make_test_apcore_mcp();
+        let reg = mcp.registry();
+        // Should return &Arc<Registry>
+        let _ = reg.list(None, None, None);
+    }
+
+    #[test]
+    fn executor_returns_arc_ref() {
+        let mcp = make_test_apcore_mcp();
+        let _exec = mcp.executor();
+        // Just verify it returns without panic
+    }
+
+    // Task 2: default strategy is "standard" for MCP (external-facing).
+    #[test]
+    fn default_executor_uses_standard_strategy() {
+        let mcp = make_test_apcore_mcp();
+        let info = mcp.executor().describe_pipeline();
+        assert_eq!(info.name, "standard");
+        // Standard strategy has several steps including ACL + validate + execute.
+        assert!(info.step_count >= 3, "got {} steps", info.step_count);
+        assert!(
+            info.step_names.iter().any(|s| s == "execute"),
+            "steps: {:?}",
+            info.step_names
+        );
+    }
+
+    #[test]
+    fn tools_returns_module_ids() {
+        let mcp = make_test_apcore_mcp_with_modules();
+        let tools = mcp.tools();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.contains(&"mod.a".to_string()));
+        assert!(tools.contains(&"mod.b".to_string()));
+    }
+
+    #[test]
+    fn tools_returns_empty_for_empty_registry() {
+        let mcp = make_test_apcore_mcp();
+        let tools = mcp.tools();
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn tools_filters_by_tags() {
+        let mcp = make_test_apcore_mcp_with_tags(vec!["public".into()]);
+        let tools = mcp.tools();
+        // Should include mod.public and mod.both (both have "public" tag)
+        assert!(tools.contains(&"mod.public".to_string()));
+        assert!(tools.contains(&"mod.both".to_string()));
+        assert!(!tools.contains(&"mod.private".to_string()));
+    }
+
+    #[test]
+    fn tools_filters_by_prefix() {
+        let mcp = make_test_apcore_mcp_with_prefix("my_tool.");
+        let tools = mcp.tools();
+        assert!(tools.contains(&"my_tool.a".to_string()));
+        assert!(tools.contains(&"my_tool.b".to_string()));
+        assert!(!tools.contains(&"other.c".to_string()));
+    }
+
+    // -- build_server_components tests (Task 6) -------------------------------
+
+    #[test]
+    fn build_server_components_returns_all_parts() {
+        let mcp = make_test_apcore_mcp();
+        let components = mcp.build_server_components();
+        assert!(components.is_ok());
+        let (_server, _router, _tools, _init_options, version, _bridge) = components.unwrap();
+        assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn build_server_components_uses_custom_version() {
+        let mcp = make_test_apcore_mcp_with_version("2.0.0");
+        let (_, _, _, _, version, _) = mcp.build_server_components().unwrap();
+        assert_eq!(version, "2.0.0");
+    }
+
+    #[test]
+    fn build_server_components_defaults_to_crate_version() {
+        let mcp = make_test_apcore_mcp();
+        let (_, _, _, _, version, _) = mcp.build_server_components().unwrap();
+        assert_eq!(version, crate::VERSION);
+    }
+
+    #[test]
+    fn build_server_components_applies_tag_filter() {
+        let mcp = make_test_apcore_mcp_with_tags(vec!["public".into()]);
+        let (_, _, tools, _, _, _) = mcp.build_server_components().unwrap();
+        // Only modules with "public" tag
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"mod.public"));
+        assert!(names.contains(&"mod.both"));
+        assert!(!names.contains(&"mod.private"));
+    }
+
+    #[test]
+    fn build_server_components_applies_prefix_filter() {
+        let mcp = make_test_apcore_mcp_with_prefix("my_tool.");
+        let (_, _, tools, _, _, _) = mcp.build_server_components().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"my_tool.a"));
+        assert!(names.contains(&"my_tool.b"));
+        assert!(!names.contains(&"other.c"));
+    }
+
+    #[test]
+    fn build_server_components_has_init_options() {
+        let mcp = make_test_apcore_mcp_with_modules();
+        let (_, _, _, init_options, _, _) = mcp.build_server_components().unwrap();
+        assert_eq!(init_options.server_name, "apcore-mcp");
+        assert_eq!(init_options.server_version, crate::VERSION);
+        // Should have tools capability since we registered handlers
+        assert!(init_options.capabilities.tools.is_some());
+        // Should have resources capability since we registered resource handlers
+        assert!(init_options.capabilities.resources.is_some());
+    }
+
+    #[test]
+    fn build_server_components_server_has_handlers() {
+        let mcp = make_test_apcore_mcp_with_modules();
+        let (server, _, _, _, _, _) = mcp.build_server_components().unwrap();
+        assert!(server.has_tool_handlers());
+        assert!(server.has_resource_handlers());
+    }
+
+    #[test]
+    fn build_server_components_tools_match_registry() {
+        let mcp = make_test_apcore_mcp_with_modules();
+        let (_, _, tools, _, _, _) = mcp.build_server_components().unwrap();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let registry_tools = mcp.tools();
+        // Registry tools plus the 5 reserved `__apcore_*` meta-tools
+        // auto-appended by the AsyncTaskBridge: 4 task-management tools
+        // plus `__apcore_module_preview` (apcore 0.21 PROTOCOL_SPEC §5.6).
+        assert_eq!(tools.len(), registry_tools.len() + 5);
+        for name in &registry_tools {
+            assert!(tool_names.contains(&name.as_str()));
+        }
+        for reserved in [
+            "__apcore_task_submit",
+            "__apcore_task_status",
+            "__apcore_task_cancel",
+            "__apcore_task_list",
+            "__apcore_module_preview",
+        ] {
+            assert!(
+                tool_names.contains(&reserved),
+                "meta-tool {reserved} must be registered"
+            );
+        }
+    }
+
+    // -- serve-methods tests (Task 7) -----------------------------------------
+
+    fn make_test_apcore_mcp_with_transport(transport: &str) -> APCoreMCP {
+        let registry = Arc::new(make_test_registry(vec![]));
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        APCoreMCP {
+            config: APCoreMCPConfig {
+                transport: transport.to_string(),
+                ..Default::default()
+            },
+            standalone_registry: Some(registry),
+            executor,
+            authenticator: None,
+            metrics_collector: None,
+            auto_metrics: None,
+            auto_usage: None,
+            output_formatter: None,
+            approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
+        }
+    }
+
+    #[test]
+    fn serve_rejects_unknown_transport() {
+        let mcp = make_test_apcore_mcp_with_transport("websocket");
+        let result = mcp.serve();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Unknown transport"));
+    }
+
+    #[test]
+    fn serve_rejects_invalid_explorer_prefix() {
+        let mcp = make_test_apcore_mcp();
+        let result = mcp.serve_with_options(ServeOptions {
+            explorer: ExplorerOptions {
+                explorer: true,
+                explorer_prefix: "no-slash".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(matches!(result, Err(APCoreMCPError::InvalidExplorerPrefix)));
+    }
+
+    /// `serve()` must carry the explorer configuration captured by the
+    /// builder.
+    ///
+    /// It used to pass `ServeOptions::default()`, while `serve_with_options`
+    /// reads explorer settings from its options argument — so every
+    /// builder-configured explorer flag was silently dropped, including the
+    /// CLI's `--explorer`, `--explorer-prefix` and `--allow-execute`.
+    ///
+    /// The fixture sets an invalid explorer prefix AND an unknown transport.
+    /// The explorer check runs first, so the error names which options
+    /// actually reached `serve_with_options`, and neither path starts a server.
+    #[test]
+    fn serve_carries_builder_explorer_config() {
+        let mut mcp = make_test_apcore_mcp_with_transport("websocket");
+        mcp.config.explorer = true;
+        mcp.config.explorer_prefix = "no-slash".to_string();
+        let result = mcp.serve();
+        assert!(
+            matches!(result, Err(APCoreMCPError::InvalidExplorerPrefix)),
+            "serve() must pass the builder's explorer config through; got: {result:?}"
+        );
+    }
+
+    /// Same for the async entry point.
+    #[tokio::test]
+    async fn serve_async_carries_builder_explorer_config() {
+        let mut mcp = make_test_apcore_mcp_with_transport("websocket");
+        mcp.config.explorer = true;
+        mcp.config.explorer_prefix = "no-slash".to_string();
+        let result = mcp.serve_async().await;
+        assert!(
+            matches!(result, Err(APCoreMCPError::InvalidExplorerPrefix)),
+            "serve_async() must pass the builder's explorer config through; got: {result:?}"
+        );
+    }
+
+    /// Explorer off in the config must stay off — the prefix is then
+    /// irrelevant and the transport check is what fires.
+    #[test]
+    fn serve_leaves_explorer_off_when_the_builder_did_not_enable_it() {
+        let mut mcp = make_test_apcore_mcp_with_transport("websocket");
+        mcp.config.explorer_prefix = "no-slash".to_string();
+        let result = mcp.serve();
+        assert!(matches!(result, Err(APCoreMCPError::UnknownTransport(_))));
+    }
+
+    #[tokio::test]
+    async fn async_serve_returns_router() {
+        let mcp = make_test_apcore_mcp();
+        let result = mcp.async_serve(AsyncServeOptions::default()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn async_serve_rejects_invalid_explorer_prefix() {
+        let mcp = make_test_apcore_mcp();
+        let result = mcp
+            .async_serve(AsyncServeOptions {
+                explorer: ExplorerOptions {
+                    explorer: true,
+                    explorer_prefix: "no-slash".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(result, Err(APCoreMCPError::InvalidExplorerPrefix)));
+    }
+
+    #[test]
+    fn error_display_unknown_transport() {
+        let err = APCoreMCPError::UnknownTransport("websocket".into());
+        assert!(err.to_string().contains("Unknown transport"));
+        assert!(err.to_string().contains("websocket"));
+    }
+
+    // -- to-openai-tools tests (Task 8) ---------------------------------------
+
+    #[test]
+    fn to_openai_tools_returns_vec_of_values() {
+        let mcp = make_test_apcore_mcp();
+        let tools = mcp.to_openai_tools(false, false).unwrap();
+        assert!(tools.is_empty() || tools.iter().all(|t| t.is_object()));
+    }
+
+    #[test]
+    fn to_openai_tools_with_modules_returns_tools() {
+        let mcp = make_test_apcore_mcp_with_modules();
+        let tools = mcp.to_openai_tools(false, false).unwrap();
+        assert_eq!(tools.len(), 2);
+        for tool in &tools {
+            assert!(tool.is_object());
+            assert_eq!(tool["type"], "function");
+            assert!(tool["function"]["name"].is_string());
+            assert!(tool["function"]["description"].is_string());
+        }
+    }
+
+    #[test]
+    fn to_openai_tools_respects_tags() {
+        let mcp = make_test_apcore_mcp_with_tags(vec!["public".into()]);
+        let tools = mcp.to_openai_tools(false, false).unwrap();
+        // Should only include modules with "public" tag (mod.public and mod.both)
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn to_openai_tools_respects_prefix() {
+        let mcp = make_test_apcore_mcp_with_prefix("my_tool.");
+        let tools = mcp.to_openai_tools(false, false).unwrap();
+        // Should only include my_tool.a and my_tool.b
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn to_openai_tools_strict_flag() {
+        let mcp = make_test_apcore_mcp_with_modules();
+        let tools = mcp.to_openai_tools(false, true).unwrap();
+        for tool in &tools {
+            assert_eq!(tool["function"]["strict"], true);
+        }
+    }
+
+    #[test]
+    fn to_openai_tools_embed_annotations() {
+        let mcp = make_test_apcore_mcp_with_modules();
+        let tools_without = mcp.to_openai_tools(false, false).unwrap();
+        let tools_with = mcp.to_openai_tools(true, false).unwrap();
+        // Both should return the same number of tools
+        assert_eq!(tools_without.len(), tools_with.len());
+    }
+
+    // -- convenience-functions tests (Task 9) ---------------------------------
+
+    #[test]
+    fn convenience_serve_config_has_defaults() {
+        let cfg = ServeConfig::default();
+        assert_eq!(cfg.transport, "stdio");
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 8000);
+        assert_eq!(cfg.name, "apcore-mcp");
+    }
+
+    #[test]
+    fn convenience_async_serve_config_has_defaults() {
+        let cfg = AsyncServeConfig::default();
+        assert_eq!(cfg.name, "apcore-mcp");
+        assert!(cfg.version.is_none());
+        assert!(cfg.tags.is_none());
+        assert!(cfg.prefix.is_none());
+    }
+
+    #[test]
+    fn convenience_openai_tools_config_has_defaults() {
+        let cfg = OpenAIToolsConfig::default();
+        assert!(!cfg.embed_annotations);
+        assert!(!cfg.strict);
+        assert!(cfg.tags.is_none());
+        assert!(cfg.prefix.is_none());
+    }
+
+    #[test]
+    fn serve_options_default_has_no_callbacks() {
+        let opts = ServeOptions::default();
+        assert!(opts.on_startup.is_none());
+        assert!(opts.on_shutdown.is_none());
+        assert!(!opts.explorer.explorer);
+    }
+
+    #[test]
+    fn async_serve_options_default() {
+        let opts = AsyncServeOptions::default();
+        assert!(!opts.explorer.explorer);
+        assert_eq!(opts.explorer.explorer_prefix, "/explorer");
+    }
+
+    // -- build_registry_json tests (Task 8, helper) ---------------------------
+
+    #[test]
+    fn build_registry_json_empty_registry() {
+        let mcp = make_test_apcore_mcp();
+        let json = mcp.build_registry_json();
+        assert!(json.is_object());
+        assert_eq!(json.as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn build_registry_json_with_modules() {
+        let mcp = make_test_apcore_mcp_with_modules();
+        let json = mcp.build_registry_json();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 2);
+        assert!(obj.contains_key("mod.a"));
+        assert!(obj.contains_key("mod.b"));
+
+        let mod_a = &obj["mod.a"];
+        assert!(mod_a["description"].is_string());
+        assert!(mod_a["input_schema"].is_object());
+        assert!(mod_a["tags"].is_array());
+    }
+
+    // ==================================================================
+    // P0 #3: Observability auto-wiring
+    // ==================================================================
+
+    #[test]
+    fn observability_flag_auto_wires_collectors() {
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(executor)
+            .name("obs-test")
+            .observability(true)
+            .build()
+            .expect("build must succeed");
+        assert!(
+            mcp.auto_metrics.is_some(),
+            "MetricsCollector should be auto-instantiated"
+        );
+        assert!(
+            mcp.auto_usage.is_some(),
+            "UsageCollector should be auto-instantiated"
+        );
+    }
+
+    #[test]
+    fn observability_off_does_not_wire_collectors() {
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(executor)
+            .name("obs-off")
+            .build()
+            .expect("build must succeed");
+        assert!(mcp.auto_metrics.is_none());
+        assert!(mcp.auto_usage.is_none());
+    }
+
+    #[test]
+    fn observability_metrics_has_export_prometheus() {
+        use crate::server::transport::MetricsExporter;
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(executor)
+            .name("obs-prom")
+            .observability(true)
+            .build()
+            .expect("build must succeed");
+        let metrics = mcp.auto_metrics.as_ref().unwrap().clone();
+        // Exercise the blanket `impl MetricsExporter for MetricsCollector` so
+        // the adapter is actually driven through the trait the bridge uses.
+        let exporter: Arc<dyn MetricsExporter> = metrics;
+        let exported = exporter.export_prometheus();
+        // Empty collector is valid; just ensure the adapter is callable.
+        assert!(exported.is_empty() || exported.contains("# HELP"));
+    }
+
+    #[test]
+    fn observability_usage_exposes_summaries() {
+        use crate::server::transport::UsageExporter;
+        let executor = Arc::new(Executor::new(Registry::new(), Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(executor)
+            .name("obs-usage")
+            .observability(true)
+            .build()
+            .expect("build must succeed");
+        let usage = mcp.auto_usage.as_ref().unwrap();
+        let summary = usage.export_json();
+        assert!(summary.get("modules").is_some());
+    }
+
+    // -- Issue D1-001: ServeConfig has extended fields -------------------------
+
+    #[test]
+    fn test_serve_config_default_has_all_fields() {
+        // [D1-001] ServeConfig must have the key Python parity fields.
+        // The 8 stub fields removed in D9-002 (`async_tasks`,
+        // `async_max_concurrent`, `schema_converter`,
+        // `annotation_mapper`, `error_mapper`, `on_startup`,
+        // `on_shutdown`, `metrics_collector`) were never read by
+        // `serve()` and used placeholder `Option<serde_json::Value>`
+        // types that could not accept real callbacks. Lifecycle and
+        // observability callbacks are wired through `ServeOptions`.
+        let cfg = ServeConfig::default();
+        assert_eq!(cfg.name, "apcore-mcp");
+        assert!(cfg.authenticator.is_none());
+        assert!(cfg.require_auth.is_none());
+        assert!(cfg.exempt_paths.is_none());
+        assert!(cfg.redact_output.is_none());
+        assert!(cfg.observability.is_none());
+    }
+
+    #[test]
+    fn test_serve_config_with_authenticator() {
+        // [D1-001] ServeConfig must accept an authenticator field.
+        use crate::auth::jwt::JWTAuthenticator;
+        let auth: std::sync::Arc<dyn crate::auth::protocol::Authenticator> = std::sync::Arc::new(
+            JWTAuthenticator::new("test-secret", None, None, None, None, None, Some(true)),
+        );
+        let cfg = ServeConfig {
+            name: "test".to_string(),
+            authenticator: Some(auth),
+            ..ServeConfig::default()
+        };
+        assert_eq!(cfg.name, "test");
+        assert!(cfg.authenticator.is_some());
+    }
+
+    // -- Issue D1-002: AsyncServeConfig has extended fields -------------------
+
+    #[test]
+    fn test_async_serve_config_default_has_all_fields() {
+        // [D1-002] AsyncServeConfig must have the key Python parity fields.
+        // Stub fields removed in D9-002 — see `test_serve_config_default_has_all_fields`.
+        let cfg = AsyncServeConfig::default();
+        assert_eq!(cfg.name, "apcore-mcp");
+        assert!(cfg.authenticator.is_none());
+        assert!(cfg.require_auth.is_none());
+        assert!(cfg.exempt_paths.is_none());
+        assert!(cfg.observability.is_none());
+    }
+
+    #[test]
+    fn test_async_serve_config_with_authenticator() {
+        // [D1-002] AsyncServeConfig must accept an authenticator field.
+        use crate::auth::jwt::JWTAuthenticator;
+        let auth: std::sync::Arc<dyn crate::auth::protocol::Authenticator> = std::sync::Arc::new(
+            JWTAuthenticator::new("test-secret", None, None, None, None, None, Some(false)),
+        );
+        let cfg = AsyncServeConfig {
+            name: "async-test".to_string(),
+            authenticator: Some(auth),
+            require_auth: Some(false),
+            ..AsyncServeConfig::default()
+        };
+        assert_eq!(cfg.name, "async-test");
+        assert!(cfg.authenticator.is_some());
+        assert_eq!(cfg.require_auth, Some(false));
+    }
+
+    // ── filter_explorer_tools — F-043 meta-tools hidden from UI ──────────────
+
+    fn make_tool(name: &str) -> Tool {
+        Tool {
+            output_schema: None,
+            name: name.to_string(),
+            description: format!("desc-{name}"),
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn filter_explorer_tools_drops_apcore_meta_prefix() {
+        // Mixed input: 3 user tools + 4 reserved meta-tools.
+        let tools = vec![
+            make_tool("text.echo"),
+            make_tool("math.calc"),
+            make_tool("__apcore_task_submit"),
+            make_tool("__apcore_task_status"),
+            make_tool("greeting"),
+            make_tool("__apcore_task_cancel"),
+            make_tool("__apcore_task_list"),
+        ];
+
+        let infos = filter_explorer_tools(&tools);
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+
+        assert_eq!(names, vec!["text.echo", "math.calc", "greeting"]);
+        assert!(
+            !names.iter().any(|n| n.starts_with("__apcore_")),
+            "filter_explorer_tools must hide reserved meta-tools from UI"
+        );
+    }
+
+    #[test]
+    fn filter_explorer_tools_passes_through_user_tools_unchanged() {
+        let tools = vec![make_tool("a.b"), make_tool("c.d")];
+        let infos = filter_explorer_tools(&tools);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].name, "a.b");
+        assert_eq!(infos[0].description, "desc-a.b");
+        assert_eq!(infos[1].name, "c.d");
+    }
+
+    #[test]
+    fn filter_explorer_tools_carries_annotations() {
+        // Without this the explorer's annotation render branch can never
+        // fire, so no destructive-tool warning is ever shown for any tool.
+        let mut tool = make_tool("cli.cp");
+        tool.annotations = Some(crate::server::types::ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: None,
+            open_world_hint: None,
+        });
+        let infos = filter_explorer_tools(&[tool]);
+        assert_eq!(
+            infos[0]
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("destructiveHint"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "annotations must reach the explorer: {:?}",
+            infos[0].annotations
+        );
+    }
+
+    #[test]
+    fn filter_explorer_tools_only_filters_exact_prefix() {
+        // A tool whose name *contains* "__apcore_" but doesn't start with it
+        // is a user tool and must NOT be hidden.
+        let tools = vec![
+            make_tool("user__apcore_thing"),
+            make_tool("__apcore_task_submit"),
+        ];
+        let infos = filter_explorer_tools(&tools);
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["user__apcore_thing"]);
+    }
+
+    // ── Regression tests for Issues 1/5 & 5/5 (Ru-C1, Ru-W4) ─────────────────
+    // serve() / async_serve() must forward ServeConfig/AsyncServeConfig fields.
+
+    #[test]
+    fn serve_config_require_auth_false_forwarded_to_builder() {
+        // [Ru-C1] When ServeConfig.require_auth = Some(false), the resulting
+        // APCoreMCPBuilder must have require_auth=false (not the default true).
+        // We test via the builder directly since serve() blocks on network I/O.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let mut builder = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("test-forward")
+            .validate_inputs(false);
+
+        // Simulate what the fixed serve() does:
+        let require_auth = Some(false);
+        if let Some(rq) = require_auth {
+            builder = builder.require_auth(rq);
+        }
+
+        // The builder's config.require_auth must now be false.
+        assert!(
+            !builder.config.require_auth,
+            "require_auth should be false after forwarding ServeConfig field"
+        );
+    }
+
+    #[test]
+    fn serve_config_require_auth_true_forwarded_to_builder() {
+        // [Ru-C1] When ServeConfig.require_auth = Some(true), the built APCoreMCP
+        // must have require_auth=true.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let mut builder = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("test-forward-true")
+            .require_auth(false); // start with false
+                                  // Simulate forwarding Some(true):
+        builder = builder.require_auth(true);
+
+        assert!(
+            builder.config.require_auth,
+            "require_auth should be true after forwarding ServeConfig field"
+        );
+    }
+
+    #[test]
+    fn serve_config_redact_output_forwarded_to_builder() {
+        // [Ru-C1] ServeConfig.redact_output must be forwarded.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let mut builder = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("test-redact");
+        // Default APCoreMCPConfig.redact_output is true; forward false.
+        builder = builder.redact_output(false);
+
+        assert!(
+            !builder.config.redact_output,
+            "redact_output should be false after forwarding"
+        );
+    }
+
+    #[test]
+    fn serve_config_authenticator_arc_forwarded_to_builder() {
+        // [Ru-C1] When ServeConfig.authenticator is set, the builder must
+        // store it (authenticator_arc must exist and work).
+        use crate::auth::jwt::JWTAuthenticator;
+        let auth: Arc<dyn crate::auth::protocol::Authenticator> = Arc::new(JWTAuthenticator::new(
+            "secret",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        ));
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let builder = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("test-auth")
+            .authenticator_arc(auth);
+
+        assert!(
+            builder.authenticator.is_some(),
+            "authenticator must be stored after authenticator_arc()"
+        );
+    }
+
+    #[test]
+    fn serve_config_exempt_paths_forwarded_to_builder() {
+        // [Ru-C1] ServeConfig.exempt_paths must be forwarded.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let paths: Vec<String> = vec!["/health".to_string(), "/metrics".to_string()];
+        let path_set: std::collections::HashSet<String> = paths.into_iter().collect();
+        let builder = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("test-exempt")
+            .exempt_paths(path_set.clone());
+
+        assert_eq!(
+            builder.config.exempt_paths.as_ref().unwrap(),
+            &path_set,
+            "exempt_paths must be stored after forwarding"
+        );
+    }
+
+    #[test]
+    fn serve_config_observability_json_extraction() {
+        // [D1-001] serve()/async_serve() forward ServeConfig.observability to
+        // APCoreMCPBuilder::observability(bool). The placeholder field is JSON;
+        // the wiring extracts a bool from `true`/`false` literals or
+        // `{ "enabled": bool }` objects, defaulting to true on shape mismatch.
+        // This test exercises the extraction logic directly so a mistake here
+        // can be caught without spinning up the stdio serve loop.
+        fn extract(obs: &serde_json::Value) -> bool {
+            obs.as_bool()
+                .or_else(|| obs.get("enabled").and_then(|v| v.as_bool()))
+                .unwrap_or(true)
+        }
+        assert!(extract(&serde_json::json!(true)));
+        assert!(!extract(&serde_json::json!(false)));
+        assert!(extract(&serde_json::json!({"enabled": true})));
+        assert!(!extract(&serde_json::json!({"enabled": false})));
+        // Unknown shape → default on (presence implies user intent).
+        assert!(extract(&serde_json::json!({})));
+        assert!(extract(&serde_json::json!("yes")));
+    }
+
+    // ── Regression tests for Issues 2/5 & 4/5 (Ru-W1, Ru-W3) ─────────────────
+    // approval_handler() must complete without panic (smoke test).
+
+    #[test]
+    fn approval_handler_setter_does_not_panic() {
+        // [Ru-W1] APCoreMCPBuilder::approval_handler() must complete without panic.
+        // The handler is stored even though it is not yet wired.
+        use apcore::approval::{ApprovalHandler, ApprovalRequest, ApprovalResult};
+        use apcore::errors::ModuleError;
+        use async_trait::async_trait;
+
+        #[derive(Debug)]
+        struct NoOpApproval;
+
+        #[async_trait]
+        impl ApprovalHandler for NoOpApproval {
+            async fn request_approval(
+                &self,
+                _request: &ApprovalRequest,
+            ) -> Result<ApprovalResult, ModuleError> {
+                let mut result = ApprovalResult::default();
+                result.status = "approved".to_string();
+                Ok(result)
+            }
+            async fn check_approval(&self, _id: &str) -> Result<ApprovalResult, ModuleError> {
+                let mut result = ApprovalResult::default();
+                result.status = "approved".to_string();
+                Ok(result)
+            }
+        }
+
+        let handler: Arc<dyn ApprovalHandler + Send + Sync> = Arc::new(NoOpApproval);
+        // Must not panic; warning is emitted internally.
+        let builder = APCoreMCP::builder()
+            .name("approval-test")
+            .approval_handler(handler);
+
+        assert!(
+            builder.approval_handler.is_some(),
+            "approval_handler must be stored on the builder"
+        );
+    }
+
+    #[test]
+    fn builder_build_with_approval_handler_emits_warn_and_succeeds() {
+        // [Ru-W3] build() with approval_handler configured must succeed and store
+        // the handler (not panic or error).
+        use apcore::approval::{ApprovalHandler, ApprovalRequest, ApprovalResult};
+        use apcore::errors::ModuleError;
+        use async_trait::async_trait;
+
+        #[derive(Debug)]
+        struct NoOpApproval;
+
+        #[async_trait]
+        impl ApprovalHandler for NoOpApproval {
+            async fn request_approval(
+                &self,
+                _request: &ApprovalRequest,
+            ) -> Result<ApprovalResult, ModuleError> {
+                let mut result = ApprovalResult::default();
+                result.status = "approved".to_string();
+                Ok(result)
+            }
+            async fn check_approval(&self, _id: &str) -> Result<ApprovalResult, ModuleError> {
+                let mut result = ApprovalResult::default();
+                result.status = "approved".to_string();
+                Ok(result)
+            }
+        }
+
+        let handler: Arc<dyn ApprovalHandler + Send + Sync> = Arc::new(NoOpApproval);
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("approval-build-test")
+            .approval_handler(handler)
+            .build()
+            .expect("build with approval_handler must succeed");
+
+        // Handler is stored on the struct (dead_code, but accessible via debug).
+        assert!(
+            mcp.approval_handler.is_some(),
+            "approval_handler must be stored on APCoreMCP after build"
+        );
+    }
+
+    // ── A-002 regression: approval_store / approval_notify builder methods ────
+
+    #[test]
+    fn builder_approval_store_setter_stores_field() {
+        // [A-002] APCoreMCPBuilder::approval_store() must store the store.
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let builder = APCoreMCP::builder()
+            .name("approval-store-test")
+            .approval_store(store);
+
+        assert!(
+            builder.approval_store.is_some(),
+            "approval_store must be stored on the builder"
+        );
+    }
+
+    #[test]
+    fn builder_approval_notify_setter_stores_callback() {
+        // [A-002] APCoreMCPBuilder::approval_notify() must store the callback.
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let builder = APCoreMCP::builder()
+            .name("approval-notify-test")
+            .approval_store(store)
+            .approval_notify(|_id, _module, _args| {});
+
+        assert!(
+            builder.approval_notify_callback.is_some(),
+            "approval_notify_callback must be stored on the builder"
+        );
+    }
+
+    #[test]
+    fn builder_build_with_approval_store_wires_handler() {
+        // [A-002] build() with approval_store must create a StorageBackedApprovalHandler
+        // and store it as approval_handler on APCoreMCP.
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("approval-store-build-test")
+            .approval_store(store)
+            .build()
+            .expect("build with approval_store must succeed");
+
+        assert!(
+            mcp.approval_handler.is_some(),
+            "approval_handler must be wired from approval_store after build"
+        );
+    }
+
+    #[test]
+    fn builder_build_with_approval_store_and_notify_wires_handler() {
+        // [A-002] build() with both approval_store and approval_notify must
+        // produce a handler (with notify callback attached).
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("approval-notify-build-test")
+            .approval_store(store)
+            .approval_notify(|_id, _module, _args| {})
+            .build()
+            .expect("build with approval_store+notify must succeed");
+
+        assert!(
+            mcp.approval_handler.is_some(),
+            "approval_handler must be wired when both store and notify are configured"
+        );
+    }
+
+    // ── apexe#29: interactive approval end to end ────────────────────────────
+    //
+    // These drive the REAL shipped path: `ApcoreExecutorAdapter` ->
+    // `apcore::Executor` -> apcore's own approval gate ->
+    // `ElicitationApprovalHandler`. Nothing about the elicitation resolution is
+    // stubbed; only the MCP session at the far edge is a mock, standing in for
+    // the client that would answer the prompt.
+
+    /// A module marked `requires_approval` that records whether it ran.
+    ///
+    /// Execution is the assertion that matters: a gate that "approves" without
+    /// the body running, or a rejection that lets it run anyway, both show up
+    /// here and in neither the status string nor the returned text.
+    #[derive(Debug)]
+    struct GatedModule {
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Module for GatedModule {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn output_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn description(&self) -> &str {
+            "deletes something important"
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({"deleted": true}))
+        }
+    }
+
+    /// Stands in for an MCP client that declared elicitation support.
+    ///
+    /// Records the prompt so the test can prove a real round trip happened
+    /// rather than inferring one from an "approved" verdict that a broken
+    /// handler could also produce by defaulting open.
+    struct RecordingSession {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        action: crate::helpers::ElicitAction,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::router::SessionHandle for RecordingSession {
+        async fn elicit_form(
+            &self,
+            message: &str,
+            requested_schema: &Value,
+        ) -> Result<crate::helpers::ElicitResult, Box<dyn std::error::Error + Send + Sync>>
+        {
+            assert!(
+                requested_schema.get("properties").is_some(),
+                "the approval prompt must carry a non-empty schema: {requested_schema}"
+            );
+            self.prompts
+                .lock()
+                .expect("prompt sink")
+                .push(message.to_string());
+            Ok(crate::helpers::ElicitResult {
+                action: self.action.clone(),
+                content: None,
+            })
+        }
+    }
+
+    /// Flatten the router's content items into one searchable string.
+    fn rendered(content: &[crate::server::router::ContentItem]) -> String {
+        content
+            .iter()
+            .map(|item| item.data.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Wire the real stack: gated module, real executor, an
+    /// `ElicitationApprovalHandler` constructed with `None` exactly as a CLI
+    /// entry point must (it never sees a session), and the shipped adapter.
+    fn gated_router(
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::server::router::ExecutionRouter {
+        let registry = Arc::new(apcore::registry::registry::Registry::default());
+        let descriptor = ModuleDescriptor {
+            module_id: "demo.gated".to_string(),
+            name: None,
+            description: "deletes something important".to_string(),
+            documentation: None,
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
+            version: "1.0.0".to_string(),
+            tags: vec![],
+            annotations: Some(ModuleAnnotations {
+                requires_approval: true,
+                ..Default::default()
+            }),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register("demo.gated", Box::new(GatedModule { executed }), descriptor)
+            .expect("register gated module");
+
+        let mut executor = Executor::new(registry, Arc::new(Config::default()));
+        // `None`: the handler is built outside the router and never sees a
+        // session. This is precisely the construction that used to reject
+        // every call, and it must now resolve the live callback per request.
+        executor.set_approval_handler(Box::new(crate::adapters::ElicitationApprovalHandler::new(
+            None,
+        )));
+
+        let adapter = ApcoreExecutorAdapter {
+            inner: Arc::new(executor),
+            strategy: None,
+        };
+        crate::server::router::ExecutionRouter::new(Box::new(adapter), false, None)
+    }
+
+    #[tokio::test]
+    async fn test_elicitation_approval_prompts_the_client_and_runs_the_module() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let extra = crate::server::router::CallExtra {
+            progress_token: None,
+            send_notification: None,
+            session: Some(Arc::new(RecordingSession {
+                prompts: Arc::clone(&prompts),
+                action: crate::helpers::ElicitAction::Accept,
+            })),
+            identity: None,
+            typed_identity: None,
+        };
+
+        let (content, is_error, _) = router
+            .handle_call_with_extra("demo.gated", &json!({}), Some(extra))
+            .await;
+
+        let rendered = rendered(&content);
+        assert!(!is_error, "an approved call must succeed, got: {rendered}");
+        let recorded = prompts.lock().expect("prompt sink").clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the client must have been prompted exactly once: {recorded:?}"
+        );
+        assert!(
+            recorded[0].contains("demo.gated"),
+            "the prompt must name the module being approved: {}",
+            recorded[0]
+        );
+        assert!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must run once approval was granted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_elicitation_approval_declined_blocks_the_module() {
+        // The round trip must be able to say no. Without this, a handler that
+        // ignored the response and always approved would pass the accept test.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let extra = crate::server::router::CallExtra {
+            progress_token: None,
+            send_notification: None,
+            session: Some(Arc::new(RecordingSession {
+                prompts: Arc::clone(&prompts),
+                action: crate::helpers::ElicitAction::Decline,
+            })),
+            identity: None,
+            typed_identity: None,
+        };
+
+        let (content, is_error, _) = router
+            .handle_call_with_extra("demo.gated", &json!({}), Some(extra))
+            .await;
+
+        assert!(is_error, "a declined approval must fail the call");
+        assert_eq!(
+            prompts.lock().expect("prompt sink").len(),
+            1,
+            "the client must still have been prompted"
+        );
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must NOT run when the user declined"
+        );
+        let rendered = rendered(&content);
+        assert!(
+            rendered.contains("decline"),
+            "the denial must carry the user's action: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_session_still_rejects_cleanly() {
+        // A client that never declared elicitation support gets the
+        // fail-closed rejection, unchanged. This is the control that keeps the
+        // two tests above honest: if approval had simply stopped being
+        // enforced, they would pass and this one would not.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+
+        let extra = crate::server::router::CallExtra {
+            progress_token: None,
+            send_notification: None,
+            session: None,
+            identity: None,
+            typed_identity: None,
+        };
+
+        let (content, is_error, _) = router
+            .handle_call_with_extra("demo.gated", &json!({}), Some(extra))
+            .await;
+
+        assert!(
+            is_error,
+            "no elicitation path means the call must be denied"
+        );
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must NOT run without approval"
+        );
+        let rendered = rendered(&content);
+        assert!(
+            rendered.contains("No elicitation callback available"),
+            "the rejection must say why: {rendered}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reaching elicitation the way a transport does (apexe#29)
+    // -----------------------------------------------------------------------
+
+    /// Stands in for the transport's outbound half.
+    ///
+    /// Records the prompt and answers it as a user would. Answering from
+    /// inside `send` keeps the test free of polling without weakening it: the
+    /// pending entry is registered before the write, so a reply this prompt
+    /// must still find its waiter.
+    struct ScriptedSink {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        session: std::sync::Mutex<std::sync::Weak<crate::server::session::McpSession>>,
+        action: &'static str,
+    }
+
+    impl ScriptedSink {
+        fn new(prompts: Arc<std::sync::Mutex<Vec<String>>>, action: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                prompts,
+                session: std::sync::Mutex::new(std::sync::Weak::new()),
+                action,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::session::OutboundSink for ScriptedSink {
+        async fn send(&self, message: Value) -> Result<(), crate::server::session::SessionError> {
+            self.prompts.lock().expect("prompt sink").push(
+                message["params"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            let session = self.session.lock().expect("session slot").upgrade();
+            if let Some(session) = session {
+                session.try_take_response(&json!({
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": { "action": self.action },
+                }));
+            }
+            Ok(())
+        }
+    }
+
+    /// Register a capability-declaring session under `id` on `router`.
+    fn register_session(
+        router: &crate::server::router::ExecutionRouter,
+        id: &str,
+        action: &'static str,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = ScriptedSink::new(Arc::clone(&prompts), action);
+        let session = Arc::new(crate::server::session::McpSession::new(
+            id,
+            Arc::clone(&sink) as Arc<dyn crate::server::session::OutboundSink>,
+        ));
+        *sink.session.lock().expect("session slot") = Arc::downgrade(&session);
+        session.set_client_capabilities(json!({ "elicitation": {} }));
+        router.session_registry().insert(session);
+        prompts
+    }
+
+    #[tokio::test]
+    async fn test_elicitation_is_reachable_from_a_transport_dispatched_call() {
+        // The tests above hand the router a session directly, which only an
+        // SDK caller can do. A transport cannot: `handle_call` receives a
+        // plain JSON `_meta` and nothing else, and a `Value` cannot carry a
+        // trait object — so the session slot was hard-coded `None` and
+        // `apcore-mcp serve` could not prompt however well the library half
+        // worked. This drives the same shipping stack through that path.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = register_session(&router, "sess-1", "accept");
+
+        let extra = json!({ "sessionId": "sess-1" });
+        let (content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        let rendered = rendered(&content);
+        assert!(!is_error, "an approved call must succeed, got: {rendered}");
+        let recorded = prompts.lock().expect("prompt sink").clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the session id alone must be enough to reach the client: {recorded:?}"
+        );
+        assert!(
+            recorded[0].contains("demo.gated"),
+            "the prompt must name the module: {}",
+            recorded[0]
+        );
+        assert!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must run once approval was granted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_transport_dispatched_decline_blocks_the_module() {
+        // The accept test alone would pass against a stub that approved
+        // everything without reading the answer.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = register_session(&router, "sess-1", "decline");
+
+        let extra = json!({ "sessionId": "sess-1" });
+        let (content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        assert!(is_error, "a declined approval must fail the call");
+        assert_eq!(prompts.lock().expect("prompt sink").len(), 1);
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must NOT run when the user declined"
+        );
+        assert!(
+            rendered(&content).contains("decline"),
+            "the denial must carry the user's action: {}",
+            rendered(&content)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_nested_meta_shape_resolves_the_same_session() {
+        // `handle_call` sees two extra shapes in practice: the `params._meta`
+        // object the transport passes straight through, and an SDK wrapper
+        // with `_meta` nested inside. Both must resolve, or elicitation works
+        // on one caller and silently does not on the other.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = register_session(&router, "sess-1", "accept");
+
+        let extra = json!({ "_meta": { "sessionId": "sess-1" } });
+        let (_content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        assert!(!is_error);
+        assert_eq!(prompts.lock().expect("prompt sink").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_call_reaches_only_its_own_session() {
+        // Two live connections. A prompt raised by one must not be delivered
+        // to the other — the same confidentiality property the SSE session
+        // isolation work established, now for the server-to-client direction.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts_a = register_session(&router, "sess-a", "accept");
+        let prompts_b = register_session(&router, "sess-b", "accept");
+
+        let extra = json!({ "sessionId": "sess-a" });
+        let (_content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        assert!(!is_error);
+        assert_eq!(prompts_a.lock().expect("prompt sink").len(), 1);
+        assert!(
+            prompts_b.lock().expect("prompt sink").is_empty(),
+            "another connection was prompted for a call it never made"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unknown_session_id_still_rejects_cleanly() {
+        // A stale or forged id must fail closed, exactly as no session does.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        register_session(&router, "sess-1", "accept");
+
+        let extra = json!({ "sessionId": "no-such-session" });
+        let (content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        assert!(is_error, "an unresolvable session must not approve a call");
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must NOT run"
+        );
+        assert!(
+            rendered(&content).contains("No elicitation callback available"),
+            "the rejection must say why: {}",
+            rendered(&content)
+        );
+    }
+
+    // ── ACL-sourced approval gating, end to end ─────────────────────────────
+    //
+    // Every other `approval` test in this crate stops at the Config Bus parsing
+    // layer — they prove the key is *accepted*, not that it *does* anything.
+    // These drive a real `ACL` + real approval handler + real module through
+    // `ExecutionRouter::handle_call`, the exact path a `tools/call` takes, and
+    // pin the claim this crate's 0.19.0 CHANGELOG makes: "gating the call on a
+    // human decision even though the ACL itself allows it".
+    //
+    // The module's own `requires_approval` annotation is FALSE, so the ACL rule
+    // is the only possible source of a requirement; the rule is argument-scoped
+    // (`conditions.arguments.has_key`), so the same module is gated or not
+    // depending on what the call carries.
+    //
+    // Cross-language counterparts: `tests/test_acl_approval_gating_e2e.py`
+    // (Python) and `tests/acl-approval-gating-e2e.test.ts` (TypeScript).
+
+    /// Approves everything, but records what it was asked about.
+    #[derive(Debug)]
+    struct RecordingApprovalHandler {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl apcore::approval::ApprovalHandler for RecordingApprovalHandler {
+        async fn request_approval(
+            &self,
+            request: &apcore::approval::ApprovalRequest,
+        ) -> Result<apcore::approval::ApprovalResult, apcore::errors::ModuleError> {
+            self.seen
+                .lock()
+                .expect("approval sink")
+                .push(request.module_id.clone());
+            Ok(apcore::approval::ApprovalResult::approved("test"))
+        }
+
+        async fn check_approval(
+            &self,
+            approval_id: &str,
+        ) -> Result<apcore::approval::ApprovalResult, apcore::errors::ModuleError> {
+            let mut result = apcore::approval::ApprovalResult::approved("test");
+            result.approval_id = Some(approval_id.to_string());
+            Ok(result)
+        }
+    }
+
+    /// A module that asks for no approval on its own account.
+    #[derive(Debug)]
+    struct UngatedDeleteModule;
+
+    #[async_trait::async_trait]
+    impl Module for UngatedDeleteModule {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        }
+        fn output_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn description(&self) -> &str {
+            "deletes a path"
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            Ok(json!({"deleted": true}))
+        }
+    }
+
+    /// A real executor whose only approval source is an argument-scoped ACL rule.
+    fn acl_gated_router(
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> crate::server::router::ExecutionRouter {
+        let registry = Arc::new(apcore::registry::registry::Registry::default());
+        let descriptor = ModuleDescriptor {
+            module_id: "files.delete".to_string(),
+            name: None,
+            description: "deletes a path".to_string(),
+            documentation: None,
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            output_schema: json!({"type": "object"}),
+            version: "1.0.0".to_string(),
+            tags: vec![],
+            // Deliberately false: any requirement observed below can only have
+            // come from the ACL rule, which is the whole point.
+            annotations: Some(ModuleAnnotations {
+                requires_approval: false,
+                ..Default::default()
+            }),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register("files.delete", Box::new(UngatedDeleteModule), descriptor)
+            .expect("register module");
+
+        let acl = apcore::ACL::try_new(
+            vec![
+                // Narrow rule first (first-match-wins, §6.3): a recursive
+                // delete is allowed but must be put to a human.
+                {
+                    // `ACLRule` is #[non_exhaustive] as of apcore 0.29.0 — a struct
+                    // literal no longer compiles from outside that crate.
+                    #[allow(unused_mut)]
+                    let mut rule = apcore::ACLRule::new(
+                        vec!["*".to_string()],
+                        vec!["files.delete".to_string()],
+                        "allow",
+                    );
+                    rule.approval = Some(apcore::ApprovalRequirement::Required);
+                    rule.conditions = Some(json!({"arguments": {"has_key": ["recursive"]}}));
+                    rule
+                },
+                // Broad rule: everything else this caller does is allowed.
+                {
+                    // `ACLRule` is #[non_exhaustive] as of apcore 0.29.0 — a struct
+                    // literal no longer compiles from outside that crate.
+                    #[allow(unused_mut)]
+                    let mut rule = apcore::ACLRule::new(
+                        vec!["*".to_string()],
+                        vec!["*".to_string()],
+                        "allow".to_string(),
+                    );
+                    rule
+                },
+            ],
+            "deny",
+            None,
+        )
+        .expect("ACL should build");
+
+        let mut executor = Executor::new(registry, Arc::new(Config::default()));
+        executor.set_acl(acl);
+        executor.set_approval_handler(Box::new(RecordingApprovalHandler { seen }));
+
+        let adapter = ApcoreExecutorAdapter {
+            inner: Arc::new(executor),
+            strategy: None,
+        };
+        crate::server::router::ExecutionRouter::new(Box::new(adapter), false, None)
+    }
+
+    #[tokio::test]
+    async fn test_acl_approval_rule_gates_a_matching_tools_call() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = acl_gated_router(Arc::clone(&seen));
+
+        let (content, is_error, _) = router
+            .handle_call(
+                "files.delete",
+                &json!({"path": "/tmp/x", "recursive": true}),
+                None,
+            )
+            .await;
+
+        assert!(
+            !is_error,
+            "approved call should succeed: {}",
+            rendered(&content)
+        );
+        assert_eq!(
+            seen.lock().expect("approval sink").as_slice(),
+            ["files.delete"],
+            "a call carrying `recursive` matches the rule's conditions.arguments.has_key \
+             and MUST reach the approval handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acl_approval_rule_does_not_gate_a_non_matching_tools_call() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = acl_gated_router(Arc::clone(&seen));
+
+        let (content, is_error, _) = router
+            .handle_call("files.delete", &json!({"path": "/tmp/x"}), None)
+            .await;
+
+        assert!(
+            !is_error,
+            "ungated call should succeed: {}",
+            rendered(&content)
+        );
+        assert!(
+            seen.lock().expect("approval sink").is_empty(),
+            "a call without `recursive` does not match the approval rule and MUST NOT be \
+             put to a human — gating it would be the over-refusal §6.1.7 exists to prevent"
+        );
+    }
+
+    // ── ACL enforcement on apcore:// management resource reads ──────────────
+    //
+    // aiperceivable/apcore-mcp#15 claims every `apcore://system.*` read
+    // dispatches through `ExecutionRouter::handle_call` — never directly
+    // against the registry — so ACL and audit apply identically to
+    // `tools/call` and `resources/read`. The resource tests in
+    // `server/factory.rs` all drive a stub router, so they prove the read is
+    // *routed*; none proves the ACL actually *refuses*. A bypass here would be
+    // a management-surface disclosure, so it is asserted directly.
+
+    /// Register the management resources over a real executor whose ACL
+    /// carries a single `system.*` rule with `effect`.
+    fn system_resource_server(effect: &str) -> crate::server::server::MCPServer {
+        let registry = Arc::new(apcore::registry::registry::Registry::default());
+        let mut config = Config::default();
+        config.set("sys_modules.enabled", json!(true));
+        config.set("sys_modules.events.enabled", json!(true));
+        let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
+
+        apcore::sys_modules::register_sys_modules(Arc::clone(&registry), &executor, &config, None)
+            .expect("register_sys_modules should succeed");
+
+        executor.set_acl(
+            apcore::ACL::try_new(
+                vec![{
+                    // `ACLRule` is #[non_exhaustive] as of apcore 0.29.0 — a struct
+                    // literal no longer compiles from outside that crate.
+                    #[allow(unused_mut)]
+                    let mut rule = apcore::ACLRule::new(
+                        vec!["*".to_string()],
+                        vec!["system.*".to_string()],
+                        effect.to_string(),
+                    );
+                    rule
+                }],
+                "deny",
+                None,
+            )
+            .expect("ACL should build"),
+        );
+
+        let adapter = ApcoreExecutorAdapter {
+            inner: Arc::new(executor),
+            strategy: None,
+        };
+        let router = Arc::new(crate::server::router::ExecutionRouter::new(
+            Box::new(adapter),
+            false,
+            None,
+        ));
+
+        let factory = MCPServerFactory::new();
+        let mut server = factory
+            .create_server("acl-resource-read-test", "1.0.0")
+            .expect("create_server");
+        factory.register_resource_handlers(&mut server, &registry, router);
+        server
+    }
+
+    /// Control: an ACL that permits `system.*` lets the read through.
+    ///
+    /// Without this, the denial test below would pass just as happily against
+    /// an adapter that never served the resource at all.
+    #[tokio::test]
+    async fn test_acl_allows_management_resource_read() {
+        let server = system_resource_server("allow");
+        let result = server
+            .read_resource("apcore://system.health.summary".to_string())
+            .expect("read_resource handler registered")
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "an allowed caller must reach the management resource: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acl_denial_blocks_management_resource_read() {
+        let server = system_resource_server("deny");
+        let result = server
+            .read_resource("apcore://system.health.summary".to_string())
+            .expect("read_resource handler registered")
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an ACL that denies system.* MUST refuse the resource read — reading a \
+             management resource must not bypass the gate a tools/call passes"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "input_contract_tests.rs"]
+mod input_contract_tests;

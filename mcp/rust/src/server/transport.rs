@@ -1,0 +1,3855 @@
+//! TransportManager — manages MCP transport lifecycle (stdio, HTTP, SSE).
+//!
+//! Also exposes Prometheus metrics for observability.
+
+use std::convert::Infallible;
+use std::sync::Arc;
+
+use axum::extract::Request;
+use axum::response::{IntoResponse, Redirect};
+use axum::routing::{get, post};
+use axum::Router;
+use hyper::StatusCode;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+use tokio_stream::wrappers::LinesStream;
+
+use crate::server::session::{McpSession, OutboundSink, SessionError, SessionRegistry};
+
+// ---------------------------------------------------------------------------
+// Task 1: TransportError
+// ---------------------------------------------------------------------------
+
+/// Unified error type for all transport failure modes.
+#[derive(Debug, thiserror::Error)]
+pub enum TransportError {
+    #[error("invalid host: {0}")]
+    InvalidHost(String),
+
+    #[error("port must be between 1 and 65535, got {0}")]
+    InvalidPort(u16),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("failed to bind to {host}:{port}: {source}")]
+    Bind {
+        host: String,
+        port: u16,
+        source: hyper::Error,
+    },
+
+    #[error("server error: {0}")]
+    Server(String),
+}
+
+// ---------------------------------------------------------------------------
+// MetricsExporter trait
+// ---------------------------------------------------------------------------
+
+/// Trait for exporting server metrics.
+pub trait MetricsExporter: Send + Sync {
+    /// Export metrics in Prometheus text format.
+    fn export_prometheus(&self) -> String;
+}
+
+/// Blanket adapter: a shared apcore [`MetricsCollector`] already exposes a
+/// `export_prometheus()` method, so wrap it directly as a `MetricsExporter`.
+impl MetricsExporter for apcore::observability::metrics::MetricsCollector {
+    fn export_prometheus(&self) -> String {
+        apcore::observability::metrics::MetricsCollector::export_prometheus(self)
+    }
+}
+
+/// Trait for exporting usage summaries at the `/usage` endpoint.
+pub trait UsageExporter: Send + Sync {
+    /// Return a JSON summary of module usage (per-module plus per-caller
+    /// breakdown) suitable for JSON serialisation at `/usage`.
+    fn export_json(&self) -> Value;
+}
+
+impl UsageExporter for apcore::observability::usage::UsageCollector {
+    fn export_json(&self) -> Value {
+        let summaries = self.get_all_summaries();
+        serde_json::json!({
+            "modules": summaries
+                .iter()
+                .map(|s| serde_json::json!({
+                    "module_id": s.module_id,
+                    "call_count": s.call_count,
+                    "error_count": s.error_count,
+                    "avg_latency_ms": s.avg_latency_ms,
+                    "unique_callers": s.unique_callers,
+                    "trend": s.trend,
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// McpHandler trait
+// ---------------------------------------------------------------------------
+
+/// Trait for handling MCP JSON-RPC messages.
+///
+/// The transport layer delegates incoming messages to an `McpHandler`
+/// implementation, which processes them and optionally returns a response.
+/// Notifications (no `id` field) return `None`.
+#[async_trait::async_trait]
+pub trait McpHandler: Send + Sync {
+    /// Handle an incoming JSON-RPC message.
+    ///
+    /// Returns `Some(response)` for requests, `None` for notifications.
+    async fn handle_message(&self, message: Value) -> Option<Value>;
+
+    /// The registry of live sessions this handler answers through, when it
+    /// supports server-initiated requests such as `elicitation/create`.
+    ///
+    /// A transport registers each connection here so a tool call dispatched
+    /// from that connection can address it back. Returning `None` — the
+    /// default — means the handler has no server-to-client half, and the
+    /// transport skips session bookkeeping entirely.
+    fn session_registry(&self) -> Option<Arc<crate::server::session::SessionRegistry>> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HttpAuthConfig
+// ---------------------------------------------------------------------------
+
+/// Authentication configuration for HTTP transports.
+#[derive(Default, Clone)]
+pub struct HttpAuthConfig {
+    /// Optional authenticator. When `None`, no auth middleware is applied.
+    pub authenticator: Option<Arc<dyn crate::auth::protocol::Authenticator>>,
+    /// Whether unauthenticated requests are rejected (`true`) or allowed (`false`).
+    pub require_auth: bool,
+    /// Explorer URL prefix for GET-only exemption (browsing exempt, POST requires auth).
+    pub explorer_prefix: Option<String>,
+    /// User-configured paths that bypass authentication entirely.
+    pub exempt_paths: Option<std::collections::HashSet<String>>,
+}
+
+impl std::fmt::Debug for HttpAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpAuthConfig")
+            .field("authenticator", &self.authenticator.as_ref().map(|_| "..."))
+            .field("require_auth", &self.require_auth)
+            .field("explorer_prefix", &self.explorer_prefix)
+            .field("exempt_paths", &self.exempt_paths)
+            .finish()
+    }
+}
+
+/// Apply [`AuthMiddlewareLayer`] to a router based on [`HttpAuthConfig`].
+///
+/// Returns the router unchanged if no authenticator is configured.
+/// Validates that `exempt_paths` entries start with `/`.
+pub(crate) fn apply_auth_layer(app: Router, auth_config: HttpAuthConfig) -> Router {
+    let Some(auth) = auth_config.authenticator else {
+        return app;
+    };
+
+    use crate::auth::middleware::AuthMiddlewareLayer;
+
+    // Explorer browsing (GET) is exempt; execution (POST) requires auth.
+    let mut get_prefixes = Vec::new();
+    if let Some(prefix) = auth_config.explorer_prefix {
+        get_prefixes.push(prefix.clone());
+        get_prefixes.push(format!("{prefix}/"));
+    }
+
+    let mut layer = AuthMiddlewareLayer::new(auth)
+        .require_auth(auth_config.require_auth)
+        .exempt_get_prefixes(get_prefixes);
+
+    // Forward user-configured exempt paths (normalize missing leading /).
+    if let Some(paths) = auth_config.exempt_paths {
+        let normalized: std::collections::HashSet<String> = paths
+            .into_iter()
+            .map(|p| {
+                if p.starts_with('/') {
+                    p
+                } else {
+                    tracing::warn!(
+                        "exempt_paths entry '{}' missing leading '/', auto-prepending",
+                        p
+                    );
+                    format!("/{p}")
+                }
+            })
+            .collect();
+        layer = layer.exempt_paths(normalized);
+    }
+
+    tracing::info!(
+        "Authentication enabled (require_auth={})",
+        auth_config.require_auth
+    );
+
+    app.layer(layer)
+}
+
+// ---------------------------------------------------------------------------
+// Task 2: TransportManager struct
+// ---------------------------------------------------------------------------
+
+/// [`OutboundSink`] for the stdio transport.
+///
+/// stdout is owned exclusively by the read/dispatch loop, so a session cannot
+/// write to it directly. Requests are queued here instead and the loop drains
+/// them, which is also what keeps two concurrent writes from interleaving
+/// halfway through a JSON line.
+struct StdioSink {
+    outbound: tokio::sync::mpsc::Sender<Value>,
+}
+
+#[async_trait::async_trait]
+impl OutboundSink for StdioSink {
+    async fn send(&self, message: Value) -> Result<(), SessionError> {
+        self.outbound
+            .send(message)
+            .await
+            .map_err(|_| SessionError::Send("stdio transport closed".to_string()))
+    }
+}
+
+/// RAII deregistration for the stdio transport's single session.
+///
+/// stdio has no disconnect event to hang teardown off, and
+/// `run_stdio_with_io` can leave through a read or write error as well as
+/// through EOF. `Drop` covers all of them, and the unwind path besides.
+struct StdioSessionGuard {
+    session_id: String,
+    registry: Option<Arc<SessionRegistry>>,
+    /// Cancel handler cloned from the manager.
+    ///
+    /// [A-D-TR-2] The guard needs cancellation, not the whole manager, so it
+    /// holds the handler rather than an `Arc<TransportManager>` — this keeps
+    /// `run_stdio`'s `&self` signature intact.
+    #[allow(clippy::type_complexity)]
+    cancel_handler: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl Drop for StdioSessionGuard {
+    fn drop(&mut self) {
+        if let Some(ref registry) = self.registry {
+            registry.remove(&self.session_id);
+        }
+        // [A-D-TR-2] Cancel the session's async tasks on teardown, as
+        // `SseSessionGuard::drop` already does. The
+        // `set_async_task_bridge` / `set_cancel_handler` Contract says the
+        // manager cancels a session's tasks on transport teardown and does not
+        // restrict that to network transports; Python honours it on stdio too,
+        // so stdio tasks used to leak past client exit on Rust only.
+        // Registry removal comes first, matching the SSE ordering: a tool call
+        // blocked on an elicitation is woken by the closed session rather than
+        // waiting out its timeout.
+        if let Some(ref cancel) = self.cancel_handler {
+            cancel(&self.session_id);
+        }
+    }
+}
+
+/// Manages the transport layer for the MCP server.
+pub struct TransportManager {
+    start_time: tokio::time::Instant,
+    module_count: usize,
+    metrics_exporter: Option<Arc<dyn MetricsExporter>>,
+    usage_exporter: Option<Arc<dyn UsageExporter>>,
+    /// Optional handler called when the transport detects a session
+    /// disconnect / cancellation notification. Used by
+    /// [`AsyncTaskBridge::cancel_session_tasks`] to forward cancellation
+    /// to any tasks launched from that session.
+    #[allow(clippy::type_complexity)]
+    cancel_handler: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl TransportManager {
+    /// Create a new transport manager with an optional metrics exporter.
+    pub fn new(metrics_exporter: Option<Arc<dyn MetricsExporter>>) -> Self {
+        Self {
+            start_time: tokio::time::Instant::now(),
+            module_count: 0,
+            metrics_exporter,
+            usage_exporter: None,
+            cancel_handler: None,
+        }
+    }
+
+    /// Install an optional usage exporter (surfaced at `/usage`).
+    pub fn set_usage_exporter(&mut self, exporter: Option<Arc<dyn UsageExporter>>) {
+        self.usage_exporter = exporter;
+    }
+
+    /// Install a cancellation handler invoked with the session id when the
+    /// transport observes a client disconnect or explicit cancel. The
+    /// handler typically forwards to
+    /// [`AsyncTaskBridge::cancel_session_tasks`].
+    #[allow(clippy::type_complexity)]
+    pub fn set_cancel_handler(&mut self, handler: Option<Arc<dyn Fn(&str) + Send + Sync>>) {
+        self.cancel_handler = handler;
+    }
+
+    /// Invoke the cancellation handler with the given session id.
+    /// No-op when no handler is installed.
+    pub fn notify_cancel(&self, session_id: &str) {
+        if let Some(h) = &self.cancel_handler {
+            h(session_id);
+        }
+    }
+
+    /// Set the number of registered modules (for metrics).
+    pub fn set_module_count(&mut self, count: usize) {
+        self.module_count = count;
+    }
+
+    /// Get the current module count.
+    pub fn module_count(&self) -> usize {
+        self.module_count
+    }
+
+    /// Validate host and port parameters.
+    fn validate_host_port(host: &str, port: u16) -> Result<(), TransportError> {
+        if host.is_empty() {
+            return Err(TransportError::InvalidHost(host.to_string()));
+        }
+        if port == 0 {
+            return Err(TransportError::InvalidPort(port));
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3: Health & Metrics
+    // -----------------------------------------------------------------------
+
+    /// Build the health check response payload.
+    fn build_health_response(&self) -> HealthResponse {
+        HealthResponse {
+            status: "ok",
+            uptime_seconds: self.start_time.elapsed().as_secs_f64(),
+            module_count: self.module_count,
+        }
+    }
+
+    /// Build the metrics response.
+    ///
+    /// Returns `Ok(body)` with Prometheus text when an exporter is configured,
+    /// or `Err(())` when no exporter is available (caller should return 404).
+    fn build_metrics_response(&self) -> Result<String, ()> {
+        match &self.metrics_exporter {
+            Some(exporter) => Ok(exporter.export_prometheus()),
+            None => Err(()),
+        }
+    }
+
+    /// Build the usage response.
+    ///
+    /// Returns `Ok(body)` with JSON when a usage exporter is configured,
+    /// or `Err(())` otherwise.
+    fn build_usage_response(&self) -> Result<Value, ()> {
+        match &self.usage_exporter {
+            Some(exporter) => Ok(exporter.export_json()),
+            None => Err(()),
+        }
+    }
+
+    /// Build an axum [`Router`] with `/health`, `/metrics`, and `/usage` GET routes.
+    ///
+    /// The returned router uses `Arc<TransportManager>` as shared state.
+    /// `/usage` returns 404 when no `UsageExporter` is configured.
+    pub fn health_metrics_router(self: &Arc<Self>) -> Router {
+        let tm = Arc::clone(self);
+        Router::new()
+            .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler))
+            .route("/usage", get(usage_handler))
+            .with_state(tm)
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4: stdio transport
+    // -----------------------------------------------------------------------
+
+    /// Run the MCP server over stdio transport (blocks until EOF on stdin).
+    ///
+    /// Reads line-delimited JSON-RPC from stdin and writes responses to stdout.
+    pub async fn run_stdio(&self, handler: &dyn McpHandler) -> Result<(), TransportError> {
+        crate::stdio::scope(true, async {
+            let (writer, claim) = crate::stdio::protocol_writer()?;
+            tracing::info!("Starting stdio transport");
+            self.run_stdio_with_io(
+                tokio::io::stdin(),
+                crate::stdio::ProtocolWriter::new(writer, claim),
+                handler,
+            )
+            .await
+        })
+        .await?
+    }
+
+    /// Testable core of `run_stdio` — reads from any `AsyncRead`, writes to any `AsyncWrite`.
+    ///
+    /// Each line is parsed as JSON. Valid messages are dispatched to `handler`.
+    /// If the handler returns `Some(response)`, it is written as a JSON line to the writer.
+    /// Invalid JSON lines are logged and skipped. EOF drains work already in
+    /// flight, then returns cleanly.
+    ///
+    /// # Why dispatch is concurrent
+    ///
+    /// This loop used to await `handle_message` inline, which made stdio
+    /// strictly serial: nothing was read while a call ran. That is fatal for
+    /// elicitation, not merely slow. A tool call that asks the client a
+    /// question blocks until the answer arrives — and the answer arrives on
+    /// stdin, which the loop is not reading because it is blocked on the call.
+    /// The deadlock is total and self-inflicted, and it is why `apcore-mcp
+    /// serve` (stdio by default) could not prompt even once the router knew
+    /// how (apexe#29).
+    ///
+    /// Handlers therefore run in a [`FuturesUnordered`] that is polled
+    /// alongside the reader, matching what the SSE transport already does. All
+    /// three arms share this one task, so `writer` stays exclusively owned and
+    /// needs no lock, and neither `R` nor `W` gains a `Send + 'static` bound.
+    /// Responses may now be written in an order other than the one the client
+    /// sent — JSON-RPC correlates by `id`, and SSE has behaved this way since
+    /// concurrent dispatch landed there.
+    ///
+    /// Lines are pulled through [`LinesStream`] rather than `read_line`
+    /// because the read shares a `select!` with the other two arms:
+    /// `read_line` is not cancellation-safe and would lose a partially read
+    /// line whenever another arm won the race, whereas `Lines` keeps that
+    /// state in the stream where an unfinished poll cannot drop it.
+    ///
+    /// [`FuturesUnordered`]: futures::stream::FuturesUnordered
+    /// [`LinesStream`]: tokio_stream::wrappers::LinesStream
+    pub async fn run_stdio_with_io<R, W>(
+        &self,
+        reader: R,
+        mut writer: W,
+        handler: &dyn McpHandler,
+    ) -> Result<(), TransportError>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        // stdio carries exactly one connection, but it still needs an id: it
+        // is what `stamp_session_id` publishes, what the router looks a
+        // session up by, and what binds async tasks to this run. A uuid
+        // rather than a constant so two servers in one process cannot collide.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_registry = handler.session_registry();
+
+        // Server-initiated messages are funnelled through a channel instead of
+        // being written directly: `writer` is owned by this task, and the
+        // session hands its requests to whichever arm of the `select!` below
+        // is free to write them.
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Value>(256);
+        let mcp_session = session_registry.as_ref().map(|registry| {
+            let session = Arc::new(McpSession::new(
+                session_id.clone(),
+                Arc::new(StdioSink {
+                    outbound: outbound_tx,
+                }),
+            ));
+            registry.insert(Arc::clone(&session));
+            session
+        });
+        // Deregisters on every exit path, including the `?` on a read or
+        // write error, and wakes anything still waiting on an answer.
+        let _session_guard = StdioSessionGuard {
+            session_id: session_id.clone(),
+            registry: session_registry.clone(),
+            cancel_handler: self.cancel_handler.clone(),
+        };
+
+        let mut lines = LinesStream::new(BufReader::new(reader).lines());
+        let mut inflight = FuturesUnordered::new();
+        let mut eof = false;
+
+        loop {
+            tokio::select! {
+                line = lines.next(), if !eof => {
+                    match line {
+                        None => {
+                            tracing::info!("stdio: EOF reached, draining in-flight calls");
+                            eof = true;
+                            // Nothing further can arrive, so an outstanding
+                            // elicitation will never be answered. Fail it now
+                            // rather than hold the drain open for its timeout.
+                            if let Some(ref session) = mcp_session {
+                                session.close();
+                            }
+                        }
+                        Some(Err(e)) => return Err(e.into()),
+                        Some(Ok(line)) => {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let mut message: Value = match serde_json::from_str(trimmed) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!("stdio: invalid JSON, skipping: {}", e);
+                                    continue;
+                                }
+                            };
+                            // An answer to a server-initiated request completes
+                            // its waiter and goes no further; the handler would
+                            // see a message with no `method` and reject it.
+                            if let Some(ref session) = mcp_session {
+                                if session.try_take_response(&message) {
+                                    continue;
+                                }
+                            }
+                            stamp_session_id(&mut message, &session_id);
+                            inflight.push(handler.handle_message(message));
+                        }
+                    }
+                }
+                Some(response) = inflight.next(), if !inflight.is_empty() => {
+                    if let Some(response) = response {
+                        Self::write_stdio_message(&mut writer, &response).await?;
+                    }
+                }
+                Some(outgoing) = outbound_rx.recv() => {
+                    Self::write_stdio_message(&mut writer, &outgoing).await?;
+                }
+            }
+
+            if eof && inflight.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Write one JSON-RPC message as a line, then flush.
+    async fn write_stdio_message<W>(writer: &mut W, message: &Value) -> Result<(), TransportError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut bytes =
+            serde_json::to_vec(message).map_err(|e| TransportError::Server(e.to_string()))?;
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 5: streamable-HTTP transport
+    // -----------------------------------------------------------------------
+
+    /// Build an axum [`Router`] for the streamable-HTTP transport.
+    ///
+    /// Includes `/health`, `/metrics`, and `/mcp` endpoints.
+    /// The `/mcp` endpoint handles POST (JSON-RPC request/response),
+    /// GET (per-connection SSE server→client stream, see
+    /// [`streamable_http_get_handler`]), and DELETE (session termination).
+    /// Extra routes are merged into the router if provided.
+    pub fn build_streamable_http_app(
+        self: &Arc<Self>,
+        handler: Arc<dyn McpHandler>,
+        extra_routes: Option<Router>,
+    ) -> Router {
+        // TODO: Per MCP spec, each client connection should get its own
+        // session ID.  Currently a single ID is shared across all connections,
+        // which means DELETE (session termination) affects all clients.
+        // Requires a session store keyed by UUID.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mcp_state = StreamableHttpState {
+            handler,
+            session_id,
+        };
+
+        let mcp_router = Router::new()
+            .route(
+                "/",
+                post(streamable_http_post_handler)
+                    .get(streamable_http_get_handler)
+                    .delete(streamable_http_delete_handler),
+            )
+            .with_state(mcp_state);
+
+        let mut app = self.health_metrics_router().nest("/mcp", mcp_router);
+
+        if let Some(extra) = extra_routes {
+            app = app.merge(extra);
+        }
+
+        // Axum's nest() does not match trailing slashes.  Add a fallback
+        // redirect so that e.g. /explorer/ redirects to /explorer.
+        app = app.fallback(trailing_slash_redirect);
+
+        app
+    }
+
+    /// Run the MCP server over streamable-HTTP transport.
+    ///
+    /// Binds to the given host and port and serves until shutdown.
+    pub async fn run_streamable_http(
+        self: &Arc<Self>,
+        handler: Arc<dyn McpHandler>,
+        host: &str,
+        port: u16,
+        extra_routes: Option<Router>,
+    ) -> Result<(), TransportError> {
+        self.run_streamable_http_with_auth(
+            handler,
+            host,
+            port,
+            extra_routes,
+            HttpAuthConfig::default(),
+        )
+        .await
+    }
+
+    /// Run the MCP server over streamable-HTTP transport with optional authentication.
+    ///
+    /// When `auth_config.authenticator` is provided, requests are authenticated
+    /// via [`AuthMiddlewareLayer`](crate::auth::middleware::AuthMiddlewareLayer)
+    /// which handles exempt paths, GET-only exemptions, `require_auth` flag,
+    /// and identity propagation via task-local.
+    pub async fn run_streamable_http_with_auth(
+        self: &Arc<Self>,
+        handler: Arc<dyn McpHandler>,
+        host: &str,
+        port: u16,
+        extra_routes: Option<Router>,
+        auth_config: HttpAuthConfig,
+    ) -> Result<(), TransportError> {
+        Self::validate_host_port(host, port)?;
+        tracing::info!("Starting streamable-http transport on {}:{}", host, port);
+
+        let app = self.build_streamable_http_app(handler, extra_routes);
+        let app = apply_auth_layer(app, auth_config);
+
+        let addr: std::net::SocketAddr = format!("{}:{}", host, port)
+            .parse()
+            .map_err(|_| TransportError::InvalidHost(host.to_string()))?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app)
+            .await
+            .map_err(TransportError::Io)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6: SSE transport (deprecated)
+    // -----------------------------------------------------------------------
+
+    /// Build an axum [`Router`] for the SSE transport.
+    ///
+    /// Includes `/health`, `/metrics`, `/sse` (GET), and `/messages/` (POST).
+    ///
+    /// Each `GET /sse` opens an independent session: it is assigned a fresh
+    /// session id, gets its own inbound queue, and receives only the responses
+    /// to messages posted to `/messages/?sessionId=<its own id>`. Sessions are
+    /// removed from the registry when the client disconnects. Mirrors the
+    /// TypeScript SDK's `runSse`, which keys one `SSEServerTransport` per
+    /// session id, and the Python SDK's `SseServerTransport.connect_sse`.
+    #[deprecated(note = "SSE transport is deprecated. Use streamable-HTTP instead.")]
+    pub fn build_sse_app(
+        self: &Arc<Self>,
+        handler: Arc<dyn McpHandler>,
+        extra_routes: Option<Router>,
+    ) -> Router {
+        #[allow(deprecated)]
+        self.build_sse_app_parts(handler, extra_routes).0
+    }
+
+    /// Build the SSE router and hand back the live-session registry alongside
+    /// it.
+    ///
+    /// Deregistration is otherwise unobservable from outside: a leaked entry
+    /// still answers `400` once its inbound receiver is dropped, so status
+    /// codes alone cannot tell a removed session from a leaked one. Tests
+    /// assert on the registry directly.
+    #[deprecated(note = "SSE transport is deprecated. Use streamable-HTTP instead.")]
+    fn build_sse_app_parts(
+        self: &Arc<Self>,
+        handler: Arc<dyn McpHandler>,
+        extra_routes: Option<Router>,
+    ) -> (Router, SseSessions) {
+        let sse_state = SseState {
+            handler,
+            sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            manager: Arc::clone(self),
+        };
+        let sessions = Arc::clone(&sse_state.sessions);
+
+        let sse_router = Router::new()
+            .route("/sse", get(sse_stream_handler))
+            .route("/messages/", post(sse_messages_handler))
+            .with_state(sse_state);
+
+        let mut app = self.health_metrics_router().merge(sse_router);
+
+        if let Some(extra) = extra_routes {
+            app = app.merge(extra);
+        }
+
+        (app, sessions)
+    }
+
+    /// Run the MCP server over SSE transport (deprecated).
+    ///
+    /// Mounts `/sse` (GET) for the event stream and `/messages/` (POST) for
+    /// client-to-server messages. Logs a deprecation warning at startup.
+    #[deprecated(note = "SSE transport is deprecated. Use streamable-HTTP instead.")]
+    pub async fn run_sse(
+        self: &Arc<Self>,
+        handler: Arc<dyn McpHandler>,
+        host: &str,
+        port: u16,
+        extra_routes: Option<Router>,
+    ) -> Result<(), TransportError> {
+        #[allow(deprecated)]
+        self.run_sse_with_auth(handler, host, port, extra_routes, HttpAuthConfig::default())
+            .await
+    }
+
+    /// Run the MCP server over SSE transport with optional authentication (deprecated).
+    #[deprecated(note = "SSE transport is deprecated. Use streamable-HTTP instead.")]
+    pub async fn run_sse_with_auth(
+        self: &Arc<Self>,
+        handler: Arc<dyn McpHandler>,
+        host: &str,
+        port: u16,
+        extra_routes: Option<Router>,
+        auth_config: HttpAuthConfig,
+    ) -> Result<(), TransportError> {
+        Self::validate_host_port(host, port)?;
+        tracing::info!("Starting sse transport on {}:{}", host, port);
+        tracing::warn!("SSE transport is deprecated. Use Streamable HTTP instead.");
+
+        #[allow(deprecated)]
+        let app = self.build_sse_app(handler, extra_routes);
+
+        let app = apply_auth_layer(app, auth_config);
+
+        let addr: std::net::SocketAddr = format!("{}:{}", host, port)
+            .parse()
+            .map_err(|_| TransportError::InvalidHost(host.to_string()))?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app)
+            .await
+            .map_err(TransportError::Io)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Health response struct
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    uptime_seconds: f64,
+    module_count: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Axum handlers
+// ---------------------------------------------------------------------------
+
+async fn health_handler(
+    axum::extract::State(tm): axum::extract::State<Arc<TransportManager>>,
+) -> axum::Json<HealthResponse> {
+    axum::Json(tm.build_health_response())
+}
+
+async fn metrics_handler(
+    axum::extract::State(tm): axum::extract::State<Arc<TransportManager>>,
+) -> axum::response::Response {
+    match tm.build_metrics_response() {
+        Ok(body) => (
+            StatusCode::OK,
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            body,
+        )
+            .into_response(),
+        Err(()) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn usage_handler(
+    axum::extract::State(tm): axum::extract::State<Arc<TransportManager>>,
+) -> axum::response::Response {
+    match tm.build_usage_response() {
+        Ok(body) => (StatusCode::OK, axum::Json(body)).into_response(),
+        Err(()) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streamable-HTTP state & handlers
+// ---------------------------------------------------------------------------
+
+/// Shared state for the streamable-HTTP MCP endpoint.
+///
+/// # Why this transport has no elicitation
+///
+/// `session_id` here is minted once per *application*, not once per
+/// connection, so every client that talks to this endpoint reports the same
+/// id. Registering it in the [`SessionRegistry`] would therefore point every
+/// connection at one [`McpSession`]: a prompt raised by one client's tool
+/// call would be written to whichever connection happened to own the entry,
+/// and any client could answer another's prompt. That is precisely the
+/// cross-connection leak the SSE session isolation work removed, and it must
+/// not be reintroduced here for the sake of feature parity.
+///
+/// Inbound messages are consequently not stamped with a session id either, so
+/// [`ExecutionRouter::extract_extra`] resolves no session and elicitation is
+/// simply unavailable — which fails closed: a gated call is denied rather than
+/// prompted on the wrong stream. `streamable_http_elicitation_fails_closed`
+/// pins that.
+///
+/// Making elicitation work here requires per-connection sessions first (the
+/// `TODO` in [`TransportManager::build_streamable_http_app`]), not a
+/// registration bolted onto the shared id.
+///
+/// [`SessionRegistry`]: crate::server::session::SessionRegistry
+/// [`McpSession`]: crate::server::session::McpSession
+/// [`ExecutionRouter::extract_extra`]: crate::server::router::ExecutionRouter
+#[derive(Clone)]
+struct StreamableHttpState {
+    handler: Arc<dyn McpHandler>,
+    session_id: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum HttpProtocolError {
+    #[error("Unsupported MCP-Protocol-Version")]
+    UnsupportedVersion,
+}
+
+impl IntoResponse for HttpProtocolError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":self.to_string()})),
+        )
+            .into_response()
+    }
+}
+
+/// Validate a protocol header consistently on every MCP HTTP method.
+fn http_protocol_version(headers: &axum::http::HeaderMap) -> Result<&str, HttpProtocolError> {
+    let version = match headers.get("mcp-protocol-version") {
+        None => "2025-03-26",
+        Some(value) => value.to_str().unwrap_or_default(),
+    };
+    if !matches!(version, "2024-11-05" | "2025-03-26" | "2025-06-18") {
+        return Err(HttpProtocolError::UnsupportedVersion);
+    }
+    Ok(version)
+}
+
+/// POST /mcp — accept a JSON-RPC request and return a JSON-RPC response.
+async fn streamable_http_post_handler(
+    axum::extract::State(state): axum::extract::State<StreamableHttpState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(mut body): axum::Json<Value>,
+) -> axum::response::Response {
+    let version = match http_protocol_version(&headers) {
+        Ok(version) => version,
+        Err(error) => return error.into_response(),
+    };
+    stamp_http_protocol(&mut body, version);
+    match state.handler.handle_message(body).await {
+        Some(response) => (
+            StatusCode::OK,
+            [
+                ("content-type", "application/json"),
+                ("mcp-session-id", state.session_id.as_str()),
+            ],
+            serde_json::to_string(&response).unwrap_or_default(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::ACCEPTED,
+            [("mcp-session-id", state.session_id.as_str())],
+        )
+            .into_response(),
+    }
+}
+
+/// GET /mcp — per-connection SSE streaming endpoint.
+///
+/// [L-2] Opens a long-lived server→client Server-Sent Events stream for the
+/// session (MCP Streamable HTTP transport). The stream first emits the
+/// `endpoint` event carrying the session-scoped POST URL, then holds the
+/// connection open with periodic keep-alive comments until the client
+/// disconnects. Each GET gets its own independent stream — the previous
+/// placeholder emitted one event and closed the connection immediately, which
+/// prevented clients from receiving any server-initiated messages.
+async fn streamable_http_get_handler(
+    axum::extract::State(state): axum::extract::State<StreamableHttpState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Err(error) = http_protocol_version(&headers) {
+        return error.into_response();
+    }
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use std::time::Duration;
+
+    let session_id = state.session_id.clone();
+
+    // Per-connection channel: the first item is the `endpoint` event; the
+    // stream then stays open. axum's `KeepAlive` injects SSE comment frames so
+    // intermediaries do not close an otherwise-idle connection. When the client
+    // disconnects, axum drops the response future and the spawned task's send
+    // attempts fail, tearing the per-connection task down.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(16);
+    tokio::spawn(async move {
+        // Advertise the session-scoped POST endpoint (MCP `endpoint` event).
+        let endpoint = Event::default()
+            .event("endpoint")
+            .data(format!("/mcp?sessionId={session_id}"));
+        if tx.send(Ok(endpoint)).await.is_err() {
+            return;
+        }
+        // Hold the stream open. The KeepAlive layer below handles liveness;
+        // this loop simply keeps the sender alive until the receiver (client)
+        // goes away, at which point `closed()` resolves and the task exits.
+        tx.closed().await;
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// DELETE /mcp — session termination.
+async fn streamable_http_delete_handler(
+    axum::extract::State(_state): axum::extract::State<StreamableHttpState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Err(error) = http_protocol_version(&headers) {
+        return error.into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// SSE transport state & handlers (deprecated)
+// ---------------------------------------------------------------------------
+
+/// Registry of live SSE sessions: session id → that connection's inbound queue.
+///
+/// Guarded by a `std::sync::Mutex` rather than tokio's: every critical section
+/// is a single `HashMap` operation with no `.await` inside, and a synchronous
+/// lock is what lets [`SseSessionGuard::drop`] deregister a session during a
+/// panic unwind, where awaiting is impossible.
+type SseSessions =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;
+
+/// Lock the session registry, recovering from a poisoned mutex.
+///
+/// Poisoning carries no meaning here: the map holds channel senders, and a
+/// panic mid-`insert`/`remove` cannot leave a `HashMap` in a state that a
+/// later `get`/`remove` misreads. Failing every subsequent connection over it
+/// would turn one panicking session into a dead transport.
+fn lock_sessions(
+    sessions: &SseSessions,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, tokio::sync::mpsc::Sender<Value>>>
+{
+    sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// RAII teardown for one SSE session: deregisters it and fires the transport's
+/// cancellation handler when the consumer task ends, however it ends.
+///
+/// The teardown used to be two statements after the dispatch loop, which a
+/// panic inside `McpHandler::handle_message` unwound straight past — leaking
+/// the registry entry for the lifetime of the process and skipping [TM-4]
+/// cancellation for every task the session had launched. Python brackets the
+/// same work in `try`/`finally` (`_scoped_session`); `Drop` is the Rust
+/// equivalent, and the family spec requires RAII for resource cleanup.
+struct SseSessionGuard {
+    session_id: String,
+    sessions: SseSessions,
+    manager: Arc<TransportManager>,
+    /// Server-to-client half, when the handler has one. Deregistered here as
+    /// well so a disconnect fails the connection's outstanding elicitations
+    /// immediately instead of leaving each to run out its own timeout.
+    session_registry: Option<Arc<SessionRegistry>>,
+}
+
+impl SseSessionGuard {
+    /// Register `session_id` against its inbound queue and return the guard
+    /// that will remove it again. Registration happens before the consumer
+    /// task starts so the advertised endpoint URL is usable immediately.
+    fn register(
+        session_id: String,
+        sessions: SseSessions,
+        manager: Arc<TransportManager>,
+        inbound_tx: tokio::sync::mpsc::Sender<Value>,
+        session_registry: Option<Arc<SessionRegistry>>,
+    ) -> Self {
+        lock_sessions(&sessions).insert(session_id.clone(), inbound_tx);
+        Self {
+            session_id,
+            sessions,
+            manager,
+            session_registry,
+        }
+    }
+}
+
+impl Drop for SseSessionGuard {
+    fn drop(&mut self) {
+        lock_sessions(&self.sessions).remove(&self.session_id);
+        // Before cancellation, so a tool call blocked on an elicitation is
+        // woken by the closed session rather than waiting out its timeout.
+        if let Some(ref registry) = self.session_registry {
+            registry.remove(&self.session_id);
+        }
+        // [TM-4] Cancel any async tasks bound to the disconnecting session,
+        // matching the TypeScript `transport.onclose` handler. The id matches
+        // because every dispatched message was stamped with it — see
+        // [`stamp_session_id`].
+        self.manager.notify_cancel(&self.session_id);
+        tracing::debug!(session_id = %self.session_id, "sse session closed");
+    }
+}
+
+/// [`OutboundSink`] over one SSE connection's event channel.
+///
+/// The channel is the same one the dispatch loop writes responses to, so a
+/// server-initiated request travels the client's existing stream rather than
+/// needing a second one. Cloning the sender is what keeps the session's writes
+/// bound to this connection and no other.
+struct SseSink {
+    events: tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, Infallible>>,
+}
+
+#[async_trait::async_trait]
+impl OutboundSink for SseSink {
+    async fn send(&self, message: Value) -> Result<(), SessionError> {
+        let data =
+            serde_json::to_string(&message).map_err(|e| SessionError::Send(e.to_string()))?;
+        self.events
+            .send(Ok(axum::response::sse::Event::default()
+                .event("message")
+                .data(data)))
+            .await
+            .map_err(|_| SessionError::Send("sse stream closed".to_string()))
+    }
+}
+
+/// Shared state for the SSE transport.
+///
+/// The registry is the only shared piece; every connection owns its own inbound
+/// queue and its own outbound event stream, so one client can never observe
+/// another client's responses.
+#[derive(Clone)]
+struct SseState {
+    handler: Arc<dyn McpHandler>,
+    sessions: SseSessions,
+    manager: Arc<TransportManager>,
+}
+
+/// How many messages one SSE session may have in a handler at the same time.
+///
+/// Dispatch is concurrent so a cheap request cannot be stuck behind an
+/// expensive one, but unbounded spawning would let a single connection turn
+/// its 256-message inbound queue into 256 simultaneous handler invocations.
+/// Messages past the limit stay queued; the inbound channel's own capacity
+/// applies backpressure to `POST /messages/` beyond that.
+const MAX_CONCURRENT_SESSION_DISPATCHES: usize = 16;
+
+/// Query parameters accepted by `POST /messages/`.
+#[derive(serde::Deserialize)]
+struct SseMessageQuery {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+/// Write the transport-minted session id onto an inbound client message as
+/// `params._meta.sessionId`.
+///
+/// This is the Rust counterpart of the TypeScript SDK's `extra.sessionId`
+/// (supplied by `SSEServerTransport`) and of the Python SDK's
+/// `transport_session_var` ContextVar, which `_scoped_session` sets around the
+/// server run. All three publish the *transport's own* id, not the client's:
+/// the value keys [`AsyncTaskBridge::session_tasks`], and
+/// `notifications/cancelled` already routes a caller-supplied key into
+/// `cancel_session_tasks`, so a client permitted to choose its own session id
+/// could name — and mass-cancel — another connection's tasks. The write is
+/// therefore an unconditional **overwrite**, never a default-if-absent.
+///
+/// Requests with absent `params` receive an empty object so list operations
+/// retain connection-scoped protocol negotiation. Malformed non-object params
+/// are left untouched for the handler to reject.
+fn stamp_session_id(message: &mut Value, session_id: &str) {
+    let Some(object) = message.as_object_mut() else {
+        return;
+    };
+    let Some(params) = object
+        .entry("params")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return;
+    };
+    match params.get_mut("_meta") {
+        // Preserve sibling keys such as `progressToken`.
+        Some(Value::Object(meta)) => {
+            meta.remove("mcpProtocolVersion");
+            meta.insert(
+                "sessionId".to_string(),
+                Value::String(session_id.to_string()),
+            );
+        }
+        // Absent, or present but not an object — replace it wholesale so a
+        // non-object `_meta` cannot shadow the id we are about to publish.
+        _ => {
+            params.insert(
+                "_meta".to_string(),
+                serde_json::json!({ "sessionId": session_id }),
+            );
+        }
+    }
+}
+
+/// HTTP remains stateless and cannot elicit; only the request header controls
+/// result capabilities. Never accept a caller-supplied live session identity.
+fn stamp_http_protocol(message: &mut Value, version: &str) {
+    let Some(object) = message.as_object_mut() else {
+        return;
+    };
+    let Some(params) = object
+        .entry("params")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return;
+    };
+    if !params.get("_meta").is_some_and(Value::is_object) {
+        params.insert("_meta".into(), serde_json::json!({}));
+    }
+    if let Some(meta) = params["_meta"].as_object_mut() {
+        meta.remove("sessionId");
+        meta.insert("mcpProtocolVersion".into(), serde_json::json!(version));
+    }
+}
+
+/// GET /sse — open a session-scoped server-sent event stream.
+///
+/// Emits the MCP `endpoint` event carrying this session's POST URL, then
+/// streams the responses to messages posted for this session and nothing else.
+/// A keep-alive comment is sent periodically so the stream is never silent and
+/// intermediaries do not close an idle connection. Every dispatched message is
+/// stamped with this connection's session id (see [`stamp_session_id`]) so
+/// tasks submitted over it are bound to it and can be cancelled on disconnect.
+/// Messages are dispatched concurrently, up to
+/// [`MAX_CONCURRENT_SESSION_DISPATCHES`], so responses may arrive in an order
+/// other than the one the client posted in — JSON-RPC correlates by `id`.
+/// When the client disconnects the session is removed from the registry and its
+/// consumer task exits, so no zombie consumer is left behind to swallow a later
+/// message. Removal is [`SseSessionGuard`]'s `Drop`, so it survives a panic in
+/// the handler as well as an ordinary exit.
+async fn sse_stream_handler(
+    axum::extract::State(state): axum::extract::State<SseState>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use std::time::Duration;
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Inbound: messages posted to /messages/?sessionId=<this session>.
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<Value>(256);
+    // Outbound: the SSE frames this connection — and only this one — receives.
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
+
+    // Server-to-client half. Registered before the consumer task starts so a
+    // tool call dispatched from this connection can address it back for
+    // `elicitation/create` — the lookup key is the same session id the
+    // dispatch loop stamps onto every inbound message.
+    let session_registry = state.handler.session_registry();
+    let mcp_session = session_registry.as_ref().map(|registry| {
+        let session = Arc::new(McpSession::new(
+            session_id.clone(),
+            Arc::new(SseSink {
+                events: event_tx.clone(),
+            }),
+        ));
+        registry.insert(Arc::clone(&session));
+        session
+    });
+
+    // Moved into the consumer task below: whichever way that task ends —
+    // client disconnect, channel close, or a panic in the handler — dropping
+    // the guard deregisters the session and fires the cancellation handler.
+    let guard = SseSessionGuard::register(
+        session_id.clone(),
+        state.sessions.clone(),
+        state.manager.clone(),
+        inbound_tx,
+        session_registry,
+    );
+
+    let handler = state.handler.clone();
+    let owned_session_id = session_id.clone();
+    let dispatch_slots = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_SESSION_DISPATCHES,
+    ));
+
+    tokio::spawn(async move {
+        let _session_guard = guard;
+        let endpoint = Event::default()
+            .event("endpoint")
+            .data(format!("/messages/?sessionId={owned_session_id}"));
+        if event_tx.send(Ok(endpoint)).await.is_ok() {
+            loop {
+                tokio::select! {
+                    // The client went away: axum dropped the response body and
+                    // with it the receiving half of the event channel.
+                    _ = event_tx.closed() => break,
+                    inbound = inbound_rx.recv() => {
+                        let Some(mut message) = inbound else { break };
+                        // An answer to a server-initiated request is not a
+                        // request. It has to complete its waiter here; the
+                        // handler would see a message with no `method` and
+                        // reject it as -32600, and the elicitation would hang
+                        // until its timeout.
+                        if let Some(ref session) = mcp_session {
+                            if session.try_take_response(&message) {
+                                continue;
+                            }
+                        }
+                        stamp_session_id(&mut message, &owned_session_id);
+                        // Dispatch off the receive loop. Awaiting the handler
+                        // here made the session strictly serial: a pipelined
+                        // `ping` sat behind a 30-second `tools/call`, and so
+                        // did disconnect detection, which delayed TM-4
+                        // cancellation by the same 30 seconds. TypeScript
+                        // dispatches concurrently.
+                        let handler = Arc::clone(&handler);
+                        let event_tx = event_tx.clone();
+                        let slots = Arc::clone(&dispatch_slots);
+                        tokio::spawn(async move {
+                            // Taken inside the task, not in the loop: taking
+                            // it above would put the loop right back to
+                            // waiting on handlers once the session saturates.
+                            let Ok(_permit) = slots.acquire().await else {
+                                return;
+                            };
+                            if let Some(response) = handler.handle_message(message).await {
+                                let data = serde_json::to_string(&response).unwrap_or_default();
+                                let event = Event::default().event("message").data(data);
+                                let _ = event_tx.send(Ok(event)).await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        // Stop accepting before deregistering. A POST that cloned this
+        // session's sender while it was still registered has not necessarily
+        // run its `send` yet; closing the receiver first makes that send fail
+        // — and the POST answer 400 — instead of queueing a message onto a
+        // consumer that has already stopped. See `sse_messages_handler` for
+        // the window this cannot close.
+        inbound_rx.close();
+        drop(_session_guard);
+    });
+
+    tracing::debug!(session_id = %session_id, "sse session opened");
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(event_rx))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// POST /messages/?sessionId=... — accept a client-to-server JSON-RPC message.
+///
+/// The `sessionId` query parameter names the SSE stream that will receive the
+/// response; it is the value advertised by that stream's `endpoint` event.
+/// Returns 202 Accepted once queued, or 400 when the session is missing or
+/// unknown — a message with nowhere to go must not be silently absorbed.
+///
+/// The two rejection bodies are deliberately distinct. `unknown session` means
+/// the registry had no entry; `session closed` means the entry was there but
+/// its stream went away between lookup and send. Collapsing them into one
+/// string makes a registry leak untestable, because a leaked entry keeps
+/// answering 400 through the second branch.
+///
+/// # What 202 does and does not promise
+///
+/// 202 means the message was queued to a session that was registered and
+/// still consuming at lookup time. It is not a promise of execution. Lookup
+/// and send cannot be made atomic with the consumer's teardown without holding
+/// the registry lock across `send().await`, which would let one slow session
+/// block every other session's POSTs. The consumer therefore closes its
+/// receiver as its first teardown step, which collapses the window to a
+/// message that lands in the queue in the instant between the consumer leaving
+/// its dispatch loop and that close. Such a message is dropped after a 202.
+///
+/// The exposure is bounded to the disconnecting client's own last message: its
+/// stream is already gone, so there was nowhere to deliver the response
+/// either. The case is logged at `debug` rather than left silent.
+async fn sse_messages_handler(
+    axum::extract::State(state): axum::extract::State<SseState>,
+    axum::extract::Query(query): axum::extract::Query<SseMessageQuery>,
+    axum::Json(body): axum::Json<Value>,
+) -> axum::response::Response {
+    let Some(session_id) = query.session_id else {
+        tracing::debug!("rejected sse message: no sessionId query parameter");
+        return (
+            StatusCode::BAD_REQUEST,
+            "missing sessionId query parameter; use the URL from the endpoint event",
+        )
+            .into_response();
+    };
+
+    let sender = lock_sessions(&state.sessions).get(&session_id).cloned();
+    let Some(sender) = sender else {
+        tracing::debug!(session_id = %session_id, "rejected sse message: unknown session");
+        return (StatusCode::BAD_REQUEST, "unknown session").into_response();
+    };
+
+    match sender.send(body).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        // The stream closed between lookup and send.
+        Err(_) => {
+            tracing::debug!(session_id = %session_id, "rejected sse message: session closed mid-send");
+            (StatusCode::BAD_REQUEST, "session closed").into_response()
+        }
+    }
+}
+
+/// Fallback handler that strips a trailing slash and redirects.
+///
+/// Axum's `nest("/prefix", ...)` matches `/prefix` but not `/prefix/`.
+/// This fallback redirects `/prefix/` → `/prefix` so both work.
+/// Non-trailing-slash paths that don't match any route get a 404.
+async fn trailing_slash_redirect(req: Request) -> axum::response::Response {
+    let path = req.uri().path();
+    if path.len() > 1 && path.ends_with('/') {
+        let trimmed = path.trim_end_matches('/');
+        Redirect::permanent(trimmed).into_response()
+    } else {
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    use crate::server::router::SessionHandle;
+
+    // -----------------------------------------------------------------------
+    // Mock McpHandler for testing
+    // -----------------------------------------------------------------------
+
+    /// A mock handler that echoes back the request wrapped in a response envelope.
+    struct EchoHandler;
+
+    #[async_trait::async_trait]
+    impl McpHandler for EchoHandler {
+        async fn handle_message(&self, message: Value) -> Option<Value> {
+            // Simulate JSON-RPC: if the message has an "id", return a response.
+            if message.get("id").is_some() {
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": message.get("params").cloned().unwrap_or(Value::Null),
+                }))
+            } else {
+                // Notification — no response.
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 1 tests: TransportError
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transport_error_invalid_port_display() {
+        let err = TransportError::InvalidPort(0);
+        assert_eq!(err.to_string(), "port must be between 1 and 65535, got 0");
+    }
+
+    #[test]
+    fn transport_error_invalid_host_display() {
+        let err = TransportError::InvalidHost("".to_string());
+        assert_eq!(err.to_string(), "invalid host: ");
+    }
+
+    #[test]
+    fn transport_error_io_wraps_and_preserves_message() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file gone");
+        let err = TransportError::Io(io_err);
+        assert_eq!(err.to_string(), "I/O error: file gone");
+    }
+
+    #[test]
+    fn transport_error_io_from_conversion() {
+        let io_err = std::io::Error::other("boom");
+        let err: TransportError = io_err.into();
+        assert!(matches!(err, TransportError::Io(_)));
+    }
+
+    #[test]
+    fn transport_error_implements_std_error() {
+        let err = TransportError::Server("oops".to_string());
+        // Ensure it implements std::error::Error by using it as a trait object.
+        let _: &dyn Error = &err;
+    }
+
+    #[test]
+    fn transport_error_server_display() {
+        let err = TransportError::Server("something broke".to_string());
+        assert_eq!(err.to_string(), "server error: something broke");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2 tests: TransportManager struct
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transport_manager_new_without_exporter() {
+        let tm = TransportManager::new(None);
+        assert!(tm.metrics_exporter.is_none());
+        assert_eq!(tm.module_count, 0);
+    }
+
+    #[test]
+    fn transport_manager_new_with_exporter() {
+        struct DummyExporter;
+        impl MetricsExporter for DummyExporter {
+            fn export_prometheus(&self) -> String {
+                "dummy".to_string()
+            }
+        }
+        let exporter: Arc<dyn MetricsExporter> = Arc::new(DummyExporter);
+        let tm = TransportManager::new(Some(exporter));
+        assert!(tm.metrics_exporter.is_some());
+    }
+
+    #[test]
+    fn transport_manager_module_count_defaults_to_zero() {
+        let tm = TransportManager::new(None);
+        assert_eq!(tm.module_count(), 0);
+    }
+
+    #[test]
+    fn transport_manager_set_module_count() {
+        let mut tm = TransportManager::new(None);
+        tm.set_module_count(5);
+        assert_eq!(tm.module_count(), 5);
+    }
+
+    #[test]
+    fn validate_host_port_rejects_empty_host() {
+        let result = TransportManager::validate_host_port("", 8080);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransportError::InvalidHost(_)
+        ));
+    }
+
+    #[test]
+    fn validate_host_port_rejects_port_zero() {
+        let result = TransportManager::validate_host_port("localhost", 0);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransportError::InvalidPort(0)
+        ));
+    }
+
+    #[test]
+    fn validate_host_port_accepts_valid() {
+        assert!(TransportManager::validate_host_port("127.0.0.1", 8080).is_ok());
+        assert!(TransportManager::validate_host_port("localhost", 1).is_ok());
+        assert!(TransportManager::validate_host_port("0.0.0.0", 65535).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3 tests: Health & Metrics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_health_response_returns_ok_status() {
+        let tm = TransportManager::new(None);
+        let resp = tm.build_health_response();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.uptime_seconds >= 0.0);
+        assert_eq!(resp.module_count, 0);
+    }
+
+    #[test]
+    fn build_health_response_reflects_module_count() {
+        let mut tm = TransportManager::new(None);
+        tm.set_module_count(3);
+        let resp = tm.build_health_response();
+        assert_eq!(resp.module_count, 3);
+    }
+
+    #[test]
+    fn build_metrics_response_without_exporter_returns_err() {
+        let tm = TransportManager::new(None);
+        assert!(tm.build_metrics_response().is_err());
+    }
+
+    #[test]
+    fn build_metrics_response_with_exporter_returns_body() {
+        struct MockExporter;
+        impl MetricsExporter for MockExporter {
+            fn export_prometheus(&self) -> String {
+                "# HELP up\nup 1\n".to_string()
+            }
+        }
+        let exporter: Arc<dyn MetricsExporter> = Arc::new(MockExporter);
+        let tm = TransportManager::new(Some(exporter));
+        let result = tm.build_metrics_response();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "# HELP up\nup 1\n");
+    }
+
+    #[tokio::test]
+    async fn health_handler_returns_json() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let app = tm.health_metrics_router();
+
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["module_count"], 0);
+        assert!(json["uptime_seconds"].as_f64().unwrap() >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn metrics_handler_returns_404_without_exporter() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let app = tm.health_metrics_router();
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_handler_returns_prometheus_text_with_exporter() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        struct MockExporter;
+        impl MetricsExporter for MockExporter {
+            fn export_prometheus(&self) -> String {
+                "# TYPE gauge\nmy_metric 42\n".to_string()
+            }
+        }
+
+        let exporter: Arc<dyn MetricsExporter> = Arc::new(MockExporter);
+        let tm = Arc::new(TransportManager::new(Some(exporter)));
+        let app = tm.health_metrics_router();
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/plain; version=0.0.4; charset=utf-8");
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "# TYPE gauge\nmy_metric 42\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_handler_reflects_module_count() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut tm = TransportManager::new(None);
+        tm.set_module_count(7);
+        let tm = Arc::new(tm);
+        let app = tm.health_metrics_router();
+
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["module_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_get_emits_endpoint_event_and_stays_open() {
+        // [L-2] GET /mcp must open a per-connection SSE stream that emits the
+        // `endpoint` event and then stays open (held by KeepAlive) rather than
+        // closing immediately.
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "GET /mcp must be an SSE stream; content-type was {ct}"
+        );
+
+        // Read just the first frame; the stream stays open afterwards, so wrap
+        // the read in a timeout (a closed-immediately stream would instead
+        // yield None / end quickly).
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("first SSE frame should arrive promptly")
+            .expect("stream must yield a frame")
+            .expect("frame must not be an error");
+        let data = frame.into_data().expect("data frame");
+        let text = String::from_utf8_lossy(&data);
+        assert!(
+            text.contains("event:endpoint") || text.contains("event: endpoint"),
+            "first SSE frame must be the endpoint event; got: {text:?}"
+        );
+        assert!(
+            text.contains("/mcp?sessionId="),
+            "endpoint event must carry the session-scoped URL; got: {text:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4 tests: stdio transport
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stdio_reads_jsonrpc_request_and_writes_response() {
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#.to_string() + "\n";
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        let result = tm.run_stdio_with_io(reader, &mut output, &handler).await;
+
+        assert!(result.is_ok());
+        let response_str = String::from_utf8(output).unwrap();
+        let response: Value = serde_json::from_str(response_str.trim()).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn stdio_eof_returns_ok() {
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        let result = tm.run_stdio_with_io(reader, &mut output, &handler).await;
+
+        assert!(result.is_ok());
+        assert!(output.is_empty());
+    }
+
+    /// [A-D-TR-2] stdio teardown must cancel the session's async tasks.
+    ///
+    /// `StdioSessionGuard::drop` removed the session from the registry but
+    /// never reached the cancel handler — `notify_cancel` had exactly one call
+    /// site in the file, `SseSessionGuard::drop`. The
+    /// `set_async_task_bridge` / `set_cancel_handler` Contract is not
+    /// restricted to network transports, and Python honours it on stdio.
+    #[tokio::test]
+    async fn stdio_teardown_notifies_cancel_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let calls_cb = Arc::clone(&calls);
+        let seen_cb = Arc::clone(&seen);
+        let mut tm = TransportManager::new(None);
+        tm.set_cancel_handler(Some(Arc::new(move |session_id: &str| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+            seen_cb.lock().unwrap().push(session_id.to_string());
+        })));
+
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        tm.run_stdio_with_io(reader, &mut output, &EchoHandler)
+            .await
+            .expect("stdio run");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "stdio teardown must invoke the cancel handler exactly once"
+        );
+        assert!(
+            !seen.lock().unwrap()[0].is_empty(),
+            "the cancel handler must receive the stdio session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_invalid_json_is_skipped() {
+        // First line is invalid, second line is valid.
+        let input = "not-json\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"test\"}\n".to_string();
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        let result = tm.run_stdio_with_io(reader, &mut output, &handler).await;
+
+        assert!(result.is_ok());
+        let response_str = String::from_utf8(output).unwrap();
+        let response: Value = serde_json::from_str(response_str.trim()).unwrap();
+        assert_eq!(response["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn stdio_notification_produces_no_output() {
+        // Notification: no "id" field — handler returns None.
+        let input = r#"{"jsonrpc":"2.0","method":"notify"}"#.to_string() + "\n";
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        let result = tm.run_stdio_with_io(reader, &mut output, &handler).await;
+
+        assert!(result.is_ok());
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stdio_multiple_requests() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"a"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"b"}"#,
+            "\n",
+        )
+        .to_string();
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        tm.run_stdio_with_io(reader, &mut output, &handler)
+            .await
+            .unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        let r1: Value = serde_json::from_str(lines[0]).unwrap();
+        let r2: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(r1["id"], 1);
+        assert_eq!(r2["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn stdio_empty_lines_are_skipped() {
+        let input = "\n\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\"}\n\n".to_string();
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        tm.run_stdio_with_io(reader, &mut output, &handler)
+            .await
+            .unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        assert_eq!(lines.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 5 tests: streamable-HTTP transport
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn streamable_http_app_health_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_app_metrics_returns_404_without_exporter() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_post_mcp_returns_jsonrpc_response() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/list",
+            "params": {}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("mcp-session-id").is_some());
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 42);
+    }
+
+    #[tokio::test]
+    async fn test_http_protocol_header_rejects_invalid_values() {
+        use axum::body::Body;
+        use axum::http::{HeaderValue, Request};
+        use tower::ServiceExt;
+
+        let transport = Arc::new(TransportManager::new(None));
+        let app = transport.build_streamable_http_app(Arc::new(EchoHandler), None);
+        for header in [
+            HeaderValue::from_static("2099-01-01"),
+            HeaderValue::from_static(""),
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        ] {
+            for method in ["POST", "GET", "DELETE"] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("mcp-protocol-version", header.clone())
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streamable_http_post_notification_returns_202() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        // Notification: no "id" field.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_delete_mcp_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_extra_routes_are_merged() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+
+        let extra = Router::new().route("/custom", get(|| async { "custom-response" }));
+        let app = tm.build_streamable_http_app(handler, Some(extra));
+
+        let req = Request::builder()
+            .uri("/custom")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "custom-response");
+    }
+
+    #[tokio::test]
+    async fn run_streamable_http_rejects_empty_host() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let result = tm.run_streamable_http(handler, "", 8080, None).await;
+        assert!(matches!(result, Err(TransportError::InvalidHost(_))));
+    }
+
+    #[tokio::test]
+    async fn run_streamable_http_rejects_port_zero() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let result = tm.run_streamable_http(handler, "localhost", 0, None).await;
+        assert!(matches!(result, Err(TransportError::InvalidPort(0))));
+    }
+
+    #[tokio::test]
+    async fn streamable_http_get_mcp_returns_sse() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let req = Request::builder().uri("/mcp").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.contains("text/event-stream"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6 tests: SSE transport (deprecated)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sse_app_health_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        #[allow(deprecated)]
+        let app = tm.build_sse_app(handler, None);
+
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sse_app_metrics_returns_404_without_exporter() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        #[allow(deprecated)]
+        let app = tm.build_sse_app(handler, None);
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Open a `GET /sse` stream and return its body plus the session id read
+    /// off the mandatory `endpoint` event.
+    async fn open_sse_session(app: &Router) -> (axum::body::Body, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let req = Request::builder().uri("/sse").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let text = read_sse_chunk(&mut body).await;
+        assert!(
+            text.contains("event:endpoint") || text.contains("event: endpoint"),
+            "first SSE frame must be the endpoint event; got: {text:?}"
+        );
+        let session_id = text
+            .split("sessionId=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("endpoint event must carry sessionId")
+            .to_string();
+        (body, session_id)
+    }
+
+    /// Read the next data chunk from an SSE body as UTF-8 text.
+    async fn read_sse_chunk(body: &mut axum::body::Body) -> String {
+        use http_body_util::BodyExt;
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("SSE frame should arrive promptly")
+            .expect("stream must yield a frame")
+            .expect("frame must not be an error");
+        let data = frame.into_data().expect("data frame");
+        String::from_utf8_lossy(&data).to_string()
+    }
+
+    /// Collect the next `count` JSON-RPC responses carried by `message` events.
+    async fn collect_sse_responses(body: &mut axum::body::Body, count: usize) -> Vec<Value> {
+        let mut responses = Vec::new();
+        while responses.len() < count {
+            let chunk = read_sse_chunk(body).await;
+            for line in chunk.lines() {
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(payload.trim()) else {
+                    continue;
+                };
+                if value.get("id").is_some() {
+                    responses.push(value);
+                }
+            }
+        }
+        responses
+    }
+
+    /// Collect the JSON-RPC ids carried by the next `count` `message` events.
+    async fn collect_sse_response_ids(body: &mut axum::body::Body, count: usize) -> Vec<i64> {
+        collect_sse_responses(body, count)
+            .await
+            .iter()
+            .filter_map(|v| v.get("id").and_then(Value::as_i64))
+            .collect()
+    }
+
+    /// POST a JSON-RPC request bound to a specific SSE session.
+    async fn post_sse_message(app: &Router, session_id: &str, id: i64) -> StatusCode {
+        post_sse_message_with_params(app, session_id, id, Value::Null)
+            .await
+            .0
+    }
+
+    /// POST a JSON-RPC request carrying explicit `params` to a specific
+    /// SSE session. `Value::Null` omits the member entirely. Returns the
+    /// status and the response body — the two 400 branches of
+    /// `sse_messages_handler` are distinguishable only by their body.
+    async fn post_sse_message_with_params(
+        app: &Router,
+        session_id: &str,
+        id: i64,
+        params: Value,
+    ) -> (StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut body = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "test" });
+        if !params.is_null() {
+            body["params"] = params;
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/messages/?sessionId={session_id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Wait for the consumer task to notice its client left and deregister.
+    ///
+    /// Polls the registry rather than probing `POST /messages/`: a probe is
+    /// itself a message, and the zombie-consumer regression only tears down
+    /// *after* pulling one more message off the queue, so a probing wait
+    /// would feed the zombie and then report success.
+    ///
+    /// Panics if the session outlives its stream — that is the registry leak
+    /// this suite exists to catch, so it must fail loudly rather than fall
+    /// through unasserted.
+    async fn await_session_removal(sessions: &SseSessions, session_id: &str) {
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+            if !lock_sessions(sessions).contains_key(session_id) {
+                return;
+            }
+        }
+        panic!("session {session_id} was still registered after its stream closed");
+    }
+
+    fn sse_test_app() -> Router {
+        sse_test_app_parts().0
+    }
+
+    /// An SSE test app plus its live-session registry.
+    fn sse_test_app_parts() -> (Router, SseSessions) {
+        sse_test_app_parts_with(Arc::new(TransportManager::new(None)), Arc::new(EchoHandler))
+    }
+
+    /// As [`sse_test_app_parts`], with a caller-supplied manager and handler.
+    fn sse_test_app_parts_with(
+        tm: Arc<TransportManager>,
+        handler: Arc<dyn McpHandler>,
+    ) -> (Router, SseSessions) {
+        #[allow(deprecated)]
+        tm.build_sse_app_parts(handler, None)
+    }
+
+    #[tokio::test]
+    async fn sse_messages_post_returns_202_for_a_live_session() {
+        let app = sse_test_app();
+        let (_body, session_id) = open_sse_session(&app).await;
+        assert_eq!(
+            post_sse_message(&app, &session_id, 1).await,
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_messages_post_rejects_missing_session_id() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = sse_test_app();
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "test" });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/messages/")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sse_messages_post_rejects_unknown_session_id() {
+        let app = sse_test_app();
+        assert_eq!(
+            post_sse_message(&app, "no-such-session", 1).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_get_returns_event_stream() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = sse_test_app();
+        let req = Request::builder().uri("/sse").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.contains("text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn sse_get_emits_endpoint_event_before_any_message() {
+        // A spec-compliant SSE client waits for `endpoint` to learn the POST
+        // URL; a stream that stays silent until the first response hangs it.
+        let app = sse_test_app();
+        let (_body, session_id) = open_sse_session(&app).await;
+        assert!(!session_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sse_dispatch_stamps_the_connection_session_id() {
+        // Without this the session id never reaches the AsyncTaskBridge:
+        // `notify_cancel` fires with the server-minted uuid on disconnect,
+        // but `session_tasks` is keyed from `params._meta.sessionId`, so
+        // `cancel_session_tasks` matches zero tasks and a submitted task
+        // runs to completion after the client is gone.
+        let app = sse_test_app();
+        let (mut body, session_id) = open_sse_session(&app).await;
+        assert_eq!(
+            post_sse_message_with_params(&app, &session_id, 1, serde_json::json!({}))
+                .await
+                .0,
+            StatusCode::ACCEPTED
+        );
+
+        // EchoHandler mirrors `params` back as `result`.
+        let responses = collect_sse_responses(&mut body, 1).await;
+        assert_eq!(
+            responses[0]["result"]["_meta"]["sessionId"],
+            Value::String(session_id.clone()),
+            "the dispatched message must carry this connection's session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_dispatch_overwrites_a_client_supplied_session_id() {
+        // A client that could name its own session could name someone
+        // else's: `notifications/cancelled` routes a caller-supplied key
+        // straight into `cancel_session_tasks`. The transport id must win.
+        let app = sse_test_app();
+        let (mut body, session_id) = open_sse_session(&app).await;
+        let params = serde_json::json!({
+            "_meta": { "sessionId": "victim-session", "progressToken": 7 }
+        });
+        assert_eq!(
+            post_sse_message_with_params(&app, &session_id, 1, params)
+                .await
+                .0,
+            StatusCode::ACCEPTED
+        );
+
+        let responses = collect_sse_responses(&mut body, 1).await;
+        let meta = &responses[0]["result"]["_meta"];
+        assert_eq!(
+            meta["sessionId"],
+            Value::String(session_id),
+            "a client-supplied sessionId must be overwritten, not honoured"
+        );
+        assert_eq!(
+            meta["progressToken"], 7,
+            "stamping must preserve the other _meta members"
+        );
+    }
+
+    #[test]
+    fn stamp_session_id_replaces_a_non_object_meta() {
+        let mut message = serde_json::json!({
+            "method": "tools/call",
+            "params": { "name": "t", "_meta": "not-an-object" }
+        });
+        stamp_session_id(&mut message, "sess-1");
+        assert_eq!(message["params"]["_meta"]["sessionId"], "sess-1");
+        assert_eq!(message["params"]["name"], "t");
+    }
+
+    #[test]
+    fn test_stamp_session_id_preserves_malformed_params_and_stamps_absent_params() {
+        for mut message in [
+            serde_json::json!({ "method": "tools/list", "params": [1, 2] }),
+            serde_json::json!({ "method": "tools/list", "params": null }),
+        ] {
+            let before = message.clone();
+            stamp_session_id(&mut message, "sess-1");
+            assert_eq!(message, before);
+        }
+        let mut message = serde_json::json!({"method":"tools/list"});
+        stamp_session_id(&mut message, "sess-1");
+        assert_eq!(message["params"]["_meta"]["sessionId"], "sess-1");
+    }
+
+    #[test]
+    fn test_protocol_metadata_is_transport_owned() {
+        let mut message = serde_json::json!({"method":"tools/call","params":{
+            "_meta":{"sessionId":"forged","mcpProtocolVersion":"2025-06-18","progressToken":"p"}}});
+        stamp_http_protocol(&mut message, "2025-03-26");
+        assert_eq!(
+            message["params"]["_meta"]["mcpProtocolVersion"],
+            "2025-03-26"
+        );
+        assert!(message["params"]["_meta"].get("sessionId").is_none());
+        stamp_session_id(&mut message, "real-session");
+        assert!(message["params"]["_meta"]
+            .get("mcpProtocolVersion")
+            .is_none());
+        assert_eq!(message["params"]["_meta"]["sessionId"], "real-session");
+        assert_eq!(message["params"]["_meta"]["progressToken"], "p");
+    }
+
+    #[tokio::test]
+    async fn sse_concurrent_sessions_receive_only_their_own_responses() {
+        // Two simultaneous streams. The pre-fix implementation shared one
+        // process-global receiver behind an `Arc<Mutex<..>>` whose guard was
+        // held across `recv().await`; tokio's Mutex is FIFO-fair, so the two
+        // consumers alternated strictly and handed out responses round-robin.
+        //
+        // The ids are therefore posted in *runs* — 1,2,3 to A then 4,5,6 to B
+        // — and asserted unsorted. Round-robin over a shared queue can only
+        // produce the alternating split {1,3,5}/{2,4,6}, so it cannot satisfy
+        // these assertions no matter how the streams are scheduled. (An
+        // interleaved post order plus `sort_unstable()` is satisfied *by* the
+        // bug, which is what the previous version of this test did.)
+        let (app, sessions) = sse_test_app_parts();
+        let (mut body_a, session_a) = open_sse_session(&app).await;
+        let (mut body_b, session_b) = open_sse_session(&app).await;
+        assert_ne!(
+            session_a, session_b,
+            "each connection needs its own session"
+        );
+
+        for (session, id) in [
+            (&session_a, 1),
+            (&session_a, 2),
+            (&session_a, 3),
+            (&session_b, 4),
+            (&session_b, 5),
+            (&session_b, 6),
+        ] {
+            assert_eq!(
+                post_sse_message(&app, session, id).await,
+                StatusCode::ACCEPTED
+            );
+        }
+
+        // Sorted, because dispatch within a session is concurrent and
+        // responses may complete out of order. Sorting is safe here in a way
+        // it was not before: the round-robin split is {1,3,5}/{2,4,6}, which
+        // does not become {1,2,3}/{4,5,6} under any ordering.
+        let mut ids_a = collect_sse_response_ids(&mut body_a, 3).await;
+        let mut ids_b = collect_sse_response_ids(&mut body_b, 3).await;
+        ids_a.sort_unstable();
+        ids_b.sort_unstable();
+        assert_eq!(ids_a, vec![1, 2, 3], "stream A leaked or lost responses");
+        assert_eq!(ids_b, vec![4, 5, 6], "stream B leaked or lost responses");
+
+        // Partial regression guard: isolation restored but the zombie
+        // consumer reintroduced. A leaves; its consumer must go with it
+        // unprompted (so the very next post to A is rejected rather than
+        // silently eaten), while B — untouched by A's departure — keeps
+        // working.
+        drop(body_a);
+        await_session_removal(&sessions, &session_a).await;
+        let (status, message) =
+            post_sse_message_with_params(&app, &session_a, 99, Value::Null).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a departed session must stop accepting messages"
+        );
+        assert_eq!(message, "unknown session");
+        assert_eq!(
+            post_sse_message(&app, &session_b, 7).await,
+            StatusCode::ACCEPTED,
+            "one client leaving must not disturb another's session"
+        );
+        assert_eq!(collect_sse_response_ids(&mut body_b, 1).await, vec![7]);
+    }
+
+    #[tokio::test]
+    async fn sse_disconnect_does_not_swallow_later_messages() {
+        // Every past disconnect used to leave a zombie consumer that ate
+        // exactly one subsequent message while POST still answered 202.
+        let (app, sessions) = sse_test_app_parts();
+        for _ in 0..3 {
+            let (body, session_id) = open_sse_session(&app).await;
+            drop(body);
+            // The consumer must notice the closed stream on its own, without
+            // being handed a message to trip over.
+            await_session_removal(&sessions, &session_id).await;
+            let (status, message) =
+                post_sse_message_with_params(&app, &session_id, 0, Value::Null).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "the first message after a disconnect was consumed, not rejected"
+            );
+            assert_eq!(message, "unknown session");
+        }
+
+        let (mut body, session_id) = open_sse_session(&app).await;
+        for id in [1, 2, 3] {
+            assert_eq!(
+                post_sse_message(&app, &session_id, id).await,
+                StatusCode::ACCEPTED
+            );
+        }
+        let mut ids = collect_sse_response_ids(&mut body, 3).await;
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "messages were swallowed after disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_disconnect_deregisters_the_session() {
+        // Status codes alone cannot certify deregistration: drop the
+        // `sessions.remove(..)` call and a post to a dead session still
+        // answers 400, just via the "the stream closed between lookup and
+        // send" arm instead of the registry miss. The two are told apart
+        // only by their body, and only the registry itself can show that
+        // the entry is gone rather than merely inert — an unbounded leak
+        // otherwise goes undetected for the lifetime of the process.
+        let (app, sessions) = sse_test_app_parts();
+
+        let (body, session_id) = open_sse_session(&app).await;
+        assert!(
+            lock_sessions(&sessions).contains_key(&session_id),
+            "an open stream must be registered"
+        );
+
+        drop(body);
+        await_session_removal(&sessions, &session_id).await;
+        assert!(
+            lock_sessions(&sessions).is_empty(),
+            "the closed session leaked into the registry"
+        );
+
+        let (status, message) =
+            post_sse_message_with_params(&app, &session_id, 1, Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            message, "unknown session",
+            "the rejection must come from the registry miss, not from a send \
+             onto a dropped receiver of a still-registered session"
+        );
+    }
+
+    /// A handler that holds message id 1 until released and answers every
+    /// other id immediately. Stands in for a slow `tools/call` with a cheap
+    /// `ping` pipelined behind it.
+    struct GatedHandler {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl McpHandler for GatedHandler {
+        async fn handle_message(&self, message: Value) -> Option<Value> {
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            if id == 1 {
+                self.release.notified().await;
+            }
+            Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }))
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_dispatch_does_not_head_of_line_block_a_session() {
+        // `handle_message` used to be awaited inside the select arm, so one
+        // slow call stalled every later message on that connection — and
+        // stalled disconnect detection with it, delaying TM-4 cancellation
+        // by the full duration of the slow call.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (app, _sessions) = sse_test_app_parts_with(
+            Arc::new(TransportManager::new(None)),
+            Arc::new(GatedHandler {
+                release: Arc::clone(&release),
+            }),
+        );
+        let (mut body, session_id) = open_sse_session(&app).await;
+
+        // 1 blocks; 2 is posted behind it and must not wait for it.
+        assert_eq!(
+            post_sse_message(&app, &session_id, 1).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            post_sse_message(&app, &session_id, 2).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            collect_sse_response_ids(&mut body, 1).await,
+            vec![2],
+            "a cheap message must overtake a blocked one"
+        );
+
+        // `notify_one` stores a permit, so it cannot be missed if the waiter
+        // has not reached `notified()` yet.
+        release.notify_one();
+        assert_eq!(collect_sse_response_ids(&mut body, 1).await, vec![1]);
+    }
+
+    /// A handler that panics on message id 1 and echoes anything else.
+    struct PanickingHandler;
+
+    #[async_trait::async_trait]
+    impl McpHandler for PanickingHandler {
+        async fn handle_message(&self, message: Value) -> Option<Value> {
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            assert_ne!(id, 1, "deliberate handler panic");
+            Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }))
+        }
+    }
+
+    /// A `TransportManager` whose cancel handler records the session ids it
+    /// is called with, plus that record.
+    #[allow(clippy::type_complexity)]
+    fn recording_transport_manager() -> (Arc<TransportManager>, Arc<std::sync::Mutex<Vec<String>>>)
+    {
+        let cancelled: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let recorder = Arc::clone(&cancelled);
+        let mut tm = TransportManager::new(None);
+        tm.set_cancel_handler(Some(Arc::new(move |session_id: &str| {
+            recorder
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(session_id.to_string());
+        })));
+        (Arc::new(tm), cancelled)
+    }
+
+    #[test]
+    fn sse_session_guard_deregisters_during_a_panic_unwind() {
+        // Teardown used to be two statements after the dispatch loop, which
+        // an unwind walks straight past: the registry entry would leak for
+        // the lifetime of the process and TM-4 cancellation would never run
+        // for the tasks that session had launched. Drop runs on the unwind
+        // path; straight-line code does not.
+        //
+        // The panic message this prints to stderr is expected.
+        let sessions: SseSessions = Arc::new(std::sync::Mutex::new(Default::default()));
+        let (tm, cancelled) = recording_transport_manager();
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<Value>(1);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = SseSessionGuard::register(
+                "sess-1".to_string(),
+                Arc::clone(&sessions),
+                Arc::clone(&tm),
+                inbound_tx,
+                None,
+            );
+            assert!(lock_sessions(&sessions).contains_key("sess-1"));
+            panic!("deliberate panic while the session is registered");
+        }));
+
+        assert!(unwound.is_err(), "the panic must have propagated");
+        assert!(
+            lock_sessions(&sessions).is_empty(),
+            "the session leaked into the registry across an unwind"
+        );
+        assert_eq!(
+            *cancelled.lock().unwrap_or_else(|p| p.into_inner()),
+            vec!["sess-1".to_string()],
+            "TM-4 cancellation must run on the unwind path too"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_handler_panic_does_not_kill_the_session() {
+        // Concurrent dispatch confines a panicking handler to its own task,
+        // so one bad message no longer takes the whole connection with it —
+        // and teardown still happens, on the guard, when the client leaves.
+        //
+        // The panic message this prints to stderr is expected.
+        let (tm, cancelled) = recording_transport_manager();
+        let (app, sessions) = sse_test_app_parts_with(tm, Arc::new(PanickingHandler));
+
+        let (mut body, session_id) = open_sse_session(&app).await;
+        assert_eq!(
+            post_sse_message(&app, &session_id, 1).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            post_sse_message(&app, &session_id, 2).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            collect_sse_response_ids(&mut body, 1).await,
+            vec![2],
+            "a panic in one dispatch must not stop the session serving others"
+        );
+
+        drop(body);
+        await_session_removal(&sessions, &session_id).await;
+        assert!(lock_sessions(&sessions).is_empty());
+        assert_eq!(
+            *cancelled.lock().unwrap_or_else(|p| p.into_inner()),
+            vec![session_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_extra_routes_are_merged() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let extra = Router::new().route("/extra", get(|| async { "extra" }));
+        #[allow(deprecated)]
+        let app = tm.build_sse_app(handler, Some(extra));
+
+        let req = Request::builder()
+            .uri("/extra")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn run_sse_rejects_empty_host() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let result = tm.run_sse(handler, "", 8080, None).await;
+        assert!(matches!(result, Err(TransportError::InvalidHost(_))));
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn run_sse_rejects_port_zero() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let result = tm.run_sse(handler, "localhost", 0, None).await;
+        assert!(matches!(result, Err(TransportError::InvalidPort(0))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional unit tests: edge cases and error paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transport_error_bind_display() {
+        // Construct a Bind error with a hyper::Error source.
+        // We can't easily construct hyper::Error directly, so test the other variants.
+        let err = TransportError::Server("bind failed".to_string());
+        assert!(err.to_string().contains("bind failed"));
+    }
+
+    #[test]
+    fn transport_error_is_debug() {
+        let err = TransportError::InvalidPort(99);
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("InvalidPort"));
+        assert!(debug.contains("99"));
+    }
+
+    #[test]
+    fn transport_error_invalid_host_preserves_value() {
+        let err = TransportError::InvalidHost("bad-host!".to_string());
+        assert_eq!(err.to_string(), "invalid host: bad-host!");
+    }
+
+    #[test]
+    fn transport_error_invalid_port_boundary_65535() {
+        let err = TransportError::InvalidPort(65535);
+        assert_eq!(
+            err.to_string(),
+            "port must be between 1 and 65535, got 65535"
+        );
+    }
+
+    #[test]
+    fn validate_host_port_rejects_both_invalid() {
+        // Empty host is checked first.
+        let result = TransportManager::validate_host_port("", 0);
+        assert!(matches!(
+            result.unwrap_err(),
+            TransportError::InvalidHost(_)
+        ));
+    }
+
+    #[test]
+    fn health_response_serializes_correctly() {
+        let tm = TransportManager::new(None);
+        let resp = tm.build_health_response();
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("status").is_some());
+        assert!(json.get("uptime_seconds").is_some());
+        assert!(json.get("module_count").is_some());
+    }
+
+    #[tokio::test]
+    async fn stdio_whitespace_only_lines_are_skipped() {
+        let input = "   \n\t\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\"}\n".to_string();
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        tm.run_stdio_with_io(reader, &mut output, &handler)
+            .await
+            .unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        assert_eq!(lines.len(), 1);
+        let r: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(r["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn stdio_response_ends_with_newline() {
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_string() + "\n";
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        tm.run_stdio_with_io(reader, &mut output, &handler)
+            .await
+            .unwrap();
+
+        // Each response line must end with \n.
+        assert!(output.last() == Some(&b'\n'));
+    }
+
+    #[tokio::test]
+    async fn stdio_mixed_notifications_and_requests() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","method":"notify1"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"req1"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notify2"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"req2"}"#,
+            "\n",
+        )
+        .to_string();
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+
+        let tm = TransportManager::new(None);
+        let handler = EchoHandler;
+        tm.run_stdio_with_io(reader, &mut output, &handler)
+            .await
+            .unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        // Only 2 responses for the 2 requests (notifications produce nothing).
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_metrics_returns_200_with_exporter() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        struct MockExporter;
+        impl MetricsExporter for MockExporter {
+            fn export_prometheus(&self) -> String {
+                "test_metric 1\n".to_string()
+            }
+        }
+
+        let exporter: Arc<dyn MetricsExporter> = Arc::new(MockExporter);
+        let tm = Arc::new(TransportManager::new(Some(exporter)));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "test_metric 1\n");
+    }
+
+    #[tokio::test]
+    async fn streamable_http_unknown_route_returns_404() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let req = Request::builder()
+            .uri("/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_post_mcp_returns_session_id_header() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"test"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        let session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // Session ID should be a valid UUID (36 chars with hyphens).
+        assert_eq!(session_id.len(), 36);
+        assert!(uuid::Uuid::parse_str(session_id).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration-style tests: real TCP listener on ephemeral port
+    // -----------------------------------------------------------------------
+
+    /// Helper: collect a hyper Incoming body into bytes.
+    async fn collect_body(body: hyper::body::Incoming) -> Vec<u8> {
+        use http_body_util::BodyExt;
+        let collected = body.collect().await.unwrap();
+        collected.to_bytes().to_vec()
+    }
+
+    /// Helper: build an HTTP client for integration tests.
+    fn test_client() -> hyper_util::client::legacy::Client<
+        hyper_util::client::legacy::connect::HttpConnector,
+        axum::body::Body,
+    > {
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http()
+    }
+
+    #[tokio::test]
+    async fn integration_health_endpoint_responds() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = test_client();
+        let resp = client
+            .request(
+                hyper::Request::builder()
+                    .uri(format!("http://{}/health", addr))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body(resp.into_body()).await;
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["module_count"], 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn integration_metrics_endpoint_404_without_exporter() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = test_client();
+        let resp = client
+            .request(
+                hyper::Request::builder()
+                    .uri(format!("http://{}/metrics", addr))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn integration_metrics_endpoint_200_with_exporter() {
+        struct TestExporter;
+        impl MetricsExporter for TestExporter {
+            fn export_prometheus(&self) -> String {
+                "# HELP test\ntest_total 99\n".to_string()
+            }
+        }
+
+        let exporter: Arc<dyn MetricsExporter> = Arc::new(TestExporter);
+        let tm = Arc::new(TransportManager::new(Some(exporter)));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = test_client();
+        let resp = client
+            .request(
+                hyper::Request::builder()
+                    .uri(format!("http://{}/metrics", addr))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body(resp.into_body()).await;
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "# HELP test\ntest_total 99\n"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn integration_usage_endpoint_404_without_exporter() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = test_client();
+        let resp = client
+            .request(
+                hyper::Request::builder()
+                    .uri(format!("http://{}/usage", addr))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn integration_usage_endpoint_200_with_exporter() {
+        struct TestUsage;
+        impl UsageExporter for TestUsage {
+            fn export_json(&self) -> Value {
+                serde_json::json!({"modules": [{"module_id": "a", "call_count": 1}]})
+            }
+        }
+        let mut tm = TransportManager::new(None);
+        let exporter: Arc<dyn UsageExporter> = Arc::new(TestUsage);
+        tm.set_usage_exporter(Some(exporter));
+        let tm = Arc::new(tm);
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = test_client();
+        let resp = client
+            .request(
+                hyper::Request::builder()
+                    .uri(format!("http://{}/usage", addr))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body(resp.into_body()).await;
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.get("modules").is_some());
+        server.abort();
+    }
+
+    #[test]
+    fn cancel_handler_invocation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+        let mut tm = TransportManager::new(None);
+        tm.set_cancel_handler(Some(Arc::new(move |_sid: &str| {
+            c.fetch_add(1, Ordering::SeqCst);
+        })));
+        tm.notify_cancel("sess-1");
+        tm.notify_cancel("sess-2");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn integration_mcp_post_endpoint_responds() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
+        let client = test_client();
+        let resp = client
+            .request(
+                hyper::Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{}/mcp", addr))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = collect_body(resp.into_body()).await;
+        let json: Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn integration_extra_routes_served() {
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let extra = Router::new().route("/custom", get(|| async { "hello-integration" }));
+        let app = tm.build_streamable_http_app(handler, Some(extra));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = test_client();
+        let resp = client
+            .request(
+                hyper::Request::builder()
+                    .uri(format!("http://{}/custom", addr))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body(resp.into_body()).await;
+        assert_eq!(String::from_utf8(body).unwrap(), "hello-integration");
+
+        server.abort();
+    }
+
+    // ---- HttpAuthConfig tests ────────────────────────────────────────
+
+    #[test]
+    fn http_auth_config_default() {
+        let cfg = HttpAuthConfig::default();
+        assert!(cfg.authenticator.is_none());
+        assert!(!cfg.require_auth);
+        assert!(cfg.explorer_prefix.is_none());
+        assert!(cfg.exempt_paths.is_none());
+    }
+
+    #[test]
+    fn http_auth_config_debug_does_not_panic() {
+        let cfg = HttpAuthConfig::default();
+        let debug = format!("{:?}", cfg);
+        assert!(debug.contains("HttpAuthConfig"));
+    }
+
+    #[test]
+    fn http_auth_config_clone() {
+        let cfg = HttpAuthConfig {
+            require_auth: true,
+            explorer_prefix: Some("/explorer".into()),
+            ..Default::default()
+        };
+        let cloned = cfg.clone();
+        assert!(cloned.require_auth);
+        assert_eq!(cloned.explorer_prefix.as_deref(), Some("/explorer"));
+    }
+
+    #[test]
+    fn apply_auth_layer_without_authenticator_is_noop() {
+        let app = Router::new().route("/test", get(|| async { "ok" }));
+        let result = super::apply_auth_layer(app, HttpAuthConfig::default());
+        // Should return a valid router (no panic).
+        let _ = result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-initiated requests over stdio (apexe#29)
+    // -----------------------------------------------------------------------
+
+    /// A real [`ServerHandler`] whose one tool answers by eliciting.
+    ///
+    /// Only the tool body is a stand-in. `initialize` capability recording,
+    /// JSON-RPC dispatch, session lookup by the stamped id, and the transport
+    /// loop are all the shipping code paths.
+    ///
+    /// [`ServerHandler`]: crate::server::server::ServerHandler
+    fn eliciting_handler(
+        registry: Arc<SessionRegistry>,
+    ) -> Arc<crate::server::server::ServerHandler> {
+        use crate::server::server::{CallToolHandler, MCPServer, ServerHandler};
+        use crate::server::types::{
+            CallToolResult, InitializationOptions, ServerCapabilities, TextContent, Tool,
+            ToolsCapability,
+        };
+
+        let mut server = MCPServer::with_params("test", "stdio", "127.0.0.1", 0);
+        server.list_tools_handler = Some(Arc::new(|| {
+            vec![Tool {
+                output_schema: None,
+                name: "demo.gated".into(),
+                description: "needs approval".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                annotations: None,
+                meta: None,
+            }]
+        }));
+
+        let call_registry = Arc::clone(&registry);
+        let call_tool: CallToolHandler = Arc::new(move |_name, _args, extra| {
+            let registry = Arc::clone(&call_registry);
+            Box::pin(async move {
+                // Exactly what the router does: recover the connection from
+                // the session id the transport stamped onto `_meta`.
+                let session = extra
+                    .as_ref()
+                    .and_then(|meta| meta.get("sessionId"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| registry.get(id));
+                let Some(session) = session else {
+                    return CallToolResult::new(
+                        vec![TextContent::new("no session on this call".to_string())],
+                        true,
+                    );
+                };
+                match session
+                    .elicit_form(
+                        "approve demo.gated?",
+                        &serde_json::json!({"type": "object"}),
+                    )
+                    .await
+                {
+                    Ok(result) => CallToolResult::new(
+                        vec![TextContent::new(format!("action={:?}", result.action))],
+                        false,
+                    ),
+                    Err(e) => {
+                        CallToolResult::new(vec![TextContent::new(format!("denied: {e}"))], true)
+                    }
+                }
+            })
+        });
+        server.call_tool_handler = Some(call_tool);
+        server.session_registry = Some(registry);
+
+        Arc::new(
+            ServerHandler::from_server(
+                &server,
+                InitializationOptions {
+                    server_name: "test-server".into(),
+                    server_version: "1.0.0".into(),
+                    capabilities: ServerCapabilities {
+                        tools: Some(ToolsCapability { list_changed: true }),
+                        resources: None,
+                        extensions: None,
+                    },
+                },
+            )
+            .expect("handlers are registered"),
+        )
+    }
+
+    type ClientReader = tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>;
+    type ClientWriter = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+    /// Read one JSON line from the server, failing loudly instead of hanging.
+    ///
+    /// The timeout is the assertion that matters most here: with a serial
+    /// dispatch loop the server never writes the prompt, because it is blocked
+    /// inside the very call that wants to send it.
+    async fn recv(lines: &mut ClientReader) -> Value {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("server went silent — a serial dispatch loop deadlocks here")
+            .expect("read from server")
+            .expect("server closed the stream early");
+        serde_json::from_str(&line).expect("server wrote a non-JSON line")
+    }
+
+    async fn send(writer: &mut ClientWriter, message: Value) {
+        let mut bytes = serde_json::to_vec(&message).expect("serialize");
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await.expect("write to server");
+        writer.flush().await.expect("flush");
+    }
+
+    #[tokio::test]
+    async fn stdio_carries_an_elicitation_round_trip() {
+        let registry = Arc::new(SessionRegistry::new());
+        let handler = eliciting_handler(Arc::clone(&registry));
+        let tm = Arc::new(TransportManager::new(None));
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_lines = BufReader::new(client_read).lines();
+
+        let serve = tokio::spawn({
+            let tm = Arc::clone(&tm);
+            let handler = Arc::clone(&handler);
+            async move {
+                let (server_read, server_write) = tokio::io::split(server);
+                tm.run_stdio_with_io(server_read, server_write, handler.as_ref())
+                    .await
+            }
+        });
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "capabilities": { "elicitation": {} } },
+            }),
+        )
+        .await;
+        let init = recv(&mut client_lines).await;
+        assert_eq!(init["id"], 1, "initialize must be answered first: {init}");
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "demo.gated", "arguments": {} },
+            }),
+        )
+        .await;
+
+        // The server asks. Reaching this line at all is the fix.
+        let prompt = recv(&mut client_lines).await;
+        assert_eq!(
+            prompt["method"], "elicitation/create",
+            "the server must issue the MCP elicitation request: {prompt}"
+        );
+        assert_eq!(prompt["params"]["message"], "approve demo.gated?");
+        assert!(
+            !prompt["id"].is_null(),
+            "the prompt needs an id for the client to answer on: {prompt}"
+        );
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": prompt["id"], "result": { "action": "accept" },
+            }),
+        )
+        .await;
+
+        let result = recv(&mut client_lines).await;
+        assert_eq!(
+            result["id"], 2,
+            "the answer must complete the original call: {result}"
+        );
+        let text = result["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("Accept"),
+            "the call must carry the user's actual answer: {result}"
+        );
+
+        drop(client_write);
+        drop(client_lines);
+        serve
+            .await
+            .expect("join")
+            .expect("the stdio loop must exit cleanly on EOF");
+    }
+
+    #[tokio::test]
+    async fn stdio_does_not_prompt_a_client_that_never_declared_elicitation() {
+        // The control for the test above. If capability gating were dropped,
+        // that test would still pass and this one would hang on a prompt no
+        // conforming client is obliged to answer.
+        let registry = Arc::new(SessionRegistry::new());
+        let handler = eliciting_handler(Arc::clone(&registry));
+        let tm = Arc::new(TransportManager::new(None));
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_lines = BufReader::new(client_read).lines();
+
+        let serve = tokio::spawn({
+            let tm = Arc::clone(&tm);
+            let handler = Arc::clone(&handler);
+            async move {
+                let (server_read, server_write) = tokio::io::split(server);
+                tm.run_stdio_with_io(server_read, server_write, handler.as_ref())
+                    .await
+            }
+        });
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "capabilities": { "roots": {} } },
+            }),
+        )
+        .await;
+        let _init = recv(&mut client_lines).await;
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "demo.gated", "arguments": {} },
+            }),
+        )
+        .await;
+
+        let next = recv(&mut client_lines).await;
+        assert_eq!(
+            next["id"], 2,
+            "the next message must be the call's own answer, not a prompt: {next}"
+        );
+        assert_eq!(
+            next["result"]["isError"], true,
+            "an approval that cannot be asked for must fail closed: {next}"
+        );
+
+        drop(client_write);
+        drop(client_lines);
+        serve.await.expect("join").expect("stdio loop");
+    }
+
+    #[tokio::test]
+    async fn stdio_passes_an_unsolicited_response_to_the_handler() {
+        // Interception must be narrow. A response-shaped message carrying an
+        // id this server never issued is the handler's business — swallowing
+        // it here would hide a client bug behind silence.
+        let registry = Arc::new(SessionRegistry::new());
+        let handler = eliciting_handler(Arc::clone(&registry));
+        let tm = Arc::new(TransportManager::new(None));
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_lines = BufReader::new(client_read).lines();
+
+        let serve = tokio::spawn({
+            let tm = Arc::clone(&tm);
+            let handler = Arc::clone(&handler);
+            async move {
+                let (server_read, server_write) = tokio::io::split(server);
+                tm.run_stdio_with_io(server_read, server_write, handler.as_ref())
+                    .await
+            }
+        });
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": "never-issued", "result": { "action": "accept" },
+            }),
+        )
+        .await;
+
+        let response = recv(&mut client_lines).await;
+        assert_eq!(response["id"], "never-issued");
+        assert_eq!(
+            response["error"]["code"], -32600,
+            "an unrecognised response must still get the handler's verdict: {response}"
+        );
+
+        drop(client_write);
+        drop(client_lines);
+        serve.await.expect("join").expect("stdio loop");
+    }
+
+    #[tokio::test]
+    async fn stdio_keeps_serving_other_requests_while_a_call_awaits_an_answer() {
+        // Concurrency is load-bearing, not incidental: a second client request
+        // must be answered while the first is parked on an elicitation.
+        let registry = Arc::new(SessionRegistry::new());
+        let handler = eliciting_handler(Arc::clone(&registry));
+        let tm = Arc::new(TransportManager::new(None));
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_lines = BufReader::new(client_read).lines();
+
+        let serve = tokio::spawn({
+            let tm = Arc::clone(&tm);
+            let handler = Arc::clone(&handler);
+            async move {
+                let (server_read, server_write) = tokio::io::split(server);
+                tm.run_stdio_with_io(server_read, server_write, handler.as_ref())
+                    .await
+            }
+        });
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "capabilities": { "elicitation": {} } },
+            }),
+        )
+        .await;
+        let _init = recv(&mut client_lines).await;
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "demo.gated", "arguments": {} },
+            }),
+        )
+        .await;
+        let prompt = recv(&mut client_lines).await;
+        assert_eq!(prompt["method"], "elicitation/create");
+
+        // The gated call is now parked. An unrelated request must not queue
+        // behind it.
+        send(
+            &mut client_write,
+            serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+        )
+        .await;
+        let listed = recv(&mut client_lines).await;
+        assert_eq!(
+            listed["id"], 3,
+            "tools/list must be answered while the gated call waits: {listed}"
+        );
+
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": prompt["id"], "result": { "action": "decline" },
+            }),
+        )
+        .await;
+        let result = recv(&mut client_lines).await;
+        assert_eq!(result["id"], 2);
+
+        drop(client_write);
+        drop(client_lines);
+        serve.await.expect("join").expect("stdio loop");
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-initiated requests over SSE
+    // -----------------------------------------------------------------------
+
+    /// POST an arbitrary JSON-RPC message to a specific SSE session.
+    async fn post_sse_raw(app: &Router, session_id: &str, message: Value) -> StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/messages/?sessionId={session_id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&message).unwrap()))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    fn eliciting_sse_app(registry: Arc<SessionRegistry>) -> Router {
+        let handler = eliciting_handler(registry) as Arc<dyn McpHandler>;
+        sse_test_app_parts_with(Arc::new(TransportManager::new(None)), handler).0
+    }
+
+    #[tokio::test]
+    async fn sse_carries_an_elicitation_round_trip() {
+        let registry = Arc::new(SessionRegistry::new());
+        let app = eliciting_sse_app(Arc::clone(&registry));
+        let (mut body, session_id) = open_sse_session(&app).await;
+
+        assert_eq!(
+            post_sse_raw(
+                &app,
+                &session_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": { "capabilities": { "elicitation": {} } },
+                })
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+        let init = collect_sse_responses(&mut body, 1).await;
+        assert_eq!(init[0]["id"], 1, "initialize must be answered: {:?}", init);
+
+        assert_eq!(
+            post_sse_raw(
+                &app,
+                &session_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": { "name": "demo.gated", "arguments": {} },
+                })
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+
+        let prompt = collect_sse_responses(&mut body, 1).await;
+        assert_eq!(
+            prompt[0]["method"], "elicitation/create",
+            "the prompt must travel the client's own stream: {:?}",
+            prompt
+        );
+
+        assert_eq!(
+            post_sse_raw(
+                &app,
+                &session_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": prompt[0]["id"], "result": { "action": "accept" },
+                })
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+
+        let result = collect_sse_responses(&mut body, 1).await;
+        assert_eq!(result[0]["id"], 2);
+        let text = result[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("Accept"),
+            "the call must carry the user's answer: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_elicitation_reaches_only_the_connection_that_triggered_it() {
+        // The confidentiality property the session isolation work established
+        // must hold for the server-to-client direction too: a prompt naming
+        // one client's pending action must never surface on another's stream.
+        let registry = Arc::new(SessionRegistry::new());
+        let app = eliciting_sse_app(Arc::clone(&registry));
+        let (mut body_a, session_a) = open_sse_session(&app).await;
+        let (mut body_b, session_b) = open_sse_session(&app).await;
+        assert_ne!(session_a, session_b);
+
+        for session in [&session_a, &session_b] {
+            post_sse_raw(
+                &app,
+                session,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": { "capabilities": { "elicitation": {} } },
+                }),
+            )
+            .await;
+        }
+        let _ = collect_sse_responses(&mut body_a, 1).await;
+        let _ = collect_sse_responses(&mut body_b, 1).await;
+
+        // Only A calls the gated tool.
+        post_sse_raw(
+            &app,
+            &session_a,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "demo.gated", "arguments": {} },
+            }),
+        )
+        .await;
+
+        let prompt = collect_sse_responses(&mut body_a, 1).await;
+        assert_eq!(prompt[0]["method"], "elicitation/create");
+
+        // B must see nothing. Its keep-alive is 15s away, so a frame arriving
+        // inside one second is a leaked message, not a heartbeat.
+        use http_body_util::BodyExt;
+        let leaked = tokio::time::timeout(std::time::Duration::from_secs(1), body_b.frame()).await;
+        assert!(
+            leaked.is_err(),
+            "another connection's stream received a frame while idle: {:?}",
+            leaked.map(|f| f.map(|f| f.map(|f| f.into_data())))
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_disconnect_wakes_a_call_waiting_on_an_answer() {
+        // Without deregistration on disconnect the parked call would sit on
+        // its full timeout after the client is already gone.
+        let registry = Arc::new(SessionRegistry::new());
+        let app = eliciting_sse_app(Arc::clone(&registry));
+        let (mut body, session_id) = open_sse_session(&app).await;
+
+        post_sse_raw(
+            &app,
+            &session_id,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "capabilities": { "elicitation": {} } },
+            }),
+        )
+        .await;
+        let _ = collect_sse_responses(&mut body, 1).await;
+
+        post_sse_raw(
+            &app,
+            &session_id,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "demo.gated", "arguments": {} },
+            }),
+        )
+        .await;
+        let prompt = collect_sse_responses(&mut body, 1).await;
+        assert_eq!(prompt[0]["method"], "elicitation/create");
+        assert_eq!(registry.len(), 1, "the session is live while it waits");
+
+        // The client walks away mid-prompt.
+        drop(body);
+
+        for _ in 0..1000 {
+            if registry.get(&session_id).is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("a disconnected client left its session registered");
+    }
+
+    #[tokio::test]
+    async fn streamable_http_elicitation_fails_closed() {
+        // Guards the decision documented on `StreamableHttpState`: this
+        // transport's session id is per-application, so wiring it into the
+        // registry would let one client's prompt land on another's stream.
+        // Until per-connection sessions exist here, a gated call must be
+        // denied rather than prompted — and this test must be updated, not
+        // deleted, when that changes.
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let registry = Arc::new(SessionRegistry::new());
+        let handler = eliciting_handler(Arc::clone(&registry)) as Arc<dyn McpHandler>;
+        let tm = Arc::new(TransportManager::new(None));
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let post = |body: Value| {
+            let app = app.clone();
+            async move {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
+            }
+        };
+
+        post(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "capabilities": { "elicitation": {} } },
+        }))
+        .await;
+
+        let result = post(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "demo.gated", "arguments": {} },
+        }))
+        .await;
+
+        assert_eq!(
+            result["result"]["isError"], true,
+            "a gated call must be denied where it cannot be prompted: {result}"
+        );
+        assert!(
+            registry.is_empty(),
+            "streamable HTTP must not register its shared session id — doing so \
+             would point every connection at one session"
+        );
+    }
+}
