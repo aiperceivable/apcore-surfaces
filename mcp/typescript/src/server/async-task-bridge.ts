@@ -1,0 +1,797 @@
+/**
+ * AsyncTaskBridge — MCP ↔ apcore `AsyncTaskManager` adapter.
+ *
+ * Surfaces apcore's {@link AsyncTaskManager} through the MCP protocol so
+ * that long-running modules can be submitted, polled, cancelled, and listed
+ * via reserved meta-tools. Async-hinted modules (either
+ * `metadata.async === true` OR `annotations.extra["mcp_async"] === "true"`)
+ * are routed through `AsyncTaskManager.submit()` instead of the synchronous
+ * executor call path; the agent receives a `{task_id, status: "pending"}`
+ * envelope it can resolve via the four reserved `__apcore_task_*` meta-tools.
+ *
+ * Full spec: apcore-mcp/docs/features/async-task-bridge.md (F-043).
+ */
+
+import type { ModuleDescriptor } from "../types.js";
+import { ErrorCodes } from "../types.js";
+
+/**
+ * Lazy snapshot of apcore-js's TaskLimitExceededError class for `instanceof`
+ * dispatch in handleMetaTool. Mirrors the lazy-load pattern used by
+ * adapters/errors.ts so callers don't pay an import-time tax.
+ */
+let _taskLimitExceededClass: (new (...args: unknown[]) => Error) | null | undefined;
+
+async function _loadTaskLimitExceededClass(): Promise<
+  (new (...args: unknown[]) => Error) | null
+> {
+  if (_taskLimitExceededClass !== undefined) {
+    return _taskLimitExceededClass ?? null;
+  }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const apcore = (await import("apcore-js")) as any;
+    _taskLimitExceededClass = apcore.TaskLimitExceededError ?? null;
+  } catch {
+    _taskLimitExceededClass = null;
+  }
+  return _taskLimitExceededClass ?? null;
+}
+
+// Eager fire-and-forget load so the cache is warm by the time handleMetaTool
+// fires under typical flows. The synchronous code path below tolerates a cold
+// cache by also duck-typing on `error.code`.
+void _loadTaskLimitExceededClass();
+
+/**
+ * Detect a task-capacity-exceeded error from apcore-js. Prefers `instanceof`
+ * dispatch when the class has been resolved; falls back to duck-typing on
+ * `error.code === "TASK_LIMIT_EXCEEDED"` so cold-cache or
+ * apcore-js-unavailable scenarios still classify correctly.
+ */
+function _isTaskLimitExceeded(err: unknown): boolean {
+  if (err === null || typeof err !== "object") return false;
+  const cls = _taskLimitExceededClass;
+  if (cls && err instanceof cls) return true;
+  const obj = err as { code?: unknown; name?: unknown };
+  if (obj.code === ErrorCodes.TASK_LIMIT_EXCEEDED) return true;
+  if (obj.name === "TaskLimitExceededError") return true;
+  return false;
+}
+
+/** Reserved meta-tool prefix. Module ids starting with this are forbidden. */
+export const APCORE_META_TOOL_PREFIX = "__apcore_";
+
+/**
+ * Reserved meta-tool names.
+ *
+ * Four task-management tools (submit/status/cancel/list) plus one
+ * preflight tool (`__apcore_module_preview`, apcore 0.21 PROTOCOL_SPEC §5.6).
+ */
+export const META_TOOL_NAMES = Object.freeze({
+  SUBMIT: "__apcore_task_submit",
+  STATUS: "__apcore_task_status",
+  CANCEL: "__apcore_task_cancel",
+  LIST: "__apcore_task_list",
+  PREVIEW: "__apcore_module_preview",
+} as const);
+
+/** Duck-typed TaskInfo projection matching apcore-js `TaskInfo`. */
+export interface TaskInfoProjection {
+  task_id: string;
+  module_id: string;
+  status: string;
+  submitted_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+}
+
+/**
+ * Minimal duck-typed `AsyncTaskManager` contract the bridge depends on.
+ *
+ * This mirrors **apcore-js 0.32.3**, whose `submit` takes an options object and
+ * whose `getStatus` / `listTasks` are async. It is intentionally TS-local:
+ * apcore-python and apcore-rust still expose positional `context` and sync
+ * reads, so their bridges keep their own manager shape. The cross-language
+ * contract is the MCP `__apcore_task_*` envelope, not this interface.
+ */
+export interface AsyncTaskManagerLike {
+  submit(
+    moduleId: string,
+    inputs: Record<string, unknown>,
+    opts?: { context?: unknown | null },
+  ): Promise<string>;
+  getStatus(taskId: string): Promise<{
+    taskId: string;
+    moduleId: string;
+    status: string;
+    submittedAt: number;
+    startedAt: number | null;
+    completedAt: number | null;
+    result: Record<string, unknown> | null;
+    error: string | null;
+  } | null>;
+  getResult(taskId: string): Promise<Record<string, unknown>>;
+  cancel(taskId: string): Promise<boolean>;
+  listTasks(status?: string): Promise<Array<{
+    taskId: string;
+    moduleId: string;
+    status: string;
+    submittedAt: number;
+    startedAt: number | null;
+    completedAt: number | null;
+    result: Record<string, unknown> | null;
+    error: string | null;
+  }>>;
+  shutdown?(): Promise<void>;
+}
+
+/**
+ * Minimal duck-typed `Executor` contract used by `__apcore_module_preview`.
+ *
+ * `validate(moduleId, inputs, context)` is the dry-run preflight entry
+ * point in apcore 0.20+; it never throws on input-shape errors —
+ * malformed inputs are surfaced as a failed `PreflightCheckResult` in
+ * the returned `PreflightResult`. apcore 0.21 added
+ * `predicted_changes` populated from `Module.preview()`.
+ */
+export interface ExecutorLike {
+  validate(
+    moduleId: string,
+    inputs?: Record<string, unknown> | null,
+    context?: unknown | null,
+  ): Promise<{
+    valid: boolean;
+    requiresApproval?: boolean;
+    requires_approval?: boolean;
+    predictedChanges?: unknown[];
+    predicted_changes?: unknown[];
+    checks?: Array<{
+      check: string;
+      passed: boolean;
+      error?: unknown;
+      warnings?: string[];
+    }>;
+  }>;
+}
+
+/** MCP-facing Tool shape used to advertise meta-tools. */
+export interface AsyncMetaTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+/** Options for {@link AsyncTaskBridge}. */
+export interface AsyncTaskBridgeOptions {
+  /** When false, `isAsyncModule()` always returns false — meta-tools are disabled. */
+  enabled?: boolean;
+  /**
+   * Optional output-redactor invoked on completed task results before they are
+   * returned from `__apcore_task_status`. Signature matches apcore-js's
+   * `redactSensitive(result, outputSchema)`.
+   */
+  redactSensitive?: (
+    result: Record<string, unknown>,
+    outputSchema: Record<string, unknown>,
+  ) => Record<string, unknown>;
+  /** Map of module_id → output_schema used by `redactSensitive`. */
+  outputSchemaMap?: Record<string, Record<string, unknown>>;
+  /**
+   * Look up a module's descriptor by id. Used by `__apcore_task_submit` to
+   * enforce the spec rule "non-async module → ASYNC_MODULE_NOT_ASYNC".
+   * When omitted, the rule is skipped (preserves backwards-compatible
+   * behavior for tests / direct construction without a registry). [A-D-008]
+   */
+  descriptorLookup?: (moduleId: string) => ModuleDescriptor | null | undefined;
+  /**
+   * Optional executor reference used by `__apcore_module_preview` to drive
+   * the cross-language `executor.validate()` preflight (apcore PROTOCOL_SPEC
+   * §5.6). When omitted, the preview meta-tool returns
+   * `PREVIEW_UNAVAILABLE`.
+   */
+  executor?: ExecutorLike;
+}
+
+/**
+ * Routes MCP tool calls either to the synchronous Execution Router (default)
+ * or to `AsyncTaskManager.submit()` for async-hinted modules.
+ */
+export class AsyncTaskBridge {
+  private readonly _manager: AsyncTaskManagerLike;
+  private readonly _enabled: boolean;
+  private readonly _redactSensitive?: AsyncTaskBridgeOptions["redactSensitive"];
+  private readonly _outputSchemaMap: Record<string, Record<string, unknown>>;
+  private readonly _descriptorLookup?: AsyncTaskBridgeOptions["descriptorLookup"];
+  private readonly _executor?: ExecutorLike;
+  /**
+   * Maps task_id → progressToken recorded at submit time so terminal-
+   * state notifications can be fanned out via the original token.
+   * [A-D-018]
+   */
+  private readonly _progressTokens = new Map<string, string | number>();
+  /**
+   * Maps session/connection key → list of task ids launched from that
+   * session so {@link cancelSessionTasks} can cancel them on transport
+   * disconnect. Mirrors Rust's `session_tasks` map. [A-D-018]
+   */
+  private readonly _sessionTasks = new Map<string, string[]>();
+
+  constructor(manager: AsyncTaskManagerLike, options?: AsyncTaskBridgeOptions) {
+    this._manager = manager;
+    this._enabled = options?.enabled ?? true;
+    this._redactSensitive = options?.redactSensitive;
+    this._outputSchemaMap = options?.outputSchemaMap ?? {};
+    this._descriptorLookup = options?.descriptorLookup;
+    this._executor = options?.executor;
+  }
+
+  /** Whether async routing and meta-tools are enabled. */
+  get enabled(): boolean {
+    return this._enabled;
+  }
+
+  /** Expose the underlying manager (used by server lifecycle for shutdown). */
+  get manager(): AsyncTaskManagerLike {
+    return this._manager;
+  }
+
+  /**
+   * Return true if the descriptor carries an async hint — either
+   * `metadata.async === true` OR `annotations.extra["mcp_async"] === "true"`.
+   */
+  isAsyncModule(descriptor: ModuleDescriptor | null | undefined): boolean {
+    return this._enabled && AsyncTaskBridge.isAsyncModuleDescriptor(descriptor);
+  }
+
+  /** Detect descriptor hints independently of whether this bridge is enabled. */
+  static isAsyncModuleDescriptor(descriptor: ModuleDescriptor | null | undefined): boolean {
+    if (!descriptor) return false;
+    const meta = descriptor.metadata ?? {};
+    // Accept both boolean true AND the string "true" — Python and Rust
+    // both accept the string form (registries that store annotations as
+    // YAML produce string booleans). Match Python's case-insensitive
+    // semantics so that `"True"` / `"TRUE"` round-tripped through YAML
+    // dispatchers agree across SDKs. [A-D-021 / A-003 cross-lang fix]
+    const isTruthyAsyncString = (v: unknown): boolean =>
+      typeof v === "string" && v.trim().toLowerCase() === "true";
+    const asyncFlag = meta["async"];
+    if (asyncFlag === true || isTruthyAsyncString(asyncFlag)) return true;
+    const annotations = descriptor.annotations;
+    if (annotations?.extra) {
+      const flag = annotations.extra["mcp_async"];
+      if (flag === true || isTruthyAsyncString(flag)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Submit a module invocation to the AsyncTaskManager. Returns the standard
+   * MCP envelope `{task_id, status: "pending"}`.
+   */
+  async submit(
+    moduleId: string,
+    inputs: Record<string, unknown>,
+    context?: unknown | null,
+    options?: {
+      /** Optional MCP progress token (recorded for fan-out). [A-D-018] */
+      progressToken?: string | number;
+      /** Optional session/connection key (recorded for cancelSessionTasks). [A-D-018] */
+      sessionKey?: string;
+      /**
+       * Optional notification sender. When provided together with `progressToken`,
+       * a progress sink is installed on the apcore Context so mid-execution progress
+       * events from modules are forwarded as `notifications/progress` MCP messages.
+       * Mirrors Python's `_install_progress_sink` pattern. [D11-015]
+       */
+      sendNotification?: (notification: Record<string, unknown>) => Promise<void> | void;
+    },
+  ): Promise<{ task_id: string; status: "pending" }> {
+    // [D11-015] Install progress sink on the context BEFORE submitting, so the
+    // module can emit mid-execution progress via context.data[MCP_PROGRESS_KEY].
+    // Mirrors Python's async_task_bridge.py _install_progress_sink() pattern.
+    if (
+      options?.progressToken !== undefined &&
+      options?.sendNotification !== undefined &&
+      context !== null &&
+      context !== undefined &&
+      typeof context === "object"
+    ) {
+      const progressToken = options.progressToken;
+      const sendNotification = options.sendNotification;
+      const contextData = (context as Record<string, unknown>).data;
+      if (contextData && typeof contextData === "object") {
+        (contextData as Record<string, unknown>)["_mcp_progress"] = async (
+          progress: number,
+          total: number,
+        ) => {
+          await sendNotification({
+            method: "notifications/progress",
+            params: { progressToken, progress, total },
+          });
+        };
+      }
+    }
+
+    const taskId = await this._manager.submit(moduleId, inputs, { context: context ?? null });
+    if (options?.progressToken !== undefined) {
+      this._progressTokens.set(taskId, options.progressToken);
+    }
+    if (options?.sessionKey !== undefined) {
+      const list = this._sessionTasks.get(options.sessionKey) ?? [];
+      list.push(taskId);
+      this._sessionTasks.set(options.sessionKey, list);
+    }
+    return { task_id: taskId, status: "pending" };
+  }
+
+  /**
+   * Look up the progress token recorded for a task at submit time.
+   *
+   * Used by transport / terminal-notification dispatch to route
+   * `notifications/progress` to the original caller. Returns undefined
+   * when no token was registered. [A-D-018]
+   */
+  getProgressToken(taskId: string): string | number | undefined {
+    return this._progressTokens.get(taskId);
+  }
+
+  /**
+   * Cancel every async task currently tracked under `sessionKey`.
+   *
+   * Used by the transport layer on client disconnect to ensure
+   * long-running tasks bound to that session don't keep running after
+   * the client has gone. Returns the number of tasks cancelled.
+   * Mirrors Rust's `AsyncTaskBridge::cancel_session_tasks`. [A-D-018]
+   */
+  async cancelSessionTasks(sessionKey: string): Promise<number> {
+    // [A-D-005] Detach the task list from the map BEFORE iterating cancels.
+    // A concurrent submit() between get() and the post-loop delete() would
+    // otherwise append to the same Array reference and the trailing delete
+    // would drop the newly-tracked task. Mirrors Python's `pop()` and Rust's
+    // `remove()` — both detach before yielding to manager.cancel.
+    const taskIds = this._sessionTasks.get(sessionKey);
+    if (!taskIds || taskIds.length === 0) return 0;
+    this._sessionTasks.delete(sessionKey);
+    let cancelled = 0;
+    for (const taskId of taskIds) {
+      try {
+        const ok = await this._manager.cancel(taskId);
+        if (ok) cancelled++;
+      } catch {
+        // Cancel may fail if the task has already completed; swallow.
+      }
+      this._progressTokens.delete(taskId);
+    }
+    return cancelled;
+  }
+
+  /**
+   * Build the four MCP meta-tool definitions. Caller merges these with
+   * the regular tool list returned by `tools/list`.
+   */
+  buildMetaTools(): AsyncMetaTool[] {
+    if (!this._enabled) return [];
+    return [
+      {
+        name: META_TOOL_NAMES.SUBMIT,
+        description:
+          "Submit an async-hinted apcore module for background execution. " +
+          "Returns `{task_id, status: \"pending\"}`. Use `__apcore_task_status` " +
+          "to poll until terminal state.",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            module_id: { type: "string" },
+            arguments: { type: "object", additionalProperties: true, default: {} },
+            version_hint: { type: "string" },
+          },
+          required: ["module_id"],
+        },
+      },
+      {
+        name: META_TOOL_NAMES.STATUS,
+        description:
+          "Return the TaskInfo projection for a previously submitted async " +
+          "task. When the task is `completed`, the redacted result is inlined.",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: { task_id: { type: "string" } },
+          required: ["task_id"],
+        },
+      },
+      {
+        name: META_TOOL_NAMES.CANCEL,
+        description:
+          "Cooperatively cancel a pending or running async task. Returns " +
+          "`{task_id, cancelled: bool}`.",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: { task_id: { type: "string" } },
+          required: ["task_id"],
+        },
+      },
+      {
+        name: META_TOOL_NAMES.LIST,
+        description:
+          "List tracked async tasks. Optional `status` filter narrows to a " +
+          "single lifecycle state.",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            status: {
+              type: "string",
+              enum: ["pending", "running", "completed", "failed", "cancelled"],
+            },
+          },
+        },
+      },
+      {
+        name: META_TOOL_NAMES.PREVIEW,
+        description:
+          "Preview a module call: predict state changes, validate inputs, " +
+          "and check approval requirements WITHOUT executing the module. " +
+          "Returns `{valid, requires_approval, predicted_changes, checks}`. " +
+          "Use this before invoking destructive or stateful modules to let " +
+          "the AI orchestrator answer 'what would change in the world if I " +
+          "called this?' (apcore PROTOCOL_SPEC §5.6).",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            module_id: { type: "string" },
+            arguments: { type: "object", additionalProperties: true, default: {} },
+          },
+          required: ["module_id"],
+        },
+      },
+    ];
+  }
+
+  /**
+   * Whether `toolName` is one of the reserved meta-tools. Used by the
+   * execution router to short-circuit dispatch before touching the executor.
+   */
+  isMetaTool(toolName: string): boolean {
+    return (
+      this._enabled &&
+      (toolName === META_TOOL_NAMES.SUBMIT ||
+        toolName === META_TOOL_NAMES.STATUS ||
+        toolName === META_TOOL_NAMES.CANCEL ||
+        toolName === META_TOOL_NAMES.LIST ||
+        toolName === META_TOOL_NAMES.PREVIEW)
+    );
+  }
+
+  /**
+   * Dispatch a meta-tool invocation. The caller must have already confirmed
+   * `isMetaTool(toolName)` is true.
+   */
+  async handleMetaTool(
+    toolName: string,
+    args: Record<string, unknown>,
+    context?: unknown | null,
+  ): Promise<Record<string, unknown>> {
+    switch (toolName) {
+      case META_TOOL_NAMES.SUBMIT: {
+        const moduleId = args["module_id"];
+        if (typeof moduleId !== "string" || moduleId.length === 0) {
+          throw new Error("__apcore_task_submit requires module_id (string)");
+        }
+        if (moduleId.startsWith(APCORE_META_TOOL_PREFIX)) {
+          throw new Error(
+            `Reserved module id: "${moduleId}". Ids prefixed with ` +
+              `"${APCORE_META_TOOL_PREFIX}" are reserved for apcore-mcp meta-tools.`,
+          );
+        }
+        // Spec: __apcore_task_submit on a non-async module returns
+        // ASYNC_MODULE_NOT_ASYNC. Python enforces; TS+Rust were silently
+        // wrapping sync modules as async tasks. The check is only applied
+        // when a descriptor-lookup callback is wired (the normal
+        // production path); direct test construction without a registry
+        // skips this guard to preserve unit-test ergonomics. [A-D-008]
+        if (this._descriptorLookup) {
+          const descriptor = this._descriptorLookup(moduleId);
+          if (!descriptor || !this.isAsyncModule(descriptor)) {
+            const err = new Error(
+              `ASYNC_MODULE_NOT_ASYNC: module "${moduleId}" is not async-hinted; ` +
+                `use regular tools/call instead of __apcore_task_submit`,
+            );
+            (err as Error & { code?: string }).code = "ASYNC_MODULE_NOT_ASYNC";
+            throw err;
+          }
+        }
+        // [A-D-020] Validate `arguments` is a JSON object (not an array,
+        // string, number, etc.). Python rejects non-objects; pre-fix TS
+        // coerced via `?? {}` and silently passed through arrays/strings.
+        const rawArgs = args["arguments"];
+        if (
+          rawArgs !== undefined &&
+          rawArgs !== null &&
+          (typeof rawArgs !== "object" || Array.isArray(rawArgs))
+        ) {
+          throw new Error(
+            "__apcore_task_submit requires `arguments` to be a JSON object",
+          );
+        }
+        const inputs = (rawArgs as Record<string, unknown> | undefined) ?? {};
+        // [A-D-222] Catch TaskLimitExceededError from manager.submit() and
+        // surface it as a structured TASK_LIMIT_EXCEEDED envelope with
+        // retryable=true. Mirrors Python's
+        // `apcore_mcp/server/async_task_bridge.py:375-376` which explicitly
+        // catches TaskLimitExceededError. Pre-fix TS let the bare error
+        // bubble — it would still get mapped by the router's ErrorMapper,
+        // but bridges that call handleMetaTool directly (toolkit/library
+        // use) saw a raw Error without errorType or retryable hints.
+        try {
+          return (await this.submit(moduleId, inputs, context)) as unknown as Record<string, unknown>;
+        } catch (err: unknown) {
+          if (_isTaskLimitExceeded(err)) {
+            const e = err as Error & { details?: Record<string, unknown> | null };
+            return {
+              isError: true,
+              errorType: ErrorCodes.TASK_LIMIT_EXCEEDED,
+              message: e.message,
+              details: e.details ?? null,
+              retryable: true,
+            };
+          }
+          throw err;
+        }
+      }
+      case META_TOOL_NAMES.STATUS: {
+        const taskId = args["task_id"];
+        if (typeof taskId !== "string" || taskId.length === 0) {
+          throw new Error("__apcore_task_status requires task_id (string)");
+        }
+        const info = await this._manager.getStatus(taskId);
+        if (!info) {
+          // [D10-003] Return envelope (matching Python's `(content, is_error=True, None)`
+          // and Rust's `Ok(envelope)`). Throwing here would force the caller's catch path
+          // to diverge from Python+Rust, breaking cross-SDK error handling.
+          return {
+            error: "ASYNC_TASK_NOT_FOUND",
+            task_id: taskId,
+            isError: true,
+          };
+        }
+        const projection = this._projectTaskInfo(info);
+        // [A-D-025] Inline result on terminal completed status — even
+        // when info.result is null/undefined (Python always inlines;
+        // pre-fix TS only inlined when truthy, silently dropping `null`).
+        // A configured redactor must succeed before a completed result leaves
+        // the bridge. The router maps failures to a safe tool error.
+        if (info.status === "completed") {
+          const schema = this._outputSchemaMap[info.moduleId] ?? {};
+          let redacted: Record<string, unknown> | null = info.result;
+          if (this._redactSensitive && info.result) {
+            try {
+              redacted = this._redactSensitive(info.result, schema);
+            } catch {
+              throw new Error("Output redaction failed");
+            }
+          }
+          projection.result = redacted;
+        } else if (info.status === "failed" && info.error) {
+          projection.error = info.error;
+        }
+        return projection as unknown as Record<string, unknown>;
+      }
+      case META_TOOL_NAMES.CANCEL: {
+        const taskId = args["task_id"];
+        if (typeof taskId !== "string" || taskId.length === 0) {
+          throw new Error("__apcore_task_cancel requires task_id (string)");
+        }
+        // [D10-004] Pre-check existence (matching Python `_handle_cancel_tool`).
+        // Without this, unknown task_ids silently return `{cancelled: false}` —
+        // callers can't distinguish "task existed and is uncancellable" from
+        // "task never existed".
+        if (!(await this._manager.getStatus(taskId))) {
+          this._progressTokens.delete(taskId);
+          return {
+            error: "ASYNC_TASK_NOT_FOUND",
+            task_id: taskId,
+            isError: true,
+          };
+        }
+        const cancelled = await this._manager.cancel(taskId);
+        // [A-D-009] Drop the progress-token binding after a single-task cancel
+        // so notifications/progress for cancelled tasks don't fan out to a
+        // token whose caller has already been told the task is gone. Mirrors
+        // Python's `_progress_bindings.pop(task_id, None)` and Rust's
+        // `progress_tokens.remove(task_id)`.
+        this._progressTokens.delete(taskId);
+        return { task_id: taskId, cancelled };
+      }
+      case META_TOOL_NAMES.PREVIEW: {
+        const moduleId = args["module_id"];
+        if (typeof moduleId !== "string" || moduleId.length === 0) {
+          throw new Error(
+            "__apcore_module_preview requires module_id (string)",
+          );
+        }
+        // Reject reserved-prefix module ids the same way the submit branch
+        // does at line 474 — the preview meta-tool must not introspect the
+        // bridge's own meta-tools (apcore PROTOCOL_SPEC §5.6 contract).
+        // Cross-SDK parity: Python and Rust apply the same guard.
+        if (moduleId.startsWith(APCORE_META_TOOL_PREFIX)) {
+          throw new Error(
+            `Reserved module id: "${moduleId}". Names starting with ` +
+              `"${APCORE_META_TOOL_PREFIX}" are reserved for apcore-mcp ` +
+              "meta-tools and cannot be previewed via this handler.",
+          );
+        }
+        if (!this._executor) {
+          // Bridge was constructed without an executor reference — preview
+          // is a runtime no-op rather than an error so the meta-tool stays
+          // discoverable across heterogenous deployments.
+          return {
+            error: "PREVIEW_UNAVAILABLE",
+            message:
+              "Module preview requires an Executor reference; bridge was built without one.",
+          };
+        }
+        // Preserve `arguments: null` verbatim (forwarded as null to
+        // executor.validate). The calling business decides whether
+        // null is acceptable for the target module. Reject only
+        // structurally-impossible shapes — arrays and scalars can
+        // never represent a JSON object.
+        const rawArgs = args["arguments"];
+        if (
+          rawArgs !== undefined &&
+          rawArgs !== null &&
+          (typeof rawArgs !== "object" || Array.isArray(rawArgs))
+        ) {
+          throw new Error(
+            "__apcore_module_preview requires `arguments` to be a JSON object or null",
+          );
+        }
+        // null → null, undefined → null (no caller intent to pass inputs),
+        // {x:1} → {x:1}. Distinguishing missing from explicit null is not
+        // observable downstream — both represent "no inputs supplied".
+        const inputs =
+          rawArgs === undefined
+            ? null
+            : (rawArgs as Record<string, unknown> | null);
+        const preflight = await this._executor.validate(
+          moduleId,
+          inputs,
+          context ?? null,
+        );
+        // PreflightResult fields land in either snake_case or camelCase
+        // depending on the apcore-js minor; normalize to the canonical
+        // wire shape (snake_case) Python and Rust emit.
+        const requiresApproval =
+          preflight.requires_approval ??
+          preflight.requiresApproval ??
+          false;
+        const predictedChanges =
+          preflight.predicted_changes ?? preflight.predictedChanges ?? [];
+        const checks = (preflight.checks ?? []).map((c) => {
+          const out: Record<string, unknown> = {
+            check: c.check,
+            passed: c.passed,
+          };
+          if (c.error !== undefined && c.error !== null) out["error"] = c.error;
+          if (c.warnings && c.warnings.length > 0) out["warnings"] = c.warnings;
+          return out;
+        });
+        return {
+          valid: preflight.valid,
+          requires_approval: requiresApproval,
+          predicted_changes: predictedChanges,
+          checks,
+        };
+      }
+      case META_TOOL_NAMES.LIST: {
+        // [A-D-024] Validate status filter against the spec enum;
+        // Python+Rust both reject unknown values. Pre-fix TS forwarded
+        // any string verbatim to listTasks(filter).
+        const status = args["status"];
+        let filter: string | undefined;
+        if (status !== undefined && status !== null) {
+          if (typeof status !== "string") {
+            throw new Error(
+              "__apcore_task_list `status` filter must be a string",
+            );
+          }
+          const validStatuses = [
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+          ];
+          if (!validStatuses.includes(status)) {
+            throw new Error(
+              `__apcore_task_list invalid status filter: ${JSON.stringify(status)}; ` +
+                `must be one of ${validStatuses.join(", ")}`,
+            );
+          }
+          filter = status;
+        }
+        const tasks = await this._manager.listTasks(filter);
+        return { tasks: tasks.map((t) => this._projectTaskInfo(t)) };
+      }
+      default:
+        throw new Error(`Unknown meta-tool: ${toolName}`);
+    }
+  }
+
+  private _projectTaskInfo(info: {
+    taskId: string;
+    moduleId: string;
+    status: string;
+    submittedAt: number;
+    startedAt: number | null;
+    completedAt: number | null;
+    result: Record<string, unknown> | null;
+    error: string | null;
+  }): TaskInfoProjection {
+    return {
+      task_id: info.taskId,
+      module_id: info.moduleId,
+      status: info.status,
+      submitted_at: info.submittedAt,
+      started_at: info.startedAt,
+      completed_at: info.completedAt,
+    };
+  }
+}
+
+/**
+ * Factory that dynamically imports apcore-js's `AsyncTaskManager` and wraps
+ * it in an `AsyncTaskBridge`. Returns null when apcore-js is unavailable.
+ */
+export async function createAsyncTaskBridge(
+  executor: unknown,
+  options?: {
+    enabled?: boolean;
+    maxConcurrent?: number;
+    maxTasks?: number;
+    outputSchemaMap?: Record<string, Record<string, unknown>>;
+    /**
+     * Optional descriptor lookup (typically `(id) => registry.getDefinition(id)`).
+     * When provided, `__apcore_task_submit` enforces the spec's
+     * ASYNC_MODULE_NOT_ASYNC rule. [A-D-008]
+     */
+    descriptorLookup?: (moduleId: string) => ModuleDescriptor | null | undefined;
+  },
+): Promise<AsyncTaskBridge | null> {
+  if (options?.enabled === false) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const apcore = (await import("apcore-js")) as any;
+    const AsyncTaskManager = apcore.AsyncTaskManager ?? apcore.default?.AsyncTaskManager;
+    if (!AsyncTaskManager) return null;
+    const manager = new AsyncTaskManager({
+      executor,
+      maxConcurrent: options?.maxConcurrent ?? 10,
+      maxTasks: options?.maxTasks ?? 1000,
+    }) as AsyncTaskManagerLike;
+    const redactSensitive = apcore.redactSensitive ?? apcore.default?.redactSensitive;
+    // Pass the executor through so `__apcore_module_preview` can drive
+    // `executor.validate()` (apcore PROTOCOL_SPEC §5.6).
+    const executorLike =
+      typeof (executor as { validate?: unknown })?.validate === "function"
+        ? (executor as ExecutorLike)
+        : undefined;
+    return new AsyncTaskBridge(manager, {
+      enabled: true,
+      redactSensitive: typeof redactSensitive === "function" ? redactSensitive : () => {
+        throw new Error("Output redaction failed");
+      },
+      outputSchemaMap: options?.outputSchemaMap,
+      descriptorLookup: options?.descriptorLookup,
+      executor: executorLike,
+    });
+  } catch {
+    return null;
+  }
+}

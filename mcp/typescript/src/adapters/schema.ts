@@ -1,0 +1,371 @@
+/**
+ * SchemaConverter - Converts apcore module schemas to MCP-compatible JSON Schema.
+ *
+ * Handles deep copying, inlining $ref references, and ensuring schemas
+ * have the required `type: "object"` for MCP tool input/output schemas.
+ */
+
+import type { JsonSchema, ModuleDescriptor } from "../types.js";
+
+export interface ConvertSchemaOptions {
+  strict?: boolean;
+}
+
+/**
+ * [SC-1] Maximum recursion depth for $ref inlining and schema descent.
+ * Matches Python's _MAX_REF_DEPTH and Rust's MAX_REF_DEPTH (32 levels).
+ * Prevents stack overflow on pathological-but-legal acyclic schemas
+ * (e.g. a chain of 100,000 distinct $defs each pointing to the next).
+ */
+const MAX_REF_DEPTH = 32;
+
+/**
+ * JavaScript-specific prototype-pollution guard (mirrors apcore-toolkit's
+ * `PROTO_DENY_LIST` in `binding-parser.ts`). Reject these names when used as
+ * `$ref` segments, so that a malicious schema cannot resolve `#/$defs/__proto__`,
+ * `#/$defs/constructor`, or `#/$defs/prototype` to inherited values on
+ * `Object.prototype`. Python and Rust ports do not require an equivalent.
+ */
+const PROTO_DENY_LIST: ReadonlySet<string> = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
+export class SchemaConverter {
+  /**
+   * Convert a module descriptor's inputSchema to an MCP-compatible schema.
+   */
+  convertInputSchema(
+    descriptor: ModuleDescriptor,
+    options?: ConvertSchemaOptions,
+  ): JsonSchema {
+    return this._convertSchema(descriptor.inputSchema, options);
+  }
+
+  /**
+   * Convert a module descriptor's outputSchema to an MCP-compatible schema.
+   */
+  convertOutputSchema(
+    descriptor: ModuleDescriptor,
+    options?: ConvertSchemaOptions,
+  ): JsonSchema {
+    return this._convertSchema(descriptor.outputSchema, options);
+  }
+
+  /**
+   * Apply all schema transformations: deep copy, inline $ref, ensure object type.
+   */
+  _convertSchema(schema: JsonSchema, options?: ConvertSchemaOptions): JsonSchema {
+    // Deep copy to avoid mutating the original
+    const copied = structuredClone(schema);
+
+    // Extract and remove $defs before inlining
+    const defs = (copied["$defs"] as Record<string, JsonSchema>) ?? {};
+    delete copied["$defs"];
+
+    // Inline all $ref references (with circular ref detection)
+    const inlined = this._inlineRefs(copied, defs, new Set<string>(), 0) as JsonSchema;
+
+    // Ensure the top-level schema has type: "object"
+    const normalized = this._ensureObjectType(inlined);
+
+    // [SC-11] Default strict=true to match Python and Rust SDKs. Pre-fix
+    // TS defaulted to false (undefined → falsy), silently producing
+    // permissive schemas. Callers that explicitly want non-strict must
+    // now pass `{ strict: false }`.
+    const strict = options?.strict ?? true;
+    if (strict) {
+      return this._applyStrict(normalized) as JsonSchema;
+    }
+    return normalized;
+  }
+
+  /**
+   * Recursively set `additionalProperties: false` on every object-shaped
+   * schema node that does not already specify `additionalProperties`.
+   *
+   * A node is treated as an object schema when ANY of:
+   *   - `type === "object"`
+   *   - `Array.isArray(type) && type.includes("object")`
+   *   - `"properties" in node` AND the declared scalar `type` (if any) isn't
+   *     a non-object scalar (string/number/integer/boolean/null)
+   *
+   * Recurses only into known subschema slots. Opaque value slots like
+   * `enum`, `const`, `examples`, `default` are left untouched.
+   */
+  _applyStrict(node: unknown): unknown {
+    if (Array.isArray(node)) {
+      return node.map((item) => this._applyStrict(item));
+    }
+    if (node === null || typeof node !== "object") {
+      return node;
+    }
+
+    const obj = node as Record<string, unknown>;
+    const result: Record<string, unknown> = { ...obj };
+
+    // Recurse into subschema slots only
+    if ("properties" in result && result.properties !== null && typeof result.properties === "object" && !Array.isArray(result.properties)) {
+      const props = result.properties as Record<string, unknown>;
+      const newProps: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(props)) {
+        newProps[k] = this._applyStrict(v);
+      }
+      result.properties = newProps;
+    }
+    if ("patternProperties" in result && result.patternProperties !== null && typeof result.patternProperties === "object" && !Array.isArray(result.patternProperties)) {
+      const pp = result.patternProperties as Record<string, unknown>;
+      const newPP: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(pp)) {
+        newPP[k] = this._applyStrict(v);
+      }
+      result.patternProperties = newPP;
+    }
+    if ("$defs" in result && result.$defs !== null && typeof result.$defs === "object" && !Array.isArray(result.$defs)) {
+      const defs = result.$defs as Record<string, unknown>;
+      const newDefs: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(defs)) {
+        newDefs[k] = this._applyStrict(v);
+      }
+      result.$defs = newDefs;
+    }
+    if ("definitions" in result && result.definitions !== null && typeof result.definitions === "object" && !Array.isArray(result.definitions)) {
+      const defs = result.definitions as Record<string, unknown>;
+      const newDefs: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(defs)) {
+        newDefs[k] = this._applyStrict(v);
+      }
+      result.definitions = newDefs;
+    }
+    if ("items" in result) {
+      result.items = this._applyStrict(result.items);
+    }
+    if ("additionalProperties" in result && typeof result.additionalProperties === "object" && result.additionalProperties !== null) {
+      result.additionalProperties = this._applyStrict(result.additionalProperties);
+    }
+    if ("not" in result) {
+      result.not = this._applyStrict(result.not);
+    }
+    for (const key of ["oneOf", "anyOf", "allOf"] as const) {
+      if (Array.isArray(result[key])) {
+        result[key] = (result[key] as unknown[]).map((v) => this._applyStrict(v));
+      }
+    }
+    for (const key of ["if", "then", "else"] as const) {
+      if (key in result) {
+        result[key] = this._applyStrict(result[key]);
+      }
+    }
+    // [D11-002] Mirror Python's _SCHEMA_CHILD_SCHEMA_KEYS: also recurse into
+    // `propertyNames` (single schema) and `contains` (single schema).
+    for (const key of ["propertyNames", "contains"] as const) {
+      if (key in result && result[key] !== null && typeof result[key] === "object") {
+        result[key] = this._applyStrict(result[key]);
+      }
+    }
+    // [D11-002] Mirror Python's _SCHEMA_CHILD_LIST_KEYS: also recurse into
+    // `prefixItems` (array of schemas).
+    if ("prefixItems" in result && Array.isArray(result["prefixItems"])) {
+      result["prefixItems"] = (result["prefixItems"] as unknown[]).map((v) => this._applyStrict(v));
+    }
+
+    // Decide whether this node is object-shaped
+    const type = result["type"];
+    const SCALAR_TYPES = new Set(["string", "number", "integer", "boolean", "null"]);
+    let isObjectShaped = false;
+    if (type === "object") {
+      isObjectShaped = true;
+    } else if (Array.isArray(type) && type.includes("object")) {
+      isObjectShaped = true;
+    } else if (type === undefined && "properties" in result) {
+      isObjectShaped = true;
+    } else if (typeof type === "string" && !SCALAR_TYPES.has(type) && "properties" in result) {
+      // Unknown string type with properties — treat as object
+      isObjectShaped = true;
+    }
+
+    if (isObjectShaped && !("additionalProperties" in result)) {
+      result["additionalProperties"] = false;
+    }
+
+    return result;
+  }
+
+  /**
+   * Recursively inline `$ref` references using the provided $defs map.
+   *
+   * Handles dicts (objects), arrays, and primitive values.
+   * Skips the `$defs` key itself during traversal.
+   */
+  _inlineRefs(
+    node: unknown,
+    defs: Record<string, JsonSchema>,
+    activeRefs: Set<string>,
+    depth: number = 0,
+  ): unknown {
+    // [SC-1] Cap recursion at MAX_REF_DEPTH to match Python+Rust.
+    if (depth > MAX_REF_DEPTH) {
+      throw new Error(
+        `Maximum schema recursion depth (${MAX_REF_DEPTH}) exceeded`,
+      );
+    }
+    if (Array.isArray(node)) {
+      return node.map((item) =>
+        this._inlineRefs(item, defs, activeRefs, depth + 1),
+      );
+    }
+
+    if (node !== null && typeof node === "object") {
+      const obj = node as Record<string, unknown>;
+
+      // If this object is a $ref, resolve it
+      if (typeof obj["$ref"] === "string") {
+        const refPath = obj["$ref"];
+
+        // Detect circular references
+        if (activeRefs.has(refPath)) {
+          throw new Error(`Circular $ref detected: ${refPath}`);
+        }
+
+        const resolved = this._resolveRef(refPath, defs);
+
+        // Track this ref as active during recursion
+        let inlinedTarget: unknown;
+        activeRefs.add(refPath);
+        try {
+          inlinedTarget = this._inlineRefs(resolved, defs, activeRefs, depth + 1);
+        } finally {
+          // [SC-2] Use try/finally so an exception mid-recursion doesn't
+          // leave activeRefs poisoned for subsequent sibling branches.
+          activeRefs.delete(refPath);
+        }
+
+        // [SC-SIB] Sibling keys written beside `$ref` (e.g.
+        // `{"$ref": "#/$defs/Token", "x-sensitive": true}`) MUST survive
+        // resolution — dropping them silently is a credential-disclosure
+        // path, since the router's output redaction reads `x-sensitive` off
+        // the *resolved* schema (see docs/features/schema-converter.md
+        // #ref-sibling-keys-are-preserved). Shallow-merge every key besides
+        // `$ref` OVER the resolved-and-inlined target, with the sibling
+        // winning on conflict — it is the caller's explicit, more specific
+        // value, and the $defs entry is only the default. A chained
+        // `$ref`-to-`$ref` carries siblings contributed at each hop, with
+        // the outermost sibling winning, because each recursion level here
+        // applies its own siblings last, on top of what the inner call
+        // already merged in. A sibling that is itself a subschema is
+        // independently walked through `_inlineRefs` so it cannot smuggle
+        // an unresolved nested `$ref` past the resolver.
+        const siblingKeys = Object.keys(obj).filter((key) => key !== "$ref");
+        if (siblingKeys.length === 0) {
+          return inlinedTarget;
+        }
+        const merged: Record<string, unknown> =
+          inlinedTarget !== null && typeof inlinedTarget === "object" && !Array.isArray(inlinedTarget)
+            ? { ...(inlinedTarget as Record<string, unknown>) }
+            : {};
+        for (const key of siblingKeys) {
+          merged[key] = this._inlineRefs(obj[key], defs, activeRefs, depth + 1);
+        }
+        return merged;
+      }
+
+      // Otherwise, recurse into each key (skip $defs)
+      const result: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(obj)) {
+        if (key === "$defs") {
+          continue;
+        }
+        result[key] = this._inlineRefs(value, defs, activeRefs, depth + 1);
+      }
+      return result;
+    }
+
+    // Primitives pass through unchanged
+    return node;
+  }
+
+  /**
+   * Resolve a `$ref` path (e.g. `#/$defs/MyType`) against the $defs map.
+   *
+   * Returns a deep copy of the resolved definition to avoid mutation.
+   * Throws Error if the ref format is invalid or the definition is not found.
+   *
+   * JS-specific hardening (mirrors apcore-toolkit's `PROTO_DENY_LIST` in
+   * `binding-parser.ts`): reject ref segments that resolve to dangerous
+   * prototype-chain keys (`__proto__`, `constructor`, `prototype`). Without
+   * this guard, `defs[name]` would return values from `Object.prototype`
+   * even when the user supplied no matching definition, enabling prototype
+   * pollution / unexpected schema resolution. This deny-list has no Python
+   * counterpart because Python's attribute lookups are not affected by this
+   * vulnerability class.
+   */
+  _resolveRef(
+    refPath: string,
+    defs: Record<string, JsonSchema>,
+  ): JsonSchema {
+    const prefix = "#/$defs/";
+    if (!refPath.startsWith(prefix)) {
+      throw new Error(`Invalid $ref format: ${refPath}`);
+    }
+
+    const name = refPath.slice(prefix.length);
+    if (!name) {
+      throw new Error(`Invalid $ref format: ${refPath}`);
+    }
+
+    // [SC-PROTO] Reject prototype-pollution segments before key lookup.
+    if (PROTO_DENY_LIST.has(name)) {
+      throw new Error(`$ref not found: ${refPath}`);
+    }
+
+    // Use Object.prototype.hasOwnProperty.call to guarantee we never read
+    // inherited keys (defense-in-depth alongside PROTO_DENY_LIST above).
+    if (!Object.prototype.hasOwnProperty.call(defs, name)) {
+      throw new Error(`$ref not found: ${refPath}`);
+    }
+
+    const definition = defs[name];
+    if (definition === undefined) {
+      throw new Error(`$ref not found: ${refPath}`);
+    }
+
+    // Return a deep copy to avoid shared mutation
+    return structuredClone(definition);
+  }
+
+  /**
+   * Ensure the schema has `type: "object"`.
+   *
+   * - Empty schema -> `{ type: "object", properties: {} }`
+   * - Schema without `type` -> adds `type: "object"`
+   * - Schema with non-object `type` but defining `properties` -> forces
+   *   `type: "object"` to keep cross-language parity with Python/Rust [D11-4].
+   */
+  _ensureObjectType(schema: JsonSchema): JsonSchema {
+    // Empty schema (no keys)
+    if (Object.keys(schema).length === 0) {
+      return { type: "object", properties: {} };
+    }
+
+    // If type is already set, only upgrade when `properties` is present but
+    // the current type is not object-compatible (Python/Rust parity).
+    if (schema["type"] !== undefined) {
+      const hasProperties =
+        schema !== null &&
+        typeof schema === "object" &&
+        "properties" in schema;
+      const typeValue = schema["type"];
+      const typeIsObject =
+        typeValue === "object" ||
+        (Array.isArray(typeValue) && typeValue.includes("object"));
+      if (hasProperties && !typeIsObject) {
+        schema["type"] = "object";
+      }
+      return schema;
+    }
+
+    // Add type: "object" if missing
+    return { ...schema, type: "object" };
+  }
+}

@@ -1,0 +1,1188 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+
+## [0.23.8] - 2026-11-20
+
+### Changed
+
+- Resolve effective OpenAPI parameters and validate the selected proxy modules before registering with MCP.
+
+## [0.23.7] - 2026-11-18
+
+### Security
+
+- Upgrade `@modelcontextprotocol/sdk` from 1.26 to 1.32.0.
+
+### Changed
+
+- Align the advertised `extensions` server capability with the SDK 1.32 typing
+  (`Record<string, object>`). No wire-format change.
+- Refresh the development toolchain to `vitest` / `@vitest/coverage-v8` 5.1.0.
+
+## [0.23.6] - 2026-11-09
+
+### Changed
+
+- Requires `apcore-toolkit >=0.14.2`. `apcore-toolkit` 0.14.1 resolved its own
+  `package.json` through `createRequire(import.meta.url)` at module load, which
+  throws under `bun build --compile` (`Cannot find module '../package.json' from
+  '/$bunfs/root/<entry>'`) and reports the host application's version inside
+  bundles that emit real paths. Dependency floor only — `apcore-toolkit` stays an
+  external dependency, so no build output changes.
+
+## [0.23.5] - 2026-11-08
+
+### Fixed
+
+- Align the async task bridge with the apcore-js 0.32.3 manager API: construct
+  the manager with an options object, pass submission context through options,
+  and await asynchronous status, result and task-list operations.
+
+### Compatibility
+
+- Custom managers passed to `AsyncTaskBridge` must implement the apcore-js
+  0.32.3 async manager contract.
+
+## [0.23.4] - 2026-11-02
+
+### Fixed
+
+- Return tool execution and approval failures as MCP tool results with
+  `isError: true`. Reject unknown tool names with JSON-RPC error `-32602`
+  before invoking the executor; failures inside known tools remain tool errors.
+- Apply default key-name redaction when an output schema is missing. If output
+  redaction is unavailable or fails, withhold the original output and return a
+  safe error, including for streaming chunks and configured async task results.
+- Avoid logging complete execution exceptions or redaction exception details,
+  which can contain sensitive values.
+
+### Compatibility
+
+- Output redaction runs before formatting. Existing `outputFormatter` callbacks
+  can calculate a digest over the redacted representation; formatter failures
+  still fall back to JSON serialization. Directly constructed async bridges
+  retain their optional redactor configuration.
+- Tool errors now use MCP tool results instead of JSON-RPC internal errors.
+  Callers should check `isError` in successful `tools/call` responses.
+
+### Tests
+
+- Cover unknown tools, known-tool failures, approval errors, missing schemas,
+  redaction failures, streaming, async results, sensitive logs and digests.
+
+## [0.23.2] - 2026-10-25
+
+### Fixed
+
+- Reserve protocol stdout for the complete stdio lifetime, including CLI
+  configuration, discovery, startup, request execution and shutdown. Route
+  ordinary JavaScript stdout diagnostics to stderr while preserving a separate
+  protocol writer.
+- Share ownership across nested serving layers, reject unrelated concurrent
+  stdio sessions and duplicate active transport claims, and allow sequential
+  sessions after cleanup completes.
+- Close the SDK transport on EOF, SIGINT and SIGTERM before draining handlers,
+  so peer-dependent elicitation and sampling waits can be cancelled. Forward
+  request abort signals to apcore cancellation tokens.
+- Keep timeout responses prompt while retaining ownership of deferred module
+  finalizers until shutdown cleanup completes, when supported by the core SDK.
+- Drain buffered protocol writes before the next session takes ownership;
+  preserve write callbacks, backpressure and protocol write errors.
+- Preserve HTTP/SSE host output and leave stdio ownership available while a real
+  network request is active.
+
+### Compatibility
+
+- Keep the installable dependency floor at `apcore-js >=0.32.2`. Complete
+  physical module execution and finalizer drainage requires `apcore-js 0.32.3`
+  or newer. With 0.32.2, the bridge drains managed MCP handlers but cannot join
+  module execution that outlives an executor timeout or cancellation response.
+- Public serving APIs and MCP wire formats remain unchanged.
+
+### Tests
+
+- Cover noisy stdio lifecycles, EOF/signal cancellation, deferred finalizers,
+  protocol backpressure and sequential handoff, plus live HTTP/SSE output and
+  ownership preservation.
+- Make deep-JSON projection tests portable across runtime encoder capabilities
+  and verify encoder failures deterministically; add no production nesting cap.
+
+## [0.23.1] - 2026-10-19
+
+### Fixed — MCP object root validation
+
+- Reject root type declarations that cannot accept object inputs instead of silently replacing them. Preserve object-containing unions, reject invalid unions, and verify discovery and preflight behavior with 17 shared root-schema cases.
+
+### Fixed
+
+- Resolve apcore-mcp #20 consistently across Python, TypeScript and Rust: MCP
+  `inputSchema` is an independent copy of the runtime descriptor schema, with
+  only the required object root normalized. Optionality, explicit nullability,
+  defaults, local references and additional-property policies are preserved.
+- Stop sourcing MCP inputs from OpenAI strict exports and stop implicitly
+  injecting `additionalProperties: false`. Arguments reach native preflight and
+  execution unchanged; meaningful explicit nulls are never globally removed.
+- Retain factory strict/registry arguments for source compatibility. They no
+  longer choose an MCP schema projection. Standalone SchemaConverter and
+  OpenAI strict exports retain their existing behavior.
+
+### Tests
+
+- Shared `mcp_input_contract.json` contract 1.0: 11 schemas, 27 valid/invalid
+  inputs, real Registry + Executor + router paths, with `validate_inputs` on
+  and off. Validate schema/input immutability, defaults, nulls, required fields,
+  nested arrays/objects, free-form payloads and local references.
+- `tool_mapping.json` contract 2.0 reflects runtime-faithful MCP discovery.
+- Final full suite: 913 passed, 0 failed; coverage 85.91% (clean HEAD 85.78%; existing 90% gate remains unmet).
+
+
+## [0.23.0] - 2026-10-14
+
+Prepared locally; publish after apcore 0.32.1 is available and the dependency floor is raised to that release.
+
+### Added
+
+- Advertise synchronous object output schemas and return structured objects derived from the primary already-redacted JSON text for supported modern MCP clients. Preserve additional trace text and legacy wire formats.
+- Validate the exact advertised schema after redaction, using local references and declared schema dialects without fetching external schemas. Invalid or unrepresentable output returns a payload-free tool error.
+
+### Fixed
+
+- Track protocol negotiation for caller-supplied MCP servers through public transport APIs; distinguish SSE session state from Streamable HTTP request headers.
+- Remove duplicate SSE transport startup, normalize async hints, reject non-finite or precision-losing output numbers, and clear stale structured payloads. Preserve negotiated protocol state when a second transport connection is rejected.
+- Use a declared Ajv dependency to validate raw schemas without lossy TypeBox conversion, including reference siblings, anchors, and composition constraints.
+
+### Compatibility
+
+- Existing public factory and router signatures remain unchanged. Configure handlers before MCP initialization; legacy clients receive no new fields.
+- Reference-based sensitive output requires the core 0.32.1 dependency fix: https://github.com/aiperceivable/apcore-typescript/issues/38. Publish that core patch and update the dependency floor before publishing this SDK.
+
+## [0.22.3] - 2026-10-09
+
+### Changed
+
+- Align the three SDK package versions at 0.22.3.
+- Raise the apcore dependency floor to 0.32.0 and apcore-toolkit to 0.14.0.
+  Published dependency packages were used for compatibility validation.
+- Align the declared Node.js requirement and CI with the dependencies' Node.js 20 minimum.
+
+### Fixed
+
+- Format canonical schema-validation diagnostics using JSON Pointer `path`
+  before the legacy `field` fallback. An empty pointer is displayed as
+  `<root>`; nested and escaped pointers are preserved verbatim, and the
+  original `details.errors` entries (including `keyword`) remain unchanged.
+
+### Compatibility
+
+- apcore-toolkit 0.14.0 tightens its pure-data BindingLoader (unknown keys,
+  one-sided schema pairs, and strict-mode tags). This bridge does not call
+  that loader; OpenAPI scanning, proxy writers, Markdown and output
+  formatter signatures are unchanged. No toolkit-specific code adaptation
+  is required. Application binding files loaded by apcore still need to
+  satisfy apcore 0.32.0's stricter runtime validation.
+- Executor timeout cancellation, collect-all preflight checks, governance
+  gate binding and logging redaction are handled by apcore. Existing bridge
+  delegation remains compatible; prohibited governance-step configuration
+  must be corrected by the application rather than relaxed by the bridge.
+
+### Validation
+
+- Full suite against apcore 0.32.0 and apcore-toolkit 0.14.0: 823 passed, 0 failed.
+
+- Review regression coverage includes `/` (an empty property name), empty
+  root pointers, escaped nested paths, canonical-path precedence, and null or
+  non-string paths falling back to legacy fields. Original diagnostic details
+  remain unchanged; existing legacy-field tests continue to pass.
+
+
+## [0.22.1] - 2026-09-29
+
+Adopts apcore-toolkit 0.13.0, whose `OpenAPIScanner` emits module IDs in apcore's Canonical ID
+alphabet itself, and removes the OpenAPI backend's own module-ID projection. Mirrors the spec
+repo's Unreleased entry; `apcore-mcp-python` and `apcore-mcp-rust` make the same change. 817 tests
+pass (was 809; against apcore-toolkit 0.13.0 the unchanged code failed 14, every one a pinned
+pre-0.13 ID).
+
+### Changed — BREAKING
+
+- **OpenAPI backend: module IDs — and therefore MCP tool names and OpenAI function names — are now
+  the IDs apcore-toolkit's scanner emits; `openapiBackend` no longer projects them.** apcore-toolkit
+  0.13.0 normalises every emitted `moduleId` into apcore's alphabet: camelCase split into words,
+  `-` and other characters outside `[A-Za-z0-9_.]` replaced with `_`, a legal ID never rewritten,
+  the final ID normalised after `basePathPrefix` and the `deriveModuleId` / `transformModule` hooks.
+  The bridge's projection (lowercase, then `-` → `_`, installed as a `transformModule` wrapper) was
+  redundant for the alphabet and disagreed with the toolkit on every camelCase name.
+  `openapiBackend` now forwards the caller's `transformModule` verbatim and registers what `scan`
+  returns (`src/openapi-backend.ts`).
+  - **Migration:** tool names / module IDs derived from camelCase or hyphenated `operationId`s,
+    path segments, a camelCase `prefix` or hook output change: `listpets` → `list_pets`,
+    `petstore.listpets` → `petstore.list_pets`, `showpetbyid` → `show_pet_by_id`,
+    `pets.petid.get` → `pets.pet_id.get` (`/pets/{petId}`), `petstore.…` → `pet_store.…` for
+    `prefix: "PetStore"`, and a hook returning `MyThing` gives `my_thing` (was `mything`).
+    Already-legal IDs (`users.user_id.get`, FastAPI's `read_item_items__item_id__get`,
+    `/pet-store/items` → `pet_store.items.get`) do not change. **ACL rules, bindings and
+    `include` / `exclude` patterns keyed on the old IDs must be updated**, as must clients calling
+    tools by name.
+- **`apcore-toolkit` floor raised to 0.13.0** (was `>=0.12.0`); `pnpm-lock.yaml` refreshed (only the
+  `apcore-toolkit` entries change). The OpenAPI backend registers what the scanner emits; below
+  0.13.0 a camelCase `operationId` would reach the registry verbatim and be refused. The README's
+  Requirements section, which still named `apcore-js >= 0.21.1` and an optional
+  `apcore-toolkit >= 0.6.1`, now states the real floors.
+
+### Changed
+
+- **The skip of an ID apcore's registry would still refuse now runs on the IDs `scan` returned**,
+  after the toolkit's normalisation and deduplication and before the collision preflight and the
+  writer, rather than inside the `transformModule` wrapper, which saw each ID before the toolkit's
+  final normalisation. The skip warning is unchanged in substance ("OpenAPI operation skipped: …")
+  and now names the **emitted** ID (`3ds_2`, not `3ds`); it supersedes the module's scan warnings,
+  including the toolkit's own legality warning, rather than logging beside them.
+
+### Deprecated
+
+- **`projectModuleId`** (exported from the package root). No longer needed and no longer called by
+  anything in apcore-mcp. Kept with its behaviour unchanged — it still lowercases without splitting
+  words, so it does **not** reproduce the toolkit's IDs — and marked `@deprecated` in its JSDoc. It
+  will be removed in a later minor release. `MODULE_ID_SEGMENT` is not deprecated.
+
+### Tests
+
+- `tests/openapi-backend-conformance.test.ts` drives `openapi_backend.json` contract 2.0 (expected
+  IDs re-pinned to toolkit 0.13.0 output). Its collector now separates warnings from errors, and the
+  `expected_skipped` assertion follows the fixture's tightened semantics: one warning names the ID
+  and the segment, **and no error names the ID** — the toolkit's legality warning alone would
+  satisfy the old joined-log check.
+- New `tests/openapi-backend-module-ids.test.ts` (8 tests): IDs registered as emitted; a hook
+  returning `MyThing` registers as `my_thing` rather than being skipped; the caller's
+  `transformModule` still runs and may drop; a hook ID normalisation cannot repair (`Pets.2Fa`) is
+  skipped naming the emitted `pets.2_fa`; an empty hook ID is skipped; a skipped module stays out of
+  the collision preflight; `projectModuleId`'s unchanged behaviour; and a source guard that nothing
+  in `src/` calls it (TypeScript's `@deprecated` has no runtime or lint enforcement here).
+- `tests/openapi-backend-wiring.test.ts` and `tests/cli.test.ts` re-pinned `listpets` → `list_pets`.
+- Checked by mutation: leaving out the skip fails the shared `unprojectable_segment_skipped_with_warning`
+  case; moving the check back inside `transformModule` fails `prefix_applied_to_every_id`.
+
+## [0.22.0] - 2026-09-24
+
+> **Shipped in all three bridges.** Implemented in `apcore-mcp-python`, `apcore-mcp-typescript` and
+> `apcore-mcp-rust`. See the docs repo's [CHANGELOG](https://github.com/aiperceivable/apcore-mcp/blob/main/CHANGELOG.md#0220---2026-09-24)
+> for the cross-bridge summary.
+
+Raises the required floor to apcore-js 0.31.0 and apcore-toolkit 0.12.0, fixes a credential-disclosure
+defect found while reviewing what those two releases changed, and passes through a capability
+apcore-toolkit 0.12.0 added. 809 tests pass (was 800).
+
+### Security
+
+- **`$ref` sibling keys were discarded during `SchemaConverter._inlineRefs`, dropping
+  `x-sensitive`** ([`schema_converter.json`](https://github.com/aiperceivable/apcore-mcp/blob/main/conformance/fixtures/schema_converter.json),
+  new fixture, 8 cases + 1 error case). A node like `{"$ref": "#/$defs/Token", "x-sensitive": true}`
+  resolved to the referenced `$defs` entry **alone** — the early `return result;` inside the
+  `try`/`finally` in `src/adapters/schema.ts::_inlineRefs` skipped the loop that would otherwise
+  have copied sibling keys, so every key written beside `$ref` (`x-sensitive`, `description`,
+  `deprecated`, ...) vanished. This is a credential-disclosure path, not a fidelity nicety: the
+  `ExecutionRouter`'s output redaction (`src/server/router.ts::_maybeRedact`) reads `x-sensitive`
+  off the *resolved* output schema to decide what to mask, so a field marked sensitive behind a
+  `$ref` reached the redactor with nothing to redact on and was returned in plaintext.
+
+  `_inlineRefs` now resolves the `$ref` target, recursively inlines refs within it (unchanged), and
+  **shallow-merges the node's sibling keys over the resolved-and-inlined result, sibling winning on
+  key conflict** — the sibling is the caller's explicit, more specific value; the `$defs` entry is
+  only the default. A sibling that is itself a subschema is independently walked through
+  `_inlineRefs`, so it cannot smuggle an unresolved nested `$ref` past the resolver, and a chained
+  `$ref`-to-`$ref` carries siblings contributed at each hop, with the outermost sibling winning. A
+  `$ref` naming a definition absent from `$defs` still throws unchanged — `_resolveRef`'s error
+  behavior, including the `PROTO_DENY_LIST` guard, was not touched; this only changes what happens
+  to siblings once a reference *does* resolve. See
+  [`docs/features/schema-converter.md#ref-sibling-keys-are-preserved`](https://github.com/aiperceivable/apcore-mcp/blob/main/docs/features/schema-converter.md#ref-sibling-keys-are-preserved).
+
+  Found by reviewing what apcore 0.31.0 (decision D-98/D-124) and apcore-toolkit 0.12.0 changed:
+  both fixed the identical defect in their own `$ref` resolvers. `SchemaConverter._inlineRefs` is a
+  fully independent implementation with no shared code path to either, so it was not fixed by
+  bumping the dependency floor and carried the same latent bug.
+
+  New: `tests/schema-converter-conformance.test.ts` (9 tests) — drives every `test_cases[]` and
+  `error_cases[]` entry in the shared fixture through the public
+  `SchemaConverter.convertInputSchema(descriptor, { strict: false })` path (`strict: false` per the
+  fixture's `entry_point`, so `additionalProperties` injection doesn't add noise). Confirmed to fail
+  against the pre-fix code on the sibling-preservation cases.
+
+### Changed — dependency floor
+
+- **Required `apcore-js` floor raised to `>=0.31.0`** (from `>=0.30.0`) and **required
+  `apcore-toolkit` floor raised to `>=0.12.0`** (from `>=0.11.1`) in `package.json`; `pnpm-lock.yaml`
+  regenerated and now resolves `apcore-js@0.31.0` / `apcore-toolkit@0.12.0`. apcore-js 0.31.0 is two
+  joined audit cycles (`PROTOCOL_SPEC` v1.37.0 → v1.59.0) settling 54 cross-language divergences,
+  five of them security defects, none on a surface this package uses (Context/Identity
+  construction, `Registry`, `Module`, `ModuleError`, `redactSensitive`, ACL — grepped against every
+  symbol both changelogs named as changed). apcore-toolkit 0.12.0 adds the Device Authorization Flow
+  (unused here) and `BindingLoader.load`'s `pattern` parameter (`BindingLoader` is not used by this
+  package — confirmed via grep), and raises its own apcore floor to 0.31.0. After running the full
+  suite (below) and `pnpm run build`/`pnpm run typecheck`, the floor raise itself required no other
+  code change beyond the security fix above and the `authHeaderFactory` widening below.
+
+### Added
+
+- **`OpenApiBackendOptions.authHeaderFactory` accepts an async factory.** Widened from
+  `() => Record<string, string>` to `() => Record<string, string> | Promise<Record<string, string>>`
+  in `src/openapi-backend.ts`, matching apcore-toolkit 0.12.0's own widening of
+  `HTTPProxyRegistryWriter.authHeaderFactory`. This package's option is forwarded to
+  `HTTPProxyRegistryWriter` as a direct pass-through (`authHeaderFactory: options.authHeaderFactory`
+  at the `openapiBackend` writer construction), which already awaits the value internally — awaiting
+  a non-promise is a no-op — so no other code changed. Purely additive and backward-compatible:
+  every existing synchronous factory keeps working unchanged, and callers can now also pass a
+  credential factory that performs a token refresh (e.g. an OAuth client-credentials exchange)
+  before returning headers.
+
+## [0.21.0] - 2026-09-07
+
+Bugfix release for two OpenAPI-backend defects in this package, found in a cross-SDK sweep that
+compared all three bridges line by line against `docs/features/openapi-backend.md`. One fix changes
+the effective value of a shipped configuration key by a factor of 1000 — see **Changed** — which is
+why this is a minor bump rather than a patch. Released together with `apcore-mcp-rust` 0.21.0 and
+`apcore-mcp-python` 0.21.0. 800 tests pass (was 793).
+
+### Changed
+
+- **`mcp.openapi.timeout`'s effective value changes by a factor of 1000.** The key is documented in
+  seconds and was passed to `loadSpec` — whose parameter is milliseconds — without conversion, so
+  what shipped was a millisecond budget wearing a seconds label. A deployment that discovered this
+  empirically and compensated (writing `timeout: 30000` to get 30 seconds) will now get 30000
+  seconds. Such a configuration should drop the compensation and use the documented seconds value.
+  See **Fixed** for why the old behaviour was a defect.
+
+### Fixed
+
+- **`mcp.openapi.timeout` is seconds and `loadSpec` takes milliseconds, so the documented default
+  was a 30 ms spec-fetch budget**
+  ([#10](https://github.com/aiperceivable/apcore-mcp-typescript/issues/10)).
+  `buildOpenapiBackendFromConfig` defaulted the key to `30` and passed it straight through to
+  `loadSpec`, whose option is milliseconds (`apcore-toolkit` `openapi-loader.ts`: "Request timeout
+  in milliseconds. Defaults to 30_000"). `docs/features/openapi-backend.md` line 367 documents it
+  in seconds — `timeout: 30.0  # spec fetch timeout, seconds` — so any remote spec URL that did not
+  answer within 30 ms aborted, looking like an intermittent network problem rather than a
+  configuration bug. It got *worse* the more carefully it was configured: the documented
+  `timeout: 5` produced a 5 ms budget. The value now converts at the `loadSpec` boundary, keeping
+  the Config Bus key in seconds to match the docs and the other two SDKs.
+
+- **The Config Bus and CLI routes never resolved `Config.projectRoot`**
+  ([apcore-mcp#19](https://github.com/aiperceivable/apcore-mcp/issues/19)). `resolveSpecLocation`
+  implemented the rule correctly, but nothing on either route ever supplied the base, so a relative
+  `mcp.openapi.spec` fell back to `process.cwd()` — precisely the population
+  `docs/features/openapi-backend.md` requirement 3 was written for (a supervisor spawning a worker,
+  a container whose entrypoint chdirs, a CLI invoked from a subdirectory). The lookup now happens
+  once inside `openapiBackend`, so every route reaches it rather than each call site having to
+  remember. `OpenAPIBackendOptions.projectRoot` becomes an override: omitted, it reads
+  `Config.projectRoot`, mirroring Python's `_resolve_project_root`. A `Config` that cannot be
+  loaded degrades to the CWD rather than aborting startup.
+
+### Added
+
+- `tests/openapi-backend-wiring.test.ts` (7 tests) — both defects above were invisible to the
+  existing suite, which hands `openapiBackend` an already-parsed document and calls
+  `resolveSpecLocation` directly with an explicit `projectRoot`: it covers the pure functions and
+  never the wiring between them, so no test ever performed a real fetch. These run a local HTTP
+  server answering after 120 ms and a temporary `Config.projectRoot`. Each was confirmed to fail
+  against the pre-fix code.
+
+## [0.20.0] - 2026-09-06
+
+Bugfix release from a `/apcore-skills:sync` pass across all three bridges. 0.20.0's tests all passed
+and its features work as documented — this release closes gaps between what shipped and what the
+PRD/SRS actually promise, found by re-verifying documented claims against source directly rather than
+against the 0.20.0 session's own narrative. 793 tests pass (was 782).
+
+### Fixed
+
+- **The CLI never got `--from-openapi` or any of the seven `--openapi-*` flags at all.** PRD F-054
+  documents seven CLI flags for this bridge; none of them existed in `src/cli.ts` — confirmed by
+  grep returning zero hits for `openapi` in that file before this release. `--from-openapi`,
+  `--openapi-base-url`, `--openapi-prefix`, `--openapi-include`, `--openapi-exclude`,
+  `--openapi-header` (repeatable), and `--openapi-no-deprecated` are now parsed, validated (prefix
+  required when combined with `--extensions-dir`, malformed `--openapi-header` rejected), and wired
+  through to `openapiBackend`.
+
+- **`mcp.openapi.spec` set on the Config Bus alone now starts a server (PRD F-054 Acceptance
+  Criterion 1).** `mcp.openapi` was registered as a Config Bus namespace default — the key
+  round-tripped — but nothing ever read it back, in either `cli.ts` or `serve()`/`asyncServe()`.
+  `registryOrExecutor` is now optional on `serve()`/`asyncServe()`; when omitted, the backend
+  resolves from `mcp.openapi` alone, throwing when neither a backend nor `mcp.openapi.spec` is
+  given. When both an explicit backend and `mcp.openapi` are configured, the two are unioned
+  (backend first, OpenAPI layered on top) and `mcp.openapi.prefix` becomes required. New
+  `buildOpenapiBackendFromConfig` helper (mirrors `acl-builder.ts`'s `buildAclFromConfig`) in
+  `openapi-backend.ts`, exported alongside the existing `openapiBackend`.
+
+- **§6.2.1 tier-2 ACL diagnostic (FR-ACL-004) was completely dead code.** `formatAclNeverMatchesWarnings`
+  was exported from `index.ts` with zero call sites anywhere in `src/` and zero references in any
+  of the 33 test files. The 0.20.0 CHANGELOG entry for this function ("Callers pass
+  `ACL.validateRules()` output once the registry is assembled") described a wiring that did not
+  exist. Now called from `serve()`/`asyncServe()` after the executor is fully assembled, using the
+  same `effectiveAcl` the executor itself was built with.
+
+- **`AclRuleFindingLike`'s field names did not match apcore-js's real `ACL.validateRules()` finding
+  shape — even once wired, every warning would have rendered as `mcp.acl.rules[0] '?': `.** The
+  real shape (verified directly against a live `ACL` instance) is `{ruleIndex, conditionPath,
+  conditionKey, effect, syncResolvable, asyncResolvable}` — no `path`/`reason`/`message` field
+  exists at all. `formatAclNeverMatchesWarnings` now reads the real fields and constructs the
+  explanatory sentence itself (apcore hands back structured data only, no free-text reason).
+
+- **`build_acl_from_config`'s success log (spec: "logs at INFO on success") only fired in Python.**
+  `acl-builder.ts` had zero logging calls anywhere in the file. Pre-existing (not introduced in
+  0.20.0) but never previously caught — no test asserted the log fires in any language. Added
+  `console.info("Built ACL with N rule(s), default_effect=X")` on success, matching Python and the
+  spec's stated cross-language guarantee.
+
+- **`mcp.openapi.acknowledge_unapproved_writes` was documented as the suppression for the "nothing
+  will ask for approval" warning (FR-OPENAPI-005) in the warning's own message text, but nothing
+  ever read it.** `openapiBackend` now accepts `acknowledgeUnapprovedWrites?: boolean` and skips
+  the warning when true; `buildOpenapiBackendFromConfig` reads it from the Config Bus mapping.
+
+- **`config.ts`'s `MCP_DEFAULTS` never got an `openapi` key.** Python's got one; TypeScript's did
+  not, so `Config.get("mcp.openapi")` had no registered default and no documented round-trip.
+
+### Tests
+
+- `tests/cli.test.ts` — 5 new cases: the Config-Bus-only backend, the missing-prefix combination
+  error, malformed `--openapi-header`, and an end-to-end local-file `--from-openapi` run (no
+  network) that asserts the resulting registry actually contains the scanned module.
+- `tests/acl-tier2-warning.test.ts` (5 cases, new file) — the corrected `AclRuleFindingLike` shape,
+  and the real `asyncServe()` wiring against a live `apcore-js` `ACL` carrying an inert rule;
+  asserts the exact string `'?'` never appears, which is what the bug produced.
+- `tests/acl.test.ts` — 2 new cases for the `console.info` success log.
+
+### Documentation
+
+- `docs/features/openapi-backend.md`'s `## Contract: openapi_backend` Returns section and
+  `docs/srs-apcore-mcp.md`'s FR-OPENAPI-001 both claimed registered-module `metadata` visibility as
+  universal. Measured directly: only Rust's writer preserves it; Python's and TypeScript's both
+  drop it — an upstream (apcore-toolkit) inconsistency, now stated as Rust-only in both documents.
+- `docs/srs-apcore-mcp.md`'s FR-OPENAPI-002 heading corrected from "projects unchanged onto both
+  protocol surfaces" to "is projected, then reaches both protocol surfaces unchanged" — the old
+  text contradicted its own Description and Boundary Conditions.
+
+Feature release: the **OpenAPI backend** — point the bridge at an OpenAPI 3.0/3.1 document and every
+operation becomes an MCP tool, proxied over HTTP — plus the `mcp.acl` half of apcore 0.29.0's
+PROTOCOL_SPEC §6.2.1 pattern-array closure. Raises the required `apcore-js` floor to `0.30.0` and
+the `apcore-toolkit` floor to `0.11.1`. 782 tests pass.
+
+### Added
+
+- **`src/openapi-backend.ts` — a third backend source.** `openapiBackend(spec, options?)` composes
+  apcore-toolkit's shipped pieces (`loadSpec` → `OpenAPIScanner.scan` →
+  `HTTPProxyRegistryWriter.write`) into a populated `Registry` and hands it to the machinery this
+  bridge already has: no scanning logic, no schema conversion and no new execution path. Exported
+  from the package root alongside `projectModuleId`, `resolveSpecLocation`, `MODULE_ID_SEGMENT` and
+  the `OpenAPIBackendOptions` type. It returns a `Promise` — `loadSpec` is async here and
+  synchronous in Python and Rust, which is a language difference the shared fixture does not assert.
+
+- **A module-ID projection, without which the backend serves nothing.** apcore-toolkit's
+  `deriveModuleId` sanitizes to `[A-Za-z0-9_.-]`; apcore's registry accepts only
+  `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`. Of nine realistic operation shapes only two register
+  unrepaired, and the canonical Swagger Petstore (`listPets`, `createPets`, `showPetById`) is
+  entirely in the rejected set. `projectModuleId` lowercases and maps `-` to `_`; a segment that
+  still does not begin with a lowercase letter (`/v1/2fa`) is **skipped with a warning** rather than
+  repaired, because completing it means inventing a character. The projection runs after any
+  caller-supplied `transformModule` and before the scanner's `deduplicateIds`.
+
+- **A pre-write collision preflight**, fatal and atomic, naming every colliding ID; and a mandatory
+  `prefix` when the OpenAPI backend is combined with another backend source.
+
+- **A startup warning that nothing will ask for approval before a write.** Reports the absence of an
+  approval path, never the presence of protection — an attached ACL does not suppress it, following
+  the rule apcore states on `GovernanceState.unprotectedControlSurface`.
+
+- **`formatAclNeverMatchesWarnings(findings)` — the §6.2.1 tier-2 diagnostic.** Pure formatting,
+  exactly like the `formatUnprotectedControlSurfaceWarning` beside it: `["$not", "*"]` has legal
+  arity, exactly one operand, and matches nothing, so it loads, changes no decision, and must still
+  be reported. Callers pass `ACL.validateRules()` output once the registry is assembled.
+
+### Changed
+
+- **`buildAclFromConfig` validates in PROTOCOL_SPEC §6.2.1's normative order** — `effect` →
+  `approval` → `callers` → `targets`, with `defaultEffect` ahead of the rule loop and the
+  unknown-key check ahead of all four. This builder ran it in reverse, so a rule wrong in both
+  `effect` and `callers` was refused for `callers` here and for `effect` by apcore's own doors.
+
+- **`buildAclFromConfig` validates rule by rule.** apcore-js validates inside the `ACL` constructor
+  over the whole list and exports no per-rule validator, so a throwaway single-rule construction is
+  the only way to learn which rule was at fault while the builder still knows its index.
+
+- **Required floors: `apcore-js>=0.30.0`, `apcore-toolkit>=0.11.1`.** apcore **0.29.0** is the
+  correctness floor; apcore-toolkit **0.11.0** the capability floor; **0.11.1** changes no API and
+  forces apcore **0.30.0**, which is independently needed for `Config.projectRoot`.
+
+### Fixed
+
+- **`ACLRuleError` escaped `buildAclFromConfig` raw and without the rule index.** apcore-js's own
+  message names its position within the list it was handed; the bridge now re-raises as an `Error`
+  prefixed `mcp.acl.rules[i]` (`mcp.acl` for a section-scoped fault), preserving apcore's message
+  verbatim after the prefix and chaining the original as `cause`.
+
+- **`mcp.openapi.spec` is path-typed and apcore 0.30.0's protections do not reach it.**
+  `Config.pathTypedKeys()` is a fixed set of apcore's own keys and never consults a namespace
+  registered through `Config.registerNamespace`, and the §9.2.1 requirement-5 empty-value discard is
+  gated on it. `resolveSpecLocation` owns three rules instead: an `http(s)://` value verbatim, a
+  set-but-empty value discarded with a warning so resolution falls through, and a relative path
+  resolved against `Config.projectRoot`.
+
+### Tests
+
+- `tests/openapi-backend-conformance.test.ts` drives the new shared fixture `openapi_backend.json`
+  (9 module cases + 3 spec-resolution cases + 4 error cases).
+- `tests/acl-conformance.test.ts` drives `acl_config.json` at `contract_version` 1.2 (32 cases) and
+  understands the 1.2 additions `expected_error_substrings`, `expected_error_names_field` and
+  `must_not_contain`. The fixture pins the **bare** field name rather than a reason phrase: for one
+  §6.2.1 fault apcore-js writes *"Rule 0 'targets' has an illegal pattern-array shape: '$not' at
+  index 0 takes exactly one operand and this carries 2"* while apcore-python writes an entirely
+  different sentence, and apcore-rust names the offending element (`'callers[1]'`) rather than the
+  field. An earlier draft of the fixture pinned fragments read off apcore-python alone; two of six
+  failed here.
+
+
+## [0.19.0] - 2026-09-01
+
+`system.*` management surface correctness and governance-transparency release.
+Fixes aiperceivable/apcore-mcp#14, #15, and #16 (phase A) —
+aiperceivable/apcore-mcp-typescript#9 is the implementation issue for this
+repository. Bumps the required `apcore-js` floor to `0.28.0` and
+`apcore-toolkit` floor to `0.10.2`.
+
+### Security
+
+- **Read-only `system.*` management modules are no longer projected as MCP
+  tools.** `system.health.*`, `system.usage.*`, and `system.manifest.*` were
+  built into `tools/list` by `buildTools()` like any other module — with
+  `sys_modules.enabled = true`, six management tools entered the agent's
+  tool-selection space, which PROTOCOL_SPEC §6.6.2 classifies as
+  Observability/Introspection resources, not tools. They are now served
+  exclusively via `resources/read`: the three parameterless modules as
+  static resources (`apcore://system.health.summary`,
+  `apcore://system.usage.summary{?period}`, `apcore://system.manifest.full`)
+  and the three per-module modules as resource templates
+  (`apcore://system.{health,manifest,usage}.module/{module_id}{?period}`).
+  `system.control.*` write modules are unaffected — they stay tools, gated
+  by ACL and approval exactly as before. Every management resource read is
+  dispatched through the same `ExecutionRouter.handleCall()` pipeline as
+  `tools/call`, so ACL, approval, audit, and redaction all apply identically
+  — resources are never read by calling a module or collector directly.
+  (aiperceivable/apcore-mcp#15(a), aiperceivable/apcore-mcp-typescript#9)
+- **New startup warning for an unprotected `system.control.*` surface.**
+  `serve()` / `asyncServe()` now call the new `Executor.governanceState()`
+  (apcore-js 0.28.0) right after the executor is fully wired and print a
+  prominent, multi-line warning — naming exactly which of ACL / built-in ACL
+  gate / approval handler / built-in approval gate / per-module
+  `requiresApproval` is missing, plus the concrete configuration that closes
+  each gap — whenever `system.control.*` is registered and reachable with no
+  recognised gate in front of it. This is a warning only; it never blocks
+  startup, and it is printed via the pre-suppression `console.warn` so
+  `mcp.log_level` cannot silence it. (aiperceivable/apcore-mcp#15(b))
+- **The ACL rule template in `src/acl-builder.ts` documented a `sys.*`
+  namespace that does not exist**, so a rule copied from it silently never
+  matched anything — a copied **deny** rule left the management surface
+  completely open while the operator believed it was blocked. Replaced with
+  the real `system.*` module ids and a complete, copy-pasteable three-rule
+  template (read access, administration, catch-all deny), plus the two
+  mechanism notes it depends on (MCP callers always normalise to
+  `@external`; console-vs-agent separation must go through `conditions`
+  reading JWT-derived `identity_types`/`roles`). A new test asserts every
+  `targets` pattern in the shipped template matches at least one module id
+  a real `registerSysModules()` call actually registers.
+  (aiperceivable/apcore-mcp#14)
+
+### Added
+
+- **`com.aiperceivable/management` MCP extension (SEP-2133, phase A).**
+  `MCPServerFactory.createServer()` takes an optional third
+  `managementSurfaces` argument (`{ health, usage, manifest, control }`) and,
+  when at least one is `true`, advertises the extension in the `initialize`
+  response's `capabilities.extensions`, listing only the surfaces actually
+  registered, alongside the current PROTOCOL_SPEC version. `serve()` /
+  `asyncServe()` compute this from the registry automatically. The extension
+  is metadata only — a client that never inspects
+  `capabilities.extensions` still reaches every management resource and tool
+  through ordinary `resources/read` / `tools/call`, subject only to ACL and
+  approval; a regression test asserts this explicitly.
+  (aiperceivable/apcore-mcp#16 phase A)
+- `AclConfigRule.approval` — Config Bus `mcp.acl` rules may now carry
+  `approval` (apcore 0.28.0 argument-scoped approval, PROTOCOL_SPEC §6.1.6).
+  Previously any rule with this key was rejected outright by the "unknown
+  rule key" check; the value is now accepted and passed through to
+  `new ACL()`, which performs the authoritative validation. Both spellings
+  apcore-js's own `ACLApproval` accepts are accepted here — `"required"` and
+  `"not_required"`. An earlier iteration accepted only `"required"`, which
+  made this bridge **stricter than the schema it bridges**: a rule that
+  loads fine from apcore's own `acl/` directory failed at startup when the
+  identical rule was carried through the Config Bus instead. Rejecting the
+  redundant spelling prevented no misconfiguration — apcore treats an
+  explicit `not_required` and an omitted key identically — while breaking a
+  valid configuration.
+- README: documents that enabling `sys_modules.enabled` without configuring
+  an `acl/` directory leaves the entire management surface — including
+  `system.control.*` — with no authorization (`ACL.discover()` returns
+  `null` on a missing path, identical to never configuring an ACL at all).
+
+### Changed
+
+- Required `apcore-js` floor raised to `>=0.28.0` (adds
+  `Executor.governanceState()`, consumed by the new startup warning above).
+- Required `apcore-toolkit` floor raised to `>=0.10.2`. Per the toolkit's own
+  changelog, 0.10.2 is scoped entirely to the ACL/Executor governance layer
+  and touches nothing this package consumes (`formatModule`, `Registry`,
+  annotations); no code changes were needed in `src/markdown.ts` or
+  elsewhere, and the full suite passes unmodified against both new floors.
+
+### Tests
+
+- **New `tests/acl-approval-gating-e2e.test.ts`.** Every other `approval`
+  test in this repo stopped at the Config Bus parsing layer — they proved
+  the key was *accepted*, not that it *did* anything, leaving the
+  "gating the call on a human decision even though the ACL itself allows it"
+  claim unverified at the MCP boundary. These drive a real `apcore-js`
+  `Executor` (real `ACL`, real approval handler, real module) through
+  `ExecutionRouter.handleCall`, with the module's own `requiresApproval`
+  annotation set to **false** so the ACL rule is the only possible source of
+  the requirement, and an argument-scoped condition
+  (`conditions.arguments.has_key`) deciding it: a call carrying `recursive`
+  reaches the approval handler, an otherwise identical call without it does
+  not.
+- The shared `acl_config.json` fixture gained `approval` contract cases (see
+  the spec repo's 0.19.0 entry), pinning the accepted-value set across the
+  three bridges rather than leaving each to decide independently — the gap
+  that allowed the `not_required` divergence noted above.
+- New `tests/system-surface-conformance.test.ts`: drives the shared
+  `apcore-mcp/conformance/fixtures/system_surface.json` fixture — built from
+  a real `apcore-js` `registerSysModules()` call — through `buildTools()` /
+  `registerResourceHandlers()`, asserting the resulting tool names, resource
+  URIs and resource-template URIs match byte-for-byte. The Python and Rust
+  bridges run the identical fixture; this is what caught both of them
+  missing the `{?period}` RFC 6570 query-expansion suffix on
+  `system.usage.module`'s template — `systemResourceUriTemplate()` here
+  already had it right (aiperceivable/apcore-mcp#15's cross-language parity
+  acceptance criterion, now a regression test instead of a one-time manual
+  check).
+
+## [0.18.1] - 2026-08-20
+
+Patch release. Bumps the required `mcp-embedded-ui` floor to `>=0.5.0` (was `>=0.4.0`). No `apcore-mcp` code changes — `createNodeHandler` is called exactly as before. All 676 tests pass unmodified against mcp-embedded-ui 0.5.0.
+
+### Changed
+
+- **Required `mcp-embedded-ui` floor raised to `>=0.5.0`.** A consumer who mounts the Explorer inherits mcp-embedded-ui 0.5.0's Try-It editor prefill change (spec F6/FR-1): the prefill now emits only the keys listed in `inputSchema.required`, using each property's declared `default` when present and `null` otherwise, instead of inventing a type-based value (`""`, `0`, ...) for every property.
+
+### Fixed
+
+- Inherited from mcp-embedded-ui 0.5.0: `/validate` (F7) no longer returns HTTP 500 for a tool whose `inputSchema` cannot be compiled — it now reports a single `keyword: "schema"` validation failure at HTTP 200.
+- Inherited from mcp-embedded-ui 0.5.0: `project_url` is now scheme-checked (`http://`, `https://`, `mailto:`, or a leading `/`) before being placed in `href` on the Explorer page.
+
+## [0.18.0] - 2026-08-19
+
+### Security
+
+- **`__apcore_module_preview` no longer discloses module introspection to a
+  caller the ACL denied.** The bridge serialises `Executor.validate()`'s
+  `PreflightResult` verbatim, and apcore-js `<=0.26.0` gated
+  `Module.preflight()` / `Module.preview()` on module lookup alone — pipeline
+  Step 3 — while the ACL check is Step 4. A denied caller therefore ran
+  module-authored code and received what it returned: for a command-wrapping
+  module the resolved binary and its argv, for a writer the target of the side
+  effect. Raising the `apcore-js` floor to `>=0.27.0` closes it at the layer
+  that owns the gate (PROTOCOL_SPEC §12.8.5.1, spec v1.13.0, apcore#96); no
+  bridge code changed. A denied caller still receives the failed `acl` check, so
+  it still learns why. Pinned by `tests/server/preflightDisclosure.test.ts`,
+  which drives a real `Executor` over a real `Registry` and a real `ACL` and
+  asserts a sentinel binary path and argv appear nowhere in the denied envelope.
+
+### Changed
+
+- **Required `apcore-js` floor raised to `>=0.27.0`.** Of the 0.27 breaking
+  changes, only the `validate()` disclosure gate above reaches this package: the
+  bridge does not construct pipelines from YAML, does not use
+  `SchemaValidator`'s coercion knob, does not configure `obs.redaction`, and
+  registers no `StepMiddleware`.
+
+## [0.17.2] - 2026-07-14
+
+Patch release. Fixes the MCP elicitation approval flow and bumps the required `apcore-js` floor to `0.26.0`.
+
+### Fixed
+
+- **`ElicitationApprovalHandler` now sends a non-empty elicitation `requestedSchema`.** The approval elicitation was previously sent with an empty schema; minimal SDK clients tolerate this, but clients that render an approval form (Cursor, Codex, ...) ignore or reject an empty schema, so the request returned no response and the gate failed closed. The handler now sends an object schema with a boolean `approve` field and honors an explicit `approve: false` from the form. Mirrors apcore-mcp (Python) 0.17.2.
+
+### Changed
+
+- **Required `apcore-js` floor raised to `>=0.26.0`** to align the ecosystem on the 0.26.0 governance layer.
+
+## [0.17.1] - 2026-07-07
+update package dependency version for apcore-toolkit (0.10.0) and increment project patch version
+
+
+## [0.17.0] - 2026-06-23
+
+Audit-driven hardening of the serve/embed entry points and the Phase B approval
+chain, plus the apcore-js 0.25 / apcore-toolkit 0.9.1 dependency uplift.
+
+### Added
+
+- **Low-level `serve()` / `asyncServe()` now accept `approvalStore` /
+  `approvalNotify`** and drive the store lifecycle (`start()` before transport,
+  `stop()` on shutdown / `close()`), so Phase B async approval is usable without
+  the `APCoreMCP` class. This also fixes a latent leak: a manually built store
+  passed via `serve()` previously never had its sweep timer started, so records
+  grew unbounded.
+- **`APCoreMCP` class reaches the full serve surface**: `APCoreMCPOptions` gained
+  `strategy`, `redactOutput`, `outputFormat`, and `trace`;
+  `APCoreMCPServeOptions` / `AsyncServeOptions` gained `dynamic` (runtime tool
+  registration) — all now forwarded.
+- Optional `start?()` / `stop?()` on the `ApprovalStore` interface to match the
+  duck-typed lifecycle already honored at runtime.
+
+### Fixed
+
+- **`outputFormat` now fails fast**: requesting `csv` / `jsonl` when
+  apcore-toolkit is unavailable throws a clear error instead of silently
+  returning an empty string to the model (silent data loss).
+
+### Changed
+
+- Documented `outputFormat: "json"` as a native `JSON.stringify` no-op (it does
+  not route through apcore-toolkit).
+- Raised dependency floors to `apcore-js>=0.25.0` and `apcore-toolkit>=0.9.1`
+  (drop-in; no consumed API changed). All 615 tests pass.
+
+
+## [0.16.1] - 2026-06-18
+
+### Changed
+- Removes local CancelToken implementation and re-exports from apcore-js
+- Updates trace ID validation and generation to use W3C 32-hex format matching apcore
+- Updates JSDoc comments to reflect the new context implementation
+- Fixes drift between bridge trace IDs and apcore's enforced W3C format
+
+## [0.16.0] - 2026-06-12
+
+### Added
+
+- **Approval Phase B: async polling via `__apcore_approval_check` meta-tool**.
+  apcore-mcp now supports out-of-band human approvals that do not block the MCP connection.
+
+  New public API:
+  - `ApprovalStore` (interface) — pluggable persistence; three async methods:
+    `savePending`, `getResult`, `resolve`.
+  - `InMemoryApprovalStore` — in-process implementation for testing/local dev.
+    Bounded memory: per-record TTL via `setTimeout`, background `setInterval` sweep
+    (`.unref()`'d to not block process exit), and `maxRecords` hard cap.
+    **Not suitable for production.**
+  - `StorageBackedApprovalHandler` — writes pending records on `requestApproval()`,
+    reads them on `checkApproval()`. Optional `notifyCallback` for Slack/email/webhooks.
+  - `ApprovalBridge` — registers `__apcore_approval_check` as an MCP meta-tool,
+    symmetric with `AsyncTaskBridge`.
+
+  Usage:
+  ```typescript
+  import { APCoreMCP, InMemoryApprovalStore } from "apcore-mcp";
+
+  const store = new InMemoryApprovalStore();
+  const mcp = new APCoreMCP(registry, { approvalStore: store });
+
+  // External system approves out-of-band:
+  await store.resolve(approvalId, { approved: true });
+  ```
+
+  Phase A (`ElicitationApprovalHandler`) is unchanged.
+
+Closes [issue #70](https://github.com/aiperceivable/apcore/issues/70): remove bridge-level `userFixable` stamping now that apcore-js 0.24.0 resolves it at construction time.
+
+### Changed
+
+- **Raised apcore-js floor to `>=0.24.0`** (`package.json`). apcore-js 0.24.0 introduced the `userFixable` field on `ModuleError` (resolved by `_USER_FIXABLE_BY_CODE` at construction) for all user-actionable codes.
+- **Removed bridge-level `userFixable: true` stamps** from `_matchApcoreErrorInstance` and the duck-typing fallback block in `src/adapters/errors.ts`. The three removed branches covered `DependencyNotFoundError`, `DependencyVersionMismatchError`, `VersionConstraintError` (instanceof path) and `DEPENDENCY_NOT_FOUND | DEPENDENCY_VERSION_MISMATCH`, `VERSION_CONSTRAINT_INVALID | BINDING_SCHEMA_*` (duck-typed path). `userFixable` now flows through the existing `_attachAiGuidance` path. All 582 tests pass.
+
+## [0.15.0] - 2026-05-29
+
+Audit-driven consistency work from `/apcore-skills:audit --scope mcp`. Nine TypeScript-side fixes land here; the docs/spec repo (`apcore-mcp/`) remains at 0.15.0 because no spec contracts changed, so SDK versions also stay at 0.15.0 pending an explicit release decision. The entries below describe changes already committed on `main`.
+
+### Changed
+
+- **Upgraded required runtime to apcore-js 0.22.0 and apcore-toolkit 0.8.0** (`package.json`). Adopts the apcore-js 0.22.0 real-interrupt cancellation contract (D-18): the bridge `CancelToken` is now backed by an `AbortController` and exposes `signal`, and `BridgeContext` exposes a `signal: AbortSignal` (the bound token's signal, or a shared never-aborted fallback) so modules performing Web-API I/O (`fetch`, `setTimeout` via `AbortSignal.timeout`, Web Streams) participate in real abort on inbound MCP `notifications/cancelled` — previously only cooperative `isCancelled` polling worked. No public API change; full suite green (582 passed, incl. 4 new D-18 signal tests).
+
+### Breaking Changes
+
+- **[D11-2] `/usage` removed from `DEFAULT_EXEMPT_PATHS` in `auth/middleware.ts`.** Previously `DEFAULT_EXEMPT_PATHS = {"/health", "/metrics", "/usage"}` — `/usage` was unauthenticated by default in TypeScript, but Python and Rust used `{"/health", "/metrics"}` and would 401 the same request when `require_auth=true`. The `/usage` endpoint now requires authentication by default. Callers who want it exempt must opt-in explicitly via `exemptPaths`.
+
+### Fixed
+
+- **[D11-1] Auth middleware now hydrates identity on exempt paths (best-effort).** Previously `/health`, `/metrics`, and `/usage` early-returned without invoking the authenticator, so `getCurrentIdentity()` returned `null` inside the exempt-route handler even when a valid `Authorization: Bearer …` header was present. Python and Rust have always done best-effort identity extraction on exempt paths. The authenticator is now called inside a try/catch (log + continue on error) and the resolved identity is bound to the per-request `identityStorage` context before `next(req, res)` runs.
+- **[D11-3] `tryDenormalize` now accepts underscore-bearing module IDs to match Python and Rust.** The previous inline regex (`^[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*$`) rejected the underscore class, so input `"my_mod-v2"` returned `null` in TypeScript while Python and Rust returned `"my_mod.v2"`. Now uses the shared `MODULE_ID_PATTERN` (`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`) on the dash→dot candidate.
+- **[D11-4] `_ensureObjectType` upgrades `type` to `"object"` when `properties` is present.** Previously TypeScript early-returned the schema unchanged whenever `type` was defined, leaving `{type: "string", properties: {...}}` as-is; Python and Rust force `type: "object"` so the strict pass can inject `additionalProperties: false`. TypeScript now matches.
+- **[D10-002] `MCPServerFactory.createServer(name)` validates non-empty + max 255 chars per spec.** Throws an `Error` for empty / oversized names. Cross-SDK parity with the matching fix in Python and Rust.
+- **[D10-003] `ErrorMapper.toMcpError` for `APPROVAL_PENDING` now only accepts the canonical `approval_id` source key.** Previously TypeScript accepted both `approvalId` and `approval_id`; Python and Rust accepted snake_case only. The `approvalId` branch is dropped — upstream apcore SDKs always emit snake_case, so this is a no-op for production callers.
+
+### Refactored
+
+- **[D9-003] Removed orphan `createAuthMiddleware` factory.** Previously exported from `src/auth/middleware.ts:119` with a 74-LOC body, deliberately not re-exported from `src/index.ts` (per A-D-230). Zero production callers in `src/` or `examples/`; only its own unit tests referenced it. Deleted along with `tests/auth/middleware.test.ts`. The A-D-230 comments in `src/auth/index.ts` now flag the factory as removed pending real `asyncServe` wiring.
+- **[D9-005] Deleted `src/explorer/` and `src/inspector/` TODO-only stub directories.** Both were 3-line files (`// TODO: Port from apcore-mcp-python\nexport {};`) with zero importers. Will be re-created when the ports actually begin.
+- **[D9-010] Relocated `planning/` to `docs/history/planning/`.** Sixteen plan files plus `state.json` with every feature `"status": "completed"` were sitting at top level — long since shipped. Moved out of the project root so the published package surface is cleaner.
+
+### Known Issues
+
+- **[D10-004]** Audit flagged a defensive-depth divergence: TypeScript rejects whitespace-only hosts via `host.trim().length === 0`, while Python and Rust accept whitespace and fail later at bind. The fix actually belongs in Python and Rust (tighten their validation). Tracked for the next round.
+
+
+Leverages **apcore-js 0.21.1 + apcore-toolkit 0.7.0**. Cross-SDK byte-
+equivalent with `apcore-mcp-python` and `apcore-mcp-rust` 0.15.0.
+
+### Changed
+
+- **Dependency bump**: `apcore-js >= 0.21.1` (was `>= 0.19.0`); `apcore-toolkit >= 0.7.0` (was `>= 0.5.0`, kept as `optionalDependencies`).
+
+### Added
+
+- **Built-in output format support**: Added `--output-format` (`json`, `csv`, `jsonl`) to CLI and `outputFormat` option to `serve()`. Leverages `apcore-toolkit` 0.7 for standard tabular formatting.
+- **`__apcore_module_preview` meta-tool** (apcore 0.21 PROTOCOL_SPEC §5.6 / §12.8) — fifth reserved meta-tool alongside the four `__apcore_task_*` ones. New `META_TOOL_NAMES.PREVIEW` constant. The handler drives `executor.validate(moduleId, inputs, context)` and returns a `{valid, requires_approval, predicted_changes, checks}` envelope WITHOUT executing the module. PreflightResult fields are normalized from camelCase (`requiresApproval`, `predictedChanges`) to snake_case to match the cross-SDK wire shape Python and Rust emit. `arguments: null` and missing `arguments` are both preserved as `null` (the calling business decides whether null is acceptable); structurally-wrong shapes (arrays, scalars) throw `__apcore_module_preview requires \`arguments\` to be a JSON object or null`. Returns `{error: "PREVIEW_UNAVAILABLE"}` envelope when the bridge was constructed without an `executor`.
+- **`MCPServerFactory({ richDescription: true })` + `MCPServerFactory.prepare()` static method** — when `richDescription` is on, `buildTool` renders `Tool.description` as canonical apcore-toolkit Markdown (`formatModule({ style: "markdown" })`) instead of the plain one-line description. Includes title, description, parameters list, returns list, behavior table (only fields differing from defaults — toolkit 0.6 alignment), tags, and examples. LLMs select tools primarily from this string; Markdown packs more decision signal per token. Display-overlay `mcp.description` overrides still win first. The static `MCPServerFactory.prepare()` async method primes the toolkit cache so subsequent synchronous `buildTool` calls can render Markdown without re-importing the optional dependency. One-shot `console.warn` when `apcore-toolkit` is missing.
+- **`OpenAIConverter` `richDescription` option** — same Markdown rendering for OpenAI tool definitions. Accepted on both `convertRegistry({ richDescription: true })` and `convertDescriptor({ richDescription: true })`. Pairs with `await primeMarkdownToolkit()` for sync rendering.
+- **`src/markdown.ts` module** — public exports: `isMarkdownAvailable()`, `primeMarkdownToolkit()` (eagerly load apcore-toolkit so `isMarkdownAvailable` returns sync truth), `renderModuleMarkdown(descriptor)` (async — loads toolkit on demand), `renderModuleMarkdownSync(descriptor)` (sync — requires prior priming).
+- **`ErrorCodes.CIRCUIT_BREAKER_OPEN` mapping** (apcore 0.20 sync alignment A-001) — `ErrorMapper.toMcpError` dispatches the breaker-open code to a retryable=true envelope with `aiGuidance` mirrored from the apcore error class (or a generic recovery hint when absent).
+
+### Tests
+
+- +9 new tests covering `__apcore_module_preview` (basic predict, camelCase→snake_case normalization, missing executor → PREVIEW_UNAVAILABLE, missing module_id, `arguments: null` preserved, missing arguments preserved, array rejection, isMetaTool recognition), `CIRCUIT_BREAKER_OPEN` mapping (retryable + aiGuidance, custom-guidance preservation), and `richDescription` on factory + converter (Markdown rendering, display-overlay override, plain fallback).
+- Total suite: **549 passed** (was 534).
+
+## [0.14.0] - 2026-05-01
+
+### Changed
+
+- **Dependency bump**: `apcore-js >= 0.19.0` (was `>= 0.18.0`). Picks up the expanded 12-field `ModuleAnnotations`, `auto_schema` modes, `spec_version` in binding YAML, and new dependency/binding error classes (see apcore-js 0.19.0 CHANGELOG).
+- **New dependency**: `apcore-toolkit >= 0.5.0` — provides `BindingLoader`, `BindingParser`, and `ScannedModule.display` for consumers that load `.binding.yaml` files.
+- `BridgeContext` now accepts an optional `traceId` argument so inbound W3C traceparent trace_ids propagate through the call chain.
+- `/usage` added to the default authentication exempt-paths list (alongside `/health` and `/metrics`).
+- **`ModuleAnnotations.paginationStyle`** widened from `"cursor" | "offset" | "page"` union to `string`, matching apcore-js 0.16.0's relaxed type.
+
+### Added
+
+- **W3C Trace Context bridging (F-042)** — `tools/call` requests carrying
+  `_meta.traceparent` now flow through to the apcore `Context.traceId` so the
+  downstream trace chain stays linked. Successful tool responses include a
+  freshly minted `_meta.traceparent` so clients can continue the W3C trace
+  chain across subsequent MCP invocations. New `parseTraceparent()` and
+  `buildTraceparent()` helpers live under `src/server/traceContext.ts` and are
+  re-exported from the package root. Traceparent parsing delegates to
+  apcore-js's `TraceContext.fromTraceparent()` when available for a single
+  source of truth on validation.
+- **Async Task Bridge (F-043)** — New `AsyncTaskBridge` class in
+  `src/server/asyncTaskBridge.ts` routes async-hinted modules
+  (`metadata.async === true` OR `annotations.extra["mcp_async"] === "true"`)
+  through apcore-js's `AsyncTaskManager.submit()` and returns an immediate
+  `{task_id, status: "pending"}` envelope. Four reserved meta-tools
+  (`__apcore_task_submit`, `__apcore_task_status`, `__apcore_task_cancel`,
+  `__apcore_task_list`) are advertised via `tools/list` and dispatched by the
+  execution router. `MCPServerFactory.buildTools()` now rejects any module id
+  starting with `__apcore_` to prevent namespace collision. Completed task
+  results are redacted via apcore-js's `redactSensitive()` before being inlined
+  in `__apcore_task_status`. Enabled by default; disable via
+  `serve({ async: false })` or CLI `--no-async`.
+- **Observability auto-wiring (F-044)** — `serve()`, `asyncServe()`, and
+  `APCoreMCP` now accept `observability: true` (or `metricsCollector: true`)
+  to auto-instantiate apcore-js's `MetricsCollector` + `MetricsMiddleware` and
+  `UsageCollector` + `UsageMiddleware` via `executor.use()`. A new `/usage`
+  HTTP endpoint returns module and caller summaries. CLI flag `--observability`
+  enables the full stack. Back-compat: passing a pre-instantiated
+  `MetricsExporter` in `metricsCollector` still works unchanged.
+- **`instanceof` dispatch for apcore-js error classes** — `ErrorMapper` now
+  imports apcore-js's concrete `TaskLimitExceededError`,
+  `VersionConstraintError`, `DependencyNotFoundError`, and
+  `DependencyVersionMismatchError` classes and dispatches via `instanceof` when
+  available, preserving structured fields across the cross-language contract.
+  Falls back to the duck-typed `error.code` path when apcore-js is unavailable.
+- **8 new error code mappings** in `ErrorCodes` and `ErrorMapper` — `DEPENDENCY_NOT_FOUND`, `DEPENDENCY_VERSION_MISMATCH`, `TASK_LIMIT_EXCEEDED`, `VERSION_CONSTRAINT_INVALID`, `BINDING_SCHEMA_INFERENCE_FAILED`, `BINDING_SCHEMA_MODE_CONFLICT`, `BINDING_STRICT_SCHEMA_INCOMPATIBLE`, `BINDING_POLICY_VIOLATION`. Dependency errors are marked `userFixable: true`; `TASK_LIMIT_EXCEEDED` is marked `retryable: true`; binding/version-constraint errors pass through with `userFixable: true`.
+- **Annotation description suffix** — `AnnotationMapper.toDescriptionSuffix()` now emits `cache_ttl`, `cache_key_fields`, and `pagination_style` when present, alongside the existing `cacheable`/`paginated` fields.
+
+### Cross-language sync (deferred-modules round, 2026-04-28)
+
+- **Dependency bump**: `mcp-embedded-ui >= 0.4.0` (was `>= 0.3.2`). The new release ships `POST /tools/{name}/validate` (F7) — read-only schema validation, ungated by `allowExecute` or `authHook`. The route flows automatically through the existing `createNodeHandler` adapter. **Resolves EUI-1.**
+- **JWT-1 (BREAKING) — `Authenticator.authenticate` takes `Record<string, string>` instead of `IncomingMessage`.** All three SDKs now use `authenticate(headers: HeaderMap) -> Promise<Identity | null>`. Use the new `extractHeaders(req)` helper (re-exported from the package root) to flatten a Node `IncomingMessage`:
+  ```ts
+  // Before:
+  authenticator.authenticate(req);
+  // After:
+  import { extractHeaders } from "apcore-mcp";
+  authenticator.authenticate(extractHeaders(req));
+  ```
+- **OC-1 — TS strict-mode walker parity with Python+Rust.** The TS strict-mode pipeline now mirrors apcore's canonical `to_strict_schema`: promotes `x-llm-description` → `description`, strips all `x-*` extension keys after promotion, recurses into `oneOf` / `anyOf` / `allOf` and `$defs` / `definitions`, sorts property names alphabetically, and removes `default` values. Output now matches Python+Rust (which delegate to apcore directly). 6 regression tests.
+- **EB-2 — adapter-hook kwargs.** `serve()` and `asyncServe()` accept `schemaConverter`, `annotationMapper`, `errorMapper` options that override the factory's built-in adapters. New `MCPServerFactoryOptions` shape. Useful for downstream extensions that customize JSON-Schema strictness, the annotation wire format, or error formatting.
+- **MID-5 — `ModuleIDNormalizer.tryDenormalize`.** New bijection-guarded variant validates the dash→dot-replaced result against `MODULE_ID_PATTERN`, returning `null` for inputs that aren't valid pre-images of `normalize`. Plain `denormalize` stays lenient. 9 regression tests.
+- **AM-L1 — F-041 annotation extras parity test.** Added a regression test that pins TypeScript's wire format for `mcp_*` extras (single-newline separator between `[Annotations: …]` and the first extra line). Python and Rust were aligned to this format in 0.14.0; TS already emitted it. 1 regression test.
+- TC-011 integration tests added in `tests/explorer/explorer.test.ts` pinning the `/validate` wire-up.
+
+---
+
+## [0.13.0] - 2026-04-06
+
+### Added
+
+- **Pipeline Strategy Selection** (F-036) — `serve({strategy: "minimal"})` and CLI `--strategy` with 5 presets.
+- **Tool Output Redaction** (F-038) — `serve({redactOutput: true})` applies `redactSensitive()` before MCP serialization. Default: on.
+- **Pipeline Observability** (F-037) — `serve({trace: true})` enables `callWithTrace()` for per-step timing.
+- **Tool Preflight Validation** (F-039) — `ExecutionRouter.validateTool()` for dry-run validation.
+- **YAML Pipeline Configuration** (F-040) — Config Bus `mcp.pipeline` section via `buildStrategyFromConfig()`.
+- **Annotation Metadata Passthrough** (F-041) — `annotations.extra` keys with `mcp_` prefix flow to descriptions.
+- **4 new error mappings** — `CONFIG_ENV_MAP_CONFLICT`, `PIPELINE_ABORT`, `STEP_NOT_FOUND`, `VERSION_INCOMPATIBLE`.
+- **RegistryListener wired to `serve({dynamic: true})`**.
+
+### Changed
+
+- **Dependency bump**: `apcore-js >= 0.17.1` (was `>= 0.15.1`).
+
+---
+
+## [0.12.0] - 2026-03-31
+
+### Added
+
+- **Config Bus namespace registration** (F-033) — Registers `mcp` namespace with apcore Config Bus (`APCORE_MCP` env prefix). MCP configuration (transport, host, port, auth, explorer) can be managed via unified `apcore.yaml`.
+- **Error Formatter Registry integration** (F-034) — `McpErrorFormatter` registered with apcore's `ErrorFormatterRegistry`, formalizing MCP error formatting into the shared protocol.
+- **Dot-namespaced event constants** — `APCORE_EVENTS` object with canonical event type names from apcore 0.15.0 (§9.16).
+- **6 new error code mappings** — `CONFIG_NAMESPACE_DUPLICATE`, `CONFIG_NAMESPACE_RESERVED`, `CONFIG_ENV_PREFIX_CONFLICT`, `CONFIG_MOUNT_ERROR`, `CONFIG_BIND_ERROR`, `ERROR_FORMATTER_DUPLICATE`.
+
+### Changed
+
+- Dependency bump: requires `apcore-js >= 0.15.1` (was `>= 0.14.0`) for Config Bus (§9.4), Error Formatter Registry (§8.8), and dot-namespaced event types (§9.16).
+
+---
+
+## [0.11.0] - 2026-03-26
+
+### Added
+- **Display overlay in `buildTool()`** — MCP tool name, description, and guidance now sourced from `metadata.display.mcp` when present.
+  - Tool name: `metadata.display.mcp.alias` (pre-sanitized by `DisplayResolver`, already `[a-zA-Z_][a-zA-Z0-9_-]*` and ≤ 64 chars).
+  - Tool description: `metadata.display.mcp.description`, with `guidance` appended as `\n\nGuidance: <text>` when set.
+  - Falls back to raw `descriptor.moduleId` / `descriptor.description` when no display overlay is present.
+- Added `reportProgress()` and `elicit()` to README API reference.
+- Added missing `serve()` options to README: `explorerTitle`, `explorerProjectName`, `explorerProjectUrl`, `requireAuth`, `outputFormatter`.
+
+### Changed
+- Dependency recommendation: works best with `apcore-toolkit >= 0.4.0` for `DisplayResolver`.
+
+### Fixed
+- Removed reference to nonexistent `examples/` directory in README.
+
+### Tests
+- `TestBuildToolDisplayOverlay` (6 tests): MCP alias used as tool name, MCP description used, guidance appended to description, surface-specific override wins over default, fallback to scanner values when no overlay, all fields combined.
+
+## [0.10.2] - 2026-03-22
+
+### Changed
+- Rebrand: aipartnerup → aiperceivable
+
+## [0.10.1] - 2026-03-21
+
+### Changed
+
+- **ESM-native JSON import**: Replaced `createRequire` workaround with `import ... with { type: "json" }` for loading `package.json`, removing the `node:module` dependency.
+
+## [0.10.0] - 2026-03-14
+
+### Changed
+
+- **Dependency bump**: Requires `apcore-js>=0.13.0` (was `>=0.9.0`). Picks up new annotation fields (`cacheable`, `paginated`, `cacheTtl`, `cacheKeyFields`, `paginationStyle`).
+- **`ModuleAnnotations` interface**: Added optional `cacheable`, `cacheTtl`, `cacheKeyFields`, `paginated`, and `paginationStyle` fields to match apcore 0.13.0.
+- **Annotation description suffix**: `AnnotationMapper.toDescriptionSuffix()` now includes `cacheable` and `paginated` when set to non-default values.
+
+## [0.9.0] - 2026-03-06
+
+### Added
+
+- **`asyncServe()` public API** — New function that builds an embeddable Node.js HTTP request handler `(req, res) => Promise<void>` for mounting the MCP server into a larger HTTP application. TypeScript equivalent of Python's `async_serve()` context manager. Returns `{ handler, close }` for lifecycle management.
+- **`AsyncServeOptions` and `AsyncServeApp` types** — Dedicated options interface (omits transport/host/port/lifecycle hooks) and return type for `asyncServe()`.
+- **`TransportManager.buildStreamableHttpApp()`** — New method that creates a composable HTTP request handler without binding to a port. Foundation for `asyncServe()` and custom embedding scenarios.
+- **Deep merge for streaming chunks** — `ExecutionRouter` now uses recursive deep merge (depth-limited to 32) instead of shallow merge when accumulating streaming response chunks. Nested objects are properly merged; arrays and scalars are overwritten.
+- **`EXECUTION_CANCELLED` error handling** — `ErrorMapper` now detects `ExecutionCancelledError` (by constructor name or error code) and returns a dedicated `EXECUTION_CANCELLED` response with `retryable: true`.
+- **New error codes** — Added `VERSION_INCOMPATIBLE`, `ERROR_CODE_COLLISION`, and `EXECUTION_CANCELLED` to the `ErrorCodes` constant, matching the Python reference implementation.
+- New tests for `asyncServe()`, deep merge streaming, `ExecutionCancelledError` handling, and new error codes.
+
+## [0.8.0] - 2026-03-02
+
+### Added
+
+- **Approval error codes** — New `APPROVAL_DENIED`, `APPROVAL_TIMEOUT`, `APPROVAL_PENDING` entries in `ErrorCodes` constant for approval-related error handling.
+- **Enhanced ErrorMapper with AI guidance** — `McpErrorResponse` now carries optional `retryable`, `aiGuidance`, `userFixable`, and `suggestion` fields. `ErrorMapper.toMcpError()` extracts these from enhanced `ModuleError` instances and attaches them to responses. Approval errors (`APPROVAL_PENDING`, `APPROVAL_TIMEOUT`, `APPROVAL_DENIED`) have dedicated handling branches.
+- **AI guidance in router error text** — `ExecutionRouter` now appends AI guidance fields as a structured JSON block to error text via `_buildErrorText()`, giving AI agents richer error context.
+- **AI intent metadata in tool descriptions** — `MCPServerFactory.buildTool()` reads `x-when-to-use`, `x-when-not-to-use`, `x-common-mistakes`, and `x-workflow-hints` from `descriptor.metadata` and appends them to the tool description for AI agent visibility.
+- **`streaming` in `toDescriptionSuffix()`** — `AnnotationMapper.toDescriptionSuffix()` now includes `streaming=true` in the annotations suffix when the module declares streaming capability.
+- **`ElicitationApprovalHandler`** — New `src/adapters/approval.ts` class that bridges MCP elicitation to apcore's approval system. Exports `ElicitationApprovalHandler`, `ApprovalRequest`, and `ApprovalResult` from public API.
+- **`approvalHandler` option in `ServeOptions`** — Pass an approval handler to `serve()` for automatic wiring into the Executor. `resolveExecutor()` now accepts an optional `approvalHandler` parameter.
+- **`--approval` CLI flag** — New CLI option with modes: `elicit` (uses `ElicitationApprovalHandler`), `auto-approve`, `always-deny`, and `off` (default). The `auto-approve` and `always-deny` modes dynamically import handlers from `apcore-js`.
+- New test suites: `tests/adapters/approval.test.ts` for `ElicitationApprovalHandler`; new AI guidance and approval error tests in `tests/adapters/errors.test.ts`; streaming suffix tests in `tests/adapters/annotations.test.ts`; AI intent metadata tests in `tests/server/factory.test.ts`; `_buildErrorText` tests in `tests/server/router.test.ts`; `--approval` CLI flag tests in `tests/cli.test.ts`.
+
+## [0.7.0] - 2026-02-28
+
+### Added
+
+- **JWT Authentication** — New `src/auth/` module with `JWTAuthenticator` class for Bearer token authentication on HTTP transports. Supports configurable algorithms, audience/issuer validation, claim-to-Identity mapping (`ClaimMapping`), required claims, and permissive mode. Exported from public API: `JWTAuthenticator`, `Authenticator`, `ClaimMapping`, `JWTAuthenticatorOptions`.
+- **Identity propagation via AsyncLocalStorage** — `identityStorage` (AsyncLocalStorage) and `getCurrentIdentity()` allow any code in the request call chain to access the authenticated identity without explicit parameter passing. Exported from public API.
+- **`authenticator` and `exemptPaths` options in `ServeOptions`** — Pass an `Authenticator` instance to `serve()` to enable request authentication. `exemptPaths` customizes which routes bypass auth (default: `["/health", "/metrics"]`).
+- **CLI JWT flags** — 7 new CLI arguments: `--jwt-secret`, `--jwt-algorithm`, `--jwt-audience`, `--jwt-issuer`, `--jwt-require-auth`, `--jwt-permissive`, `--exempt-paths`.
+- **BridgeContext identity support** — `createBridgeContext()` accepts an optional `Identity` parameter. `BridgeContext.identity` type narrowed from `Record<string, unknown> | null` to `Identity | null`. Identity propagates to child contexts.
+- **Explorer Authorization UI** — Swagger-UI-style Authorization input field in the Tool Explorer. Paste a Bearer token to authenticate tool execution requests. Generated cURL commands automatically include the Authorization header.
+- **Explorer auth enforcement** — Tool execution via the Explorer returns 401 Unauthorized without a valid Bearer token when authentication is enabled. The Explorer UI displays a clear error message prompting the user to enter a token.
+- **MCP Client Configuration** — README now includes configuration examples for Claude Desktop, Claude Code, Cursor, and remote HTTP access.
+- New `jsonwebtoken` runtime dependency for JWT verification.
+- New test suites: `tests/auth/jwt.test.ts`, `tests/auth/storage.test.ts`, `tests/auth/integration.test.ts`; new identity tests in `tests/server/context.test.ts`; new JWT CLI flag tests in `tests/cli.test.ts`.
+
+### Changed
+
+- **Explorer UI layout** — Redesigned from a bottom-panel layout to a Swagger-UI-style inline accordion. Each tool expands its detail, schema, and "Try it" section directly below the tool name. Only one tool can be expanded at a time. Detail is loaded once on first expand and cached.
+- **Explorer title** — Updated from "MCP Tool Explorer" to "APCore MCP Tool Explorer" for consistent branding with the Python project.
+- **`ExecutionRouter` creates BridgeContext with identity** — When `getCurrentIdentity()` returns a non-null identity, the router creates a BridgeContext even without MCP callbacks, propagating the identity to executors.
+- **Transport auth middleware** — Both `streamable-http` and `sse` transports authenticate non-exempt requests before processing. Authenticated identity is stored in `identityStorage` (AsyncLocalStorage) so `getCurrentIdentity()` works throughout the request lifecycle.
+- **CRITICAL added to valid CLI log levels** — `--log-level` now accepts `CRITICAL` in addition to `DEBUG`, `INFO`, `WARNING`, `ERROR`.
+- **vitest config simplified** — Removed the `/dev/null` alias hack for `apcore-js` since it is now a proper direct dependency.
+- **resolve-executor tests updated** — Tests now verify that `resolveExecutor()` auto-creates an Executor from a bare Registry (since `apcore-js` is a direct dependency), replacing the previous "throws when apcore-js not installed" assertions.
+
+## [0.6.1] - 2026-02-26
+
+### Changed
+
+- **`apcore-js` promoted to direct dependency** — Moved `apcore-js` from optional peer dependency to a direct dependency in `package.json`, matching the Python `apcore-mcp` project where `apcore` is a direct dependency. Users no longer need to separately install `apcore-js` — `npm install apcore-mcp` is all that's needed.
+- **Example modules now use `apcore-js` types** — Class-based extension modules (`greeting`, `math_calc`, `text_echo`) updated to import `ModuleAnnotations`, `DEFAULT_ANNOTATIONS`, and `Context` from `apcore-js` instead of using plain duck-typed objects. The `execute()` signature now includes the `context: Context` parameter, consistent with the Python examples.
+- **README updated** — Removed outdated "apcore (peer dependency)" requirement, added note that `apcore-js` is included as a direct dependency, and added Examples section linking to `examples/README.md`.
+
+## [0.6.0] - 2026-02-25
+
+### Added
+
+- **Example modules**: `examples/` with 5 runnable demo modules — 3 class-based (`text_echo`, `math_calc`, `greeting`) and 2 programmatic via `module()` factory (`convert_temperature`, `word_count`) — for quick Explorer UI demo out of the box.
+
+### Changed
+
+- **BREAKING: `ExecutionRouter.handleCall()` return type**: Changed from `[content, isError]` to `[content, isError, traceId]`. Callers that unpack the 2-tuple must update to 3-tuple unpacking.
+- **BREAKING: Explorer `/call` response format**: Changed from `{"result": ...}` / `{"error": ...}` to MCP-compliant `CallToolResult` format: `{"content": [...], "isError": bool, "_meta": {"_trace_id": ...}}`.
+
+### Fixed
+
+- **MCP protocol compliance**: Router no longer injects `_trace_id` as a content block in tool results. `traceId` is now returned as a separate tuple element and surfaced in Explorer responses via `_meta`. Factory handler throws errors for error results so the MCP SDK correctly sets `isError=true`.
+- **Explorer UI default values**: `defaultFromSchema()` now correctly skips `null` defaults and falls through to type-based placeholders, fixing blank form fields for binding.yaml modules.
+
+## [0.5.0] - 2026-02-25
+
+### Added
+
+- **MCP Tool Explorer** — Browser-based UI for inspecting and testing MCP tools, consistent with the Python (`apcore-mcp`) implementation. Mounts at `/explorer` on HTTP transports (`streamable-http`, `sse`); silently ignored for `stdio`.
+  - `GET /explorer/` — Self-contained HTML single-page application (no external dependencies) displaying registered tools with annotation badges, input schemas, and a "Try it" section.
+  - `GET /explorer/tools` — JSON array of tool summaries (name, description, annotations).
+  - `GET /explorer/tools/{name}` — JSON tool detail including `inputSchema`.
+  - `POST /explorer/tools/{name}/call` — Execute a tool from the browser UI. Returns 403 when execution is disabled.
+- **`ExplorerHandler` class** — New `src/explorer/handler.ts` module handling all explorer HTTP routes. Accepts `ExplorerHandlerOptions` with `allowExecute` (default: `false`) and `prefix` (default: `"/explorer"`). Exported from public API.
+- **`explorer`, `explorerPrefix`, `allowExecute` options in `ServeOptions`** — Enable the explorer UI, customize the URL prefix, and control tool execution from the browser.
+- **`--explorer`, `--explorer-prefix`, `--allow-execute` CLI flags** — CLI support for all explorer options.
+- **`setExplorerHandler()` on `TransportManager`** — Allows mounting the explorer into HTTP transport servers.
+- New test suite `tests/explorer/explorer.test.ts` — 20 tests across 8 test groups (TC-001 through TC-008) covering HTML page, disabled-by-default, tool listing, tool detail, tool execution, execute-disabled 403, stdio-ignored, and custom prefix.
+
+### Changed
+
+- **`readBody()` exported from `TransportManager` module** — The shared `readBody()` utility in `src/server/transport.ts` is now exported for reuse by the explorer handler, eliminating code duplication.
+
+## [0.4.0] - 2026-02-23
+
+### Added
+
+- **MCP Resources support** — New `registerResourceHandlers()` on `MCPServerFactory`. Modules with a `documentation` field are exposed as `docs://{moduleId}` MCP resources via `resources/list` and `resources/read`. Server now advertises `resources: {}` capability.
+- **`/health` endpoint** — HTTP transports (`streamable-http`, `sse`) now serve a `/health` route returning JSON `{ status, uptime_seconds, module_count }` for readiness probing.
+- **`/metrics` Prometheus endpoint** — HTTP transports (`streamable-http`, `sse`) now serve a `/metrics` route returning Prometheus text format when a `metricsCollector` is provided. Returns 404 when no collector is configured.
+- **`MetricsExporter` interface** — Duck-typed interface for implementing custom Prometheus metrics exporters. Exported from public API.
+- **`metricsCollector` option in `ServeOptions`** — Accepts a `MetricsExporter` instance to enable the `/metrics` endpoint on HTTP transports.
+- **`Executor.validate?()` optional method** — New optional `validate(moduleId, inputs)` method on the `Executor` interface for pre-execution input validation.
+- **`validateInputs` option in `ExecutionRouterOptions`** — When `true`, `ExecutionRouter` calls `executor.validate?.()` before execution and returns a formatted validation error response on failure. Exported from public API.
+- **`tags` and `prefix` filtering in `ServeOptions`** — Pass `tags` and/or `prefix` to `serve()` to restrict which registry modules are exposed as MCP tools.
+- **`logLevel` option in `ServeOptions`** — Suppresses `console` output below the specified level (`DEBUG` | `INFO` | `WARNING` | `ERROR`) during `serve()`. All suppressed methods are restored after shutdown.
+- **`onStartup` / `onShutdown` lifecycle callbacks in `ServeOptions`** — Async hooks invoked before the transport starts and after it stops (including on error).
+- **`--log-level` validation in CLI** — The `apcore-mcp` CLI now validates `--log-level` against the allowed set and passes it to `serve()`.
+- **`streaming` field in `ModuleAnnotations`** — New boolean field to declare streaming capability in module metadata.
+- New test suite `tests/serve-features.test.ts` — covers `tags`/`prefix` filtering (F1), `logLevel` suppression (F2), and `onStartup`/`onShutdown` lifecycle hooks (F4).
+- New test suite `tests/server/metrics-endpoint.test.ts` — covers `/metrics` endpoint for both `streamable-http` and `sse` transports (200, 404, 500, content-type).
+- New test suite `tests/server/router-validate.test.ts` — covers input validation in `ExecutionRouter` (F3).
+- New test suite `tests/server/transport.test.ts` — covers `/health` endpoint for both transports, including `setModuleCount()` reflection.
+- **`resolveRegistry()` and `resolveExecutor()` exported** — Both helper functions are now part of the public API, enabling advanced users to manually resolve Registry/Executor from a `RegistryOrExecutor` union without going through `serve()` or `toOpenaiTools()`.
+- **`peerDependencies` declaration for `apcore-js`** — `package.json` now declares `apcore-js >= 0.4.0` as an optional peer dependency, informing users of the runtime requirement for CLI and bare-Registry modes.
+- New test suite `tests/resolve-executor.test.ts` — covers `resolveRegistry()` (3 tests), `resolveExecutor()` pass-through and error paths (4 tests), and `serve()` integration (2 tests).
+- New test suite `tests/cli.test.ts` — covers CLI argument validation, help output, apcore-js availability, success path with mocked apcore-js, module discovery logging, and log-level validation (13 tests).
+
+### Changed
+
+- **`toDescriptionSuffix` omits default annotation values** — `AnnotationMapper.toDescriptionSuffix()` now only includes fields that differ from their defaults (`readonly=false`, `destructive=false`, `idempotent=false`, `requiresApproval=false`, `openWorld=true`), producing shorter, more informative description suffixes.
+- **Tool errors returned as MCP `isError` result** — `MCPServerFactory.registerHandlers()` no longer throws protocol-level errors for tool execution failures; errors are returned as `CallToolResult` with `isError: true` and the error message in `content`.
+- **Progress notification index is now 1-based** — `notifications/progress` chunks sent from `ExecutionRouter` use a 1-based `progress` counter (was 0-based).
+- **Trace ID appended to tool responses** — When a `BridgeContext` is active, a `{ _trace_id }` entry is appended to the response content array for both streaming and non-streaming paths.
+- **`ModuleDescriptor.description` is now optional** — `MCPServerFactory.buildTool()` no longer throws when `description` is `null` or `undefined`.
+- **`resolveExecutor()` tries auto-creating from `apcore`** — When a bare `Registry` is passed to `serve()`, it now attempts to dynamically `require('apcore')` and instantiate a default Executor before failing with a descriptive error.
+- **`package.json` keywords expanded** — Added `mcp-server`, `tool-bridge`, `agent-tools`, `schema`, `json-schema`, `validation`, `router`, `transport`, `cli` for better npm discoverability.
+
+### Fixed
+
+- **Package name corrected from `"apcore"` to `"apcore-js"`** — `resolveExecutor()` in `src/index.ts` used `require("apcore")` and CLI in `src/cli.ts` used `import("apcore")`, which would fail even when `apcore-js` was installed. Both now reference the correct package name `"apcore-js"`, with updated error messages.
+
+- **Null-safe `call` / `callAsync` selection** — `ExecutionRouter` now uses `typeof` checks instead of truthiness when selecting between `executor.call()` and `executor.callAsync()`, preventing accidental fallthrough on falsy executor methods.
+- **`serve()` input validation** — `serve()` now validates `name` (non-empty, ≤ 255 chars), `tags` (no empty strings), and `prefix` (non-empty if provided) before starting, throwing descriptive errors.
+
+## [0.3.0] - 2026-02-22
+
+### Added
+
+- **Streaming execution support** — The MCP bridge layer now supports streaming execution. When an executor implements `stream()` and the client provides a `progressToken`, chunks are forwarded as `notifications/progress` and shallow-merged into the final result. Falls back to `call()` when streaming is not available or not requested.
+- **Elicitation and progress reporting** — New `helpers.ts` module with `reportProgress()` and `elicit()` functions for modules to report progress and request user input during execution.
+- **BridgeContext** — New duck-typed context object that carries shared data through call chains, with support for MCP callbacks and progress reporting.
+- `stream?()` method added to `Executor` interface for streaming support.
+- `HandleCallExtra` interface for MCP SDK callbacks (`sendNotification`, `sendRequest`, `_meta`).
+- `context?: unknown` parameter added to Executor interface methods (`call`, `stream`, `getDefinition`) for backward-compatible context passing.
+- `_meta.streaming` property added to OpenAI tool definitions when module descriptor has `annotations.streaming`.
+- Exported `helpers`, `BridgeContext` type, and `createBridgeContext` from public API.
+- 7 streaming router tests covering chunks, fallback, and edge cases.
+
+### Changed
+
+- `ExecutionRouter` now builds context with MCP callbacks and passes it to executors.
+- `factory.ts` wired to pass MCP SDK extra parameters to router for streaming and elicitation support.
+
+### Fixed
+
+- **BridgeContext.child() callerId alignment** — `callerId` now equals the last element of parent's `callChain` (who called me), matching apcore-typescript Context.child() behavior.
+- `redactedInputs` is now nullable (null initial) to match real Context behavior.
+- Added `readonly` modifiers to BridgeContext properties to match real Context's immutability contract.
+
+## [0.2.0] - 2026-02-20
+
+### Changed
+
+- **Breaking: All TypeScript interfaces now use camelCase** — Updated all type definitions in `types.ts` to follow TypeScript conventions (e.g., `module_id` → `moduleId`, `input_schema` → `inputSchema`, `get_definition` → `getDefinition`, `call_async` → `callAsync`). MCP hint properties also updated (e.g., `read_only_hint` → `readOnlyHint`).
+- All adapters, converters, and server components refactored to use the new camelCase property names.
+- All test files updated to match the new interface signatures (113 tests passing across 10 test files).
+
+### Added
+
+- New constants in `types.ts`: `REGISTRY_EVENTS`, `ErrorCodes`, and `MODULE_ID_PATTERN` for standardized error codes and validation.
+- New type alias `RegistryOrExecutor` for accepting either Registry or Executor.
+- `has?()` method on Registry interface for optional module existence checking.
+- Improved JSDoc comments in `types.ts` with section dividers and clearer documentation.
+
+## [0.1.1] - 2026-02-18
+
+### Fixed
+
+- **Circular `$ref` detection in SchemaConverter** — Self-referencing or mutually recursive `$ref` (e.g., TreeNode with children: TreeNode[]) now throws a descriptive `Circular $ref detected` error instead of causing infinite recursion / stack overflow.
+- **Request body size limit in HTTP transports** — `readBody()` now enforces a maximum body size (default 4MB) to prevent memory exhaustion DoS. Oversized requests receive HTTP 413; malformed JSON receives HTTP 400.
+
+### Added
+
+- Environment variable `APCORE_MAX_BODY_BYTES` to configure the maximum request body size for HTTP transports (StreamableHTTP and SSE). Defaults to 4,194,304 (4MB).
+
+## [0.1.0] - 2026-02-17
+
+### Added
+
+- Initial project setup with MCP server, schema conversion, transport management, and OpenAI tools bridge.
