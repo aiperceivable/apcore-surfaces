@@ -6,6 +6,7 @@ import contextlib
 import logging
 import time
 import warnings
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -23,8 +24,10 @@ from a2a.types import (
     GetTaskRequest,
     ListTasksRequest,
     ListTasksResponse,
+    SendMessageRequest,
     Task,
     TaskState,
+    TaskStatusUpdateEvent,
 )
 from a2a.utils.errors import TaskNotCancelableError
 from apcore.error_formatter import ErrorFormatterRegistry
@@ -50,7 +53,7 @@ from apcore_a2a.server.context import (
 from apcore_a2a.server.context import (
     identity_of as _identity_of,
 )
-from apcore_a2a.server.executor import ApCoreAgentExecutor
+from apcore_a2a.server.executor import _TERMINAL_STATES, ApCoreAgentExecutor
 
 if TYPE_CHECKING:
     from a2a.server.cluster.task_store import StoredTask
@@ -108,6 +111,31 @@ class _ObservedVersionedTaskStore(_ObservedTaskStore, _SDKVersionedTaskStore):
 
 
 class _TerminalAwareRequestHandler(DefaultRequestHandler):
+    async def on_message_send_stream(
+        self, params: SendMessageRequest, context: ServerCallContext
+    ) -> AsyncGenerator[Event, None]:
+        task_id: str | None = None
+        reported_outcome = False
+        async with contextlib.aclosing(super().on_message_send_stream(params, context)) as stream:
+            async for event in stream:
+                if isinstance(event, Task):
+                    task_id = event.id
+                if isinstance(event, (Task, TaskStatusUpdateEvent)):
+                    reported_outcome |= (
+                        event.status.state in _TERMINAL_STATES
+                        or event.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+                    )
+                yield event
+
+        if task_id is None or reported_outcome:
+            return
+        # The SDK disconnects slow subscribers when their queue fills. After an
+        # otherwise clean EOF, recover an already-settled terminal through the
+        # same identity-scoped path as GetTask.
+        task = await self.on_get_task(GetTaskRequest(id=task_id), context)
+        if task is not None and task.status.state in _TERMINAL_STATES:
+            yield TaskStatusUpdateEvent(task_id=task.id, context_id=task.context_id, status=task.status)
+
     async def on_get_task(self, params: GetTaskRequest, context: ServerCallContext) -> Task | None:
         task = await super().on_get_task(params, context)
         if task is not None:

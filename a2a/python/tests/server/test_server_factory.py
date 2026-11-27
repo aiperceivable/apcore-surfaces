@@ -8,6 +8,7 @@ import httpx
 import pytest
 from a2a.server.context import ServerCallContext
 from a2a.server.events.event_queue_v2 import EventQueueSource
+from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.types import AgentCard, CancelTaskRequest, SendMessageRequest, Task, TaskState, TaskStatusUpdateEvent
 from a2a.utils.errors import TaskNotCancelableError
 from apcore import Executor, Registry
@@ -169,8 +170,27 @@ async def test_stream_timeout_is_queryable_through_the_actual_a2a_routes():
 
 
 @pytest.mark.parametrize("versioned_store", [False, True])
-async def test_get_task_reports_the_terminal_before_a_slow_sse_reader_drains(versioned_store):
+async def test_get_task_reports_the_terminal_before_a_slow_sse_reader_drains(versioned_store, monkeypatch, caplog):
     first_task, allow_send, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    terminal_offered = asyncio.Event()
+    uses_evictable_sink = False
+    tap = EventQueueSource.tap
+    enqueue = EventQueueSource.enqueue_event
+
+    async def observe_terminal(source, event):
+        if isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED:
+            terminal_offered.set()
+        await enqueue(source, event)
+
+    async def small_subscriber_buffer(source, *args, **kwargs):
+        nonlocal uses_evictable_sink
+        if kwargs.get("evict_on_full"):
+            uses_evictable_sink = True
+            kwargs["max_queue_size"] = 2
+        return await tap(source, *args, **kwargs)
+
+    monkeypatch.setattr(EventQueueSource, "tap", small_subscriber_buffer)
+    monkeypatch.setattr(EventQueueSource, "enqueue_event", observe_terminal)
     task_id = ""
 
     class FastProducer:
@@ -183,6 +203,7 @@ async def test_get_task_reports_the_terminal_before_a_slow_sse_reader_drains(ver
 
         async def stream(self, inputs, context):
             try:
+                await first_task.wait()
                 for index in range(10_000):
                     yield {"index": index}
             finally:
@@ -244,6 +265,7 @@ async def test_get_task_reports_the_terminal_before_a_slow_sse_reader_drains(ver
         try:
             await asyncio.wait_for(first_task.wait(), 2)
             await asyncio.wait_for(stopped.wait(), 2)
+            await asyncio.wait_for(terminal_offered.wait(), 2)
             query = {"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}}
             result = await status.post("/", headers=headers, json=query)
             assert result.json()["result"]["status"]["state"] == "TASK_STATE_FAILED"
@@ -253,9 +275,34 @@ async def test_get_task_reports_the_terminal_before_a_slow_sse_reader_drains(ver
             response = await asyncio.wait_for(streaming, 3)
         frames = [json.loads(line[5:])["result"] for line in response.text.splitlines() if line.startswith("data:")]
         statuses = [event["statusUpdate"]["status"] for event in frames if "statusUpdate" in event]
+        if uses_evictable_sink:
+            assert "Evicting event queue sink" in caplog.text
         assert [item["state"] for item in statuses] == ["TASK_STATE_FAILED"]
         persisted = await status.post("/", headers=headers, json=query)
         assert persisted.json()["result"]["status"] == statuses[0]
+
+
+async def test_closed_subscriber_does_not_report_a_working_task_as_a_terminal(monkeypatch):
+    context = ServerCallContext()
+    submitted = Task(id="task", context_id="conversation", status={"state": TaskState.TASK_STATE_SUBMITTED})
+
+    async def closed_subscriber(self, params, call_context):
+        assert call_context is context
+        yield submitted
+
+    monkeypatch.setattr(DefaultRequestHandler, "on_message_send_stream", closed_subscriber)
+    store = A2ATaskStore()
+    working = Task(id=submitted.id, context_id=submitted.context_id, status={"state": TaskState.TASK_STATE_WORKING})
+    await store.save(working, context)
+    handler = _TerminalAwareRequestHandler(
+        agent_executor=ApCoreAgentExecutor(MagicMock(), MagicMock(), MagicMock()),
+        task_store=store,
+        agent_card=AgentCard(name="test", capabilities={"streaming": True}),
+    )
+
+    result = [event async for event in handler.on_message_send_stream(SendMessageRequest(), context)]
+
+    assert result == [submitted]
 
 
 async def test_disconnected_stream_persists_the_terminal_and_retires_the_projection():
