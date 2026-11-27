@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from apcore.schema.strict import _apply_llm_descriptions, to_strict_schema
+from apcore.schema.strict import to_strict_schema
 
 import apcore_mcp.markdown as _markdown
 from apcore_mcp.adapters.annotations import AnnotationMapper
 from apcore_mcp.adapters.id_normalizer import ModuleIDNormalizer
-from apcore_mcp.adapters.schema import SchemaConverter
+from apcore_mcp.adapters.schema import SchemaConverter, apply_llm_descriptions
 
 _logger = logging.getLogger(__name__)
 
@@ -198,8 +198,6 @@ class OpenAIConverter:
         6. Optional properties become nullable
         7. Recurses into nested objects, array items, oneOf/anyOf/allOf, and $defs
 
-        This matches the behavior of SchemaExporter.export_openai().
-
         Args:
             schema: JSON Schema dict to transform.
 
@@ -209,5 +207,5 @@ class OpenAIConverter:
         import copy
 
         schema = copy.deepcopy(schema)
-        _apply_llm_descriptions(schema)
+        apply_llm_descriptions(schema)
         return to_strict_schema(schema)

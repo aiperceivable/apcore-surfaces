@@ -568,20 +568,18 @@ class TestStrictModeEdgeCases:
         assert "x-llm-description" not in params["properties"]["name"]
         assert "x-sensitive" not in params["properties"]["name"]
 
-    def test_strict_mode_promotes_x_llm_description(self, converter):
+    @pytest.mark.parametrize("include_base_description", [True, False])
+    def test_strict_mode_promotes_x_llm_description(self, converter, include_base_description):
         """x-llm-description is promoted to description before stripping."""
+        query_schema = {"type": "string", "x-llm-description": "LLM-optimized description"}
+        if include_base_description:
+            query_schema["description"] = "Original description"
         descriptor = ModuleDescriptor(
             module_id="test.llm_desc",
             description="Test",
             input_schema={
                 "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Original description",
-                        "x-llm-description": "LLM-optimized description",
-                    },
-                },
+                "properties": {"query": query_schema},
                 "required": ["query"],
             },
             output_schema={},
