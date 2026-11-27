@@ -12,7 +12,7 @@
  * without an `acl/` directory has no ACL at all.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { Registry, Executor, module as apcoreModule } from "apcore-js";
+import { ExecutionPolicy, Executor, Registry, module as apcoreModule } from "apcore-js";
 import { Config } from "apcore-js/config";
 import { registerSysModules } from "apcore-js/sys-modules";
 import { Type } from "@sinclair/typebox";
@@ -36,6 +36,14 @@ function registryWithAUserModule(): Registry {
     registry,
   });
   return registry;
+}
+
+function registerControlModules(registry: Registry, executor: Executor): void {
+  registerSysModules(
+    registry,
+    executor,
+    new Config({ sys_modules: { enabled: true, events: { enabled: true } } }),
+  );
 }
 
 const systemIds = (registry: Registry): string[] =>
@@ -78,20 +86,12 @@ describe("apcore system.* modules", () => {
     expect((agentCard.skills ?? []).map((s) => s.id)).toEqual(["math.add"]);
   });
 
-  it("warns when the control surface is unprotected", () => {
-    // srs FR-AGC-007 criterion 2, reached the way a real deployment reaches it:
-    // the operator builds their own apcore stack with sys_modules.events enabled
-    // — which is what registers the three system.control.* write modules — and
-    // hands the Executor to this package. apcore's approval gate warns once and
-    // continues with no ApprovalHandler, so those modules stay callable even
-    // though FR-AGC-003 criterion 12 keeps them off the card.
+  it("warns when an explicit non-strict approval policy leaves controls unprotected", () => {
+    // srs FR-AGC-007 criterion 2. A non-strict policy allows the annotated
+    // controls to execute without an approval handler or an ACL.
     const registry = registryWithAUserModule();
-    const executor = new Executor({ registry });
-    registerSysModules(
-      registry,
-      executor,
-      new Config({ sys_modules: { enabled: true, events: { enabled: true } } }),
-    );
+    const executor = new Executor({ registry, policy: new ExecutionPolicy(null, { strict: false }) });
+    registerControlModules(registry, executor);
     expect(executor.governanceState().unprotectedControlSurface).toBe(true);
 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -101,6 +101,20 @@ describe("apcore system.* modules", () => {
     expect(said).toContain("remain callable");
     // The warning is a diagnostic and changes nothing.
     expect((agentCard.skills ?? []).map((s) => s.id)).toEqual(["math.add"]);
+  });
+
+  it("stays quiet when the default approval policy protects the controls", () => {
+    const registry = registryWithAUserModule();
+    const executor = new Executor({ registry });
+    registerControlModules(registry, executor);
+    expect(executor.governanceState()).toMatchObject({
+      controlModulesRegistered: true,
+      unprotectedControlSurface: false,
+    });
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    create(registry, executor);
+    expect(warn.mock.calls.map((call) => String(call[0])).join("\n")).not.toContain("system.control");
   });
 
   it("stays quiet when only the read modules are registered", () => {

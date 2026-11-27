@@ -44,7 +44,7 @@ The OpenAI Converter transforms apcore modules into OpenAI-compatible tool defin
 - **List[Dict[str, Any]]** (OpenAI API) — A list of dictionaries ready to be passed to the OpenAI SDK.
 
 ### Dependencies
-- **Schema Converter** — Used to resolve and inline schema references.
+- **Schema Converter** — Normalizes the root input schema and retains local references and definitions.
 - **Annotation Mapper** — Used to generate the description suffix.
 
 ## Data Flow

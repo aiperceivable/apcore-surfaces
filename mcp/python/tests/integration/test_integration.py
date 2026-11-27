@@ -11,6 +11,7 @@ import json
 from typing import Any
 
 import pytest
+from jsonschema import Draft202012Validator
 from mcp import types as mcp_types
 
 from apcore_mcp import to_openai_tools
@@ -417,21 +418,18 @@ class TestOpenAIToolsRoundtrip:
             assert isinstance(params, dict)
             assert params.get("type") == "object", f"Parameters for {tool['function']['name']} missing type: object"
 
-    def test_nested_ref_schema_is_inlined(self, registry: StubRegistry) -> None:
-        """The $ref in the nested schema is resolved and inlined, $defs removed."""
+    def test_nested_ref_schema_is_preserved_and_hardened(self, registry: StubRegistry) -> None:
+        """Strict conversion keeps the local reference and transforms its definition."""
         tools = to_openai_tools(registry)
         workflow_tool = next(t for t in tools if t["function"]["name"] == "workflow-run")
         params = workflow_tool["function"]["parameters"]
 
-        # $defs should be removed
-        assert "$defs" not in params
+        assert params["properties"]["steps"]["items"]["$ref"] == "#/$defs/Step"
+        assert params["$defs"]["Step"]["additionalProperties"] is False
 
-        # The steps array items should have the inlined Step schema
-        steps_schema = params["properties"]["steps"]
-        assert steps_schema["type"] == "array"
-        items = steps_schema["items"]
-        assert items["type"] == "object"
-        assert "name" in items["properties"]
+        validator = Draft202012Validator(params)
+        assert validator.is_valid({"steps": [{"name": "start", "params": None}]})
+        assert not validator.is_valid({"steps": [{"name": "start"}]})
 
     def test_empty_schema_gets_default(self, registry: StubRegistry) -> None:
         """Empty input_schema is converted to a normalized object schema.

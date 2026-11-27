@@ -440,12 +440,11 @@ pub fn bind_addr(config: &APCoreA2AConfig) -> Result<String, APCoreA2AError> {
 /// ever consults. This crate has `Executor::acl` right there as a public field
 /// and reading it would answer the wrong question.
 ///
-/// Withholding `system.*` from the public card (FR-AGC-003 criterion 12) removes
-/// the surface from *discovery*, not from *dispatch*: apcore's approval gate
-/// warns once and continues when no `ApprovalHandler` is configured, so the write
-/// modules stay callable. This warning exists so the card rule cannot be mistaken
-/// for a fix to that. apcore deliberately made the accessor a pure read and left
-/// the reaction to the adapter; warning is the reaction.
+/// The public Agent Card omits `system.*` (FR-AGC-003 criterion 12).
+/// Registered controls still have dispatch routes. Core's default approval
+/// gate fails closed for annotated controls without a handler. Explicit
+/// non-strict policies or strategies without governance gates can leave
+/// controls unprotected.
 fn warn_on_unprotected_control_surface(executor: &apcore::Executor) {
     if executor.governance_state().unprotected_control_surface {
         tracing::warn!(
