@@ -6,8 +6,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use apcore::{
-    register_subscriber_type, ApCoreEvent, ErrorCode, EventRetryConfig, EventSubscriber,
-    ModuleError,
+    ApCoreEvent, ErrorCode, EventRetryConfig, EventSubscriber, ModuleError, SubscriberRegistry,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde_json::{json, Value};
@@ -143,10 +142,9 @@ impl EventSubscriber for A2AEventSubscriber {
     }
 }
 
-/// Select the A2A transport for future `type: a2a` configuration entries.
-/// Existing subscriptions are owned by their original emitter.
-pub fn register_a2a_subscriber() {
-    register_subscriber_type("a2a", Box::new(from_config));
+/// Register the A2A transport for a host's configured subscribers.
+pub fn register_a2a_subscriber(registry: &mut SubscriberRegistry) {
+    registry.register("a2a", from_config);
 }
 
 #[allow(clippy::result_large_err)] // The Core factory contract uses ModuleError.

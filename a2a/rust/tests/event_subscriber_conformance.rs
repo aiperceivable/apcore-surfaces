@@ -2,8 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use apcore::{
-    create_subscriber, reset_subscriber_registry, APCore, ApCoreEvent, Config, EventSubscriber,
-    ModuleError,
+    APCore, APCoreOptions, ApCoreEvent, Config, EventSubscriber, ModuleError, SubscriberRegistry,
 };
 use apcore_a2a::{register_a2a_subscriber, A2AEventSubscriber};
 use axum::{extract::State, http::HeaderMap, http::StatusCode, routing::post, Json, Router};
@@ -76,7 +75,11 @@ async fn record_request(
     state.status
 }
 
-async fn emit_from_config(subscriber: &Value, event: &ApCoreEvent) -> Vec<ApCoreEvent> {
+async fn emit_from_config(
+    subscribers: &SubscriberRegistry,
+    subscriber: &Value,
+    event: &ApCoreEvent,
+) -> Vec<ApCoreEvent> {
     let project = tempfile::tempdir().unwrap();
     let path = project.path().join("apcore.yaml");
     std::fs::write(
@@ -88,7 +91,15 @@ async fn emit_from_config(subscriber: &Value, event: &ApCoreEvent) -> Vec<ApCore
         ),
     )
     .unwrap();
-    let client = APCore::with_config(Config::load(&path).unwrap());
+    let client = APCore::try_start_with_subscribers(
+        APCoreOptions {
+            config: Some(Config::load(&path).unwrap()),
+            fail_on_error: true,
+            ..Default::default()
+        },
+        subscribers,
+    )
+    .unwrap();
     let events = client.events().expect("configured event bus");
     let captured = Arc::new(Mutex::new(Vec::new()));
     for event_type in [DEAD_LETTER, CIRCUIT_OPENED] {
@@ -109,7 +120,7 @@ async fn emit_from_config(subscriber: &Value, event: &ApCoreEvent) -> Vec<ApCore
     diagnostics
 }
 
-async fn run_case(case: &FixtureCase, event: &ApCoreEvent) {
+async fn run_case(subscribers: &SubscriberRegistry, case: &FixtureCase, event: &ApCoreEvent) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/receive", listener.local_addr().unwrap());
     let state = Arc::new(ReceiverState {
@@ -129,9 +140,7 @@ async fn run_case(case: &FixtureCase, event: &ApCoreEvent) {
         subscriber["platform_url"] = json!(url);
     }
 
-    register_a2a_subscriber();
-    register_a2a_subscriber();
-    let diagnostics = emit_from_config(&subscriber, event).await;
+    let diagnostics = emit_from_config(subscribers, &subscriber, event).await;
     assert_eq!(
         diagnostics
             .iter()
@@ -190,32 +199,8 @@ async fn run_case(case: &FixtureCase, event: &ApCoreEvent) {
         }
     }
 
-    if case.id == "bearer_success"
-        && std::env::var("APCORE_A2A_VERIFY_LEGACY_HTTP")
-            .ok()
-            .as_deref()
-            == Some("1")
-    {
-        reset_subscriber_registry();
-        assert!(emit_from_config(&subscriber, event).await.is_empty());
-        let requests = state.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0].0["authorization"],
-            requests[1].0["authorization"]
-        );
-        assert_eq!(requests[0].1, requests[1].1);
-    }
     server.abort();
     let _ = server.await;
-}
-
-struct RestoreBuiltins;
-
-impl Drop for RestoreBuiltins {
-    fn drop(&mut self) {
-        reset_subscriber_registry();
-    }
 }
 
 #[tokio::test]
@@ -224,28 +209,20 @@ async fn a2a_subscription_is_opt_in_and_uses_core_configured_delivery() {
         "../../conformance/fixtures/event_subscriber.json"
     ))
     .unwrap();
-    reset_subscriber_registry();
-    let _restore = RestoreBuiltins;
+    let mut subscribers = SubscriberRegistry::new();
+    let other_host = SubscriberRegistry::new();
     let config = json!({"type":"a2a", "platform_url":"https://example.com/receive"});
-    assert!(format!("{:?}", create_subscriber(&config).unwrap()).starts_with("A2ASubscriber"));
+    assert!(subscribers.create(&config).is_err());
     assert_eq!(
         A2AEventSubscriber::new("https://example.com/receive").subscriber_type(),
         "a2a"
     );
-    register_a2a_subscriber();
-    assert!(format!("{:?}", create_subscriber(&config).unwrap()).starts_with("A2AEventSubscriber"));
+    register_a2a_subscriber(&mut subscribers);
+    register_a2a_subscriber(&mut subscribers);
+    assert!(format!("{:?}", subscribers.create(&config).unwrap()).starts_with("A2AEventSubscriber"));
+    assert!(other_host.create(&config).is_err());
 
-    let minimum_without_delivery = apcore::VERSION == "0.33.0"
-        && std::env::var("APCORE_A2A_REQUIRE_RELIABLE_DELIVERY")
-            .ok()
-            .as_deref()
-            != Some("1");
     for case in &fixture.test_cases {
-        if minimum_without_delivery && case.expected.dead_letters > 0 {
-            continue;
-        }
-        run_case(case, &fixture.event).await;
+        run_case(&subscribers, case, &fixture.event).await;
     }
-    reset_subscriber_registry();
-    assert!(format!("{:?}", create_subscriber(&config).unwrap()).starts_with("A2ASubscriber"));
 }
