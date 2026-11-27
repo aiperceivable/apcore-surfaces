@@ -2,6 +2,7 @@
 name = "apcore-mcp"
 version = "0.23.5-alpha.1"
 edition = "2021"
+rust-version = "1.86"
 description = "MCP bridge for apcore — expose apcore modules as MCP tools"
 license = "Apache-2.0"
 readme = "README.md"
