@@ -179,7 +179,7 @@ def test_apcore_mcp_reads_acl_from_config_bus():
         },
     }.get(key)
 
-    with patch("apcore.Config.load", return_value=fake_config):
+    with patch("apcore.config.Config.load", return_value=fake_config):
         mcp = APCoreMCP(registry)
 
     # The executor should have an ACL installed (not None) — the apcore 0.18+
@@ -215,7 +215,7 @@ def test_apcore_mcp_caller_acl_overrides_config_bus():
         default_effect="deny",
     )
 
-    with patch("apcore.Config.load", return_value=fake_config):
+    with patch("apcore.config.Config.load", return_value=fake_config):
         mcp = APCoreMCP(registry, acl=explicit_acl)
 
     # Verify the executor holds the *explicit* ACL, not the Config Bus one.

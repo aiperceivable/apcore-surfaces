@@ -250,7 +250,7 @@ export async function runSandboxRunner(moduleId: string): Promise<void> {
   const extensionsRoot = process.env.APCORE_EXTENSIONS_ROOT ?? "./extensions";
   // Dynamic import avoids circular deps and keeps the sandbox runner
   // isolated from the host CLI initialization code.
-  const apcore = await import("apcore-js").catch(() => {
+  const apcore = await import("apcore-js/full").catch(() => {
     process.stderr.write(
       "sandbox runner: apcore-js is not available in the sandboxed environment.\n",
     );

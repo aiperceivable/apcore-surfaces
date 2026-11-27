@@ -1,5 +1,7 @@
 /** Real dependency fixture; run with node --import tsx tests/fixtures/stdio-noise.ts. */
-import { Executor, LoggingMiddleware, Registry, StdoutExporter, StdoutSubscriber, TracingMiddleware } from "apcore-js";
+import { Executor, LoggingMiddleware, Registry } from "apcore-js";
+import { StdoutSubscriber } from "apcore-js/events";
+import { StdoutExporter, TracingMiddleware } from "apcore-js/observability";
 import { DisplayResolver } from "apcore-toolkit";
 import { serve } from "../../src/index.js";
 

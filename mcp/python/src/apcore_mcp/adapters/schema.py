@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator
 from typing import Any
 
 _MAX_REF_DEPTH = 32
@@ -11,9 +12,49 @@ _MAX_REF_DEPTH = 32
 # should be walked when injecting additionalProperties: false. Keys like
 # ``enum``, ``const``, ``examples``, ``default``, ``required`` hold literal
 # data and must NOT be recursed into.
-_SCHEMA_CHILD_DICT_KEYS = ("properties", "patternProperties", "$defs", "definitions")
+_SCHEMA_CHILD_DICT_KEYS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
 _SCHEMA_CHILD_LIST_KEYS = ("oneOf", "anyOf", "allOf", "prefixItems")
 _SCHEMA_CHILD_SCHEMA_KEYS = ("items", "not", "if", "then", "else", "contains", "propertyNames")
+
+
+def _schema_nodes(node: Any) -> Iterator[dict[str, Any]]:
+    if not isinstance(node, dict):
+        return
+    yield node
+    for key in _SCHEMA_CHILD_DICT_KEYS:
+        children = node.get(key)
+        if isinstance(children, dict):
+            for child in children.values():
+                yield from _schema_nodes(child)
+    for key in _SCHEMA_CHILD_LIST_KEYS:
+        children = node.get(key)
+        if isinstance(children, list):
+            for child in children:
+                yield from _schema_nodes(child)
+    for key in _SCHEMA_CHILD_SCHEMA_KEYS:
+        child = node.get(key)
+        if isinstance(child, list):
+            for item in child:  # Legacy tuple validation can use schema arrays.
+                yield from _schema_nodes(item)
+        else:
+            yield from _schema_nodes(child)
+    yield from _schema_nodes(node.get("additionalProperties"))
+
+
+def apply_llm_descriptions(schema: dict[str, Any]) -> None:
+    """Use LLM descriptions on schema nodes before removing extensions."""
+    for node in _schema_nodes(schema):
+        description = node.get("x-llm-description")
+        if isinstance(description, str):
+            node["description"] = description
+
+
+def strip_schema_extensions(schema: dict[str, Any]) -> None:
+    """Remove APCore extensions while preserving schemas' literal values."""
+    for node in _schema_nodes(schema):
+        for key in tuple(node):
+            if key.startswith("x-"):
+                del node[key]
 
 
 class SchemaConverter:
@@ -32,19 +73,22 @@ class SchemaConverter:
     def __init__(self, *, strict: bool = True) -> None:
         self._strict = strict
 
-    def convert_input_schema(self, descriptor: Any, *, strict: bool | None = None) -> dict[str, Any]:
+    def convert_input_schema(
+        self, descriptor: Any, *, strict: bool | None = None, inline_refs: bool = True
+    ) -> dict[str, Any]:
         """Convert apcore ModuleDescriptor.input_schema to MCP inputSchema.
 
         Args:
             descriptor: ModuleDescriptor with input_schema attribute
             strict: Per-call override of the construction-time strict mode.
                 ``None`` keeps the converter's own setting.
+            inline_refs: Resolve references when the target requires inlined schemas.
 
         Returns:
             MCP-compatible schema dict with $refs inlined and $defs removed
         """
         schema = descriptor.input_schema
-        return self._convert_schema(schema, strict=strict)
+        return self._convert_schema(schema, strict=strict, inline_refs=inline_refs)
 
     def convert_output_schema(self, descriptor: Any, *, strict: bool | None = None) -> dict[str, Any]:
         """Convert apcore ModuleDescriptor.output_schema.
@@ -60,13 +104,16 @@ class SchemaConverter:
         schema = descriptor.output_schema
         return self._convert_schema(schema, strict=strict)
 
-    def _convert_schema(self, schema: dict[str, Any], *, strict: bool | None = None) -> dict[str, Any]:
+    def _convert_schema(
+        self, schema: dict[str, Any], *, strict: bool | None = None, inline_refs: bool = True
+    ) -> dict[str, Any]:
         """Convert a schema, applying all transformations.
 
         Args:
             schema: JSON Schema dict to convert
             strict: Per-call override of the construction-time strict mode.
                 ``None`` keeps the converter's own setting.
+            inline_refs: Resolve references against definitions in the schema.
 
         Returns:
             Converted schema with $refs inlined, $defs removed, and type ensured
@@ -88,7 +135,7 @@ class SchemaConverter:
             return result
 
         # Inline $refs if present
-        if "$defs" in schema:
+        if inline_refs and "$defs" in schema:
             defs = schema["$defs"]
             schema = self._inline_refs(schema, defs)
             # Remove $defs from the final schema
@@ -112,46 +159,14 @@ class SchemaConverter:
         NOT descend into literal-data keys like ``enum``, ``const``,
         ``examples``, ``default``, ``required``.
         """
-        if not isinstance(node, dict):
-            return
-
-        node_type = node.get("type")
-        type_is_object = node_type == "object" or (isinstance(node_type, list) and "object" in node_type)
-        # Treat schema as object-like when it has "properties" and no
-        # conflicting non-object scalar type.
-        has_properties = "properties" in node
-        non_object_scalar = isinstance(node_type, str) and node_type != "object"
-        is_object = type_is_object or (has_properties and not non_object_scalar)
-
-        if is_object and "additionalProperties" not in node:
-            node["additionalProperties"] = False
-
-        # Recurse only into known subschema-bearing keywords.
-        for key in _SCHEMA_CHILD_DICT_KEYS:
-            child = node.get(key)
-            if isinstance(child, dict):
-                for sub in child.values():
-                    self._inject_additional_properties_false(sub)
-
-        for key in _SCHEMA_CHILD_LIST_KEYS:
-            child = node.get(key)
-            if isinstance(child, list):
-                for item in child:
-                    self._inject_additional_properties_false(item)
-
-        for key in _SCHEMA_CHILD_SCHEMA_KEYS:
-            child = node.get(key)
-            if isinstance(child, dict):
-                self._inject_additional_properties_false(child)
-            elif isinstance(child, list):
-                # ``items`` may be a list of schemas (legacy tuple validation)
-                for item in child:
-                    self._inject_additional_properties_false(item)
-
-        # additionalProperties itself may be a schema dict.
-        ap = node.get("additionalProperties")
-        if isinstance(ap, dict):
-            self._inject_additional_properties_false(ap)
+        for schema in _schema_nodes(node):
+            node_type = schema.get("type")
+            type_is_object = node_type == "object" or (isinstance(node_type, list) and "object" in node_type)
+            # A properties map implies an object unless a scalar type says otherwise.
+            non_object_scalar = isinstance(node_type, str) and node_type != "object"
+            is_object = type_is_object or ("properties" in schema and not non_object_scalar)
+            if is_object and "additionalProperties" not in schema:
+                schema["additionalProperties"] = False
 
     def _inline_refs(
         self,

@@ -40,6 +40,7 @@ from apcore_mcp.auth import (
 )
 from apcore_mcp.config import MCP_DEFAULTS, MCP_ENV_PREFIX, MCP_NAMESPACE, register_mcp_namespace
 from apcore_mcp.constants import APCORE_EVENTS, ERROR_CODES, MODULE_ID_PATTERN, REGISTRY_EVENTS
+from apcore_mcp.converters.anthropic import AnthropicConverter
 from apcore_mcp.converters.openai import OpenAIConverter
 from apcore_mcp.helpers import MCP_ELICIT_KEY, MCP_PROGRESS_KEY, ElicitResult, elicit, report_progress
 from apcore_mcp.server.approval_bridge import APPROVAL_META_TOOL_NAMES, ApprovalBridge
@@ -109,6 +110,7 @@ __all__ = [
     "ModuleIDNormalizer",
     "internal_error_response",
     # Converters
+    "AnthropicConverter",
     "OpenAIConverter",
     # Config Bus
     "MCP_NAMESPACE",
@@ -404,7 +406,7 @@ def to_openai_tools(
     registry_or_executor: object | None = None,
     *,
     embed_annotations: bool = False,
-    strict: bool = False,
+    strict: bool = True,
     tags: list[str] | None = None,
     prefix: str | None = None,
 ) -> list[dict]:

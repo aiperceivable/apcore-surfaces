@@ -305,7 +305,7 @@ def openapi_backend(
     timeout — the two are different concerns and apcore-mcp conflates them in Rust.
     """
     try:
-        from apcore import Registry
+        from apcore.registry import Registry
         from apcore_toolkit import HTTPProxyRegistryWriter, validate_effective_proxy_modules
         from apcore_toolkit.openapi_scanner import OpenAPIScanner, load_spec
     except ImportError as exc:  # pragma: no cover - exercised by the extras matrix

@@ -235,7 +235,7 @@ class TestMCPDefaultsWiredIntoServe:
             mock_tm.run_streamable_http = capturing_run_http
 
             # Patch Config.load() to return our mock config
-            with patch("apcore.Config") as mock_config_cls:
+            with patch("apcore.config.Config") as mock_config_cls:
                 mock_config_cls.load.return_value = mock_config
 
                 # Monkey-patch resolve_registry/resolve_executor at their canonical

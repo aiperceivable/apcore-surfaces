@@ -189,17 +189,20 @@ client.close();
 
 ### Deliver APCore events to an A2A receiver
 
-Call `registerA2ASubscriber()` during startup before constructing any APCore
-client that should use the A2A transport. The existing `type: a2a` configuration
-selects one subscriber, including when used as a filter delegate. Importing
-the adapter leaves the built-in Core registration in place.
+Supply the A2A subscriber factory when constructing the APCore client.
+The client's `type: a2a` setting selects the factory, including for filter delegates.
 
 ```typescript
-import { APCore, Config, createEvent } from "apcore-js";
-import { registerA2ASubscriber } from "apcore-a2a";
+import { Config } from "apcore-js/config";
+import { createEvent } from "apcore-js/events";
+import { APCore } from "apcore-js/full";
+import { createSysModulesPlugin } from "apcore-js/sys-modules";
+import { createA2AEventSubscriber } from "apcore-a2a";
 
-registerA2ASubscriber();
-const core = new APCore({ config: Config.load("apcore.yaml") });
+const core = new APCore({
+  config: Config.load("apcore.yaml"),
+  plugins: [createSysModulesPlugin({ subscriberFactories: { a2a: createA2AEventSubscriber } })],
+});
 core.events?.emit(createEvent("example.updated", "example.module", "info", { value: 42 }));
 await core.events?.flush();
 ```
@@ -224,11 +227,7 @@ sys_modules:
 An omitted `skill_id` defaults to `apevo.event_receiver`. A string `auth`
 sends a bearer token, and a header map supplies custom headers. The transport
 uses Node's fetch and sends one POST per attempt. APCore owns filter rules,
-retry, circuit breakers, and dead-letter delivery. Configured retries and
-dead-letter reporting require a Core build that propagates delivery failures
-through the circuit breaker. Core 0.33.0 keeps its existing configured event
-handling. To return to the built-in transport, omit the registration call
-when restarting your application.
+retry, circuit breakers, and dead-letter delivery.
 
 ### Add authentication
 

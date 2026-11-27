@@ -2664,7 +2664,7 @@ public function by that name in any SDK.
   3. Validate each dict against OpenAI tool schema structure.
   4. Assert all module IDs are normalized (no dots).
   5. Assert all parameters are valid JSON Schema.
-- **Expected Result:** Output is valid OpenAI tools format. All $refs are inlined. All module IDs are normalized.
+- **Expected Result** — Output uses the OpenAI tools format and normalized module IDs. The nested schema retains its local reference and the strict-converted definition it resolves to.
 - **Traceability:** F-008
 
 ---

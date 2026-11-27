@@ -41,11 +41,8 @@ def build_middleware_from_config(entries: list[dict[str, Any]]) -> list[Any]:
         return []
 
     try:
-        from apcore import (
-            ErrorHistoryMiddleware,
-            RetryConfig,
-            RetryMiddleware,
-        )
+        from apcore.middleware.error_history_middleware import ErrorHistoryMiddleware
+        from apcore.middleware.retry import RetryConfig, RetryMiddleware
     except ImportError as exc:
         raise RuntimeError("Config Bus `mcp.middleware` requires apcore>=0.18 with middleware support") from exc
 

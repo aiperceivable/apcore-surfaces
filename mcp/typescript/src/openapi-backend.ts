@@ -14,6 +14,7 @@
 
 import path from "node:path";
 import { Registry } from "apcore-js";
+import { loadMcpConfig } from "./config.js";
 import {
   HTTPProxyRegistryWriter,
   OpenAPIScanner,
@@ -374,13 +375,7 @@ function warnIfWritesHaveNoApprovalPath(
  */
 async function configProjectRoot(): Promise<string | undefined> {
   try {
-    const apcore = (await import("apcore-js")) as Record<string, any>;
-    const Config = apcore.Config ?? apcore.default?.Config;
-    if (!Config) return undefined;
-    const config =
-      typeof Config.getInstance === "function" ? Config.getInstance() : new Config();
-    const root = config?.projectRoot;
-    return typeof root === "string" && root !== "" ? root : undefined;
+    return loadMcpConfig().projectRoot;
   } catch {
     return undefined;
   }

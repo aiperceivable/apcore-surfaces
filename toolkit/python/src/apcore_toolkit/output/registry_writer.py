@@ -19,7 +19,8 @@ from apcore_toolkit.pydantic_utils import flatten_pydantic_params, resolve_targe
 from apcore_toolkit.serializers import annotations_to_dict
 
 if TYPE_CHECKING:
-    from apcore import FunctionModule, Registry
+    from apcore.decorator import FunctionModule
+    from apcore.registry import Registry
 
     from apcore_toolkit.types import ScannedModule
 
@@ -252,7 +253,7 @@ class RegistryWriter:
             annotations: Override for the annotations dict; when ``_UNSET`` it is
                 derived from ``mod.annotations``. Used to clear ``streaming``.
         """
-        from apcore import FunctionModule
+        from apcore.decorator import FunctionModule
 
         ann = annotations_to_dict(mod.annotations) if annotations is _UNSET else annotations
         return FunctionModule(

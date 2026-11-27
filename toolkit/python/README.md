@@ -113,8 +113,6 @@ with create_prometheus_server(
 ```
 
 The context closes the listening socket and waits for accepted requests to finish.
-With a Core version that exposes `PrometheusExporter.export`, that bound method can
-also serve as the rendering callback.
 
 ### Scanning and Writing
 

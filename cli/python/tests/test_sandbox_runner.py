@@ -24,8 +24,8 @@ def _invoke_main(module_id: str, stdin_json: str, extra_env: dict | None = None)
         patch("sys.stdin", io.StringIO(stdin_json)),
         patch("sys.stdout", captured),
         patch.dict("os.environ", env_override, clear=False),
-        patch("apcore.Registry", return_value=mock_registry),
-        patch("apcore.Executor", return_value=mock_executor),
+        patch("apcore.discovery.Registry", return_value=mock_registry),
+        patch("apcore.executor.Executor", return_value=mock_executor),
     ):
         main()
     return captured.getvalue()
@@ -43,8 +43,8 @@ class TestSandboxRunnerMain:
             patch.object(sys, "argv", ["runner", "math.add"]),
             patch("sys.stdin", io.StringIO('{"a": 1}')),
             patch("sys.stdout", captured),
-            patch("apcore.Registry", return_value=mock_registry),
-            patch("apcore.Executor", return_value=mock_executor),
+            patch("apcore.discovery.Registry", return_value=mock_registry),
+            patch("apcore.executor.Executor", return_value=mock_executor),
         ):
             from apcore_cli._sandbox_runner import main
 
@@ -66,8 +66,8 @@ class TestSandboxRunnerMain:
             patch("sys.stdin", io.StringIO("{}")),
             patch("sys.stdout", io.StringIO()),
             patch.dict("os.environ", {"APCORE_EXTENSIONS_ROOT": "/abs/ext"}, clear=False),
-            patch("apcore.Registry", registry_cls),
-            patch("apcore.Executor", return_value=mock_executor),
+            patch("apcore.discovery.Registry", registry_cls),
+            patch("apcore.executor.Executor", return_value=mock_executor),
         ):
             from apcore_cli._sandbox_runner import main
 
@@ -86,8 +86,8 @@ class TestSandboxRunnerMain:
             patch.object(sys, "argv", ["runner", "mod.id"]),
             patch("sys.stdin", io.StringIO("{}")),
             patch("sys.stdout", captured),
-            patch("apcore.Registry", return_value=mock_registry),
-            patch("apcore.Executor", return_value=mock_executor),
+            patch("apcore.discovery.Registry", return_value=mock_registry),
+            patch("apcore.executor.Executor", return_value=mock_executor),
         ):
             from apcore_cli._sandbox_runner import main
 

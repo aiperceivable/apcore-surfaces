@@ -307,7 +307,7 @@ export class APCoreMCP {
 
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const apcore = await import("apcore-js") as any;
+      const apcore = await import("apcore-js/full") as any;
       const RegistryClass = apcore.Registry ?? apcore.default?.Registry;
       if (!RegistryClass) {
         throw new Error("Cannot find Registry class in apcore-js");

@@ -351,9 +351,7 @@ async fn listen_for_scrapes(
 A GET serves `/metrics` by default, `/healthz` for liveness, and `/readyz` for
 the supplied readiness callback. Set a different scrape path with
 `with_metrics_path`. Query parameters do not affect endpoint selection.
-Readiness defaults to false. Older Core versions can supply a callback that
-invokes `PrometheusExporter::export()` on their existing exporter, with the
-Toolkit handle owning the listener.
+Readiness defaults to false. The Toolkit handle owns the listener lifecycle.
 
 ## Requirements
 

@@ -1,9 +1,11 @@
-import { Config, Registry } from "apcore-js";
+import { Config } from "apcore-js/config";
+import { Registry } from "apcore-js/full";
 // Instrument configuration construction without replacing the real SDK Config.
-Object.defineProperty(Config, "getInstance", { value: () => {
+const load = Config.load;
+Config.load = (...args: Parameters<typeof load>) => {
   console.log("config bootstrap diagnostic");
-  return new Config();
-} });
+  return load.apply(Config, args);
+};
 const discover = Registry.prototype.discover;
 Registry.prototype.discover = function (...args: Parameters<typeof discover>) {
   console.log("discovery bootstrap diagnostic");

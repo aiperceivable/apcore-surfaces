@@ -39,6 +39,11 @@ from MCP discovery expectations; standalone converter and OpenAI fixtures are un
 
 ### Driven by all three bridges
 
+`tool_projection.json` verifies the same module across the public MCP tool factory,
+OpenAI Chat and Responses exporters, and Anthropic exporter in all three SDKs.
+It covers distinct tool envelopes, strict options, recursive references,
+schema extension handling, and approval metadata.
+
 `acl_config.json` at `contract_version` 1.2 and `openapi_backend.json` are driven by
 `apcore-mcp-python`, `apcore-mcp-typescript` and `apcore-mcp-rust` as of each bridge's 0.20.0.
 Their expectations were computed by running the real upstreams — apcore 0.29.0's `ACLRule` errors

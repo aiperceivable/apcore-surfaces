@@ -274,7 +274,7 @@ def create_cli(
         if _skip_discovery:
             # Skip filesystem discovery entirely.
             try:
-                from apcore import Executor as _Executor
+                from apcore.executor import Executor as _Executor
 
                 if executor is None:
                     executor = _Executor(registry)
@@ -313,7 +313,7 @@ def create_cli(
                 logger.warning("Discovery failed: %s", e)
 
             try:
-                from apcore import Executor as _Executor
+                from apcore.executor import Executor as _Executor
 
                 if executor is None:
                     executor = _Executor(registry)
@@ -340,8 +340,8 @@ def create_cli(
             exit_with(EXIT_CONFIG_NOT_FOUND)
 
         try:
-            from apcore import Executor as _Executor
-            from apcore import Registry as _Registry
+            from apcore.executor import Executor as _Executor
+            from apcore.full import Registry as _Registry
 
             registry = _Registry(extensions_dir=ext_dir)
             try:

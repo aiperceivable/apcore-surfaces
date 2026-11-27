@@ -15,7 +15,8 @@ import { ExecutionRouter } from "./server/router.js";
 import { RegistryListener } from "./server/listener.js";
 import { TransportManager } from "./server/transport.js";
 import { withStdioOutput, type StdioOutputLease } from "./server/stdio-output.js";
-import { registerMcpNamespace } from "./config.js";
+import { loadMcpConfig } from "./config.js";
+import type { Config } from "apcore-js/config";
 import { registerMcpFormatter } from "./adapters/mcp-error-formatter.js";
 import type { MetricsExporter } from "./server/transport.js";
 import { installObservability, type ObservabilityFlag } from "./server/observability.js";
@@ -38,7 +39,14 @@ import pkg from "../package.json" with { type: "json" };
 export const VERSION: string = pkg.version;
 
 // ─── Type Exports ────────────────────────────────────────────────────────────
-export type { Registry, Executor, RegistryOrExecutor, OpenAIToolDef } from "./types.js";
+export type {
+  AnthropicToolDef,
+  Executor,
+  OpenAIResponsesToolDef,
+  OpenAIToolDef,
+  Registry,
+  RegistryOrExecutor,
+} from "./types.js";
 export type {
   ModuleDescriptor,
   ModuleAnnotations,
@@ -107,7 +115,7 @@ export { ApprovalBridge, APPROVAL_META_TOOL_NAMES } from "./server/approval-brid
 export type { ApprovalMetaToolName } from "./server/approval-bridge.js";
 export { McpErrorFormatter, registerMcpFormatter } from "./adapters/mcp-error-formatter.js";
 export { registerMcpNamespace, MCP_NAMESPACE, MCP_ENV_PREFIX, MCP_DEFAULTS } from "./config.js";
-export { OpenAIConverter } from "./converters/openai.js";
+export { AnthropicConverter, OpenAIConverter } from "./converters/index.js";
 export type { ConvertOptions, ConvertRegistryOptions } from "./converters/openai.js";
 export type { BuildToolsOptions } from "./server/factory.js";
 
@@ -153,6 +161,7 @@ export async function resolveExecutor(
   options?: {
     approvalHandler?: unknown;
     strategy?: string;
+    pipelineConfig?: Config;
     middleware?: unknown[];
     acl?: unknown;
   },
@@ -165,6 +174,9 @@ export async function resolveExecutor(
       console.warn(
         `strategy='${options.strategy}' ignored: input is already an Executor instance.`,
       );
+    }
+    if (options?.pipelineConfig) {
+      console.warn("mcp.pipeline ignored: input is already an Executor instance.");
     }
     executor = registryOrExecutor as Executor;
   } else {
@@ -183,10 +195,14 @@ export async function resolveExecutor(
         if (options?.strategy) {
           executorOpts.strategy = options.strategy;
         }
+        if (options?.pipelineConfig) {
+          executorOpts.config = options.pipelineConfig;
+        }
         executor = new ExecutorClass(executorOpts) as Executor;
       }
-    } catch {
-      // apcore-js not installed — fall through to error
+    } catch (error) {
+      if (options?.pipelineConfig) throw error;
+      // apcore-js not installed — fall through to error.
     }
     if (!executor) {
       throw new Error(
@@ -466,86 +482,79 @@ async function loadConfigBusOverrides(
   callerAcl: unknown | undefined,
 ): Promise<{
   resolvedStrategy: string | undefined;
+  pipelineConfig?: Config;
   combinedMiddleware: unknown[];
   effectiveAcl: unknown | null;
   configOpenapi: unknown | null;
+  projectRoot?: string;
   configBusDefaults: ConfigBusDefaults;
 }> {
   let resolvedStrategy = strategy;
   let configMiddleware: unknown[] = [];
   let configAcl: unknown | null = null;
-  let configOpenapi: unknown | null = null;
   const configBusDefaults: ConfigBusDefaults = {};
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const apcoreConfig = await import("apcore-js") as any;
-    const Config = apcoreConfig.Config ?? apcoreConfig.default?.Config;
-    const buildStrategyFromConfig = apcoreConfig.buildStrategyFromConfig ?? apcoreConfig.default?.buildStrategyFromConfig;
-    if (Config && buildStrategyFromConfig) {
-      const config = typeof Config.getInstance === 'function' ? Config.getInstance() : new Config();
-      const pipelineCfg = config.get?.("mcp.pipeline");
-      if (pipelineCfg && typeof pipelineCfg === 'object' && Object.keys(pipelineCfg).length > 0) {
-        if (resolvedStrategy) {
-          console.warn(
-            `YAML pipeline config found in Config Bus — overriding strategy='${resolvedStrategy}' with config-driven strategy.`,
-          );
-        }
-        resolvedStrategy = buildStrategyFromConfig(pipelineCfg);
-      }
-      // Load declarative middleware from Config Bus (`mcp.middleware`).
-      const mwCfg = config.get?.("mcp.middleware");
-      if (Array.isArray(mwCfg) && mwCfg.length > 0) {
-        const { buildMiddlewareFromConfig } = await import(
-          "./middleware-builder.js"
-        );
-        configMiddleware = await buildMiddlewareFromConfig(mwCfg);
-      }
-      // Load declarative ACL from Config Bus (`mcp.acl`).
-      const aclCfg = config.get?.("mcp.acl");
-      if (aclCfg) {
-        const { buildAclFromConfig } = await import("./acl-builder.js");
-        configAcl = await buildAclFromConfig(aclCfg);
-      }
-      // Read (not build — the registry doesn't exist yet at this point in
-      // serve()/asyncServe()) the `mcp.openapi` section. PRD F-054
-      // Acceptance Criterion 1: `mcp.openapi.spec` alone must start a server.
-      configOpenapi = config.get?.("mcp.openapi") ?? null;
-      // [D9-002] Load 9 scalar mcp.* keys. Snake-case → camelCase.
-      const readStr = (k: string): string | undefined => {
-        const v = config.get?.(k);
-        return typeof v === "string" ? v : undefined;
-      };
-      const readNum = (k: string): number | undefined => {
-        const v = config.get?.(k);
-        if (typeof v === "number") return v;
-        if (typeof v === "string" && v !== "") {
-          const n = Number(v);
-          if (!Number.isNaN(n)) return n;
-        }
-        return undefined;
-      };
-      const readBool = (k: string): boolean | undefined => {
-        const v = config.get?.(k);
-        if (typeof v === "boolean") return v;
-        if (typeof v === "string") {
-          if (v === "true") return true;
-          if (v === "false") return false;
-        }
-        return undefined;
-      };
-      configBusDefaults.transport = readStr("mcp.transport");
-      configBusDefaults.host = readStr("mcp.host");
-      configBusDefaults.port = readNum("mcp.port");
-      configBusDefaults.name = readStr("mcp.name");
-      configBusDefaults.logLevel = readStr("mcp.log_level");
-      configBusDefaults.validateInputs = readBool("mcp.validate_inputs");
-      configBusDefaults.explorer = readBool("mcp.explorer");
-      configBusDefaults.explorerPrefix = readStr("mcp.explorer_prefix");
-      configBusDefaults.requireAuth = readBool("mcp.require_auth");
+  const config = loadMcpConfig();
+  const pipeline = config.get("mcp.pipeline");
+  let pipelineConfig: Config | undefined;
+  if (pipeline && typeof pipeline === "object" && Object.keys(pipeline).length > 0) {
+    if (resolvedStrategy) {
+      console.warn("mcp.pipeline takes precedence over the supplied strategy name.");
     }
-  } catch {
-    // apcore-js not installed or Config Bus not available — use strategy param as-is
+    // Let Core assemble the configured steps with the new Executor's own providers.
+    config.set("pipeline", pipeline);
+    pipelineConfig = config;
+    resolvedStrategy = undefined;
   }
+  // Load declarative middleware from Config Bus (`mcp.middleware`).
+  const mwCfg = config.get("mcp.middleware");
+  if (Array.isArray(mwCfg) && mwCfg.length > 0) {
+    const { buildMiddlewareFromConfig } = await import(
+      "./middleware-builder.js"
+    );
+    configMiddleware = await buildMiddlewareFromConfig(mwCfg);
+  }
+  // Load declarative ACL from Config Bus (`mcp.acl`).
+  const aclCfg = config.get("mcp.acl");
+  if (aclCfg) {
+    const { buildAclFromConfig } = await import("./acl-builder.js");
+    configAcl = await buildAclFromConfig(aclCfg);
+  }
+  // Read (not build — the registry doesn't exist yet at this point in
+  // serve()/asyncServe()) the `mcp.openapi` section. PRD F-054
+  // Acceptance Criterion 1: `mcp.openapi.spec` alone must start a server.
+  const configOpenapi = config.get("mcp.openapi") ?? null;
+  // [D9-002] Load 9 scalar mcp.* keys. Snake-case → camelCase.
+  const readStr = (k: string): string | undefined => {
+    const v = config.get(k);
+    return typeof v === "string" ? v : undefined;
+  };
+  const readNum = (k: string): number | undefined => {
+    const v = config.get(k);
+    if (typeof v === "number") return v;
+    if (typeof v === "string" && v !== "") {
+      const n = Number(v);
+      if (!Number.isNaN(n)) return n;
+    }
+    return undefined;
+  };
+  const readBool = (k: string): boolean | undefined => {
+    const v = config.get(k);
+    if (typeof v === "boolean") return v;
+    if (typeof v === "string") {
+      if (v === "true") return true;
+      if (v === "false") return false;
+    }
+    return undefined;
+  };
+  configBusDefaults.transport = readStr("mcp.transport");
+  configBusDefaults.host = readStr("mcp.host");
+  configBusDefaults.port = readNum("mcp.port");
+  configBusDefaults.name = readStr("mcp.name");
+  configBusDefaults.logLevel = readStr("mcp.log_level");
+  configBusDefaults.validateInputs = readBool("mcp.validate_inputs");
+  configBusDefaults.explorer = readBool("mcp.explorer");
+  configBusDefaults.explorerPrefix = readStr("mcp.explorer_prefix");
+  configBusDefaults.requireAuth = readBool("mcp.require_auth");
 
   const combinedMiddleware: unknown[] = [...configMiddleware];
   if (callerMiddleware && callerMiddleware.length > 0) {
@@ -555,7 +564,7 @@ async function loadConfigBusOverrides(
   // Caller-supplied ACL wins over Config Bus.
   const effectiveAcl = callerAcl !== undefined ? callerAcl : configAcl;
 
-  return { resolvedStrategy, combinedMiddleware, effectiveAcl, configOpenapi, configBusDefaults };
+  return { resolvedStrategy, pipelineConfig, combinedMiddleware, effectiveAcl, configOpenapi, projectRoot: config.projectRoot, configBusDefaults };
 }
 
 /**
@@ -805,7 +814,7 @@ async function serveInternal(
   const origError = console.error;
 
   // ── F-040: YAML Pipeline Config via Config Bus ─────────────────────
-  const { resolvedStrategy, combinedMiddleware, effectiveAcl, configOpenapi, configBusDefaults } =
+  const { resolvedStrategy, pipelineConfig, combinedMiddleware, effectiveAcl, configOpenapi, projectRoot, configBusDefaults } =
     await loadConfigBusOverrides(strategy, callerMiddleware, callerAcl);
 
   const transport = optTransport ?? configBusDefaults.transport ?? "stdio";
@@ -826,7 +835,7 @@ async function serveInternal(
       );
     }
     const { buildOpenapiBackendFromConfig } = await import("./openapi-backend.js");
-    resolvedBackend = (await buildOpenapiBackendFromConfig(configOpenapi)) as unknown as RegistryOrExecutor;
+    resolvedBackend = (await buildOpenapiBackendFromConfig(configOpenapi, { projectRoot })) as unknown as RegistryOrExecutor;
   } else {
     resolvedBackend = registryOrExecutor;
     if (configOpenapi) {
@@ -875,6 +884,7 @@ async function serveInternal(
     const executor = await resolveExecutor(resolvedBackend, {
       approvalHandler: scopedApproval?.handler ?? effectiveApprovalHandler,
       strategy: resolvedStrategy,
+      pipelineConfig,
       middleware: combinedMiddleware,
       acl: effectiveAcl,
     });
@@ -920,8 +930,6 @@ async function serveInternal(
     );
     const resolvedMetricsCollector = obsStack.metricsCollector;
 
-    // Register MCP config namespace and error formatter (idempotent)
-    registerMcpNamespace();
     await registerMcpFormatter();
 
     // Build output schema map for redaction
@@ -1160,7 +1168,7 @@ export async function asyncServe(
   const origError = console.error;
 
   // ── F-040: YAML Pipeline Config via Config Bus ─────────────────────
-  const { resolvedStrategy, combinedMiddleware, effectiveAcl, configOpenapi, configBusDefaults } =
+  const { resolvedStrategy, pipelineConfig, combinedMiddleware, effectiveAcl, configOpenapi, projectRoot, configBusDefaults } =
     await loadConfigBusOverrides(strategy, callerMiddleware, callerAcl);
 
   // PRD F-054 Acceptance Criterion 1: `mcp.openapi.spec` alone, with no
@@ -1178,7 +1186,7 @@ export async function asyncServe(
       );
     }
     const { buildOpenapiBackendFromConfig } = await import("./openapi-backend.js");
-    resolvedBackend = (await buildOpenapiBackendFromConfig(configOpenapi)) as unknown as RegistryOrExecutor;
+    resolvedBackend = (await buildOpenapiBackendFromConfig(configOpenapi, { projectRoot })) as unknown as RegistryOrExecutor;
   } else {
     resolvedBackend = registryOrExecutor;
     if (configOpenapi) {
@@ -1214,6 +1222,7 @@ export async function asyncServe(
   const executor = await resolveExecutor(resolvedBackend, {
     approvalHandler: scopedApproval?.handler ?? effectiveApprovalHandler,
     strategy: resolvedStrategy,
+    pipelineConfig,
     middleware: combinedMiddleware,
     acl: effectiveAcl,
   });
@@ -1265,7 +1274,6 @@ export async function asyncServe(
   const resolvedMetricsCollector = obsStack.metricsCollector;
 
   // Register MCP config namespace and error formatter (idempotent)
-  registerMcpNamespace();
   await registerMcpFormatter();
 
   // Build output schema map for redaction

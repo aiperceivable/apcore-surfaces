@@ -205,7 +205,7 @@ def openapi_backend(
     ``apcore-mcp/docs/features/openapi-backend.md``.
     """
     toolkit = _require_toolkit()
-    from apcore import Registry
+    from apcore.registry import Registry
 
     if has_other_backend_source and not prefix:
         raise ValueError(

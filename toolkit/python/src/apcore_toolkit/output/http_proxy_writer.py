@@ -32,8 +32,9 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from apcore import DEFAULT_ANNOTATIONS, ErrorCodes, Registry
-from apcore.errors import ModuleError
+from apcore.errors import ErrorCodes, ModuleError
+from apcore.module import DEFAULT_ANNOTATIONS
+from apcore.registry import Registry
 from apcore_toolkit.http_verb_map import (
     _effective_openapi_path,
     _openapi_path_param_names,

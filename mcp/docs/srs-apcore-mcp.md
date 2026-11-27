@@ -306,15 +306,13 @@ FR-SCHEMA-001 through FR-SCHEMA-003 describe the standalone SchemaConverter util
 | **Priority** | P0 |
 | **Traces to** | F-008 |
 
-**Description:** The schema conversion for OpenAI `parameters` shall apply the same `$ref` inlining and `type: object` guarantee as the standalone SchemaConverter utility (FR-SCHEMA-001 through FR-SCHEMA-003). The resulting schema shall be usable as the `"parameters"` value in an OpenAI tool definition.
+**Description** — The OpenAI tool converter shall normalize the input schema root and preserve local references with their definitions. It shall apply the strict schema transformation when strict mode is enabled.
 
-**Input/Trigger:** A `ModuleDescriptor` with a populated `input_schema` dict.
+**Input/Trigger** — A `ModuleDescriptor` with a populated `input_schema` dict.
 
-**Expected Output:** An explicitly converted OpenAI parameters schema. OpenAI conversion may inline references and apply strict-mode rules; MCP factory discovery independently preserves the runtime schema and does not share that projection.
+**Expected Output** — An OpenAI `parameters` schema with local references resolvable against its retained definitions.
 
-**Boundary Conditions:** Same as FR-SCHEMA-001.
-
-**Error Conditions:** Same as FR-SCHEMA-001.
+**Boundary Conditions** — An empty input schema produces an object schema with empty properties.
 
 ---
 

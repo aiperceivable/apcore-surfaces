@@ -2202,7 +2202,7 @@ impl Default for AsyncServeConfig {
 }
 
 /// Configuration for the convenience [`to_openai_tools`] function.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct OpenAIToolsConfig {
     /// Embed annotation metadata in tool descriptions.
     pub embed_annotations: bool,
@@ -2212,6 +2212,17 @@ pub struct OpenAIToolsConfig {
     pub tags: Option<Vec<String>>,
     /// Filter modules by ID prefix.
     pub prefix: Option<String>,
+}
+
+impl Default for OpenAIToolsConfig {
+    fn default() -> Self {
+        Self {
+            embed_annotations: false,
+            strict: true,
+            tags: None,
+            prefix: None,
+        }
+    }
 }
 
 /// Convenience: build and serve in one call (blocking).
@@ -4248,7 +4259,7 @@ mod tests {
     fn convenience_openai_tools_config_has_defaults() {
         let cfg = OpenAIToolsConfig::default();
         assert!(!cfg.embed_annotations);
-        assert!(!cfg.strict);
+        assert!(cfg.strict);
         assert!(cfg.tags.is_none());
         assert!(cfg.prefix.is_none());
     }

@@ -778,7 +778,7 @@ export async function createAsyncTaskBridge(
   if (options?.enabled === false) return null;
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const apcore = (await import("apcore-js")) as any;
+    const apcore = (await import("apcore-js/full")) as any;
     const AsyncTaskManager = apcore.AsyncTaskManager ?? apcore.default?.AsyncTaskManager;
     if (!AsyncTaskManager) return null;
     const manager = new AsyncTaskManager({

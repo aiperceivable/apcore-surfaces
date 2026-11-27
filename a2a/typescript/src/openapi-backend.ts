@@ -31,7 +31,8 @@
  */
 
 import path from "node:path";
-import { Config, Registry } from "apcore-js";
+import { Registry } from "apcore-js";
+import { Config } from "apcore-js/config";
 import {
   HTTPProxyRegistryWriter,
   OpenAPIScanner,

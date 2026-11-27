@@ -16,7 +16,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ACL, ACLDeniedError, Context, createIdentity } from "apcore-js";
+import { ACLDeniedError, Context, createIdentity } from "apcore-js";
+import { ACL } from "apcore-js/full";
 import type { AuditEntry, AuditLogger as AclAuditCallback } from "apcore-js";
 import { ConfigResolver, DEFAULTS } from "./config.js";
 import { EXIT_CODES } from "./errors.js";

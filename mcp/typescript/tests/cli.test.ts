@@ -99,33 +99,28 @@ describe("CLI (cli.ts)", () => {
 
     process.argv = ["node", "cli.js", ...args];
 
-    // Always mock apcore-js to prevent Vite resolution errors
     if (useRealApcoreJs) {
-      // openapi-backend.ts's internals (registry.register/list via the real
-      // toolkit writer) need a functional Registry, not the {discover} stub
-      // below — used only by the tests that actually exercise --from-openapi
-      // end to end.
-      vi.doMock("apcore-js", async () => vi.importActual("apcore-js"));
+      // --from-openapi needs a functional Registry for the Toolkit writer.
+      vi.doMock("apcore-js/full", async () => vi.importActual("apcore-js/full"));
     } else if (apcoreAvailable) {
-      vi.doMock("apcore-js", async (importOriginal) => ({
-        ...await importOriginal<typeof import("apcore-js")>(),
+      vi.doMock("apcore-js/full", async (importOriginal) => ({
+        ...await importOriginal<typeof import("apcore-js/full")>(),
         Registry: vi.fn(function () { return {
           discover: vi.fn().mockResolvedValue(discoverCount),
         }; }),
-        // Only present when a test needs to exercise the mcp.openapi
-        // Config-Bus fallback (A-001) — real apcore-js's Config.getInstance()
-        // shape, narrowed to just what cli.ts reads.
-        Config: configOpenapi === undefined ? undefined : {
-          getInstance: () => ({
-            get: (key: string) => (key === "mcp.openapi" ? configOpenapi : undefined),
-          }),
-        },
       }));
     } else {
-      vi.doMock("apcore-js", () => {
-        throw new Error("Cannot find module 'apcore-js'");
+      vi.doMock("apcore-js/full", () => {
+        throw new Error("Cannot find module 'apcore-js/full'");
       });
     }
+    vi.doMock("apcore-js/config", () => ({
+      Config: configOpenapi === undefined ? undefined : {
+        load: () => ({
+          get: (key: string) => (key === "mcp.openapi" ? configOpenapi : undefined),
+        }),
+      },
+    }));
 
     // Always mock index.js for serve/VERSION/JWTAuthenticator/ElicitationApprovalHandler
     const mockServe = serveFn ?? vi.fn().mockResolvedValue(undefined);

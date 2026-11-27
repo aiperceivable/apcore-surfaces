@@ -1,5 +1,5 @@
 ---
-description: "Schema Converter feature spec: inlines $ref/$defs from apcore Pydantic JSON Schemas into self-contained MCP inputSchema/OpenAI parameters with root object normalization and 32-level cycle detection."
+description: "Schema Converter normalizes JSON Schema roots and supports explicit local reference inlining with a 32-level depth limit."
 ---
 
 # Schema Converter
@@ -10,12 +10,12 @@ description: "Schema Converter feature spec: inlines $ref/$defs from apcore Pyda
 
 ## Purpose
 
-The Schema Converter is responsible for transforming apcore JSON Schema definitions (produced by Pydantic) into clean, compatible schemas suitable for MCP `inputSchema` and OpenAI `parameters`. It ensures that all internal references are resolved and that the resulting schema follows the strict requirements of AI tool-use protocols.
-
-MCP factories use the descriptor's runtime schema directly rather than this explicit
-conversion utility. See the [factory input contract](mcp-server-factory.md#mcp-input-schema-contract)
-for discovery semantics; the conversion APIs documented below remain available to
-callers that explicitly request their transformations.
+The Schema Converter normalizes module input and output schemas and can inline
+local references for callers that request that transformation. The OpenAI
+converter retains local references and definitions while normalizing input
+schemas and applying strict mode when enabled. MCP discovery uses the
+descriptor's runtime schema directly. See the
+[factory input contract](mcp-server-factory.md#mcp-input-schema-contract).
 
 ## Scope
 
@@ -44,7 +44,7 @@ callers that explicitly request their transformations.
 - **ModuleDescriptor** (apcore Registry) — Contains the raw `input_schema` and `output_schema` dicts.
 
 ### Outputs
-- **JSON Schema Dict** (MCP/OpenAI Converters) — A self-contained, inlined schema dictionary.
+- **JSON Schema Dict** — A normalized schema with local references inlined when requested.
 
 ### Dependencies
 - **apcore SDK (language-equivalent: apcore-python / apcore-js / apcore Rust crate)** — Provides the `ModuleDescriptor` structure and raw schema data.
@@ -127,8 +127,7 @@ User-set `additionalProperties` values (whether `true`, `false`, or a subschema)
 
 ## Notes
 
-- This component is critical for compatibility with MCP clients (like Claude Desktop) and OpenAI's API, which often struggle with unresolved JSON Schema references.
-- It reuses patterns from apcore's internal `RefResolver` but is optimized for the specific constraints of tool-use protocols.
+- Explicit inlining is available to consumers that require self-contained schemas.
 
 ---
 

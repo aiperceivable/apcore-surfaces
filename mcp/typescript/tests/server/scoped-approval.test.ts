@@ -6,6 +6,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import * as core from "apcore-js";
+import { EventEmitter } from "apcore-js/events";
+import { AsyncTaskManager } from "apcore-js/full";
 import { describe, expect, it, vi } from "vitest";
 import { StorageBackedApprovalHandler, supportsScopedCore } from "../../src/adapters/approval.js";
 import { InMemoryApprovalStore } from "../../src/approval-store.js";
@@ -42,7 +44,7 @@ async function connect(options: { streaming?: boolean; background?: boolean; tra
   const store = new InMemoryApprovalStore();
   const notify = vi.fn().mockResolvedValue(undefined);
   const handler = new StorageBackedApprovalHandler(store, { notifyCallback: notify }).forMcpServer();
-  const events = new core.EventEmitter();
+  const events = new EventEmitter();
   const audit: Record<string, unknown>[] = [];
   events.subscribe({
     eventPattern: "apcore.approval.decision",
@@ -71,7 +73,7 @@ async function connect(options: { streaming?: boolean; background?: boolean; tra
     execute: () => ({ job: "ordinary" }),
   } as never);
   const executor = new core.Executor({ registry, approvalHandler: handler as never, eventEmitter: events });
-  const manager = options.background ? new core.AsyncTaskManager({ executor }) : undefined;
+  const manager = options.background ? new AsyncTaskManager({ executor }) : undefined;
   const asyncTaskBridge = manager ? new AsyncTaskBridge(manager as never, {
     descriptorLookup: id => registry.getDefinition(id) as never,
   }) : undefined;

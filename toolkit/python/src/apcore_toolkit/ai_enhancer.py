@@ -19,7 +19,7 @@ import typing
 from dataclasses import replace
 from typing import Any, Callable, Protocol
 
-from apcore import DEFAULT_ANNOTATIONS, ModuleAnnotations
+from apcore.module import DEFAULT_ANNOTATIONS, ModuleAnnotations
 
 from apcore_toolkit.types import ScannedModule
 

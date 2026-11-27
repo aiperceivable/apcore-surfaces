@@ -48,7 +48,7 @@ Terminal adapter for apcore. Execute AI-Perceivable modules from the command lin
 cargo install apcore-cli
 ```
 
-Build with current stable Rust (`apcore` requires Rust 1.86+, and the checked-in lockfile includes dependencies requiring Rust 1.88+), `apcore = 1.0.0-alpha.1`, and `apcore-toolkit = 0.15.1-alpha.1` with `http-proxy`. Registry-based installation requires a compatible APCore release on crates.io. When testing a locally unpacked prerelease, resolve both this crate and Toolkit against the same unpacked APCore package and confirm with `cargo metadata`.
+Build with a stable Rust toolchain that supports the lockfile's dependencies (Rust 1.88 or later). This candidate uses `apcore = 1.0.0-alpha.2` with the `config` feature and `apcore-toolkit = 0.15.1-alpha.2` with `http-proxy`. For a local prerelease build, use the same APCore crate for the CLI and Toolkit. Check the selected versions with `cargo metadata`.
 
 > **Note:** `apcore-toolkit-rust` 0.7.0 enables `serde_json/preserve_order`. This transitively affects all `serde_json::Map` iteration in your dependency tree — code that relied on alphabetical key ordering must re-sort explicitly.
 

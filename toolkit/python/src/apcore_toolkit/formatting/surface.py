@@ -11,7 +11,7 @@ import dataclasses
 import json
 from typing import Any, Literal
 
-from apcore import ModuleAnnotations
+from apcore.module import ModuleAnnotations
 
 from apcore_toolkit.serializers import annotations_to_dict, module_to_dict
 from apcore_toolkit.types import ScannedModule

@@ -1,5 +1,4 @@
-import { registerSubscriberType } from "apcore-js";
-import type { ApCoreEvent, EventRetryConfig, EventSubscriber } from "apcore-js";
+import type { ApCoreEvent, EventRetryConfig, EventSubscriber } from "apcore-js/events";
 
 export interface A2AEventSubscriberOptions {
   readonly timeoutMs?: number;
@@ -92,18 +91,16 @@ function retryFromConfig(value: unknown): EventRetryConfig | undefined {
   return retry;
 }
 
-/** Select this transport for future `type: a2a` entries, including filter delegates. */
-export function registerA2ASubscriber(): void {
-  registerSubscriberType("a2a", config => {
-    const { platform_url: url, auth, id, timeout_ms: timeoutMs, skill_id: skillId, retry } = config;
-    if (typeof url !== "string" || url.length === 0) {
-      throw new Error('a2a subscriber requires a non-empty "platform_url" string field');
-    }
-    return new A2AEventSubscriber(url, auth as AuthHeaders | undefined, {
-      id: typeof id === "string" ? id : undefined,
-      timeoutMs: typeof timeoutMs === "number" ? timeoutMs : undefined,
-      skillId: typeof skillId === "string" ? skillId : undefined,
-      retry: retryFromConfig(retry),
-    });
+/** Build this host's transport for a configured A2A subscriber or filter delegate. */
+export function createA2AEventSubscriber(config: Record<string, unknown>): A2AEventSubscriber {
+  const { platform_url: url, auth, id, timeout_ms: timeoutMs, skill_id: skillId, retry } = config;
+  if (typeof url !== "string" || url.length === 0) {
+    throw new Error('a2a subscriber requires a non-empty "platform_url" string field');
+  }
+  return new A2AEventSubscriber(url, auth as AuthHeaders | undefined, {
+    id: typeof id === "string" ? id : undefined,
+    timeoutMs: typeof timeoutMs === "number" ? timeoutMs : undefined,
+    skillId: typeof skillId === "string" ? skillId : undefined,
+    retry: retryFromConfig(retry),
   });
 }

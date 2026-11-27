@@ -35,15 +35,14 @@ callback reports ready.
 
 ```typescript
 import { once } from 'node:events';
-import { MetricsCollector, PrometheusExporter, UsageCollector } from 'apcore-js';
+import { MetricsCollector, UsageCollector, renderPrometheusMetrics } from 'apcore-js/observability';
 import { createPrometheusServer } from 'apcore-toolkit';
 
 const metrics = new MetricsCollector();
 const usage = new UsageCollector();
-const exporter = new PrometheusExporter({ collector: metrics, usageCollector: usage });
 let ready = false;
 const server = createPrometheusServer({
-  renderMetrics: () => exporter.export(),
+  renderMetrics: () => renderPrometheusMetrics(metrics, usage),
   isReady: () => ready,
 });
 const listening = once(server, 'listening');
@@ -55,8 +54,8 @@ process.once('SIGTERM', () => { server.close(); });
 
 Use the same collector instances that your APCore middleware writes to.
 The returned Node server lets the application choose the bind address, handle
-listen errors and wait for active responses to finish on shutdown. The legacy
-Core exporter and its lifecycle API are available.
+listen errors and wait for active responses to finish on shutdown. The
+`apcore-js/observability` entry point is available starting with Core alpha.2.
 
 ### ScannedModule
 

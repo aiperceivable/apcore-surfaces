@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from apcore.schema.strict import _apply_llm_descriptions, to_strict_schema
+from apcore.schema.strict import to_strict_schema
 
 import apcore_mcp.markdown as _markdown
 from apcore_mcp.adapters.annotations import AnnotationMapper
 from apcore_mcp.adapters.id_normalizer import ModuleIDNormalizer
-from apcore_mcp.adapters.schema import SchemaConverter
+from apcore_mcp.adapters.schema import SchemaConverter, apply_llm_descriptions
 
 _logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class OpenAIConverter:
         self,
         registry: Any,
         embed_annotations: bool = False,
-        strict: bool = False,
+        strict: bool = True,
         tags: list[str] | None = None,
         prefix: str | None = None,
         rich_description: bool = False,
@@ -106,7 +106,7 @@ class OpenAIConverter:
             descriptor: ModuleDescriptor with module_id, description, input_schema,
                 and optional annotations.
             embed_annotations: If True, append annotation hints to description.
-            strict: If True (default since 0.16.0, parity with TS), enable OpenAI
+            strict: If True (the default), enable OpenAI
                 strict mode: inject ``additionalProperties: false``, hoist all
                 properties into ``required`` (with optionals widened to nullable),
                 and emit ``strict: true`` on the function. [D11-5]
@@ -126,7 +126,7 @@ class OpenAIConverter:
             }
         """
         name = self._id_normalizer.normalize(descriptor.module_id)
-        parameters = self._schema_converter.convert_input_schema(descriptor)
+        parameters = self._schema_converter.convert_input_schema(descriptor, strict=False, inline_refs=False)
 
         description = self._render_description(
             descriptor,
@@ -152,6 +152,32 @@ class OpenAIConverter:
             "type": "function",
             "function": function,
         }
+
+    def convert_responses_descriptor(
+        self,
+        descriptor: Any,
+        *,
+        embed_annotations: bool = False,
+        strict: bool = True,
+        rich_description: bool = False,
+    ) -> dict[str, Any]:
+        """Convert a module to a Responses API function tool."""
+        chat = self.convert_descriptor(descriptor, embed_annotations, strict, rich_description)
+        return {"type": "function", **chat["function"], "strict": strict}
+
+    def convert_responses_registry(
+        self,
+        registry: Any,
+        *,
+        embed_annotations: bool = False,
+        strict: bool = True,
+        tags: list[str] | None = None,
+        prefix: str | None = None,
+        rich_description: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Convert a registry to Responses API function tools."""
+        tools = self.convert_registry(registry, embed_annotations, strict, tags, prefix, rich_description)
+        return [{"type": "function", **tool["function"], "strict": strict} for tool in tools]
 
     def _render_description(
         self,
@@ -198,8 +224,6 @@ class OpenAIConverter:
         6. Optional properties become nullable
         7. Recurses into nested objects, array items, oneOf/anyOf/allOf, and $defs
 
-        This matches the behavior of SchemaExporter.export_openai().
-
         Args:
             schema: JSON Schema dict to transform.
 
@@ -209,5 +233,5 @@ class OpenAIConverter:
         import copy
 
         schema = copy.deepcopy(schema)
-        _apply_llm_descriptions(schema)
+        apply_llm_descriptions(schema)
         return to_strict_schema(schema)

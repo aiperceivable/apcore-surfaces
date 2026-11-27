@@ -5,7 +5,7 @@
  */
 
 import * as fs from "node:fs";
-import { createRequire } from "node:module";
+import { Config } from "apcore-js/config";
 import yaml from "js-yaml";
 import { warn as logWarn } from "./logger.js";
 
@@ -97,26 +97,17 @@ const LEGACY_TO_NAMESPACE: Record<string, string> = Object.fromEntries(
 );
 
 /**
- * Register the apcore-cli Config Bus namespace (apcore >= 0.15.0).
- * Safe to call even when apcore-js is unavailable or < 0.15.0.
+ * Register the apcore-cli Config Bus namespace.
  */
 export function registerConfigNamespace(): void {
   try {
-    // Use createRequire to load apcore-js from an ESM module without relying on
-    // tsup's `shims` option (which injects a `require` into the bundled output
-    // but not into vitest/tsx dev paths). Native `require()` at module scope is
-    // a ReferenceError in strict ESM and would silently no-op via the catch.
-    const nodeRequire = createRequire(import.meta.url);
-    const { Config } = nodeRequire("apcore-js");
-    if (typeof Config?.registerNamespace === "function") {
-      Config.registerNamespace({
-        name: "apcore-cli",
-        envPrefix: "APCORE_CLI",
-        defaults: NAMESPACE_DEFAULTS,
-      });
-    }
+    Config.registerNamespace({
+      name: "apcore-cli",
+      envPrefix: "APCORE_CLI",
+      defaults: NAMESPACE_DEFAULTS,
+    });
   } catch {
-    // apcore-js not installed or < 0.15.0 — graceful no-op
+    // The namespace can already be registered when a host builds another CLI.
   }
 }
 

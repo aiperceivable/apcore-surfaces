@@ -188,7 +188,9 @@ class TestEndToEndWithRealApcore:
         from apcore_mcp.apcore_mcp import APCoreMCP
 
         registry = Registry()
-        executor = Executor(registry=registry)
+        from apcore.policy import ExecutionPolicy
+
+        executor = Executor(registry=registry, policy=ExecutionPolicy(strict=False))
         register_sys_modules(registry=registry, executor=executor, config=_sys_modules_config())
 
         mcp = APCoreMCP(executor, async_tasks=False)

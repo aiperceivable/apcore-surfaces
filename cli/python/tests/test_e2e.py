@@ -316,20 +316,16 @@ class TestRealApprovalGate:
             result.stderr if hasattr(result, "stderr") else ""
         )
 
-    def test_approval_bypassed_with_yes(self, real_cli):
+    def test_yes_does_not_replace_a_core_approval_handler(self, real_cli):
         runner = CliRunner()
         result = runner.invoke(real_cli, ["admin.dangerous", "--target", "my-data", "--yes"])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert data["deleted"] == "my-data"
+        assert result.exit_code == 46
 
-    def test_approval_bypassed_with_env_var(self, real_cli, monkeypatch):
+    def test_env_var_does_not_replace_a_core_approval_handler(self, real_cli, monkeypatch):
         monkeypatch.setenv("APCORE_CLI_AUTO_APPROVE", "1")
         runner = CliRunner()
         result = runner.invoke(real_cli, ["admin.dangerous", "--target", "my-data"])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert data["deleted"] == "my-data"
+        assert result.exit_code == 46
 
     def test_no_approval_normal_module(self, real_cli):
         runner = CliRunner()

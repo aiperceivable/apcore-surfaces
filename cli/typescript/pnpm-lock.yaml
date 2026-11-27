@@ -34,11 +34,11 @@ importers:
         specifier: ^5.1.0
         version: 5.1.0(vitest@5.1.0)
       apcore-js:
-        specifier: ^0.33.0 || 1.0.0-alpha.1
-        version: 0.33.0
+        specifier: 1.0.0-alpha.2
+        version: 1.0.0-alpha.2(typescript@5.9.3)
       apcore-toolkit:
-        specifier: 0.15.1-alpha.1
-        version: 0.15.1-alpha.1(@sinclair/typebox@0.34.48)
+        specifier: 0.15.1-alpha.2
+        version: 0.15.1-alpha.2(@sinclair/typebox@0.34.48)(typescript@5.9.3)
       apdev-js:
         specifier: ^0.2.4
         version: 0.2.4(typescript@5.9.3)
@@ -731,12 +731,17 @@ packages:
   any-promise@1.3.0:
     resolution: {integrity: sha512-7UvmKalWRt1wgjL1RrGxoSJW/0QZFIegpeGvZG9kjp8vrRu55XTHbwnqq2GpXm9uLbcuhxm3IqX9OB4MZR1b2A==}
 
-  apcore-js@0.33.0:
-    resolution: {integrity: sha512-+0UPovkB37qKy9kUwZmgSK6an+RqOUy+XOU9sEAauXStmQYIWmPBV7ACymQ9nwPI4RVAKiWbU4upMIqrCitxoQ==}
+  apcore-js@1.0.0-alpha.2:
+    resolution: {integrity: sha512-WnQj/V/f43e0PbYIALpvjrerv/XOJStKE+FuOEl80qYEAtKWb/pKn1ho7p11HBinc6diCBxqIGScoN7qscnsbg==}
     engines: {node: '>=20.0.0'}
+    peerDependencies:
+      typescript: ^5.5.0
+    peerDependenciesMeta:
+      typescript:
+        optional: true
 
-  apcore-toolkit@0.15.1-alpha.1:
-    resolution: {integrity: sha512-e8E9gtYAKLeBkpdIQisey4LogMdTR+qffL5PD5U0TyLiVl2v90xSBVXfHof3FkJWMj0/MKRqjlyzBk750xmt+w==}
+  apcore-toolkit@0.15.1-alpha.2:
+    resolution: {integrity: sha512-nBMk99wAGjSH/E3fCj4I5FsvlvYiVs+k+ARIGc6u+kkxiTvxoAlQNKAUviBYJBrmItwDVl+9EonaEO2qfiRQGg==}
     engines: {node: '>=20.10.0'}
     peerDependencies:
       '@sinclair/typebox': '>=0.31.0'
@@ -1939,18 +1944,22 @@ snapshots:
 
   any-promise@1.3.0: {}
 
-  apcore-js@0.33.0:
+  apcore-js@1.0.0-alpha.2(typescript@5.9.3):
     dependencies:
       '@sinclair/typebox': 0.34.48
       js-yaml: 4.3.2
       uuid: 11.1.1
+    optionalDependencies:
+      typescript: 5.9.3
 
-  apcore-toolkit@0.15.1-alpha.1(@sinclair/typebox@0.34.48):
+  apcore-toolkit@0.15.1-alpha.2(@sinclair/typebox@0.34.48)(typescript@5.9.3):
     dependencies:
       '@sinclair/typebox': 0.34.48
       ajv: 8.20.0
-      apcore-js: 0.33.0
+      apcore-js: 1.0.0-alpha.2(typescript@5.9.3)
       js-yaml: 4.3.2
+    transitivePeerDependencies:
+      - typescript
 
   apdev-js@0.2.4(typescript@5.9.3):
     dependencies:

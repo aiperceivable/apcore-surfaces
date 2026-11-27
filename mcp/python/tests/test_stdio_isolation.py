@@ -143,7 +143,7 @@ def test_cli_discovery_is_guarded(tmp_path: Path) -> None:
             def __init__(self, **kwargs): print('registry constructor')
             def discover(self): print('discovery'); return 1
         sys.argv = ['apcore-mcp', '--extensions-dir', {str(tmp_path)!r}]
-        with (patch('apcore_mcp.__main__.Registry', Registry),
+        with (patch('apcore.discovery.Registry', Registry),
               patch('apcore_mcp.__main__.serve', lambda *a, **k: print('serve'))):
             main()
         print('restored')

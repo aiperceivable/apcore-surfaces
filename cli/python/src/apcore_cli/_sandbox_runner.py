@@ -25,7 +25,8 @@ def main() -> None:
     input_data = json.loads(sys.stdin.read())
     extensions_root = os.environ.get("APCORE_EXTENSIONS_ROOT", "./extensions")
 
-    from apcore import Executor, Registry
+    from apcore.discovery import Registry
+    from apcore.executor import Executor
 
     registry = Registry(extensions_dir=extensions_root)
     registry.discover()

@@ -65,6 +65,16 @@ impl SchemaConverter {
         Self::convert_schema_with(schema, strict)
     }
 
+    /// Copy an input schema for a provider that supports recursive references.
+    pub(crate) fn copy_referenced_input_schema(schema: &Value) -> Value {
+        if schema.is_null() || schema.as_object().is_some_and(|map| map.is_empty()) {
+            return json!({"type": "object", "properties": {}});
+        }
+        let mut copied = schema.clone();
+        Self::ensure_object_type(&mut copied);
+        copied
+    }
+
     fn convert_schema_with(schema: &Value, strict: bool) -> Result<Value, AdapterError> {
         // Clone to avoid mutating input
         let mut schema = schema.clone();

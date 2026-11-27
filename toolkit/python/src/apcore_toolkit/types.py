@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from apcore import ModuleAnnotations, ModuleExample
+from apcore.module import ModuleAnnotations, ModuleExample
 
 
 @dataclass

@@ -35,7 +35,7 @@ def _make_patches(stub_registry_cls=None, discover_return=5):
         mock_registry_cls = stub_registry_cls
 
     return {
-        "registry_patch": patch("apcore_mcp.__main__.Registry", mock_registry_cls),
+        "registry_patch": patch("apcore.discovery.Registry", mock_registry_cls),
         "serve_patch": patch("apcore_mcp.__main__.serve"),
         "mock_registry_cls": mock_registry_cls,
     }
@@ -301,7 +301,7 @@ class TestFullWiring:
         mock_registry_cls.return_value = mock_instance
 
         with (
-            patch("apcore_mcp.__main__.Registry", mock_registry_cls) as mock_reg,
+            patch("apcore.discovery.Registry", mock_registry_cls) as mock_reg,
             patch("apcore_mcp.__main__.serve") as mock_serve,
         ):
             _run_main("--extensions-dir", str(tmp_path))
@@ -324,7 +324,7 @@ class TestFullWiring:
         mock_registry_cls.return_value = mock_instance
 
         with (
-            patch("apcore_mcp.__main__.Registry", mock_registry_cls),
+            patch("apcore.discovery.Registry", mock_registry_cls),
             patch("apcore_mcp.__main__.serve") as mock_serve,
         ):
             _run_main("--extensions-dir", str(tmp_path))
@@ -340,7 +340,7 @@ class TestFullWiring:
         mock_registry_cls.return_value = mock_instance
 
         with (
-            patch("apcore_mcp.__main__.Registry", mock_registry_cls),
+            patch("apcore.discovery.Registry", mock_registry_cls),
             patch("apcore_mcp.__main__.serve", side_effect=RuntimeError("bind failed")),
         ):
             with pytest.raises(SystemExit) as exc_info:
@@ -611,7 +611,7 @@ class TestBackendSourceConfigBusFallback:
         with (
             patches["registry_patch"],
             patches["serve_patch"] as mock_serve,
-            patch("apcore.Config") as mock_cfg_cls,
+            patch("apcore.config.Config") as mock_cfg_cls,
         ):
             mock_cfg_cls.load.return_value = fake_cfg
             _run_main()  # no --extensions-dir, no --from-openapi
@@ -624,7 +624,7 @@ class TestBackendSourceConfigBusFallback:
 
     def test_neither_flag_nor_config_bus_still_exits_2(self, capsys):
         fake_cfg = _FakeMcpOpenapiConfig(None)
-        with patch("apcore.Config") as mock_cfg_cls:
+        with patch("apcore.config.Config") as mock_cfg_cls:
             mock_cfg_cls.load.return_value = fake_cfg
             with pytest.raises(SystemExit) as exc_info:
                 _run_main()

@@ -16,8 +16,6 @@ import anyio
 import jsonschema  # type: ignore[import-untyped]  # MCP supplies jsonschema without its optional typing stubs.
 from apcore import CancelToken, Identity, ModuleError
 from apcore import Registry as CoreRegistry
-from apcore.schema.exporter import SchemaExporter
-from apcore.schema.types import SchemaDefinition
 from mcp import types as mcp_types
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.lowlevel.helper_types import ReadResourceContents
@@ -275,7 +273,6 @@ class MCPServerFactory:
         # the TS factory's `_warnedToolkitMissing` guard).
         self._warned_toolkit_missing = False
         self._annotation_mapper = AnnotationMapper()
-        self._schema_exporter = SchemaExporter()
         from apcore_mcp.adapters.errors import ErrorMapper
 
         self._error_mapper = ErrorMapper()
@@ -328,8 +325,8 @@ class MCPServerFactory:
         - descriptor.module_id -> Tool.name
         - descriptor.description -> Tool.description
         - descriptor.input_schema -> independent MCP Tool.inputSchema copy
-        - SchemaExporter.export_mcp() -> ToolAnnotations hints (camelCase)
-        - AnnotationMapper -> requires_approval, streaming (_meta), title
+        - AnnotationMapper -> ToolAnnotations hints and requires_approval metadata
+        - descriptor.annotations.streaming -> streaming metadata
 
         Args:
             descriptor: ModuleDescriptor with module_id, description,
@@ -363,24 +360,8 @@ class MCPServerFactory:
             raise ValueError("MCP input schema must allow an object root")
         input_schema["type"] = "object"
 
-        # NOTE: Python uses SchemaExporter.export_mcp() for annotation mapping,
-        # while TypeScript uses AnnotationMapper.toMcpAnnotations() directly.
-        # Both produce identical output. If annotation logic changes, update both paths.
-        schema_def = SchemaDefinition(
-            module_id=descriptor.module_id,
-            description=descriptor.description,
-            input_schema=descriptor.input_schema,
-            output_schema=getattr(descriptor, "output_schema", {}),
-        )
-        exported = self._schema_exporter.export_mcp(schema_def, annotations=descriptor.annotations)
-        hints = exported["annotations"]
-
         tool_annotations = mcp_types.ToolAnnotations(
-            readOnlyHint=hints.get("readOnlyHint"),
-            destructiveHint=hints.get("destructiveHint"),
-            idempotentHint=hints.get("idempotentHint"),
-            openWorldHint=hints.get("openWorldHint"),
-            title=None,
+            **self._annotation_mapper.to_mcp_annotations(descriptor.annotations),
         )
 
         # Build optional _meta with requires_approval and streaming hints
