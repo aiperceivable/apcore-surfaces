@@ -326,7 +326,9 @@ See `apcore-toolkit/docs/features/formatting.md` § Tabular Formats for the full
 Enable the `prometheus-server` feature to serve Core metrics and health probes.
 Pass a renderer backed by your application's existing collectors. The bound
 handle reports its address and provides an async `close()` that stops accepting
-connections before draining in-flight responses.
+connections before draining in-flight responses. The drain timeout covers
+asynchronous connection I/O. The renderer and readiness callback run on the
+Tokio runtime and must return without blocking.
 
 ```rust
 use std::{io, net::SocketAddr};

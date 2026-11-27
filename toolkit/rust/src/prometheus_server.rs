@@ -33,6 +33,7 @@ pub struct PrometheusServer {
 
 impl PrometheusServer {
     /// Create a listener configuration. The renderer is called for each scrape.
+    /// It runs synchronously on the Tokio runtime and must return without blocking.
     pub fn new(render_metrics: impl Fn() -> String + Send + Sync + 'static) -> Self {
         Self {
             render_metrics: Box::new(render_metrics),
@@ -49,6 +50,7 @@ impl PrometheusServer {
     }
 
     /// Check the host's current readiness for each probe. The default is false.
+    /// The callback runs synchronously on the Tokio runtime and must not block.
     #[must_use]
     pub fn with_readiness(mut self, is_ready: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         self.is_ready = Some(Box::new(is_ready));
@@ -125,7 +127,8 @@ impl PrometheusServerHandle {
         self.address
     }
 
-    /// Stop accepting and wait up to ten seconds for open connections to drain.
+    /// Stop accepting and allow up to ten seconds for asynchronous connection I/O
+    /// to drain. Synchronous renderer and readiness callbacks must return promptly.
     ///
     /// A repeated close returns successfully. Dropping this handle signals the
     /// same shutdown, while `close` waits for it to finish.
