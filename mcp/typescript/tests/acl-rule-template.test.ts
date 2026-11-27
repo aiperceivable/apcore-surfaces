@@ -1,3 +1,5 @@
+import { Config } from "apcore-js/config";
+import { registerSysModules } from "apcore-js/sys-modules";
 /**
  * Tests for the ACL rule template shipped in `src/acl-builder.ts`'s doc
  * comment (aiperceivable/apcore-mcp#14) and the `approval` rule field
@@ -45,10 +47,10 @@ describe("ACL rule template targets match registered system.* module ids", () =>
     // modules register too (registration.ts gates them behind the events
     // branch) — otherwise only the six read modules would exist and the
     // "system.control.*" pattern would match nothing, silently.
-    const config = new apcore.Config({
+    const config = new Config({
       sys_modules: { enabled: true, events: { enabled: true } },
     });
-    apcore.registerSysModules(registry, executor, config, null);
+    registerSysModules(registry, executor, config, null);
 
     const registeredIds: string[] = registry.list({ visibility: ["public", "hidden"] });
     expect(registeredIds.length).toBeGreaterThan(0);

@@ -1,3 +1,5 @@
+import { Config } from "apcore-js/config";
+import { registerSysModules } from "apcore-js/sys-modules";
 /**
  * Cross-language conformance: the nine canonical system.* modules -> exact MCP primitive.
  *
@@ -49,8 +51,8 @@ async function realRegistryAndExecutor(): Promise<{ registry: unknown; executor:
   const apcore = (await import("apcore-js")) as unknown as ApcoreJsModule;
   const registry = new apcore.Registry();
   const executor = new apcore.Executor({ registry });
-  const config = new apcore.Config(FIXTURE!.setup.config);
-  apcore.registerSysModules(registry, executor, config, null);
+  const config = new Config(FIXTURE!.setup.config);
+  registerSysModules(registry, executor, config, null);
   return { registry, executor };
 }
 

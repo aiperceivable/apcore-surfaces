@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from dataclasses import replace
 from typing import Any
 
-from apcore import DEFAULT_ANNOTATIONS, ModuleAnnotations
+from apcore.module import DEFAULT_ANNOTATIONS, ModuleAnnotations
 from apcore_toolkit.types import ScannedModule
 
 

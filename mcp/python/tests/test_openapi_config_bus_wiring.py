@@ -80,14 +80,14 @@ class TestApcoreMcpOpenapiConfigBusOnly:
 
     def test_none_backend_with_openapi_config_builds_server(self) -> None:
         fake_cfg = _FakeConfig({"mcp.openapi": {"spec": _PETSTORE}})
-        with patch("apcore.Config") as mock_cfg_cls:
+        with patch("apcore.config.Config") as mock_cfg_cls:
             mock_cfg_cls.load.return_value = fake_cfg
             mcp = APCoreMCP(None, name="test")
         assert "list_pets" in mcp.tools
 
     def test_none_backend_with_no_config_raises(self) -> None:
         fake_cfg = _FakeConfig({})
-        with patch("apcore.Config") as mock_cfg_cls:
+        with patch("apcore.config.Config") as mock_cfg_cls:
             mock_cfg_cls.load.return_value = fake_cfg
             with pytest.raises(ValueError, match="extensions_dir_or_backend is required"):
                 APCoreMCP(None, name="test")
@@ -96,7 +96,7 @@ class TestApcoreMcpOpenapiConfigBusOnly:
         from apcore import Registry
 
         fake_cfg = _FakeConfig({"mcp.openapi": {"spec": _PETSTORE}})
-        with patch("apcore.Config") as mock_cfg_cls:
+        with patch("apcore.config.Config") as mock_cfg_cls:
             mock_cfg_cls.load.return_value = fake_cfg
             with pytest.raises(ValueError, match="mcp.openapi.prefix is required"):
                 APCoreMCP(Registry(), name="test")
@@ -105,7 +105,7 @@ class TestApcoreMcpOpenapiConfigBusOnly:
         from apcore import Registry
 
         fake_cfg = _FakeConfig({"mcp.openapi": {"spec": _PETSTORE, "prefix": "petstore"}})
-        with patch("apcore.Config") as mock_cfg_cls:
+        with patch("apcore.config.Config") as mock_cfg_cls:
             mock_cfg_cls.load.return_value = fake_cfg
             mcp = APCoreMCP(Registry(), name="test")
         assert "petstore.list_pets" in mcp.tools

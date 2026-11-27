@@ -52,7 +52,7 @@ class _DeleteModule:
     description = "Delete a path"
     # Deliberately false: any approval requirement observed in these tests can
     # only have come from the ACL rule, which is the whole point.
-    annotations = {"requires_approval": False, "destructive": True}
+    annotations = {"requires_approval": False}
 
     def execute(self, inputs: dict[str, Any], context: Any) -> dict[str, Any]:
         return {"deleted": inputs["path"]}

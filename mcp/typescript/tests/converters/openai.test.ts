@@ -1,6 +1,50 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
-import { OpenAIConverter } from "../../src/converters/openai.js";
+import { AnthropicConverter, OpenAIConverter } from "../../src/index.js";
+import { MCPServerFactory } from "../../src/server/factory.js";
 import type { ModuleDescriptor, Registry } from "../../src/types.js";
+
+it("matches the shared provider tool projection", () => {
+  const fixture = JSON.parse(readFileSync(
+    new URL("../../../conformance/fixtures/tool_projection.json", import.meta.url), "utf8",
+  ));
+  const module = fixture.module;
+  const descriptor: ModuleDescriptor = {
+    moduleId: module.module_id,
+    description: module.description,
+    inputSchema: module.input_schema,
+    outputSchema: module.output_schema,
+    annotations: null,
+    examples: module.examples,
+  };
+  const registry = createMockRegistry({ [descriptor.moduleId]: descriptor });
+  const openai = new OpenAIConverter();
+  const expected = fixture.expected;
+  expect(openai.convertRegistry(registry)).toEqual([expected.openai_chat]);
+  expect(openai.convertResponsesDescriptor(descriptor, { strict: false })).toEqual(expected.openai_responses_non_strict);
+  expect(openai.convertResponsesRegistry(registry)).toEqual([{ type: "function", ...expected.openai_chat.function }]);
+  expect(new AnthropicConverter().convertDescriptor(descriptor)).toEqual(expected.anthropic);
+
+  const factory = new MCPServerFactory();
+  const annotations = {
+    readonly: false, destructive: false, idempotent: false, openWorld: true,
+    requiresApproval: true, streaming: true,
+  };
+  const tool = factory.buildTool({ ...descriptor, annotations });
+  expect(tool.name).toBe(descriptor.moduleId);
+  expect(tool.inputSchema).toEqual(descriptor.inputSchema);
+  expect(tool.outputSchema).toEqual(descriptor.outputSchema);
+  expect(tool._meta).toEqual(expected.mcp_meta);
+  expect(tool.annotations).not.toHaveProperty("requiresApproval");
+  expect(tool.annotations).not.toHaveProperty("streaming");
+  expect(factory.buildTool(descriptor)._meta).toBeUndefined();
+
+  const recursive = { ...descriptor, inputSchema: fixture.recursive_input_schema };
+  expect(new AnthropicConverter().convertDescriptor(recursive).input_schema).toEqual(recursive.inputSchema);
+  expect(openai.convertDescriptor(recursive).function.parameters).toHaveProperty(
+    ["$defs", "node", "properties", "children", "items", "$ref"], "#/$defs/node",
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -632,7 +676,7 @@ describe("OpenAIConverter", () => {
     });
 
     // D11-012: Missing oneOf nullable wrap for $ref properties
-    it("D11-012: wraps optional $ref property in oneOf nullable", () => {
+    it("wraps an optional $ref property in the A23 anyOf nullable form", () => {
       // Call _applyStrictMode directly because SchemaConverter inlines $refs
       // before the converter sees the schema. The raw schema here simulates
       // what a caller might pass directly to _applyStrictMode.
@@ -646,7 +690,7 @@ describe("OpenAIConverter", () => {
       const result = converter._applyStrictMode(schema) as Record<string, unknown>;
       const props = result.properties as Record<string, unknown>;
       expect(props.id).toEqual({
-        oneOf: [{ "$ref": "#/$defs/ID" }, { type: "null" }],
+        anyOf: [{ "$ref": "#/$defs/ID" }, { type: "null" }],
       });
     });
   });

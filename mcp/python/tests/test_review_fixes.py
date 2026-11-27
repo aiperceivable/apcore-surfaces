@@ -617,8 +617,8 @@ class TestPyC3ConfigBusPortStringConversion:
         mock_config.get.side_effect = fake_config_get
 
         with (
-            patch("apcore.Config") as mock_config_cls,
-            patch("apcore.build_strategy_from_config", return_value=None),
+            patch("apcore.config.Config") as mock_config_cls,
+            patch("apcore.pipeline_config.build_strategy_from_config", return_value=None),
             patch("apcore_mcp.MCPServerFactory") as mock_fac,
             patch("apcore_mcp.ExecutionRouter"),
             patch("apcore_mcp.TransportManager") as mock_tm_cls,
@@ -659,8 +659,8 @@ class TestPyC3ConfigBusPortStringConversion:
         mock_config.get.side_effect = fake_config_get
 
         with (
-            patch("apcore.Config") as mock_config_cls,
-            patch("apcore.build_strategy_from_config", return_value=None),
+            patch("apcore.config.Config") as mock_config_cls,
+            patch("apcore.pipeline_config.build_strategy_from_config", return_value=None),
             patch("apcore_mcp.MCPServerFactory") as mock_fac,
             patch("apcore_mcp.ExecutionRouter"),
             patch("apcore_mcp.TransportManager") as mock_tm_cls,
@@ -740,7 +740,7 @@ class TestPyW1AsyncServeConfigBusParity:
         mock_app = MagicMock()
 
         with (
-            patch("apcore.Config") as mock_config_cls,
+            patch("apcore.config.Config") as mock_config_cls,
             patch("apcore_mcp.MCPServerFactory") as mock_fac,
             patch("apcore_mcp.ExecutionRouter"),
             patch("apcore_mcp.TransportManager") as mock_tm_cls,

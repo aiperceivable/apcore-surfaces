@@ -1,1 +1,1 @@
-"""Converters: OpenAI tools format conversion."""
+"""Project APCore modules to model provider tool formats."""

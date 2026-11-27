@@ -1620,14 +1620,11 @@ async fn extended_card_keeps_the_system_namespace() {
 
 #[tokio::test]
 async fn an_unprotected_control_surface_warns_without_refusing_to_start() {
-    // srs FR-AGC-007 criteria 1, 2 and 4: the message is emitted, the server
-    // still starts, and neither card changes.
-    //
-    // The condition is real: `system.control.*` declares `requires_approval`,
-    // but apcore's approval gate warns once and continues when no
-    // `ApprovalHandler` is configured, so withholding the namespace from the
-    // card removes it from discovery and not from dispatch.
-    let (_registry, executor) = system_namespace_executor(None);
+    // srs FR-AGC-007 criteria 1, 2 and 4: the server warns and still starts.
+    // The explicit non-strict policy leaves approval-required control modules
+    // callable without a handler while the public card omits the namespace.
+    let (_registry, mut executor) = system_namespace_executor(None);
+    executor.set_policy(Some(apcore::ExecutionPolicy::default().with_strict(false)));
     assert!(
         executor.governance_state().unprotected_control_surface,
         "precondition: control modules registered with no gate engaging"

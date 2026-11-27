@@ -44,7 +44,7 @@ def _resolve_registry_and_executor(
     """
     # Path shortcut: "./extensions" → Registry + discover + Executor
     if isinstance(registry_or_executor, str | Path):
-        from apcore import Registry
+        from apcore.discovery import Registry
         from apcore.executor import Executor
 
         registry = Registry(extensions_dir=str(registry_or_executor))

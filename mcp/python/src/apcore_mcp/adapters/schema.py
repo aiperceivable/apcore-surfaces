@@ -12,7 +12,7 @@ _MAX_REF_DEPTH = 32
 # should be walked when injecting additionalProperties: false. Keys like
 # ``enum``, ``const``, ``examples``, ``default``, ``required`` hold literal
 # data and must NOT be recursed into.
-_SCHEMA_CHILD_DICT_KEYS = ("properties", "patternProperties", "$defs", "definitions")
+_SCHEMA_CHILD_DICT_KEYS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
 _SCHEMA_CHILD_LIST_KEYS = ("oneOf", "anyOf", "allOf", "prefixItems")
 _SCHEMA_CHILD_SCHEMA_KEYS = ("items", "not", "if", "then", "else", "contains", "propertyNames")
 
@@ -49,6 +49,14 @@ def apply_llm_descriptions(schema: dict[str, Any]) -> None:
             node["description"] = description
 
 
+def strip_schema_extensions(schema: dict[str, Any]) -> None:
+    """Remove APCore extensions while preserving schemas' literal values."""
+    for node in _schema_nodes(schema):
+        for key in tuple(node):
+            if key.startswith("x-"):
+                del node[key]
+
+
 class SchemaConverter:
     """Converts apcore ModuleDescriptor schemas to MCP-compatible schemas.
 
@@ -65,19 +73,22 @@ class SchemaConverter:
     def __init__(self, *, strict: bool = True) -> None:
         self._strict = strict
 
-    def convert_input_schema(self, descriptor: Any, *, strict: bool | None = None) -> dict[str, Any]:
+    def convert_input_schema(
+        self, descriptor: Any, *, strict: bool | None = None, inline_refs: bool = True
+    ) -> dict[str, Any]:
         """Convert apcore ModuleDescriptor.input_schema to MCP inputSchema.
 
         Args:
             descriptor: ModuleDescriptor with input_schema attribute
             strict: Per-call override of the construction-time strict mode.
                 ``None`` keeps the converter's own setting.
+            inline_refs: Resolve references when the target requires inlined schemas.
 
         Returns:
             MCP-compatible schema dict with $refs inlined and $defs removed
         """
         schema = descriptor.input_schema
-        return self._convert_schema(schema, strict=strict)
+        return self._convert_schema(schema, strict=strict, inline_refs=inline_refs)
 
     def convert_output_schema(self, descriptor: Any, *, strict: bool | None = None) -> dict[str, Any]:
         """Convert apcore ModuleDescriptor.output_schema.
@@ -93,13 +104,16 @@ class SchemaConverter:
         schema = descriptor.output_schema
         return self._convert_schema(schema, strict=strict)
 
-    def _convert_schema(self, schema: dict[str, Any], *, strict: bool | None = None) -> dict[str, Any]:
+    def _convert_schema(
+        self, schema: dict[str, Any], *, strict: bool | None = None, inline_refs: bool = True
+    ) -> dict[str, Any]:
         """Convert a schema, applying all transformations.
 
         Args:
             schema: JSON Schema dict to convert
             strict: Per-call override of the construction-time strict mode.
                 ``None`` keeps the converter's own setting.
+            inline_refs: Resolve references against definitions in the schema.
 
         Returns:
             Converted schema with $refs inlined, $defs removed, and type ensured
@@ -121,7 +135,7 @@ class SchemaConverter:
             return result
 
         # Inline $refs if present
-        if "$defs" in schema:
+        if inline_refs and "$defs" in schema:
             defs = schema["$defs"]
             schema = self._inline_refs(schema, defs)
             # Remove $defs from the final schema

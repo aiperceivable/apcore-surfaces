@@ -433,7 +433,7 @@ def register_config_command(apcli_group: click.Group, executor: Any) -> None:
     def config_get_cmd(key: str) -> None:
         """Read a configuration value by dot-path key."""
         try:
-            from apcore import Config
+            from apcore.config import Config
 
             value = Config().get(key)
             click.echo(f"{key} = {value!r}")

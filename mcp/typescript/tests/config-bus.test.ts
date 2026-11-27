@@ -1,11 +1,14 @@
 /**
  * D9-002: Config Bus deduplication — regression test.
  *
- * Verifies that both serve() and asyncServe() call Config.getInstance()
+ * Verifies that both serve() and asyncServe() call Config.load()
  * exactly once each (via loadConfigBusOverrides), not twice.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import type { Executor, Registry } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
@@ -42,21 +45,18 @@ vi.mock("../src/server/factory.js", () => ({
   }; }),
 }));
 
-const getInstanceSpy = vi.fn().mockReturnValue({ get: vi.fn().mockReturnValue(null) });
+const loadConfigSpy = vi.fn().mockReturnValue({ get: vi.fn().mockReturnValue(null) });
 
-vi.mock("apcore-js", async (importOriginal) => ({
-  ...await importOriginal<typeof import("apcore-js")>(),
-  Config: {
-    getInstance: (...args: unknown[]) => getInstanceSpy(...args),
-  },
-  buildStrategyFromConfig: vi.fn(),
-  default: {
+vi.mock("apcore-js/config", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("apcore-js/config")>();
+  return {
+    ...actual,
     Config: {
-      getInstance: (...args: unknown[]) => getInstanceSpy(...args),
+      registerNamespace: actual.Config.registerNamespace.bind(actual.Config),
+      load: (...args: unknown[]) => loadConfigSpy(...args),
     },
-    buildStrategyFromConfig: vi.fn(),
-  },
-}));
+  };
+});
 
 import { serve, asyncServe } from "../src/index.js";
 
@@ -85,23 +85,23 @@ function makeExecutor(registry: Registry): Executor {
 
 describe("D9-002: Config Bus deduplication", () => {
   beforeEach(() => {
-    getInstanceSpy.mockClear();
-    getInstanceSpy.mockReturnValue({ get: vi.fn().mockReturnValue(null) });
+    loadConfigSpy.mockClear();
+    loadConfigSpy.mockReturnValue({ get: vi.fn().mockReturnValue(null) });
   });
 
-  it("serve() calls Config.getInstance() exactly once via loadConfigBusOverrides", async () => {
+  it("serve() calls Config.load() exactly once via loadConfigBusOverrides", async () => {
     const registry = makeRegistry();
     const executor = makeExecutor(registry);
     await serve(executor, { transport: "stdio" });
-    expect(getInstanceSpy).toHaveBeenCalledTimes(1);
+    expect(loadConfigSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("asyncServe() calls Config.getInstance() exactly once via loadConfigBusOverrides", async () => {
+  it("asyncServe() calls Config.load() exactly once via loadConfigBusOverrides", async () => {
     const registry = makeRegistry();
     const executor = makeExecutor(registry);
     const app = await asyncServe(executor, {});
     await app.close();
-    expect(getInstanceSpy).toHaveBeenCalledTimes(1);
+    expect(loadConfigSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -110,13 +110,13 @@ describe("D9-002: Config Bus scalar key reads (transport/host/port)", () => {
     // Reset transport mock state per test.
     const { TransportManager } = await import("../src/server/transport.js");
     (TransportManager as unknown as { mockClear: () => void }).mockClear();
-    getInstanceSpy.mockClear();
+    loadConfigSpy.mockClear();
   });
 
   it("uses Config Bus mcp.port when caller does not pass port", async () => {
     // Stub Config.get to return port 9000 for mcp.port (matching the audit's
     // canonical example: APCORE_MCP_PORT=9000).
-    getInstanceSpy.mockReturnValue({
+    loadConfigSpy.mockReturnValue({
       get: vi.fn((k: string) => {
         if (k === "mcp.port") return 9000;
         if (k === "mcp.transport") return "streamable-http";
@@ -139,7 +139,7 @@ describe("D9-002: Config Bus scalar key reads (transport/host/port)", () => {
   });
 
   it("caller-supplied port wins over Config Bus mcp.port", async () => {
-    getInstanceSpy.mockReturnValue({
+    loadConfigSpy.mockReturnValue({
       get: vi.fn((k: string) => {
         if (k === "mcp.port") return 9000;
         if (k === "mcp.transport") return "streamable-http";
@@ -162,7 +162,7 @@ describe("D9-002: Config Bus scalar key reads (transport/host/port)", () => {
 describe("stdio reservation while resolving Config Bus transport", () => {
   it("reserves unspecified bootstrap, then restores before Config-selected HTTP setup", async () => {
     const stdout = process.stdout.write;
-    getInstanceSpy.mockImplementationOnce(() => {
+    loadConfigSpy.mockImplementationOnce(() => {
       expect(process.stdout.write).not.toBe(stdout);
       return { get: (key: string) => key === "mcp.transport" ? "streamable-http" : null };
     });
@@ -171,5 +171,63 @@ describe("stdio reservation while resolving Config Bus transport", () => {
       onStartup: () => { expect(process.stdout.write).toBe(stdout); },
     });
     expect(process.stdout.write).toBe(stdout);
+  });
+});
+
+describe("MCP project YAML through Core Config.load", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("applies transport, port, and name to the actual startup path", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "apcore-mcp-project-config-"));
+    try {
+      const path = join(directory, "apcore.yaml");
+      writeFileSync(path, [
+        "apcore:",
+        "  version: 1.0.0",
+        "  project: {name: test-project}",
+        "mcp:",
+        "  transport: streamable-http",
+        "  port: 9042",
+        "  name: yaml-server",
+      ].join("\n"));
+      vi.stubEnv("APCORE_CONFIG_FILE", path);
+      const actual = await vi.importActual<typeof import("apcore-js/config")>("apcore-js/config");
+      loadConfigSpy.mockImplementationOnce(() => actual.Config.load(undefined, { validate: false }));
+
+      await serve(makeExecutor(makeRegistry()), { async: false });
+
+      const { TransportManager } = await import("../src/server/transport.js");
+      const instances = vi.mocked(TransportManager).mock.results;
+      expect(instances.at(-1)?.value.runStreamableHttp).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ port: 9042 }),
+      );
+      const { MCPServerFactory } = await import("../src/server/factory.js");
+      expect(vi.mocked(MCPServerFactory).mock.results.at(-1)?.value.createServer)
+        .toHaveBeenCalledWith("yaml-server", expect.any(String), expect.anything());
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("starts with stdio defaults when no configuration file exists", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "apcore-mcp-no-config-"));
+    try {
+      vi.stubEnv("APCORE_CONFIG_FILE", undefined);
+      vi.stubEnv("HOME", directory);
+      vi.stubEnv("XDG_CONFIG_HOME", directory);
+      const actual = await vi.importActual<typeof import("apcore-js/config")>("apcore-js/config");
+      const config = actual.Config.load(undefined, { validate: false });
+      expect(config.sourcePath).toBeNull();
+      loadConfigSpy.mockReturnValueOnce(config);
+
+      await serve(makeExecutor(makeRegistry()), { async: false });
+
+      const { TransportManager } = await import("../src/server/transport.js");
+      expect(vi.mocked(TransportManager).mock.results.at(-1)?.value.runStdio)
+        .toHaveBeenCalledOnce();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

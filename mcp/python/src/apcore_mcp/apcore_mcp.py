@@ -61,7 +61,8 @@ def _load_config_bus_overrides(
     config_acl: object | None = None
     scalars: dict[str, object] = {}
     try:
-        from apcore import Config, build_strategy_from_config
+        from apcore.config import Config
+        from apcore.pipeline_config import build_strategy_from_config
     except ImportError as exc:
         logger.debug("Config Bus not available, skipping: %s", exc)
         return {
@@ -495,7 +496,7 @@ class APCoreMCP:
         # explicit from_openapi()/openapi_backend() call required.
         openapi_config: Any | None = None
         try:
-            from apcore import Config
+            from apcore.config import Config
 
             _config = Config.load()
             if _config:
@@ -515,7 +516,7 @@ class APCoreMCP:
 
             backend: Any = build_openapi_backend_from_config(openapi_config)
         elif isinstance(extensions_dir_or_backend, str | Path):
-            from apcore import Registry
+            from apcore.discovery import Registry
 
             backend = Registry(extensions_dir=str(extensions_dir_or_backend))
             backend.discover()

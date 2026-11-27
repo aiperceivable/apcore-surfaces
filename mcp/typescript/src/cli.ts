@@ -134,11 +134,10 @@ export async function main(): Promise<void> {
     if (!extensionsDir && !fromOpenapi) {
       let hasConfigBusOpenapi = false;
       try {
-        const apcore = await import("apcore-js");
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const Config = (apcore as any).Config;
-        const config = typeof Config?.getInstance === "function" ? Config.getInstance() : undefined;
-        hasConfigBusOpenapi = Boolean(config?.get?.("mcp.openapi"));
+        const { loadMcpConfig } = await import("./config.js");
+        const configured = loadMcpConfig().get("mcp.openapi");
+        const spec = (configured as { spec?: unknown } | null)?.spec;
+        hasConfigBusOpenapi = typeof spec === "string" && spec.trim() !== "";
       } catch {
         // apcore-js not installed — treated the same as "no Config Bus value".
       }
@@ -196,7 +195,7 @@ export async function main(): Promise<void> {
       discover(): Promise<number>;
     };
     try {
-      const apcore = await import("apcore-js");
+      const apcore = await import("apcore-js/full");
       Registry = apcore.Registry;
     } catch {
       fail(

@@ -56,7 +56,7 @@ export async function buildMiddlewareFromConfig(
   let apcore: Record<string, unknown>;
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    apcore = (await import("apcore-js")) as any;
+    apcore = (await import("apcore-js/full")) as any;
   } catch (err) {
     throw new Error(
       `Config Bus 'mcp.middleware' requires apcore-js>=0.18 with middleware support: ${

@@ -234,7 +234,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if extensions_dir is None and not args.from_openapi:
         has_config_bus_openapi = False
         try:
-            from apcore import Config
+            from apcore.config import Config
 
             _config = Config.load()
             has_config_bus_openapi = bool(_config and _config.get("mcp.openapi"))
@@ -287,7 +287,9 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     # directory first, then OpenAPI operations — so a collision report names
     # the OpenAPI side, which is the one the operator can rename with a prefix.
     if extensions_dir is not None:
-        registry = Registry(extensions_dir=str(extensions_dir))
+        from apcore.discovery import Registry as DiscoveryRegistry
+
+        registry = DiscoveryRegistry(extensions_dir=str(extensions_dir))
         num_modules = registry.discover()
         if num_modules == 0:
             logger.warning("No modules discovered in '%s'.", extensions_dir)

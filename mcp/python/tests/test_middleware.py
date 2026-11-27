@@ -168,7 +168,7 @@ def test_apcore_mcp_reads_config_bus_middleware():
     fake_config = MagicMock()
     fake_config.get.side_effect = lambda key, *a, **kw: config_data.get(key)
 
-    with patch("apcore.Config.load", return_value=fake_config):
+    with patch("apcore.config.Config.load", return_value=fake_config):
         mcp = APCoreMCP(registry)
 
     mws = list(mcp._executor._middleware_manager._middlewares)
@@ -194,7 +194,7 @@ def test_apcore_mcp_merges_config_and_constructor_middleware():
     fake_config.get.side_effect = lambda key, *a, **kw: config_data.get(key)
 
     user_mw = ObsLoggingMiddleware()
-    with patch("apcore.Config.load", return_value=fake_config):
+    with patch("apcore.config.Config.load", return_value=fake_config):
         mcp = APCoreMCP(registry, middleware=[user_mw])
 
     mws = list(mcp._executor._middleware_manager._middlewares)
@@ -211,7 +211,7 @@ def test_apcore_mcp_no_config_bus_still_works():
     registry = Registry()
     user_mw = RetryMiddleware()
 
-    with patch("apcore.Config.load", return_value=None):
+    with patch("apcore.config.Config.load", return_value=None):
         mcp = APCoreMCP(registry, middleware=[user_mw])
 
     assert user_mw in list(mcp._executor._middleware_manager._middlewares)

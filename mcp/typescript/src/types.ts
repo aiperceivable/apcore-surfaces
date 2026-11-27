@@ -194,6 +194,21 @@ export interface OpenAIToolDef {
   };
 }
 
+export interface OpenAIResponsesToolDef {
+  type: "function";
+  name: string;
+  description: string;
+  parameters: JsonSchema;
+  strict: boolean;
+}
+
+export interface AnthropicToolDef {
+  name: string;
+  description: string;
+  input_schema: JsonSchema;
+  input_examples?: Record<string, unknown>[];
+}
+
 // ─── Utility Types ───────────────────────────────────────────────────────────
 
 export interface TextContentDict {

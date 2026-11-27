@@ -1,3 +1,5 @@
+import { Config } from 'apcore-js/config';
+import { registerSysModules } from 'apcore-js/sys-modules';
 /**
  * End-to-end: an ACL-sourced approval requirement gates a real MCP tools/call.
  *
@@ -99,6 +101,8 @@ async function buildRouter(): Promise<{
 
   const handler = new RecordingApprovalHandler();
   const executor = new apcore.Executor({
+    // Isolate the caller-specific ACL requirement from destructive defaults.
+    policy: new apcore.ExecutionPolicy([], { gateDestructive: false }),
     registry,
     acl,
     approvalHandler: handler as never,
@@ -178,10 +182,10 @@ describe("ACL enforcement on apcore:// management resource reads", () => {
     const executor = new apcore.Executor({ registry }) as {
       setAcl?: (acl: unknown) => void;
     };
-    const config = new apcore.Config({
+    const config = new Config({
       sys_modules: { enabled: true, events: { enabled: true } },
     });
-    apcore.registerSysModules(registry, executor, config, null);
+    registerSysModules(registry, executor, config, null);
     executor.setAcl?.(new apcore.ACL([{ callers: ["*"], targets: ["system.*"], effect }], "deny"));
 
     const factory = new MCPServerFactory();

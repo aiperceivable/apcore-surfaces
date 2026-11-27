@@ -77,6 +77,7 @@ pub use crate::config::{mcp_defaults, register_mcp_namespace, MCP_ENV_PREFIX, MC
 
 // ---- Re-exports: converters -------------------------------------------------
 pub use crate::converters::openai::{ConvertOptions, ConverterError, OpenAIConverter};
+pub use crate::converters::AnthropicConverter;
 
 // ---- Re-exports: helpers ----------------------------------------------------
 pub use crate::helpers::{elicit, report_progress, ElicitResult, MCP_ELICIT_KEY, MCP_PROGRESS_KEY};

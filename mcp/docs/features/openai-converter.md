@@ -68,10 +68,25 @@ When `strict=True`, the converter performs recursive transformation:
 - Convert any property that wasn't originally required into a union type `[type, "null"]`.
 - Strip all `default` values and non-standard `x-*` keys.
 
-### Per-SDK Defaults (v0.14.0)
-- Python: `OpenAIConverter()` — strict default `false`; pass `strict=true` per call.
-- TypeScript: `convertRegistry(registry, { strict: true })` — strict default `true` (changed in 0.14.0 per OC-1).
-- Rust: explicit `strict: bool` argument required on `convert_registry`/`convert_descriptor`; no implicit default.
+### Tool formats and defaults
+
+The default OpenAI conversion uses strict schemas. Rust positional calls still
+take an explicit `strict` argument. Rust `ConvertOptions::default()` selects
+strict mode. Provider converters preserve local references and definitions.
+
+| Target | Python | TypeScript | Rust |
+| --- | --- | --- | --- |
+| OpenAI Chat Completions | `OpenAIConverter.convert_descriptor` | `OpenAIConverter.convertDescriptor` | `OpenAIConverter::convert_descriptor_with_options` |
+| OpenAI Responses | `OpenAIConverter.convert_responses_descriptor` | `OpenAIConverter.convertResponsesDescriptor` | `OpenAIConverter::convert_responses_descriptor` |
+| Anthropic Messages | `AnthropicConverter.convert_descriptor` | `AnthropicConverter.convertDescriptor` | `AnthropicConverter::convert_descriptor` |
+
+Chat Completions puts the definition in `function`. Responses puts the
+definition fields at the tool's top level. The Responses exporter emits explicit
+`strict: false` for opt-out. Both OpenAI formats can project all applicable
+modules from a registry. [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling).
+
+Anthropic returns `name`, `description`, and `input_schema`. Module
+input examples populate `input_examples`. [Anthropic tool definitions](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools).
 
 ### Module ID Normalization
 Since OpenAI function names can only contain `[a-zA-Z0-9_-]`, dots are replaced with hyphens. The converter must ensure this mapping is bijective and reversible to allow the calling application to map the tool call back to the original `module_id`.
@@ -87,7 +102,7 @@ The converter must return only standard Python types (dict, list, str, etc.) and
 
 ## Error Handling
 
-- **Incompatible Schema**: If a schema cannot be converted to OpenAI's strict format (e.g., it uses unsupported keywords), the converter logs a warning and provides the best possible non-strict alternative.
+- **Incompatible Schema**: The provider validates its supported keyword set. Prefer a compatible schema for strict mode, or explicitly select non-strict conversion.
 - **ID Conflict**: If normalization results in name collisions (e.g., `a.b` and `a-b` both become `a-b`), the converter raises a `ValueError`.
 
 ## Notes
@@ -221,7 +236,9 @@ The converter must return only standard Python types (dict, list, str, etc.) and
 - idempotent: true
 
 ### Default
-`ConvertOptions::default()` returns `{strict: false, embed_annotations: false, rich_description: false, tags: None, prefix: None}`. Callers using the default Boolean strict semantics SHOULD use the non-`_with_options` `convert_registry(registry, strict)` form for clarity.
+`ConvertOptions::default()` sets `strict = true`, `embed_annotations = false`,
+and `rich_description = false`. Registry methods accept tag and prefix filters
+separately.
 
 ---
 

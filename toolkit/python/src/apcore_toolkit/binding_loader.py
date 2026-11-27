@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from apcore import ModuleAnnotations, ModuleExample
+from apcore.module import ModuleAnnotations, ModuleExample
 
 from apcore_toolkit.types import ScannedModule
 

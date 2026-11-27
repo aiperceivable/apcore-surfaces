@@ -14,7 +14,7 @@
  * at import time rather than being ignored.
  */
 
-import { Config } from "apcore-js";
+import { Config } from "apcore-js/config";
 
 export const A2A_NAMESPACE = "apcore-a2a";
 export const A2A_ENV_PREFIX = "APCORE_A2A";

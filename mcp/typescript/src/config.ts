@@ -4,7 +4,7 @@
  * Registers the "mcp" namespace so users can configure apcore-mcp via
  * YAML (under the `mcp:` key) or env vars prefixed with APCORE_MCP_.
  */
-import { Config } from "apcore-js";
+import { Config } from "apcore-js/config";
 
 export const MCP_NAMESPACE = "mcp";
 export const MCP_ENV_PREFIX = "APCORE_MCP";
@@ -50,4 +50,10 @@ export function registerMcpNamespace(): void {
   } catch {
     // Already registered or registerNamespace not available in this apcore-js version
   }
+}
+
+/** Register MCP defaults before loading the project's configuration. */
+export function loadMcpConfig(): Config {
+  registerMcpNamespace();
+  return Config.load(undefined, { validate: false });
 }

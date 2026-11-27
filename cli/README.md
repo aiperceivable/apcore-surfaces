@@ -533,8 +533,6 @@ apcore-cli uses a 4-tier configuration precedence:
 ```yaml
 extensions:
   root: ./extensions
-logging:
-  level: DEBUG
 sandbox:
   enabled: false
 cli:

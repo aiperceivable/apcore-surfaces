@@ -25,7 +25,8 @@ from apcore_cli.exit import exit_with
 from apcore_cli.security.audit import get_audit_logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from apcore import ACL, AuditEntry, Context, Identity
+    from apcore.acl import ACL, AuditEntry
+    from apcore.context import Context, Identity
 
     from apcore_cli.config import ConfigResolver
 
@@ -234,7 +235,7 @@ def load_cli_acl(root: str, *, audit_enabled: bool = True, include_denied: bool 
             unknown rule key, malformed pattern array, non-mapping
             ``conditions``). Both map to exit ``47``.
     """
-    from apcore import ACL as _ACL
+    from apcore.acl import ACL as _ACL
 
     acl_file = acl_file_for_root(root)
     if acl_file is None:

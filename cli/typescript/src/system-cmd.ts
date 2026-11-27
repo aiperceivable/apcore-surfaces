@@ -7,7 +7,7 @@
  */
 
 import { Command } from "commander";
-import { Config } from "apcore-js";
+import { Config } from "apcore-js/config";
 import { checkApproval } from "./approval.js";
 import type { Executor, ModuleDescriptor } from "./cli.js";
 import { exitCodeForError } from "./errors.js";

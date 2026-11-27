@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from apcore_mcp import AnthropicConverter
 from apcore_mcp.converters.openai import OpenAIConverter
-from tests.conftest import ModuleAnnotations, ModuleDescriptor
+from apcore_mcp.server.factory import MCPServerFactory
+from tests.conformance_fixtures import load_fixture
+from tests.conftest import ModuleAnnotations, ModuleDescriptor, ModuleExample
 
 # ---------------------------------------------------------------------------
 # Lightweight stub for apcore Registry used in converter tests.
@@ -27,6 +30,36 @@ class StubRegistry:
 
     def get_definition(self, module_id):
         return self._descriptors.get(module_id)
+
+
+def test_provider_tool_projection():
+    fixture = load_fixture("tool_projection.json")
+    module = fixture["module"]
+    descriptor = ModuleDescriptor(**{**module, "examples": [ModuleExample(**e) for e in module["examples"]]})
+    registry = StubRegistry([descriptor])
+    openai = OpenAIConverter()
+    expected = fixture["expected"]
+    assert openai.convert_registry(registry) == [expected["openai_chat"]]
+    assert openai.convert_responses_descriptor(descriptor, strict=False) == expected["openai_responses_non_strict"]
+    assert openai.convert_responses_registry(registry) == [{"type": "function", **expected["openai_chat"]["function"]}]
+    assert AnthropicConverter().convert_descriptor(descriptor) == expected["anthropic"]
+
+    factory = MCPServerFactory()
+    descriptor.annotations = ModuleAnnotations(requires_approval=True, streaming=True)
+    tool = factory.build_tool(descriptor)
+    assert tool.name == descriptor.module_id
+    assert tool.inputSchema == descriptor.input_schema
+    assert tool.outputSchema == descriptor.output_schema
+    assert tool.meta == expected["mcp_meta"]
+    assert "requiresApproval" not in tool.annotations.model_dump()
+    assert "streaming" not in tool.annotations.model_dump()
+    descriptor.annotations = ModuleAnnotations()
+    assert factory.build_tool(descriptor).meta is None
+
+    descriptor.input_schema = fixture["recursive_input_schema"]
+    assert AnthropicConverter().convert_descriptor(descriptor)["input_schema"] == descriptor.input_schema
+    params = openai.convert_descriptor(descriptor)["function"]["parameters"]
+    assert params["$defs"]["node"]["properties"]["children"]["items"]["$ref"] == "#/$defs/node"
 
 
 class TestConvertDescriptor:

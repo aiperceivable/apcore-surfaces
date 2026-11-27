@@ -329,17 +329,10 @@ class TestConfigCommand:
         fake_config_cls = MagicMock()
         fake_config_cls.return_value.get.return_value = "42"
         monkeypatch.setattr(
-            "apcore.Config",
+            "apcore.config.Config",
             fake_config_cls,
             raising=False,
         )
-        # Guard: patch inside the lazy-imported reference too.
-        import sys
-
-        apcore_mod = sys.modules.get("apcore")
-        if apcore_mod is not None:
-            monkeypatch.setattr(apcore_mod, "Config", fake_config_cls, raising=False)
-
         ex = _make_executor()
         cli = _build_apcli_with(register_config_command, ex)
         result = CliRunner().invoke(cli, ["config", "get", "some.key"])
@@ -352,12 +345,7 @@ class TestConfigCommand:
         """Exception during Config().get propagates to exit 1."""
         bad_config = MagicMock()
         bad_config.return_value.get.side_effect = RuntimeError("nope")
-        import sys
-
-        apcore_mod = sys.modules.get("apcore")
-        if apcore_mod is not None:
-            monkeypatch.setattr(apcore_mod, "Config", bad_config, raising=False)
-        monkeypatch.setattr("apcore.Config", bad_config, raising=False)
+        monkeypatch.setattr("apcore.config.Config", bad_config, raising=False)
 
         ex = _make_executor()
         cli = _build_apcli_with(register_config_command, ex)

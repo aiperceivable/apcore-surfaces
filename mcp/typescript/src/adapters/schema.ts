@@ -9,6 +9,35 @@ import type { JsonSchema, ModuleDescriptor } from "../types.js";
 
 export interface ConvertSchemaOptions {
   strict?: boolean;
+  inlineRefs?: boolean;
+}
+
+export function prepareLlmSchema(schema: JsonSchema, stripExtensions = false): void {
+  if (typeof schema["x-llm-description"] === "string") {
+    schema.description = schema["x-llm-description"];
+  }
+  if (stripExtensions) {
+    for (const key of Object.keys(schema)) {
+      if (key.startsWith("x-")) delete schema[key];
+    }
+  }
+  const visit = (child: unknown): void => {
+    if (typeof child === "object" && child !== null && !Array.isArray(child)) {
+      prepareLlmSchema(child as JsonSchema, stripExtensions);
+    }
+  };
+  for (const key of ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]) {
+    const children = schema[key];
+    if (typeof children === "object" && children !== null) Object.values(children).forEach(visit);
+  }
+  for (const key of ["oneOf", "anyOf", "allOf", "prefixItems", "items"]) {
+    const children = schema[key];
+    if (Array.isArray(children)) children.forEach(visit);
+    else if (key === "items") visit(children);
+  }
+  for (const key of ["not", "if", "then", "else", "contains", "propertyNames", "additionalProperties"]) {
+    visit(schema[key]);
+  }
 }
 
 /**
@@ -61,14 +90,15 @@ export class SchemaConverter {
     const copied = structuredClone(schema);
 
     // Extract and remove $defs before inlining
-    const defs = (copied["$defs"] as Record<string, JsonSchema>) ?? {};
-    delete copied["$defs"];
-
-    // Inline all $ref references (with circular ref detection)
-    const inlined = this._inlineRefs(copied, defs, new Set<string>(), 0) as JsonSchema;
+    let schemaForTarget = copied;
+    if (options?.inlineRefs ?? true) {
+      const defs = (copied["$defs"] as Record<string, JsonSchema>) ?? {};
+      delete copied["$defs"];
+      schemaForTarget = this._inlineRefs(copied, defs, new Set<string>(), 0) as JsonSchema;
+    }
 
     // Ensure the top-level schema has type: "object"
-    const normalized = this._ensureObjectType(inlined);
+    const normalized = this._ensureObjectType(schemaForTarget);
 
     // [SC-11] Default strict=true to match Python and Rust SDKs. Pre-fix
     // TS defaulted to false (undefined → falsy), silently producing

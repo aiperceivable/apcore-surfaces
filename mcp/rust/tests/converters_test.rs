@@ -2,8 +2,88 @@
 
 mod common;
 
-use apcore_mcp::{OpenAIConverter, SchemaConverter};
-use serde_json::json;
+use apcore::module::ModuleAnnotations;
+use apcore::registry::ModuleDescriptor;
+use apcore_mcp::server::factory::MCPServerFactory;
+use apcore_mcp::{AnthropicConverter, ConvertOptions, OpenAIConverter, SchemaConverter};
+use serde_json::{json, Value};
+
+#[test]
+fn matches_the_shared_provider_tool_projection() {
+    let Some(fixture) = common::load_fixture::<Value>("tool_projection.json") else {
+        return;
+    };
+    let module = &fixture["module"];
+    let id = module["module_id"].as_str().unwrap();
+    let description = module["description"].as_str().unwrap();
+    let mut descriptor: ModuleDescriptor = serde_json::from_value(module.clone()).unwrap();
+    let expected = &fixture["expected"];
+    let openai = OpenAIConverter::new();
+    let default_chat = openai
+        .convert_descriptor_with_options(id, module, description, ConvertOptions::default())
+        .unwrap();
+    assert_eq!(default_chat, expected["openai_chat"]);
+    let loose_responses = openai
+        .convert_responses_descriptor(
+            id,
+            module,
+            description,
+            ConvertOptions::default().with_strict(false),
+        )
+        .unwrap();
+    assert_eq!(loose_responses, expected["openai_responses_non_strict"]);
+    let mut strict_responses = expected["openai_chat"]["function"].clone();
+    strict_responses["type"] = json!("function");
+    assert_eq!(
+        openai
+            .convert_responses_descriptor(id, module, description, ConvertOptions::default())
+            .unwrap(),
+        strict_responses
+    );
+    assert_eq!(
+        AnthropicConverter.convert_descriptor(&descriptor).unwrap(),
+        expected["anthropic"]
+    );
+
+    let factory = MCPServerFactory::new();
+    descriptor.annotations = Some(ModuleAnnotations {
+        requires_approval: true,
+        streaming: true,
+        ..Default::default()
+    });
+    let tool = factory.build_tool(&descriptor, description, None).unwrap();
+    assert_eq!(tool.name, id);
+    assert_eq!(tool.input_schema, descriptor.input_schema);
+    assert_eq!(tool.output_schema.as_ref(), Some(&descriptor.output_schema));
+    assert_eq!(tool.meta.unwrap(), expected["mcp_meta"]);
+    let annotations = serde_json::to_value(tool.annotations.unwrap()).unwrap();
+    assert!(annotations.get("requiresApproval").is_none());
+    assert!(annotations.get("streaming").is_none());
+    descriptor.annotations = Some(ModuleAnnotations::default());
+    assert!(factory
+        .build_tool(&descriptor, description, None)
+        .unwrap()
+        .meta
+        .is_none());
+
+    descriptor.input_schema = fixture["recursive_input_schema"].clone();
+    assert_eq!(
+        AnthropicConverter.convert_descriptor(&descriptor).unwrap()["input_schema"],
+        descriptor.input_schema
+    );
+    let recursive = openai
+        .convert_descriptor_with_options(
+            id,
+            &json!({"input_schema": descriptor.input_schema}),
+            description,
+            ConvertOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        recursive.pointer("/function/parameters/$defs/node/properties/children/items/$ref"),
+        Some(&json!("#/$defs/node"))
+    );
+}
 
 // ---- SchemaConverter roundtrip tests ---------------------------------------
 

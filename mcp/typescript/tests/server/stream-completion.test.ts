@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import * as core from "apcore-js";
+import { Config } from "apcore-js/config";
 import { cp, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -19,6 +20,7 @@ async function connect(
   declaresStreaming = true,
   sdk = core,
   throughFacade = false,
+  ConfigClass = Config,
 ) {
   let calls = 0;
   let streams = 0;
@@ -41,7 +43,7 @@ async function connect(
       yield { group: { detail: { right: true } }, items: [2] };
     },
   } as never);
-  const config = new sdk.Config({ stream: { max_merge_depth: 1 } });
+  const config = new ConfigClass({ stream: { max_merge_depth: 1 } });
   const executor = throughFacade ? new sdk.APCore({ registry, config }) : new sdk.Executor({ registry, config });
   if (fail === "after") executor.useAfter(() => { throw new Error("private-after-cause"); });
   const target = await connectClient(registry, executor, outputSchema);
@@ -118,7 +120,10 @@ it.each([false, true])("uses an independent Core package (facade: %s)", async (t
     expect(sdk.Executor).not.toBe(core.Executor);
     expect(sdk.APCore).not.toBe(core.APCore);
     const notifications: unknown[] = [];
-    const target = await connect(hasCompletion ? null : "after", false, sdk, throughFacade);
+    const { Config: CopyConfig }: { Config: typeof Config } = await import(
+      /* @vite-ignore */ pathToFileURL(join(packageRoot, "dist", "config-entry.js")).href
+    );
+    const target = await connect(hasCompletion ? null : "after", false, sdk, throughFacade, CopyConfig);
     try {
       const result = await target.client.callTool({ name: moduleId, arguments: {} }, undefined, hasCompletion ? undefined : {
         onprogress: ({ message }) => { notifications.push(message); },

@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { Express } from "express";
-import { Config } from "apcore-js";
+import { Config } from "apcore-js/config";
 import { A2AServerFactory } from "./server/factory.js";
 import type { Registry } from "./adapters/agent-card.js";
 import type { Authenticator } from "./auth/types.js";

@@ -361,7 +361,7 @@ async function runServe(values: CliValues): Promise<void> {
     );
   }
 
-  const { Registry } = await import("apcore-js");
+  const { Registry } = await import("apcore-js/full");
   let registry: ApcoreRegistry;
 
   if (extensionsDir) {

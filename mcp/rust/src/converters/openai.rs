@@ -4,9 +4,11 @@ use std::collections::HashMap;
 
 use apcore::module::{ModuleAnnotations, ModuleExample};
 use apcore::registry::registry::Registry;
+use apcore::schema::to_strict_schema;
 use apcore_toolkit::ScannedModule;
 use serde_json::Value;
 
+use super::prepare_llm_schema;
 use crate::adapters::{AdapterError, AnnotationMapper, ModuleIDNormalizer, SchemaConverter};
 use crate::markdown;
 
@@ -47,7 +49,7 @@ pub enum ConverterError {
 /// (currently `rich_description`, future possibilities like
 /// `embed_examples`, `compact_schema`) doesn't ratchet the positional
 /// signature of every public method.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ConvertOptions {
     /// Append annotation hints (e.g. `[idempotent]`) to the description.
     pub embed_annotations: bool,
@@ -61,8 +63,18 @@ pub struct ConvertOptions {
     pub rich_description: bool,
 }
 
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            embed_annotations: false,
+            strict: true,
+            rich_description: false,
+        }
+    }
+}
+
 impl ConvertOptions {
-    /// Construct with all flags off (same as `Default`).
+    /// Construct with strict mode enabled and other options disabled.
     pub fn new() -> Self {
         Self::default()
     }
@@ -408,7 +420,7 @@ impl OpenAIConverter {
             .unwrap_or(Value::Null);
         // OpenAI converter keeps legacy (non-strict) behavior; callers can
         // opt-in separately. MCP tool schemas in factory.rs use strict mode.
-        let mut parameters = SchemaConverter::convert_input_schema_strict(&input_schema, false)?;
+        let mut parameters = SchemaConverter::copy_referenced_input_schema(&input_schema);
 
         // Resolve the LLM-facing description. `rich_description` swaps
         // the supplied plain description for a Markdown body rendered
@@ -458,6 +470,35 @@ impl OpenAIConverter {
         }))
     }
 
+    /// Convert one module to a Responses API function tool.
+    pub fn convert_responses_descriptor(
+        &self,
+        name: &str,
+        descriptor: &Value,
+        description: &str,
+        options: ConvertOptions,
+    ) -> Result<Value, ConverterError> {
+        let strict = options.strict;
+        let chat = self.convert_descriptor_with_options(name, descriptor, description, options)?;
+        Ok(responses_tool(chat, strict))
+    }
+
+    /// Convert a registry to Responses API function tools.
+    pub fn convert_responses_registry(
+        &self,
+        registry: &Registry,
+        options: ConvertOptions,
+        tags: Option<&[&str]>,
+        prefix: Option<&str>,
+    ) -> Result<Vec<Value>, ConverterError> {
+        let strict = options.strict;
+        Ok(self
+            .convert_registry_with_options(registry, options, tags, prefix)?
+            .into_iter()
+            .map(|chat| responses_tool(chat, strict))
+            .collect())
+    }
+
     // ---- Strict mode helpers (private) --------------------------------------
 
     /// Apply OpenAI strict mode transformations to a schema.
@@ -468,192 +509,8 @@ impl OpenAIConverter {
     ///    properties required, optional properties become nullable).
     fn apply_strict_mode(schema: &Value) -> Value {
         let mut schema = schema.clone();
-        Self::apply_llm_descriptions(&mut schema);
-        Self::strip_extensions(&mut schema);
-        Self::convert_to_strict(&mut schema);
-        schema
-    }
-
-    /// Promote `x-llm-description` to `description` recursively.
-    ///
-    /// [A-D-OC-3] Promotion is unconditional: spec step 1 pins
-    /// "Promote `x-llm-description` -> `description` (before stripping)" with
-    /// no precondition, and TypeScript promotes whenever the key holds a
-    /// string. Guarding on an existing `description` meant step 2's `x-*`
-    /// strip silently discarded the text on nodes annotated only with
-    /// `x-llm-description`.
-    ///
-    /// The walk is generic rather than a keyword whitelist, matching both
-    /// TypeScript and [`Self::strip_extensions`] in this same pipeline — a
-    /// narrower walk here would let the strip remove an annotation this pass
-    /// never saw.
-    fn apply_llm_descriptions(node: &mut Value) {
-        match node {
-            Value::Object(map) => {
-                // Only string values are promotable, as TypeScript's
-                // `typeof obj["x-llm-description"] === "string"` guard requires.
-                if let Some(llm_desc) = map.get("x-llm-description").and_then(Value::as_str) {
-                    let llm_desc = llm_desc.to_string();
-                    map.insert("description".to_string(), Value::String(llm_desc));
-                }
-                for value in map.values_mut() {
-                    Self::apply_llm_descriptions(value);
-                }
-            }
-            Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    Self::apply_llm_descriptions(item);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Remove all `x-*` keys and `default` keys recursively.
-    fn strip_extensions(node: &mut Value) {
-        match node {
-            Value::Object(map) => {
-                // Remove x-* and default keys
-                map.retain(|k, _| !k.starts_with("x-") && k != "default");
-                // Recurse into all remaining values
-                for value in map.values_mut() {
-                    Self::strip_extensions(value);
-                }
-            }
-            Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    Self::strip_extensions(item);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Enforce strict mode rules on an object schema. Mutates in place.
-    ///
-    /// For objects with `properties`:
-    /// - Sets `additionalProperties: false`
-    /// - Identifies optional properties (not already in `required`)
-    /// - Makes optional properties nullable (type array or oneOf wrapping)
-    /// - Sets `required` to sorted list of all property names
-    ///
-    /// Recurses into properties, items, oneOf/anyOf/allOf, $defs/definitions.
-    fn convert_to_strict(node: &mut Value) {
-        let obj = match node.as_object_mut() {
-            Some(o) => o,
-            None => return,
-        };
-
-        // Process object schemas with properties
-        if obj.get("type") == Some(&Value::String("object".to_string()))
-            && obj.contains_key("properties")
-        {
-            // Set additionalProperties: false
-            obj.insert("additionalProperties".to_string(), Value::Bool(false));
-
-            // Collect existing required set
-            let existing_required: std::collections::HashSet<String> = obj
-                .get("required")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // Get all property names
-            let all_names: Vec<String> = obj
-                .get("properties")
-                .and_then(|v| v.as_object())
-                .map(|props| props.keys().cloned().collect())
-                .unwrap_or_default();
-
-            // Identify optional properties
-            let optional_names: Vec<String> = all_names
-                .iter()
-                .filter(|n| !existing_required.contains(n.as_str()))
-                .cloned()
-                .collect();
-
-            // Make optional properties nullable
-            if let Some(Value::Object(props)) = obj.get_mut("properties") {
-                for name in &optional_names {
-                    if let Some(prop) = props.get_mut(name) {
-                        Self::make_nullable(prop);
-                    }
-                }
-            }
-
-            // Set required to sorted list of all property names
-            let mut sorted_names = all_names;
-            sorted_names.sort();
-            obj.insert(
-                "required".to_string(),
-                Value::Array(sorted_names.into_iter().map(Value::String).collect()),
-            );
-        }
-
-        // Recurse into properties
-        if let Some(Value::Object(props)) = obj.get_mut("properties") {
-            for prop in props.values_mut() {
-                Self::convert_to_strict(prop);
-            }
-        }
-
-        // Recurse into items
-        if let Some(items) = obj.get_mut("items") {
-            if items.is_object() {
-                Self::convert_to_strict(items);
-            }
-        }
-
-        // Recurse into oneOf/anyOf/allOf
-        for keyword in &["oneOf", "anyOf", "allOf"] {
-            if let Some(Value::Array(arr)) = obj.get_mut(*keyword) {
-                for sub in arr.iter_mut() {
-                    Self::convert_to_strict(sub);
-                }
-            }
-        }
-
-        // Recurse into $defs/definitions
-        for defs_key in &["$defs", "definitions"] {
-            if let Some(Value::Object(defs)) = obj.get_mut(*defs_key) {
-                for defn in defs.values_mut() {
-                    Self::convert_to_strict(defn);
-                }
-            }
-        }
-    }
-
-    /// Make a property nullable by modifying its type or wrapping in oneOf.
-    fn make_nullable(prop: &mut Value) {
-        if let Some(obj) = prop.as_object_mut() {
-            if let Some(type_val) = obj.get_mut("type") {
-                match type_val {
-                    Value::String(s) => {
-                        // "string" -> ["string", "null"]
-                        let original = s.clone();
-                        *type_val = Value::Array(vec![
-                            Value::String(original),
-                            Value::String("null".to_string()),
-                        ]);
-                    }
-                    Value::Array(arr) if !arr.contains(&Value::String("null".to_string())) => {
-                        // ["string", "integer"] -> ["string", "integer", "null"]
-                        arr.push(Value::String("null".to_string()));
-                    }
-                    _ => {}
-                }
-            } else {
-                // No type key (pure $ref or composition) — wrap in oneOf with null
-                let original = prop.clone();
-                *prop = serde_json::json!({
-                    "oneOf": [original, {"type": "null"}]
-                });
-            }
-        }
+        prepare_llm_schema(&mut schema, false);
+        to_strict_schema(&schema)
     }
 }
 
@@ -661,6 +518,13 @@ impl Default for OpenAIConverter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn responses_tool(mut chat: Value, strict: bool) -> Value {
+    let mut tool = chat["function"].take();
+    tool["type"] = Value::String("function".to_owned());
+    tool["strict"] = Value::Bool(strict);
+    tool
 }
 
 // ---- JSON → ScannedModule adapter -------------------------------------------
@@ -792,310 +656,6 @@ mod tests {
         // Default impl works without panic
     }
 
-    // ---- Task 2: strict-mode tests ------------------------------------------
-
-    // ---- apply_llm_descriptions tests ----
-
-    #[test]
-    fn test_apply_llm_descriptions_replaces_description() {
-        let mut node = json!({
-            "description": "Original",
-            "x-llm-description": "LLM version"
-        });
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert_eq!(node["description"], "LLM version");
-    }
-
-    #[test]
-    fn test_apply_llm_descriptions_preserves_when_no_llm() {
-        let mut node = json!({
-            "description": "Original"
-        });
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert_eq!(node["description"], "Original");
-    }
-
-    #[test]
-    fn test_apply_llm_descriptions_nested_properties() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "description": "Old",
-                    "x-llm-description": "New"
-                }
-            }
-        });
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert_eq!(node["properties"]["name"]["description"], "New");
-    }
-
-    #[test]
-    fn test_apply_llm_descriptions_nested_items() {
-        let mut node = json!({
-            "type": "array",
-            "items": {
-                "description": "Old",
-                "x-llm-description": "New"
-            }
-        });
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert_eq!(node["items"]["description"], "New");
-    }
-
-    #[test]
-    fn test_apply_llm_descriptions_nested_oneof() {
-        let mut node = json!({
-            "oneOf": [
-                {"description": "A", "x-llm-description": "A-LLM"},
-                {"description": "B"}
-            ]
-        });
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert_eq!(node["oneOf"][0]["description"], "A-LLM");
-        assert_eq!(node["oneOf"][1]["description"], "B");
-    }
-
-    #[test]
-    fn test_apply_llm_descriptions_nested_defs() {
-        let mut node = json!({
-            "$defs": {
-                "Foo": {
-                    "description": "Old",
-                    "x-llm-description": "New"
-                }
-            },
-            "definitions": {
-                "Bar": {
-                    "description": "Old",
-                    "x-llm-description": "New"
-                }
-            }
-        });
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert_eq!(node["$defs"]["Foo"]["description"], "New");
-        assert_eq!(node["definitions"]["Bar"]["description"], "New");
-    }
-
-    // ---- strip_extensions tests ----
-
-    #[test]
-    fn test_strip_extensions_removes_x_keys() {
-        let mut node = json!({
-            "type": "string",
-            "x-custom": "value",
-            "x-another": 42
-        });
-        OpenAIConverter::strip_extensions(&mut node);
-        assert!(node.get("x-custom").is_none());
-        assert!(node.get("x-another").is_none());
-        assert_eq!(node["type"], "string");
-    }
-
-    #[test]
-    fn test_strip_extensions_removes_defaults() {
-        let mut node = json!({
-            "type": "string",
-            "default": "hello"
-        });
-        OpenAIConverter::strip_extensions(&mut node);
-        assert!(node.get("default").is_none());
-        assert_eq!(node["type"], "string");
-    }
-
-    #[test]
-    fn test_strip_extensions_recursive() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "x-custom": "remove",
-                    "default": "val"
-                }
-            },
-            "items": {
-                "x-ext": true
-            }
-        });
-        OpenAIConverter::strip_extensions(&mut node);
-        assert!(node["properties"]["name"].get("x-custom").is_none());
-        assert!(node["properties"]["name"].get("default").is_none());
-        assert!(node["items"].get("x-ext").is_none());
-    }
-
-    #[test]
-    fn test_strip_extensions_preserves_non_x_keys() {
-        let mut node = json!({
-            "type": "string",
-            "description": "keep",
-            "enum": ["a", "b"],
-            "x-remove": true
-        });
-        OpenAIConverter::strip_extensions(&mut node);
-        assert_eq!(node["type"], "string");
-        assert_eq!(node["description"], "keep");
-        assert_eq!(node["enum"], json!(["a", "b"]));
-        assert!(node.get("x-remove").is_none());
-    }
-
-    // ---- convert_to_strict tests ----
-
-    #[test]
-    fn test_convert_to_strict_sets_additional_properties_false() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"}
-            }
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        assert_eq!(node["additionalProperties"], false);
-    }
-
-    #[test]
-    fn test_convert_to_strict_makes_all_required() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "zebra": {"type": "string"},
-                "alpha": {"type": "integer"}
-            }
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        assert_eq!(node["required"], json!(["alpha", "zebra"]));
-    }
-
-    #[test]
-    fn test_convert_to_strict_nullable_optional_string() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"}
-            }
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        assert_eq!(
-            node["properties"]["name"]["type"],
-            json!(["string", "null"])
-        );
-    }
-
-    #[test]
-    fn test_convert_to_strict_nullable_optional_array_type() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "value": {"type": ["string", "integer"]}
-            }
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        assert_eq!(
-            node["properties"]["value"]["type"],
-            json!(["string", "integer", "null"])
-        );
-    }
-
-    #[test]
-    fn test_convert_to_strict_nullable_optional_ref() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "config": {"$ref": "#/$defs/Config"}
-            }
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        let config = &node["properties"]["config"];
-        assert!(config.get("oneOf").is_some());
-        let one_of = config["oneOf"].as_array().unwrap();
-        assert_eq!(one_of.len(), 2);
-        assert_eq!(one_of[0], json!({"$ref": "#/$defs/Config"}));
-        assert_eq!(one_of[1], json!({"type": "null"}));
-    }
-
-    #[test]
-    fn test_convert_to_strict_preserves_required() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "required_field": {"type": "string"},
-                "optional_field": {"type": "integer"}
-            },
-            "required": ["required_field"]
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        // required_field should NOT become nullable (it was already required)
-        assert_eq!(node["properties"]["required_field"]["type"], "string");
-        // optional_field SHOULD become nullable
-        assert_eq!(
-            node["properties"]["optional_field"]["type"],
-            json!(["integer", "null"])
-        );
-        // Both should be in required now
-        assert_eq!(
-            node["required"],
-            json!(["optional_field", "required_field"])
-        );
-    }
-
-    #[test]
-    fn test_convert_to_strict_recursive_nested_object() {
-        // When inner is already required, its type stays "object" and recursion applies
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "inner": {
-                    "type": "object",
-                    "properties": {
-                        "value": {"type": "string"}
-                    }
-                }
-            },
-            "required": ["inner"]
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        // inner was required so type stays "object", recursion applies strict rules
-        assert_eq!(node["properties"]["inner"]["additionalProperties"], false);
-        assert_eq!(
-            node["properties"]["inner"]["properties"]["value"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(node["properties"]["inner"]["required"], json!(["value"]));
-    }
-
-    #[test]
-    fn test_convert_to_strict_recursive_items() {
-        let mut node = json!({
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "integer"}
-                }
-            }
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        assert_eq!(node["items"]["additionalProperties"], false);
-        assert_eq!(node["items"]["required"], json!(["id"]));
-    }
-
-    #[test]
-    fn test_convert_to_strict_recursive_oneof() {
-        let mut node = json!({
-            "oneOf": [
-                {
-                    "type": "object",
-                    "properties": {
-                        "a": {"type": "string"}
-                    }
-                }
-            ]
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        assert_eq!(node["oneOf"][0]["additionalProperties"], false);
-        assert_eq!(node["oneOf"][0]["required"], json!(["a"]));
-    }
-
     // ---- apply_strict_mode end-to-end test ----
 
     #[test]
@@ -1168,74 +728,6 @@ mod tests {
         );
     }
 
-    // ---- Edge cases ----
-
-    #[test]
-    fn test_strip_extensions_array_with_objects() {
-        let mut node = json!({
-            "oneOf": [
-                {"type": "string", "x-ext": true},
-                {"type": "integer", "default": 0}
-            ]
-        });
-        OpenAIConverter::strip_extensions(&mut node);
-        assert!(node["oneOf"][0].get("x-ext").is_none());
-        assert!(node["oneOf"][1].get("default").is_none());
-    }
-
-    #[test]
-    fn test_convert_to_strict_no_properties_no_change() {
-        let mut node = json!({"type": "string"});
-        let original = node.clone();
-        OpenAIConverter::convert_to_strict(&mut node);
-        assert_eq!(node, original);
-    }
-
-    /// [A-D-OC-3] Promotion is unconditional. Spec step 1 pins
-    /// "Promote `x-llm-description` -> `description` (before stripping)" with
-    /// no precondition, and TypeScript promotes whenever the key holds a
-    /// string. Requiring an existing `description` meant step 2's `x-*` strip
-    /// silently discarded the text on a node annotated only with
-    /// `x-llm-description`.
-    #[test]
-    fn test_apply_llm_descriptions_without_existing_description_key() {
-        let mut node = json!({
-            "x-llm-description": "LLM only"
-        });
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert_eq!(node["description"], "LLM only");
-    }
-
-    /// [A-D-OC-3] Non-string values are not promoted — TypeScript guards with
-    /// `typeof obj["x-llm-description"] === "string"`.
-    #[test]
-    fn test_apply_llm_descriptions_ignores_non_string() {
-        let mut node = json!({"x-llm-description": 42});
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert!(node.get("description").is_none());
-    }
-
-    /// [A-D-OC-3] The keyed walk visited only
-    /// properties/items/oneOf/anyOf/allOf/$defs/definitions, so nodes reached
-    /// through any other keyword were promoted in TypeScript and not in Rust —
-    /// and then stripped, losing the text entirely.
-    #[test]
-    fn test_apply_llm_descriptions_reaches_non_whitelisted_keywords() {
-        let mut node = json!({
-            "type": "object",
-            "patternProperties": {
-                "^a": {"type": "string", "x-llm-description": "pattern doc"}
-            },
-            "prefixItems": [{"type": "string", "x-llm-description": "prefix doc"}]
-        });
-        OpenAIConverter::apply_llm_descriptions(&mut node);
-        assert_eq!(
-            node["patternProperties"]["^a"]["description"],
-            "pattern doc"
-        );
-        assert_eq!(node["prefixItems"][0]["description"], "prefix doc");
-    }
-
     /// End-to-end through strict conversion: a property carrying ONLY
     /// `x-llm-description` keeps that text as `description`.
     #[test]
@@ -1252,22 +744,6 @@ mod tests {
             "got: {result}"
         );
         assert!(result["properties"]["q"].get("x-llm-description").is_none());
-    }
-
-    #[test]
-    fn test_convert_to_strict_already_nullable_not_doubled() {
-        let mut node = json!({
-            "type": "object",
-            "properties": {
-                "value": {"type": ["string", "null"]}
-            }
-        });
-        OpenAIConverter::convert_to_strict(&mut node);
-        // Should not add another "null"
-        assert_eq!(
-            node["properties"]["value"]["type"],
-            json!(["string", "null"])
-        );
     }
 
     // ---- Task 3: convert-descriptor tests -----------------------------------

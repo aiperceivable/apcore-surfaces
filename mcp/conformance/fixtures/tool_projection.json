@@ -1,0 +1,74 @@
+{
+  "description": "Provider tool envelopes share canonical names and strict schema conversion, with an explicit Responses strict opt-out.",
+  "module": {
+    "module_id": "demo.send",
+    "description": "Send a message",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "to": {"type": "string", "x-llm-description": "Recipient", "x-sensitive": true},
+        "x-trace": {"type": "string", "default": "local"}
+      },
+      "required": ["to"]
+    },
+    "output_schema": {"type": "object", "properties": {"sent": {"type": "boolean"}}},
+    "examples": [{"title": "Sample", "inputs": {"to": "sample"}, "output": {}}]
+  },
+  "recursive_input_schema": {
+    "type": "object",
+    "properties": {"tree": {"$ref": "#/$defs/node"}},
+    "$defs": {
+      "node": {
+        "type": "object",
+        "properties": {
+          "children": {"type": "array", "items": {"$ref": "#/$defs/node"}}
+        },
+        "required": ["children"]
+      }
+    }
+  },
+  "expected": {
+    "mcp_meta": {"requiresApproval": true, "streaming": true},
+    "openai_chat": {
+      "type": "function",
+      "function": {
+        "name": "demo-send",
+        "description": "Send a message",
+        "parameters": {
+          "type": "object",
+          "properties": {"to": {"type": "string", "description": "Recipient"}, "x-trace": {"type": ["string", "null"]}},
+          "required": ["to", "x-trace"],
+          "additionalProperties": false
+        },
+        "strict": true
+      }
+    },
+    "openai_responses_non_strict": {
+      "type": "function",
+      "name": "demo-send",
+      "description": "Send a message",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": {"type": "string", "x-llm-description": "Recipient", "x-sensitive": true},
+          "x-trace": {"type": "string", "default": "local"}
+        },
+        "required": ["to"]
+      },
+      "strict": false
+    },
+    "anthropic": {
+      "name": "demo-send",
+      "description": "Send a message",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "to": {"type": "string", "description": "Recipient"},
+          "x-trace": {"type": "string", "default": "local"}
+        },
+        "required": ["to"]
+      },
+      "input_examples": [{"to": "sample"}]
+    }
+  }
+}

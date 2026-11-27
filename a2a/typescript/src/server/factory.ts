@@ -8,14 +8,11 @@ import {
 } from "@a2a-js/sdk/server";
 import { jsonRpcHandler, agentCardHandler, restHandler } from "@a2a-js/sdk/server/express";
 
-import {
-  Config,
-  ErrorFormatterRegistry,
-  ObsLoggingMiddleware,
-  ErrorHistoryMiddleware,
-  ErrorHistory,
-  registerSysModules,
-} from "apcore-js";
+import { ErrorFormatterRegistry, ErrorHistoryMiddleware } from "apcore-js";
+import { Config } from "apcore-js/config";
+import { ErrorHistory } from "apcore-js/full";
+import { ObsLoggingMiddleware } from "apcore-js/observability";
+import { registerSysModules } from "apcore-js/sys-modules";
 
 import { registerA2aNamespace } from "../config.js";
 

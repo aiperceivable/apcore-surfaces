@@ -34,7 +34,7 @@ def register_config_namespace() -> bool:
     install error, not a silent no-op. The prior graceful-fallback path
     was removed in the 6.2 fix.
     """
-    from apcore import Config
+    from apcore.config import Config
 
     Config.register_namespace(
         name="apcore-cli",

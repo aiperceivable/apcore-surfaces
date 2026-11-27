@@ -104,8 +104,8 @@ def test_warns_when_the_control_surface_is_unprotected(registry_with_a_user_modu
     Reached the way a real deployment reaches it: the operator builds their own
     apcore stack with `sys_modules.events` enabled — which is what registers the
     three `system.control.*` write modules — and hands the Executor to this
-    package. apcore's approval gate warns once and continues when no
-    `ApprovalHandler` is configured, so those modules stay callable even though
+    package with an explicit non-strict policy. The gate warns and continues
+    when no `ApprovalHandler` is configured, so those modules stay callable even though
     FR-AGC-003 criterion 12 keeps them off the public card. Visibility and
     invocability are separate questions, and this warning is what stops the card
     rule being mistaken for a fix to the second.
@@ -114,7 +114,9 @@ def test_warns_when_the_control_surface_is_unprotected(registry_with_a_user_modu
     from apcore.config import Config
 
     registry = registry_with_a_user_module
-    executor = Executor(registry)
+    from apcore.policy import ExecutionPolicy
+
+    executor = Executor(registry, policy=ExecutionPolicy(strict=False))
     register_sys_modules(
         registry,
         executor,

@@ -173,8 +173,6 @@ def _run_serve(args: argparse.Namespace, openapi: object | None = None) -> None:
     resolved by ``main()`` so the config file is read once. It defaults to ``None``
     only so that a direct call in a test need not supply it.
     """
-    from apcore import Registry
-
     # Step 1: Load the registry from whichever backend source(s) were given.
     # `main()` has already rejected the neither-given case as a usage error.
     registry = None
@@ -189,7 +187,10 @@ def _run_serve(args: argparse.Namespace, openapi: object | None = None) -> None:
         if not extensions_dir.is_dir():
             print(f"Error: Not a directory: {extensions_dir}", file=sys.stderr)
             sys.exit(1)
+        from apcore.discovery import Registry
+
         registry = Registry(extensions_dir=str(extensions_dir))
+        registry.discover()
 
     # `main()` resolved this already; only a direct call needs the fallback.
     if openapi is None:

@@ -113,7 +113,7 @@ class TestAPCoreMCPInit:
     def test_from_extensions_dir(self) -> None:
         mock_registry = MagicMock(spec=["list", "get_definition", "discover"])
         mock_registry.list.return_value = []
-        with patch("apcore.Registry", return_value=mock_registry) as mock_cls:
+        with patch("apcore.discovery.Registry", return_value=mock_registry) as mock_cls:
             mcp = APCoreMCP("/tmp/extensions")
             mock_cls.assert_called_once_with(extensions_dir="/tmp/extensions")
             mock_registry.discover.assert_called_once()
@@ -123,7 +123,7 @@ class TestAPCoreMCPInit:
         from pathlib import Path
 
         mock_registry = StubRegistry()
-        with patch("apcore.Registry", return_value=mock_registry) as mock_cls:
+        with patch("apcore.discovery.Registry", return_value=mock_registry) as mock_cls:
             APCoreMCP(Path("/tmp/extensions"))
             mock_cls.assert_called_once_with(extensions_dir="/tmp/extensions")
 

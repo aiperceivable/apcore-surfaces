@@ -126,24 +126,14 @@ class TestResolveExecutor:
 
     def test_creates_executor_from_registry(self, registry):
         """When given a registry, imports and creates an Executor."""
-        import sys
-
         mock_executor_cls = MagicMock()
         mock_executor_instance = MagicMock()
         mock_executor_cls.return_value = mock_executor_instance
 
-        fake_apcore_executor = MagicMock()
-        fake_apcore_executor.Executor = mock_executor_cls
-        sys.modules["apcore"] = MagicMock()
-        sys.modules["apcore.executor"] = fake_apcore_executor
-
-        try:
+        with patch("apcore.executor.Executor", mock_executor_cls):
             result = resolve_executor(registry)
             mock_executor_cls.assert_called_once_with(registry, approval_handler=None)
             assert result is mock_executor_instance
-        finally:
-            del sys.modules["apcore.executor"]
-            del sys.modules["apcore"]
 
 
 # ===========================================================================

@@ -111,7 +111,7 @@ def build_acl_from_config(acl_config: Any | None) -> Any | None:
         )
 
     try:
-        from apcore import ACL, ACLRule
+        from apcore.acl import ACL, ACLRule
     except ImportError as exc:
         raise RuntimeError("Config Bus `mcp.acl` requires apcore>=0.18 with ACL support") from exc
 

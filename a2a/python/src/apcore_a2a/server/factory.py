@@ -427,8 +427,8 @@ class A2AServerFactory:
         # Requires sys_modules=True and an executor that accepts .use() middleware.
         if sys_modules and hasattr(executor, "use"):
             try:
-                from apcore import register_sys_modules
                 from apcore.config import Config
+                from apcore.sys_modules.registration import register_sys_modules
 
                 # `sys_modules` is a TOP-LEVEL section of apcore's config
                 # (apcore config.py DEFAULTS), and `register_sys_modules` reads
@@ -519,11 +519,11 @@ class A2AServerFactory:
         # since register_sys_modules may already add it when sys_modules=True).
         if hasattr(executor, "use"):
             try:
-                from apcore import ObsLoggingMiddleware
+                from apcore.observability.context_logger import ObsLoggingMiddleware
 
                 executor.use(ObsLoggingMiddleware())
                 if metrics and not sys_modules:
-                    from apcore import ErrorHistoryMiddleware
+                    from apcore.middleware.error_history_middleware import ErrorHistoryMiddleware
 
                     executor.use(ErrorHistoryMiddleware())
             except Exception:

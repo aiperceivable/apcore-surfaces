@@ -89,7 +89,7 @@ export async function installObservability(
   let apcoreMod: Record<string, unknown>;
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    apcoreMod = (await import("apcore-js")) as any;
+    apcoreMod = (await import("apcore-js/observability")) as any;
   } catch {
     console.warn(
       "[apcore-mcp] observability requested but apcore-js is not installed; skipping auto-wire.",

@@ -25,9 +25,9 @@ import type { AddressInfo } from "node:net";
 
 const state = vi.hoisted(() => ({ projectRoot: undefined as string | undefined }));
 
-vi.mock("apcore-js", async (importOriginal) => {
+vi.mock("apcore-js/config", async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>();
-  const Config = { getInstance: () => ({ projectRoot: state.projectRoot }) };
+  const Config = { load: () => ({ projectRoot: state.projectRoot }) };
   return {
     ...actual,
     Config,

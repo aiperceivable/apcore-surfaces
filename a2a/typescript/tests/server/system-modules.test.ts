@@ -12,7 +12,9 @@
  * without an `acl/` directory has no ACL at all.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { Registry, Executor, Config, registerSysModules, module as apcoreModule } from "apcore-js";
+import { Registry, Executor, module as apcoreModule } from "apcore-js";
+import { Config } from "apcore-js/config";
+import { registerSysModules } from "apcore-js/sys-modules";
 import { Type } from "@sinclair/typebox";
 import { A2AServerFactory } from "../../src/server/factory.js";
 
