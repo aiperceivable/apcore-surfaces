@@ -987,8 +987,8 @@ impl ExecutionRouter {
         let (progress_token, send_notification, session, identity) = self.extract_extra(extra);
 
         // Resolve version_hint via the spec's 3-source cascade: [A-D-006]
-        //   1. extras.version_hint  (SDK caller-supplied, highest priority)
-        //   2. extras._meta.apcore.version  (MCP client-supplied)
+        //   1. extras.version_hint (explicit SDK input or normalized wire metadata)
+        //   2. extras._meta.apcore.version (wrapped metadata supplied by SDK callers)
         //   3. registry.get_definition(tool_name).metadata.version_hint
         //      (descriptor default, lowest)
         // Pre-fix Rust read only source #2.
@@ -4387,9 +4387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_version_hint_flows_through() {
-        // [A-D-002 regression] Real MCP traffic carries the apcore version
-        // hint at extras._meta.apcore.version — not at extras.apcore.version.
-        // Verifies the `_meta` hop is honored in source #2 of the cascade.
+        // SDK callers can pass wrapped metadata as source #2 of the cascade.
         let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let exec = VersionHintCapturingExecutor {
             captured: Arc::clone(&captured),
@@ -4403,9 +4401,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_version_hint_ignores_top_level_apcore() {
-        // [A-D-002 regression] Confirms that putting the apcore stanza at
-        // the TOP level (legacy shape that pre-fix Rust accidentally accepted)
-        // is now correctly ignored — the cascade only honors `_meta.apcore.version`.
+        // Top-level apcore is a wire metadata field, normalized by ServerHandler.
         let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let exec = VersionHintCapturingExecutor {
             captured: Arc::clone(&captured),
@@ -4415,6 +4411,75 @@ mod tests {
         let (_content, is_error, _) = router.handle_call("mod", &json!({}), Some(&extras)).await;
         assert!(!is_error);
         assert_eq!(captured.lock().unwrap().clone(), None);
+    }
+
+    #[tokio::test]
+    async fn tools_call_forwards_the_documented_wire_version_hint() {
+        use crate::server::factory::MCPServerFactory;
+        use crate::server::server::ServerHandler;
+        use crate::server::transport::McpHandler;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let router = Arc::new(ExecutionRouter::new(
+            Box::new(VersionHintCapturingExecutor {
+                captured: Arc::clone(&captured),
+            }),
+            false,
+            None,
+        ));
+        let factory = MCPServerFactory::new();
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
+        factory.register_handlers(&mut server, vec![], router);
+        let options = factory.build_init_options(&server, "test", "1.0.0", None);
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+
+        for (metadata, expected) in [
+            (json!({"apcore": {"version": "^2.0"}}), Some("^2.0")),
+            (
+                json!({
+                    "apcore": {"version": "2.1.0"},
+                    "version_hint": "1.0.0",
+                    "versionHint": "1.1.0",
+                    "_meta": {"apcore": {"version": "1.2.0"}},
+                }),
+                Some("2.1.0"),
+            ),
+            (
+                json!({
+                    "version_hint": "1.0.0",
+                    "versionHint": "1.1.0",
+                    "_meta": {"apcore": {"version": "1.2.0"}},
+                }),
+                None,
+            ),
+            (json!({"apcore": {"version": 2}}), None),
+            (json!({"apcore": {"version": "1".repeat(65)}}), None),
+            (json!({"apcore": {"version": "2.0/3.0"}}), None),
+        ] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "demo.echo", "arguments": {}, "_meta": metadata},
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["result"]["isError"], false);
+            assert_eq!(captured.lock().unwrap().as_deref(), expected);
+        }
+
+        let result = server
+            .call_tool(
+                "demo.echo".into(),
+                json!({}),
+                Some(json!({
+                    "versionHint": "3.0.0",
+                    "_meta": {"apcore": {"version": "2.0.0"}},
+                })),
+            )
+            .unwrap()
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("3.0.0"));
     }
 
     // ==================================================================
