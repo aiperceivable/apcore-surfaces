@@ -10,22 +10,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import Any
-from unittest.mock import patch
 
 import pytest
-from apcore import APCore, ApCoreEvent, Config, EventEmitter, EventRetryConfig, reset_subscriber_registry
-from apcore.events import A2ASubscriber as CoreA2ASubscriber
-from apcore.events import CircuitBreakerWrapper, create_subscriber_from_config
+from apcore.events import ApCoreEvent, EventEmitter, EventRetryConfig, SubscriberRegistry
+from apcore.full import APCore, Config
 
 from apcore_a2a import A2AEventSubscriber, register_a2a_subscriber
 
 _FIXTURE = json.loads((Path(__file__).resolve().parents[3] / "conformance/fixtures/event_subscriber.json").read_text())
 _DELIVERY_EVENTS = ("apcore.event.delivery_failed", "apcore.subscriber.circuit_opened")
-_LEGACY_FAILURE_COUNTS = {
-    "transient_failure": {"requests": 1, "dead_letters": 0},
-    "circuit_breaker": {"requests": 1, "dead_letters": 0},
-    "timeout": {"requests": 1, "dead_letters": 0},
-}
 
 
 class _DiagnosticSink:
@@ -35,15 +28,6 @@ class _DiagnosticSink:
 
     async def on_event(self, event: ApCoreEvent) -> None:
         self._events.append(event)
-
-
-@pytest.fixture(autouse=True)
-def _isolate_subscriber_registry() -> Iterator[None]:
-    reset_subscriber_registry()
-    try:
-        yield
-    finally:
-        reset_subscriber_registry()
 
 
 @contextmanager
@@ -76,14 +60,18 @@ def _receiver(
             worker.join(timeout=3)
 
 
-def _emit_from_config(path: Path, subscriber: dict[str, Any]) -> list[ApCoreEvent]:
+def _emit_from_config(
+    path: Path,
+    subscriber: dict[str, Any],
+    registry: SubscriberRegistry,
+) -> list[ApCoreEvent]:
     path.write_text(
         "version: '1.0.0'\nproject: {name: fixture}\n"
         "sys_modules:\n  enabled: true\n  events:\n    enabled: true\n"
         f"    subscribers: {json.dumps([subscriber])}\n"
     )
     events: list[ApCoreEvent] = []
-    with closing(APCore(config=Config.load(str(path)))) as core:
+    with closing(APCore(config=Config.load(str(path)), subscriber_registry=registry)) as core:
         assert core.events is not None
         for name in _DELIVERY_EVENTS:
             core.events.subscribe(_DiagnosticSink(name, events))
@@ -102,16 +90,12 @@ def test_event_subscriber_from_config(case: dict[str, Any], tmp_path: Path) -> N
         else:
             subscriber.update(platform_url=url, id="configured-a2a")
 
-        register_a2a_subscriber()
-        register_a2a_subscriber()
-        with patch("apcore.events.subscribers.aiohttp", None):
-            events = _emit_from_config(tmp_path / "apcore.yaml", subscriber)
+        registry = SubscriberRegistry()
+        register_a2a_subscriber(registry)
+        register_a2a_subscriber(registry)
+        events = _emit_from_config(tmp_path / "apcore.yaml", subscriber, registry)
 
         expected = case["expected"]
-        if not hasattr(CircuitBreakerWrapper, "retry"):
-            # The released minimum's Config wrapper counts failures for its
-            # circuit without forwarding them to the emitter's retry loop.
-            expected = {**expected, **_LEGACY_FAILURE_COUNTS.get(case["id"], {})}
         assert len(received) == expected["requests"]
         for headers, body in received:
             assert headers.get("content-type") == "application/json"
@@ -125,29 +109,27 @@ def test_event_subscriber_from_config(case: dict[str, Any], tmp_path: Path) -> N
             assert event.data["subscriber_id"] == "configured-a2a"
 
 
-def test_subscriber_factory_switch_is_opt_in_and_reversible() -> None:
+def test_subscriber_factory_is_opt_in() -> None:
     config = {"type": "a2a", "platform_url": "https://example.com/receive"}
-    assert isinstance(create_subscriber_from_config(config), CoreA2ASubscriber)
-    register_a2a_subscriber()
-    assert isinstance(create_subscriber_from_config(config), A2AEventSubscriber)
-    reset_subscriber_registry()
-    assert isinstance(create_subscriber_from_config(config), CoreA2ASubscriber)
+    registry = SubscriberRegistry()
+    register_a2a_subscriber(registry)
+    assert isinstance(registry.create(config), A2AEventSubscriber)
+    with pytest.raises(ValueError, match="a2a"):
+        SubscriberRegistry().create(config)
 
 
-def test_legacy_config_restored_after_reset(tmp_path: Path) -> None:
-    pytest.importorskip("aiohttp", reason="the legacy Core transport uses the optional events extra")
+def test_two_hosts_keep_independent_subscriber_factories(tmp_path: Path) -> None:
+    first, second = SubscriberRegistry(), SubscriberRegistry()
+    register_a2a_subscriber(first)
+    second.register(
+        "a2a",
+        lambda config: A2AEventSubscriber(config["platform_url"], skill_id="second.host"),
+    )
     with _receiver() as (url, received):
-        config_path = tmp_path / "apcore.yaml"
-        subscriber = {"type": "a2a", "platform_url": url, "auth": "test-token"}
-        register_a2a_subscriber()
-        assert _emit_from_config(config_path, subscriber) == []
-        assert len(received) == 1
-
-        reset_subscriber_registry()
-        assert _emit_from_config(config_path, subscriber) == []
-        assert len(received) == 2
-        assert received[0][0]["authorization"] == received[1][0]["authorization"] == "Bearer test-token"
-        assert received[0][1] == received[1][1]
+        subscriber = {"type": "a2a", "platform_url": url}
+        assert _emit_from_config(tmp_path / "first.yaml", subscriber, first) == []
+        assert _emit_from_config(tmp_path / "second.yaml", subscriber, second) == []
+        assert [payload["skillId"] for _, payload in received] == ["apevo.event_receiver", "second.host"]
 
 
 async def test_zero_timeout_leaves_delivery_to_the_event_bus() -> None:

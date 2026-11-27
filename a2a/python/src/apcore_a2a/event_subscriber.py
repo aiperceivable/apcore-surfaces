@@ -8,7 +8,7 @@ from dataclasses import asdict
 from typing import Any
 
 import httpx
-from apcore import ApCoreEvent, EventRetryConfig, register_subscriber_type
+from apcore.events import ApCoreEvent, EventRetryConfig, SubscriberRegistry
 
 _logger = logging.getLogger(__name__)
 
@@ -63,6 +63,6 @@ def _from_config(config: dict[str, Any]) -> A2AEventSubscriber:
     )
 
 
-def register_a2a_subscriber() -> None:
-    """Select the A2A transport for future `type: a2a` config entries."""
-    register_subscriber_type("a2a", _from_config)
+def register_a2a_subscriber(registry: SubscriberRegistry) -> None:
+    """Register the A2A transport for a host's configured subscribers."""
+    registry.register("a2a", _from_config)
