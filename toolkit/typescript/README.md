@@ -226,9 +226,14 @@ const doc    = await resp.json();
 const modules = new BindingParser().loadData(doc);
 
 // Register each module as an HTTP proxy in an in-browser registry.
-const writer = new HTTPProxyRegistryWriter({ baseUrl: '/api' });
-await writer.write(modules, registry);
+const writer = new HTTPProxyRegistryWriter({ baseUrl: new URL('/api', location.href).href });
+const results = await writer.writeAsync(modules, registry);
 ```
+
+Use `writeAsync()` for Core registries and check each result's `verified` field.
+`write()` returns an immediate result array for synchronous registries. If a
+registry returns a promise, `write()` reports it as unverified and handles any
+rejection. The registration may continue after the call returns.
 
 The default entry continues to re-export every symbol it always did (for
 tri-SDK parity with the Python and Rust toolkits and for unchanged behaviour

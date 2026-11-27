@@ -23,10 +23,10 @@ function stalledBodyFetch(status = 200): { fetchImpl: typeof fetch; signals: Abo
   return { fetchImpl, signals };
 }
 
-function proxy(fetchImpl: typeof fetch, timeout = 250, authHeaderFactory?: () => Record<string, string>) {
+async function proxy(fetchImpl: typeof fetch, timeout = 250, authHeaderFactory?: () => Record<string, string>) {
   const registry = new Registry();
   const writer = new HTTPProxyRegistryWriter({ baseUrl: 'https://example.test', fetchImpl, timeoutMs: timeout, authHeaderFactory });
-  const results = writer.write([createScannedModule({
+  const results = await writer.writeAsync([createScannedModule({
     moduleId: 'probe.get', description: 'probe', target: 'probe:get',
     inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, tags: [],
     metadata: { httpMethod: 'GET', urlPath: '/probe' },
@@ -52,7 +52,7 @@ describe('HTTP proxy cancellation', () => {
     const token = new CancelToken(); token.cancel();
     const fetchImpl = vi.fn<typeof fetch>(async () => new Response('{}'));
     const auth = vi.fn(() => ({}));
-    await expect(proxy(fetchImpl, 250, auth).execute({}, Context.create(null, null, token)))
+    await expect((await proxy(fetchImpl, 250, auth)).execute({}, Context.create(null, null, token)))
       .rejects.toBeInstanceOf(ExecutionCancelledError);
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(auth).not.toHaveBeenCalled();
@@ -69,7 +69,7 @@ describe('HTTP proxy cancellation', () => {
         signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
       });
     };
-    const outcome = proxy(fetchImpl).execute({}, Context.create(null, null, token))
+    const outcome = (await proxy(fetchImpl)).execute({}, Context.create(null, null, token))
       .then(value => ({ value, error: null }), (error: unknown) => ({ value: null, error }));
     await vi.advanceTimersByTimeAsync(25);
     token.cancel();
@@ -82,7 +82,7 @@ describe('HTTP proxy cancellation', () => {
   it('does not start a request if cancellation happens while credentials are resolved', async () => {
     const token = new CancelToken();
     const fetchImpl = vi.fn<typeof fetch>(async () => new Response('{}'));
-    const module = proxy(fetchImpl, 250, () => { token.cancel(); return {}; });
+    const module = await proxy(fetchImpl, 250, () => { token.cancel(); return {}; });
     await expect(module.execute({}, Context.create(null, null, token)))
       .rejects.toBeInstanceOf(ExecutionCancelledError);
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -97,7 +97,7 @@ describe('HTTP proxy cancellation', () => {
       if (outcome === 'failure') throw new Error('offline');
       return new Response('{"ok":true}');
     };
-    const result = proxy(fetchImpl).execute({}, Context.create(null, null, token));
+    const result = (await proxy(fetchImpl)).execute({}, Context.create(null, null, token));
     if (outcome === 'failure') await expect(result).rejects.toThrow('HTTP transport error');
     else await expect(result).resolves.toEqual({ ok: true });
     const added = add.mock.calls.filter(([name]) => name === 'abort');
@@ -111,7 +111,7 @@ describe('HTTP timeouts cover response bodies', () => {
   it.each([200, 500])('bounds proxy body reads for status %s without a context token', async (status) => {
     vi.useFakeTimers();
     const { fetchImpl, signals } = stalledBodyFetch(status);
-    const outcome = proxy(fetchImpl).execute({}, Context.create())
+    const outcome = (await proxy(fetchImpl)).execute({}, Context.create())
       .then(() => null, (error: unknown) => error);
     await vi.advanceTimersByTimeAsync(251);
     expect(signals[0].aborted).toBe(true);

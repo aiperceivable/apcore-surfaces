@@ -246,7 +246,7 @@ Registers scanned modules as HTTP proxy classes that forward requests to a runni
         baseUrl: "http://localhost:8000",
         authHeaderFactory: () => ({ Authorization: "Bearer xxx" }),
     });
-    writer.write(modules, registry);
+    const results = await writer.writeAsync(modules, registry);
     ```
 
 === "Rust"
@@ -417,16 +417,18 @@ An `unsupported_input` has operation scope and includes `location`,
 
 ### Inputs
 - `modules`: list of `ScannedModule`, required
-- `registry`: `apcore.Registry` (Python) / `Registry` (TypeScript, from `apcore-js`) / `&apcore::Registry` (Rust), required — the live registry to register HTTP proxy modules into
+- `registry`: the live registry into which proxies are registered. Python and Rust accept their Core registries. In TypeScript, use `write()` for synchronous registries and `await writeAsync()` for apcore-js or other registries whose `register()` returns a promise.
 
 ### Errors
 - None raised. Per-module failures (registry rejection, target validation, proxy-class build error) are captured into a failed `WriteResult` (Python: `verified=False, verification_error=...`; TypeScript: `createWriteResult(..., false, msg)`; Rust: `WriteResult::failed(...)`) and returned in the result list, so one failing module does not abort the batch. HTTP requests themselves are issued later, at module call-time — not during `write`. Callers should iterate the returned list and check each entry's `verified` field.
 
 ### Returns
-- On success: list of `WriteResult` — `path` is `None`/`null` (no file written)
+- One `WriteResult` per module, in input order. `path` is `None`/`null` because the writer creates no files.
+- TypeScript `writeAsync()` resolves to a result array after the registrations settle and reports any rejection on its module's result.
+- If TypeScript `write()` detects a promise-like return, it handles its rejection and returns a failed result directing the caller to `writeAsync()`. The registration may already have started and can still complete. Check the registry before retrying the same ID.
 
 ### Properties
-- async: false
+- async: `false` for `write()`. The TypeScript `writeAsync()` returns `Promise<WriteResult[]>`.
 - pure: false (mutates registry)
 - availability: Python (always — requires `httpx`; install with `apcore-toolkit[http-proxy]`), TypeScript (included in the standard package; uses global `fetch` — available in Node.js 20+, browsers, Deno, and workers), and Rust (the `http-proxy` Cargo feature is enabled by default so a vanilla dependency declaration exposes `HTTPProxyRegistryWriter`; opt out with `default-features = false` for lean builds).
 

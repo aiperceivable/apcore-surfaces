@@ -18,7 +18,7 @@
  *   baseUrl: 'http://localhost:8000',
  *   authHeaderFactory: () => ({ Authorization: 'Bearer xxx' }),
  * });
- * const results = await writer.write(modules, registry);
+ * const results = await writer.writeAsync(modules, registry);
  * ```
  */
 
@@ -70,9 +70,9 @@ function percentEncodePathSegment(value: string): string {
 }
 
 /**
- * Shape of a registry that `HTTPProxyRegistryWriter` writes to.
+ * Minimal registry interface for the proxy writer.
  *
- * Mirrors the minimal surface used by `RegistryWriter.write()`.
+ * Use `writeAsync()` if the method returns a promise, as apcore-js does.
  */
 export interface ProxyRegistry {
   register(moduleId: string, module: unknown): void;
@@ -211,6 +211,11 @@ function extractErrorMessage(resp: Response, text: string): string {
   return text.slice(0, 200);
 }
 
+function failedRegistration(moduleId: string, error: unknown): WriteResult {
+  const diagnostic = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return createWriteResult(moduleId, null, false, diagnostic);
+}
+
 /**
  * Register each {@link ScannedModule} as an HTTP proxy module in the
  * provided registry. Each registered module's `execute()` forwards its
@@ -270,29 +275,40 @@ export class HTTPProxyRegistryWriter {
   }
 
   /**
-   * Register each module's HTTP proxy into the registry.
-   *
-   * Returns one {@link WriteResult} per module. A module that fails to
-   * build is reported with `verified: false` rather than throwing, so
-   * one bad module does not abort the batch.
-   *
-   * The method is synchronous — `write` performs no I/O, only registry
-   * mutation. This matches the spec property `async: false` and the
-   * Python and Rust SDKs. (HTTP requests happen later, at module call
-   * time.) The previous `async` modifier was return-type sugar with no
-   * internal `await`; existing callers using `await writer.write(...)`
-   * keep working because `await` on a non-promise resolves immediately.
+   * Register proxies in a synchronous registry and return one result per module.
+   * A promise-like return cannot establish success here. If detected, its
+   * rejection is consumed and the result directs the caller to `writeAsync()`.
+   * The registration may already have started by the time this is detected.
    */
   write(modules: ScannedModule[], registry: ProxyRegistry): WriteResult[] {
+    return modules.map((mod) => {
+      try {
+        const registration: unknown = registry.register(mod.moduleId, this.buildFunctionModule(mod));
+        const then = (registration as { then?: unknown } | null | undefined)?.then;
+        if (typeof then === 'function') {
+          void Promise.resolve({ then: then.bind(registration) }).catch(() => undefined);
+          throw new TypeError('Registry registration returned a promise. Use writeAsync() to await registration.');
+        }
+        return createWriteResult(mod.moduleId);
+      } catch (error) {
+        return failedRegistration(mod.moduleId, error);
+      }
+    });
+  }
+
+  /**
+   * Build and register proxies in input order, waiting for each registration.
+   * A build error, thrown registration error, or rejected registration promise
+   * produces a failed result without stopping the rest of the batch.
+   */
+  async writeAsync(modules: ScannedModule[], registry: ProxyRegistry): Promise<WriteResult[]> {
     const results: WriteResult[] = [];
     for (const mod of modules) {
       try {
-        const fm = this.buildFunctionModule(mod);
-        registry.register(mod.moduleId, fm);
-        results.push(createWriteResult(mod.moduleId, null, true));
-      } catch (err) {
-        const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-        results.push(createWriteResult(mod.moduleId, null, false, msg));
+        await registry.register(mod.moduleId, this.buildFunctionModule(mod));
+        results.push(createWriteResult(mod.moduleId));
+      } catch (error) {
+        results.push(failedRegistration(mod.moduleId, error));
       }
     }
     return results;

@@ -79,11 +79,12 @@ describe('real HTTP slow-body deadlines', () => {
     await withDrippingServer(status, async base => {
       const registry = new Registry();
       const writer = new HTTPProxyRegistryWriter({ baseUrl: base, timeoutMs: TIMEOUT_MS });
-      expect(writer.write([createScannedModule({
+      const [result] = await writer.writeAsync([createScannedModule({
         moduleId: 'probe.get', description: 'probe', target: 'probe:get',
         inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, tags: [],
         metadata: { httpMethod: 'GET', urlPath: '/drip' },
-      })], registry)[0].verified).toBe(true);
+      })], registry);
+      expect(result.verified).toBe(true);
       const module = registry.get('probe.get') as unknown as {
         execute(inputs: Record<string, unknown>, ctx: Context): Promise<Record<string, unknown>>;
       };
