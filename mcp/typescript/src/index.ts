@@ -886,6 +886,9 @@ async function serveInternal(
     // warning is never silenced by `logLevel`. Warning only; never blocks
     // startup.
     const governanceState = tryGovernanceState(executor);
+    if (scopedApproval && (!governanceState?.builtinApprovalGateWired || !governanceState.approvalHandlerConfigured)) {
+      throw new Error("Phase B requires a wired Core approval gate");
+    }
     if (governanceState) {
       const warning = formatUnprotectedControlSurfaceWarning(governanceState);
       if (warning) origWarn(warning);
@@ -1207,6 +1210,18 @@ export async function asyncServe(
 
   const scopedApproval = configuredScopedApproval(effectiveApprovalHandler, resolvedBackend);
 
+  const registry = resolveRegistry(resolvedBackend);
+  const executor = await resolveExecutor(resolvedBackend, {
+    approvalHandler: scopedApproval?.handler ?? effectiveApprovalHandler,
+    strategy: resolvedStrategy,
+    middleware: combinedMiddleware,
+    acl: effectiveAcl,
+  });
+  const governanceState = tryGovernanceState(executor);
+  if (scopedApproval && (!governanceState?.builtinApprovalGateWired || !governanceState.approvalHandlerConfigured)) {
+    throw new Error("Phase B requires a wired Core approval gate");
+  }
+
   // Apply log-level suppression (post-resolution so Config Bus values apply).
   if (logLevel) {
     const levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
@@ -1217,18 +1232,9 @@ export async function asyncServe(
     if (minLevel > 3) console.error = () => { };
   }
 
-  const registry = resolveRegistry(resolvedBackend);
-  const executor = await resolveExecutor(resolvedBackend, {
-    approvalHandler: scopedApproval?.handler ?? effectiveApprovalHandler,
-    strategy: resolvedStrategy,
-    middleware: combinedMiddleware,
-    acl: effectiveAcl,
-  });
-
   // aiperceivable/apcore-mcp#15(b): see serve() for rationale — warn before
   // the app is built when system.control.* is reachable with no recognised
   // gate. Warning only; never blocks startup.
-  const governanceState = tryGovernanceState(executor);
   if (governanceState) {
     const warning = formatUnprotectedControlSurfaceWarning(governanceState);
     if (warning) origWarn(warning);

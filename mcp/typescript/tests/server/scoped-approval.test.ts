@@ -180,6 +180,13 @@ describe.skipIf(!supportsScopedCore())("scoped approval through the MCP wire", (
       expect(submitted).toMatchObject({ isError: true });
       expect(JSON.stringify(submitted.content)).toContain("Approval resumption requires a direct tool call");
       expect(JSON.stringify(submitted)).not.toContain(syntheticToken);
+      const nested = await target.client.callTool({
+        name: META_TOOL_NAMES.SUBMIT,
+        arguments: { module_id: regularId, arguments: { ...args, _approval_token: "reserved input" } },
+      });
+      expect(nested).toMatchObject({ isError: true });
+      expect(JSON.stringify(nested.content)).toContain("Approval resumption requires a direct tool call");
+      expect(JSON.stringify(nested)).not.toContain("reserved input");
     } finally {
       await target.close();
     }
@@ -197,6 +204,25 @@ it.skipIf(supportsScopedCore()).each([false, true])(
       ? new APCoreMCP(registry as never, options).asyncServe()
       : asyncServe(registry as never, options);
     await expect(startup).rejects.toThrow("Phase B requires Core with scoped approval support");
+    expect(start).not.toHaveBeenCalled();
+    expect(console.info).toBe(info);
+  },
+);
+
+it.skipIf(!supportsScopedCore()).each([false, true])(
+  "Phase B requires a wired Core approval gate (facade: %s)", async throughFacade => {
+    const info = console.info;
+    const registry = new core.Registry();
+    const approvalStore = new InMemoryApprovalStore();
+    const start = vi.spyOn(approvalStore, "start");
+    const options = { approvalStore, strategy: "internal", logLevel: "ERROR" as const };
+    const startup = throughFacade
+      ? new APCoreMCP(registry as never, options).asyncServe()
+      : asyncServe(registry as never, options);
+    await expect(startup.then(async app => {
+      await app.close();
+      return app;
+    })).rejects.toThrow("Phase B requires a wired Core approval gate");
     expect(start).not.toHaveBeenCalled();
     expect(console.info).toBe(info);
   },

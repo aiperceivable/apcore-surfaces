@@ -12,6 +12,7 @@
  * Full spec: apcore-mcp/docs/features/async-task-bridge.md (F-043).
  */
 
+import { InvalidInputError } from "apcore-js";
 import { markBackgroundApprovalContext } from "../approval-reply.js";
 import type { ModuleDescriptor } from "../types.js";
 import { ErrorCodes } from "../types.js";
@@ -528,6 +529,9 @@ export class AsyncTaskBridge {
           );
         }
         const inputs = (rawArgs as Record<string, unknown> | undefined) ?? {};
+        if (Object.hasOwn(inputs, "_approval_token")) {
+          throw new InvalidInputError("Approval resumption requires a direct tool call");
+        }
         // [A-D-222] Catch TaskLimitExceededError from manager.submit() and
         // surface it as a structured TASK_LIMIT_EXCEEDED envelope with
         // retryable=true. Mirrors Python's
