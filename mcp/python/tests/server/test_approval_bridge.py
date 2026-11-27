@@ -7,10 +7,14 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from apcore import Registry
 
-from apcore_mcp.adapters.approval import StorageBackedApprovalHandler
+from apcore_mcp.adapters.approval import _CORE_SCOPED_APPROVAL, StorageBackedApprovalHandler
 from apcore_mcp.approval_store import InMemoryApprovalStore
 from apcore_mcp.server.approval_bridge import APPROVAL_META_TOOL_NAMES, ApprovalBridge
+
+_requires_scoped_core = pytest.mark.skipif(not _CORE_SCOPED_APPROVAL, reason="requires scoped Core approval")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -78,47 +82,58 @@ def test_build_meta_tools_has_description() -> None:
 # ---------------------------------------------------------------------------
 
 
+@_requires_scoped_core
 @pytest.mark.asyncio
 async def test_check_returns_pending() -> None:
-    bridge, handler, store = _make_bridge()
-    await store.save_pending("abc-123", "mod", {"x": 1})
-    content, is_error, trace_id = await bridge.handle_meta_tool("__apcore_approval_check", {"approval_id": "abc-123"})
+    bridge, handler, _ = _make_bridge()
+    pending = await handler.request_approval(_make_approval_request())
+    content, is_error, _ = await bridge.handle_meta_tool(
+        "__apcore_approval_check", {"approval_id": pending.audit_id},
+    )
     assert is_error is False
     body = json.loads(content[0]["text"])
     assert body["status"] == "pending"
-    assert body["approval_id"] == "abc-123"
+    assert body["approval_id"] == pending.audit_id
+    assert pending.approval_id not in content[0]["text"]
 
 
+@_requires_scoped_core
 @pytest.mark.asyncio
 async def test_check_returns_approved() -> None:
     bridge, handler, store = _make_bridge()
-    await store.save_pending("abc-456", "mod", {})
-    await store.resolve("abc-456", approved=True)
-    content, is_error, _ = await bridge.handle_meta_tool("__apcore_approval_check", {"approval_id": "abc-456"})
+    pending = await handler.request_approval(_make_approval_request())
+    await store.resolve(pending.audit_id, approved=True)
+    content, is_error, _ = await bridge.handle_meta_tool(
+        "__apcore_approval_check", {"approval_id": pending.audit_id},
+    )
     assert is_error is False
     body = json.loads(content[0]["text"])
     assert body["status"] == "approved"
-    assert body["approval_id"] == "abc-456"
+    assert body["approval_id"] == pending.audit_id
+    assert "reason" not in body
+
+
+@_requires_scoped_core
+@pytest.mark.asyncio
+async def test_check_returns_rejected_without_provider_text() -> None:
+    bridge, handler, store = _make_bridge()
+    pending = await handler.request_approval(_make_approval_request())
+    await store.resolve(pending.audit_id, approved=False, reason="not today")
+    content, is_error, _ = await bridge.handle_meta_tool(
+        "__apcore_approval_check", {"approval_id": pending.audit_id},
+    )
+    assert is_error is False
+    body = json.loads(content[0]["text"])
+    assert body["status"] == "rejected"
     assert "reason" not in body
 
 
 @pytest.mark.asyncio
-async def test_check_returns_rejected_with_reason() -> None:
-    bridge, handler, store = _make_bridge()
-    await store.save_pending("abc-789", "mod", {})
-    await store.resolve("abc-789", approved=False, reason="not today")
-    content, is_error, _ = await bridge.handle_meta_tool("__apcore_approval_check", {"approval_id": "abc-789"})
-    assert is_error is False
-    body = json.loads(content[0]["text"])
-    assert body["status"] == "rejected"
-    assert body["reason"] == "not today"
-
-
-@pytest.mark.asyncio
 async def test_check_unknown_id_returns_rejected() -> None:
-    bridge, handler, store = _make_bridge()
-    content, is_error, _ = await bridge.handle_meta_tool("__apcore_approval_check", {"approval_id": "unknown-xyz"})
-    # handler.check_approval returns rejected for unknown ids
+    bridge, _, _ = _make_bridge()
+    content, is_error, _ = await bridge.handle_meta_tool(
+        "__apcore_approval_check", {"approval_id": "c5b92219-e067-485a-9752-d09cd362588d"},
+    )
     assert is_error is False
     body = json.loads(content[0]["text"])
     assert body["status"] == "rejected"
@@ -155,6 +170,7 @@ async def test_check_unknown_meta_tool_name_is_error() -> None:
 # ---------------------------------------------------------------------------
 
 
+@_requires_scoped_core
 @pytest.mark.asyncio
 async def test_request_approval_returns_pending_with_id() -> None:
     store = InMemoryApprovalStore()
@@ -174,13 +190,14 @@ async def test_request_approval_returns_pending_with_id() -> None:
     )
     result = await handler.request_approval(request)
     assert result.status == "pending"
-    assert result.approval_id is not None
-    # store should have the pending record
-    record = await store.get_result(result.approval_id)
+    assert result.approval_id is not None and result.audit_id is not None
+    assert result.approval_id != result.audit_id
+    record = await store.get_result(result.audit_id)
     assert record is not None
     assert record["status"] == "pending"
 
 
+@_requires_scoped_core
 @pytest.mark.asyncio
 async def test_request_approval_calls_notify_callback() -> None:
     store = InMemoryApprovalStore()
@@ -202,9 +219,11 @@ async def test_request_approval_calls_notify_callback() -> None:
     result = await handler.request_approval(request)
     notify.assert_awaited_once()
     args = notify.call_args
-    assert args[0][0] == result.approval_id
+    assert args[0][0] == result.audit_id
+    assert args[0][0] != result.approval_id
 
 
+@_requires_scoped_core
 @pytest.mark.asyncio
 async def test_request_approval_swallows_notify_exception() -> None:
     """notify_callback errors must not propagate."""
@@ -237,19 +256,20 @@ async def test_request_approval_swallows_notify_exception() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FailingStore:
-    """ApprovalStore stand-in whose every operation raises."""
+class _FailingStore(InMemoryApprovalStore):
+    """Scoped approval store stand-in whose operations raise."""
 
     def __init__(self, exc: BaseException) -> None:
+        super().__init__()
         self._exc = exc
 
-    async def save_pending(self, approval_id: str, module_id: str, arguments: dict) -> None:
+    async def save_scoped_pending(self, approval_id, arguments, scope, verifier) -> None:
         raise self._exc
 
-    async def get_result(self, approval_id: str) -> dict[str, Any] | None:
+    async def get_scoped_result(self, approval_id, principal) -> dict[str, Any] | None:
         raise self._exc
 
-    async def resolve(self, approval_id: str, *, approved: bool, reason: str | None = None) -> bool:
+    async def consume_scoped(self, approval_id, scope, verifier) -> dict[str, Any] | None:
         raise self._exc
 
 
@@ -267,6 +287,7 @@ def _make_approval_request() -> Any:
     )
 
 
+@_requires_scoped_core
 @pytest.mark.asyncio
 async def test_request_approval_returns_rejected_when_save_pending_raises() -> None:
     """A store that cannot persist must fail the gate closed, not raise."""
@@ -278,17 +299,19 @@ async def test_request_approval_returns_rejected_when_save_pending_raises() -> N
     assert result.reason == "Storage error"
 
 
+@_requires_scoped_core
 @pytest.mark.asyncio
 async def test_check_approval_returns_rejected_when_get_result_raises() -> None:
     """A store that cannot be read must fail the gate closed, not raise."""
     handler = StorageBackedApprovalHandler(_FailingStore(RuntimeError("redis down")))
 
-    result = await handler.check_approval("apr-1")
+    result = await handler.poll_approval("c5b92219-e067-485a-9752-d09cd362588d", None)
 
     assert result.status == "rejected"
     assert result.reason == "Storage error"
 
 
+@_requires_scoped_core
 @pytest.mark.asyncio
 async def test_capacity_failures_report_the_capacity_reason() -> None:
     """A capacity rejection is reported distinctly from a generic storage error."""
@@ -296,7 +319,7 @@ async def test_capacity_failures_report_the_capacity_reason() -> None:
     named = StorageBackedApprovalHandler(_FailingStore(RuntimeError("store capacity exceeded")))
 
     assert (await handler.request_approval(_make_approval_request())).reason == "Store capacity exceeded"
-    assert (await named.check_approval("apr-1")).reason == "Store capacity exceeded"
+    assert (await named.poll_approval("c5b92219-e067-485a-9752-d09cd362588d", None)).reason == "Store capacity exceeded"
 
 
 # ---------------------------------------------------------------------------
@@ -306,40 +329,35 @@ async def test_capacity_failures_report_the_capacity_reason() -> None:
 
 def test_approval_store_param_creates_handler() -> None:
     """Passing approval_store to APCoreMCP auto-creates StorageBackedApprovalHandler."""
-    from unittest.mock import MagicMock
-
     store = InMemoryApprovalStore()
-
-    mock_registry = MagicMock()
-    mock_registry.list.return_value = []
-    mock_executor = MagicMock()
-    mock_executor.registry = mock_registry
 
     from apcore_mcp.apcore_mcp import APCoreMCP
 
-    mcp = APCoreMCP(mock_executor, approval_store=store, async_tasks=False)
+    mcp = APCoreMCP(Registry(), approval_store=store, async_tasks=False)
     assert mcp._approval_store is store
     assert isinstance(mcp._approval_handler, StorageBackedApprovalHandler)
 
 
 def test_explicit_approval_handler_not_overridden_by_store() -> None:
     """Explicit approval_handler takes precedence over approval_store auto-wiring."""
-    from unittest.mock import MagicMock
-
     store = InMemoryApprovalStore()
     explicit_handler = StorageBackedApprovalHandler(store)
-
-    mock_registry = MagicMock()
-    mock_registry.list.return_value = []
-    mock_executor = MagicMock()
-    mock_executor.registry = mock_registry
 
     from apcore_mcp.apcore_mcp import APCoreMCP
 
     mcp = APCoreMCP(
-        mock_executor,
+        Registry(),
         approval_handler=explicit_handler,
         approval_store=store,
         async_tasks=False,
     )
     assert mcp._approval_handler is explicit_handler
+
+
+@pytest.mark.asyncio
+async def test_legacy_status_method_cannot_authorize() -> None:
+    _, handler, store = _make_bridge()
+    record_id = "c5b92219-e067-485a-9752-d09cd362588d"
+    await store.save_pending(record_id, "mod", {})
+    await store.resolve(record_id, approved=True)
+    assert (await handler.check_approval(record_id)).status == "rejected"

@@ -13,10 +13,12 @@ from contextlib import aclosing
 from typing import Any
 
 from apcore import APCore, CancelToken, Context, Executor, ModuleError, StreamingModule
+from apcore.errors import ApprovalPendingError
 from apcore.registry.types import ModuleDescriptor
 from apcore.registry.version import matches_version_hint
 from apcore.trace_context import TraceContext, TraceParent
 
+from apcore_mcp.adapters.approval import _capture_pending_error
 from apcore_mcp.adapters.errors import ErrorMapper
 from apcore_mcp.helpers import MCP_ELICIT_KEY, MCP_PROGRESS_KEY
 
@@ -634,6 +636,13 @@ class ExecutionRouter:
                 error_info = self._error_mapper.to_mcp_error(error)
                 return ([{"type": "text", "text": error_info["message"]}], True, None)
 
+        # The factory supplies this only after MCP input validation. Keep
+        # preflight and routing on business arguments; Core separates the
+        # credential at pipeline entry before governance or module execution.
+        approval_token = extra.get("_mcp_approval_token") if extra is not None else None
+        if approval_token is not None:
+            arguments = {**arguments, "_approval_token": approval_token}
+
         has_progress = progress_token is not None and send_notification is not None
         if callable(self._open_completed_stream):
             if self._core_backend:
@@ -783,6 +792,16 @@ class ExecutionRouter:
             text += "\n\n" + json.dumps(guidance)
         return text
 
+    def _invocation_error_text(self, error: Exception, arguments: dict[str, Any]) -> str:
+        if isinstance(error, ApprovalPendingError):
+            _capture_pending_error(error)
+            return "Approval pending for this tool."
+        text = self._build_error_text(self._error_mapper.to_mcp_error(error))
+        credential = arguments.get("_approval_token")
+        if isinstance(credential, str) and credential:
+            return text.replace(credential, "[redacted]")
+        return text
+
     async def _handle_call_async(
         self,
         tool_name: str,
@@ -822,9 +841,9 @@ class ExecutionRouter:
             trace_id = context.trace_id if context is not None else None
             return (content, False, trace_id)
         except Exception as error:
-            logger.error("handle_call error for %s: %s", tool_name, error)
-            error_info = self._error_mapper.to_mcp_error(error)
-            error_content: list[dict[str, Any]] = [{"type": "text", "text": self._build_error_text(error_info)}]
+            if not isinstance(error, ApprovalPendingError) and "_approval_token" not in arguments:
+                logger.error("handle_call error for %s: %s", tool_name, error)
+            error_content = [{"type": "text", "text": self._invocation_error_text(error, arguments)}]
             self._attach_traceparent(error_content, context)
             return (error_content, True, context.trace_id if context is not None else None)
 
@@ -856,8 +875,7 @@ class ExecutionRouter:
             self._attach_traceparent(content, context)
             return content, False, context.trace_id
         except Exception as error:
-            info = self._error_mapper.to_mcp_error(error)
-            failure: list[dict[str, Any]] = [{"type": "text", "text": self._build_error_text(info)}]
+            failure = [{"type": "text", "text": self._invocation_error_text(error, arguments)}]
             self._attach_traceparent(failure, context)
             return failure, True, context.trace_id
 
@@ -941,8 +959,8 @@ class ExecutionRouter:
             trace_id = context.trace_id if context is not None else None
             return (content, False, trace_id)
         except Exception as error:
-            logger.error("handle_call stream error for %s: %s", tool_name, error)
-            error_info = self._error_mapper.to_mcp_error(error)
-            stream_error_content: list[dict[str, Any]] = [{"type": "text", "text": self._build_error_text(error_info)}]
+            if not isinstance(error, ApprovalPendingError) and "_approval_token" not in arguments:
+                logger.error("handle_call stream error for %s: %s", tool_name, error)
+            stream_error_content = [{"type": "text", "text": self._invocation_error_text(error, arguments)}]
             self._attach_traceparent(stream_error_content, context)
             return (stream_error_content, True, context.trace_id if context is not None else None)

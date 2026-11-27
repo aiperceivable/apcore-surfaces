@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import secrets
 import uuid
-from typing import Any
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from hashlib import sha256
+from typing import Any, Protocol, TypeGuard
 
+from apcore import Identity
+from apcore import approval as core_approval
 from apcore.approval import ApprovalHandler, ApprovalRequest, ApprovalResult
+from apcore.errors import ApprovalPendingError
 
+from apcore_mcp.approval_store import ApprovalPrincipal, ApprovalScope, ScopedApprovalStore
 from apcore_mcp.helpers import MCP_ELICIT_KEY
 
 logger = logging.getLogger(__name__)
@@ -127,68 +138,268 @@ def _store_failure_reason(exc: BaseException) -> str:
     return "Storage error"
 
 
+_CORE_SCOPED_APPROVAL = hasattr(core_approval, "ScopedApprovalHandler")
+_TOKEN_SECRET = re.compile(r"[A-Za-z0-9_-]{43}")
+_NO_PHASE_B = "Scoped approval is unavailable for this call"
+
+
+def _approval_principal(identity: Identity | None) -> ApprovalPrincipal:
+    return (identity.type, identity.id) if isinstance(identity, Identity) else None
+
+
+def _is_public_approval_id(value: object) -> TypeGuard[str]:
+    if not isinstance(value, str) or len(value) != 36:
+        return False
+    try:
+        identifier = uuid.UUID(value)
+        return identifier.version == 4 and str(identifier) == value
+    except ValueError:
+        return False
+
+
+def _argument_snapshot(arguments: dict[str, Any]) -> str:
+    return json.dumps(arguments, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _scope_for(request: ApprovalRequest, snapshot: str) -> ApprovalScope:
+    return ApprovalScope(
+        _approval_principal(request.context.identity),
+        request.caller_id,
+        request.module_id,
+        sha256(snapshot.encode("utf-8")).hexdigest(),
+    )
+
+
+class _ScopedMCPApprovalHandler(Protocol):
+    @property
+    def scoped_approval_available(self) -> bool: ...
+
+    async def request_approval(self, request: ApprovalRequest) -> ApprovalResult: ...
+
+    async def check_approval(self, approval_id: str) -> ApprovalResult: ...
+
+    async def check_approval_for_call(self, credential: str, request: ApprovalRequest) -> ApprovalResult: ...
+
+    async def poll_approval(self, approval_id: str, principal: ApprovalPrincipal) -> ApprovalResult: ...
+
+
+def _implements_mcp_scoped_approval(handler: object) -> TypeGuard[_ScopedMCPApprovalHandler]:
+    return (
+        getattr(handler, "scoped_approval_available", None) is True
+        and all(callable(getattr(handler, method, None)) for method in (
+            "request_approval", "check_approval", "check_approval_for_call", "poll_approval",
+        ))
+    )
+
+
 class StorageBackedApprovalHandler(ApprovalHandler):
-    """Phase B approval handler backed by a pluggable ApprovalStore.
+    """Store a scoped approval with a public record ID and a separate private credential.
 
-    ``request_approval()`` saves a pending record and returns
-    ``ApprovalResult(status="pending", approval_id=...)`` causing apcore to raise
-    ``ApprovalPendingError``, which the bridge maps to ``APPROVAL_PENDING`` in
-    the MCP envelope. The agent receives ``{"errorType": "APPROVAL_PENDING",
-    "details": {"approvalId": "..."}}`` and polls ``__apcore_approval_check``.
-
-    ``check_approval()`` reads the store; called by apcore when the client
-    retries with ``_meta.approvalId`` set.
-
-    ``notify_callback`` (optional) lets callers fan out to Slack/email/etc.
-    Signature: ``async (approval_id: str, module_id: str, arguments: dict) -> None``
-
-    Neither method raises: a store failure on either path is contained and
-    surfaced as ``ApprovalResult(status="rejected", ...)`` so the gate fails
-    closed rather than propagating out of apcore's approval call.
+    Out-of-band notification receives the public ID, module ID and original
+    business arguments. Only the pending approval result carries the credential.
     """
 
-    def __init__(
-        self,
-        store: Any,
-        *,
-        notify_callback: Any | None = None,
-    ) -> None:
+    def __init__(self, store: Any, *, notify_callback: Any | None = None) -> None:
         self._store = store
         self._notify = notify_callback
 
-    async def request_approval(self, request: ApprovalRequest) -> ApprovalResult:
-        approval_id = str(uuid.uuid4())
-        module_id = getattr(request, "module_id", "unknown")
-        arguments = getattr(request, "arguments", {}) or {}
+    @property
+    def scoped_approval_available(self) -> bool:
+        return _CORE_SCOPED_APPROVAL and isinstance(self._store, ScopedApprovalStore)
 
+    async def request_approval(self, request: ApprovalRequest) -> ApprovalResult:
+        if not self.scoped_approval_available:
+            return ApprovalResult(status="rejected", reason=_NO_PHASE_B)
         try:
-            await self._store.save_pending(approval_id, module_id, arguments)
+            snapshot = _argument_snapshot(request.arguments)
+            scope = _scope_for(request, snapshot)
+        except (TypeError, ValueError, RecursionError):
+            return ApprovalResult(status="rejected", reason="Approval requires JSON business arguments")
+        approval_id = str(uuid.uuid4())
+        credential = f"{approval_id}.{secrets.token_urlsafe(32)}"
+        verifier = sha256(credential.encode("ascii")).hexdigest()
+        try:
+            await self._store.save_scoped_pending(approval_id, json.loads(snapshot), scope, verifier)
         except Exception as exc:
-            reason = _store_failure_reason(exc)
-            logger.error("approval store save_pending failed for %s: %s", approval_id, reason, exc_info=True)
-            return ApprovalResult(status="rejected", reason=reason)
+            return self._storage_failure("save", exc)
 
         if self._notify is not None:
             try:
-                await self._notify(approval_id, module_id, arguments)
+                await self._notify(approval_id, request.module_id, json.loads(snapshot))
             except Exception:
-                logger.warning("notify_callback raised for approval %s", approval_id, exc_info=True)
-
-        return ApprovalResult(status="pending", approval_id=approval_id)
+                logger.warning("Approval notification failed for record %s", approval_id)
+        return ApprovalResult(status="pending", approval_id=credential, audit_id=approval_id)
 
     async def check_approval(self, approval_id: str) -> ApprovalResult:
+        # Older Core invokes this status-only method for authorization and
+        # cannot pass a current invocation scope.
+        return ApprovalResult(status="rejected", reason=_NO_PHASE_B)
+
+    async def poll_approval(self, approval_id: str, principal: ApprovalPrincipal) -> ApprovalResult:
+        if not self.scoped_approval_available or not _is_public_approval_id(approval_id):
+            return ApprovalResult(status="rejected", reason=_NO_PHASE_B)
         try:
-            record = await self._store.get_result(approval_id)
+            record = await self._store.get_scoped_result(approval_id, principal)
         except Exception as exc:
-            reason = _store_failure_reason(exc)
-            logger.error("approval store get_result failed for %s: %s", approval_id, reason, exc_info=True)
-            return ApprovalResult(status="rejected", reason=reason)
-        if record is None:
-            return ApprovalResult(status="rejected", reason="approval_id not found")
-        status = record.get("status", "pending")
-        reason = record.get("reason")
+            return self._storage_failure("poll", exc)
+        return self._public_decision(record)
+
+    async def check_approval_for_call(self, credential: str, request: ApprovalRequest) -> ApprovalResult:
+        approval_id, _, secret = credential.partition(".")
+        if (
+            not self.scoped_approval_available
+            or not _is_public_approval_id(approval_id)
+            or not _TOKEN_SECRET.fullmatch(secret)
+        ):
+            return ApprovalResult(status="rejected", reason="Approval is unavailable for this invocation")
+        try:
+            scope = _scope_for(request, _argument_snapshot(request.arguments))
+        except (TypeError, ValueError, RecursionError):
+            return ApprovalResult(status="rejected", reason="Approval requires JSON business arguments")
+        verifier = sha256(credential.encode("ascii")).hexdigest()
+        try:
+            record = await self._store.consume_scoped(approval_id, scope, verifier)
+        except Exception as exc:
+            return self._storage_failure("resume", exc)
+        decision = self._public_decision(record)
+        if decision.status == "pending":
+            return ApprovalResult(status="pending", approval_id=credential, audit_id=approval_id)
+        return ApprovalResult(status=decision.status, reason=decision.reason, audit_id=approval_id if record else None)
+
+    @staticmethod
+    def _public_decision(record: dict[str, Any] | None) -> ApprovalResult:
+        status = record.get("status") if record is not None else None
         if status == "approved":
             return ApprovalResult(status="approved")
-        if status == "rejected":
-            return ApprovalResult(status="rejected", reason=reason)
-        return ApprovalResult(status="pending", approval_id=approval_id)
+        if status == "pending":
+            return ApprovalResult(status="pending")
+        return ApprovalResult(status="rejected", reason="Approval is unavailable for this invocation")
+
+    @staticmethod
+    def _storage_failure(operation: str, exc: Exception) -> ApprovalResult:
+        reason = _store_failure_reason(exc)
+        # Store exceptions may contain sensitive arguments or credentials.
+        logger.warning("Approval store %s failed: %s", operation, reason)
+        return ApprovalResult(status="rejected", reason=reason)
+
+
+@dataclass
+class _ApprovalDelivery:
+    handler: _ScopedMCPApprovalHandler
+    module_id: str
+    active: bool = True
+    pending: ApprovalResult | None = None
+    metadata: dict[str, str] | None = None
+
+
+_approval_delivery: ContextVar[_ApprovalDelivery | None] = ContextVar("mcp_approval_delivery", default=None)
+
+
+@contextmanager
+def _capture_approval_delivery(handler: _ScopedMCPApprovalHandler, module_id: str) -> Iterator[_ApprovalDelivery]:
+    delivery = _ApprovalDelivery(handler, module_id)
+    token = _approval_delivery.set(delivery)
+    try:
+        yield delivery
+    finally:
+        delivery.active = False
+        _approval_delivery.reset(token)
+
+
+def _pending_metadata(result: ApprovalResult) -> dict[str, str] | None:
+    approval_id, credential = result.audit_id, result.approval_id
+    if (
+        _is_public_approval_id(approval_id)
+        and isinstance(credential, str)
+        and 0 < len(credential) <= 256
+        and approval_id != credential
+    ):
+        return {"approvalId": approval_id, "resumeToken": credential}
+    return None
+
+
+def _capture_pending_error(error: ApprovalPendingError) -> None:
+    delivery = _approval_delivery.get()
+    if delivery is not None and delivery.pending is not None and error.result is delivery.pending:
+        delivery.metadata = _pending_metadata(delivery.pending)
+
+
+class _MCPScopedApprovalGate:
+    """Allow credential issuance and consumption on MCP's scoped result path."""
+
+    def __init__(self, handler: _ScopedMCPApprovalHandler) -> None:
+        self._handler = handler
+
+    def _delivery_for(self, request: ApprovalRequest) -> _ApprovalDelivery | None:
+        delivery = _approval_delivery.get()
+        if (
+            _CORE_SCOPED_APPROVAL
+            and delivery is not None
+            and delivery.active
+            and delivery.handler is self._handler
+            and request.caller_id is None
+            and request.module_id == delivery.module_id
+        ):
+            return delivery
+        return None
+
+    @staticmethod
+    def _record_decision(
+        result: ApprovalResult, delivery: _ApprovalDelivery, credential: str | None = None,
+    ) -> ApprovalResult:
+        if result.status == "pending":
+            metadata = _pending_metadata(result)
+            if metadata is None:
+                return ApprovalResult(status="rejected", reason="The provider returned an invalid pending approval")
+            # Core audits reasons and approvers. A pending result only needs
+            # the private credential and its separate public correlation ID.
+            pending = ApprovalResult(
+                status="pending", approval_id=metadata["resumeToken"], audit_id=metadata["approvalId"],
+            )
+            delivery.pending = pending
+            return pending
+
+        credentials = {value for value in (credential, result.approval_id) if isinstance(value, str) and value}
+
+        def redact(value: str | None) -> str | None:
+            if not isinstance(value, str):
+                return None
+            for secret in credentials:
+                value = value.replace(secret, "[redacted]")
+            return value
+
+        return ApprovalResult(
+            status=result.status,
+            reason=redact(result.reason),
+            approved_by=redact(result.approved_by),
+            audit_id=(
+                result.audit_id
+                if _is_public_approval_id(result.audit_id) and result.audit_id not in credentials
+                else None
+            ),
+        )
+
+    async def request_approval(self, request: ApprovalRequest) -> ApprovalResult:
+        delivery = self._delivery_for(request)
+        if delivery is None:
+            return ApprovalResult(status="rejected", reason=_NO_PHASE_B)
+        try:
+            result = await self._handler.request_approval(request)
+            return self._record_decision(result, delivery)
+        except Exception:
+            logger.warning("Scoped approval request failed")
+            return ApprovalResult(status="rejected", reason=_NO_PHASE_B)
+
+    async def check_approval(self, approval_id: str) -> ApprovalResult:
+        return ApprovalResult(status="rejected", reason=_NO_PHASE_B)
+
+    async def check_approval_for_call(self, credential: str, request: ApprovalRequest) -> ApprovalResult:
+        delivery = self._delivery_for(request)
+        if delivery is None:
+            return ApprovalResult(status="rejected", reason=_NO_PHASE_B)
+        try:
+            result = await self._handler.check_approval_for_call(credential, request)
+            return self._record_decision(result, delivery, credential)
+        except Exception:
+            logger.warning("Scoped approval resumption failed")
+            return ApprovalResult(status="rejected", reason=_NO_PHASE_B)
