@@ -11,6 +11,10 @@ use apcore::events::{ApCoreEvent, EventSubscriber, StdoutSubscriber};
 use apcore::executor::Executor;
 use apcore::module::Module;
 use apcore::registry::registry::{ModuleDescriptor, Registry};
+use apcore_mcp::approval_store::{
+    ApprovalPrincipal, ApprovalRecord, ApprovalScope, ApprovalStore, ApprovalVerifier,
+    InMemoryApprovalStore, StoreResult,
+};
 use apcore_mcp::{APCoreMCP, ServeOptions};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -29,33 +33,53 @@ impl Drop for CancellationCleanup {
     }
 }
 
-struct NoisyApprovalStore;
-type StoreError = Box<dyn std::error::Error + Send + Sync>;
+#[derive(Default)]
+struct NoisyApprovalStore(InMemoryApprovalStore);
 
 #[async_trait]
-impl apcore_mcp::approval_store::ApprovalStore for NoisyApprovalStore {
-    async fn save_pending(
-        &self,
-        _id: &str,
-        _module: &str,
-        _arguments: &Value,
-    ) -> Result<(), StoreError> {
-        Ok(())
+impl ApprovalStore for NoisyApprovalStore {
+    fn supports_scoped_approval(&self) -> bool {
+        self.0.supports_scoped_approval()
     }
-    async fn get_result(
-        &self,
-        _id: &str,
-    ) -> Result<Option<apcore_mcp::approval_store::ApprovalRecord>, StoreError> {
-        Ok(None)
+
+    async fn save_pending(&self, id: &str, module: &str, arguments: &Value) -> StoreResult<()> {
+        self.0.save_pending(id, module, arguments).await
     }
-    async fn resolve(
-        &self,
-        _id: &str,
-        _approved: bool,
-        _reason: Option<String>,
-    ) -> Result<bool, StoreError> {
-        Ok(false)
+
+    async fn get_result(&self, id: &str) -> StoreResult<Option<ApprovalRecord>> {
+        self.0.get_result(id).await
     }
+
+    async fn resolve(&self, id: &str, approved: bool, reason: Option<String>) -> StoreResult<bool> {
+        self.0.resolve(id, approved, reason).await
+    }
+
+    async fn save_scoped_pending(
+        &self,
+        id: &str,
+        verifier: &ApprovalVerifier,
+        scope: &ApprovalScope,
+    ) -> StoreResult<()> {
+        self.0.save_scoped_pending(id, verifier, scope).await
+    }
+
+    async fn get_scoped_result(
+        &self,
+        id: &str,
+        principal: Option<&ApprovalPrincipal>,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        self.0.get_scoped_result(id, principal).await
+    }
+
+    async fn consume_scoped(
+        &self,
+        id: &str,
+        verifier: &ApprovalVerifier,
+        scope: &ApprovalScope,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        self.0.consume_scoped(id, verifier, scope).await
+    }
+
     fn start_sweep(&self) -> Option<tokio::task::JoinHandle<()>> {
         struct SweepCleanup;
         impl Drop for SweepCleanup {
@@ -177,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let executor = Arc::new(Executor::new(Arc::new(registry), Arc::new(config)));
     let mut builder = APCoreMCP::builder().backend(executor).transport("stdio");
     if mode == "sweep" {
-        builder = builder.approval_store(Arc::new(NoisyApprovalStore));
+        builder = builder.approval_store(Arc::new(NoisyApprovalStore::default()));
     }
     let server = builder.build()?;
     let options = ServeOptions {

@@ -779,6 +779,15 @@ impl ExecutionRouter {
         self.async_bridge.as_ref()
     }
 
+    fn has_approval_input(tool_name: &str, arguments: &Value) -> bool {
+        arguments.get("_approval_token").is_some()
+            || (tool_name == crate::server::async_task_bridge::META_TOOL_SUBMIT
+                && arguments
+                    .get("arguments")
+                    .and_then(|value| value.get("_approval_token"))
+                    .is_some())
+    }
+
     /// Redact sensitive fields from tool inputs for safe logging.
     ///
     /// If a schema is registered for `tool_name`, uses
@@ -960,6 +969,9 @@ impl ExecutionRouter {
         arguments: &Value,
         extra: Option<&Value>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
+        if Self::has_approval_input(tool_name, arguments) {
+            return Self::stream_error("Approval credentials belong in request metadata".into());
+        }
         // [B-002] Register a CancelToken for this call so an inbound MCP
         // `notifications/cancelled` (forwarded into `router.cancel_call(call_id)`)
         // cooperatively cancels in-flight work. call_id sourced from
@@ -1001,6 +1013,7 @@ impl ExecutionRouter {
                 Some(token)
                     if crate::adapters::approval::resume_audit_id(token).is_some()
                         && self.supports_scoped_approval()
+                        && crate::server::approval_bridge::has_tool_response_context()
                         && !AsyncTaskBridge::is_reserved_id(tool_name) =>
                 {
                     Some(token)
@@ -1069,14 +1082,15 @@ impl ExecutionRouter {
         // dispatch below.
         if let Some(approval_bridge) = &self.approval_bridge {
             if ApprovalBridge::is_meta_tool(tool_name) {
-                let (value, is_error) =
-                    if crate::server::approval_bridge::has_tool_response_context() {
-                        approval_bridge
-                            .check_wire_status(arguments, apcore_ctx.identity.as_ref())
-                            .await
-                    } else {
-                        approval_bridge.handle_meta_tool(tool_name, arguments).await
-                    };
+                let (value, is_error) = if approval_bridge.supports_scoped_approval()
+                    || crate::server::approval_bridge::has_tool_response_context()
+                {
+                    approval_bridge
+                        .check_wire_status(arguments, apcore_ctx.identity.as_ref())
+                        .await
+                } else {
+                    approval_bridge.handle_meta_tool(tool_name, arguments).await
+                };
                 let result = if is_error {
                     Err(apcore::errors::ModuleError::new(
                         apcore::errors::ErrorCode::GeneralInvalidInput,
@@ -1218,13 +1232,17 @@ impl ExecutionRouter {
         } else {
             arguments
         };
-        self.dispatch_stream_or_call(
+        crate::server::approval_bridge::run_foreground_approval(
             tool_name,
-            execution_arguments,
-            &context_value,
-            version_hint.as_deref(),
             &apcore_ctx,
-            progress_token.as_ref().zip(send_notification.as_ref()),
+            self.dispatch_stream_or_call(
+                tool_name,
+                execution_arguments,
+                &context_value,
+                version_hint.as_deref(),
+                &apcore_ctx,
+                progress_token.as_ref().zip(send_notification.as_ref()),
+            ),
         )
         .await
     }
@@ -1317,12 +1335,17 @@ impl ExecutionRouter {
         arguments: &Value,
         extra: Option<CallExtra>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
-        let redacted = self.redact_inputs(tool_name, arguments);
-        tracing::debug!(
-            tool = tool_name,
-            inputs = %redacted,
-            "Executing tool call"
-        );
+        if Self::has_approval_input(tool_name, arguments) {
+            return Self::stream_error("Approval credentials belong in request metadata".into());
+        }
+        if !ApprovalBridge::is_meta_tool(tool_name) {
+            let redacted = self.redact_inputs(tool_name, arguments);
+            tracing::debug!(
+                tool = tool_name,
+                inputs = %redacted,
+                "Executing tool call"
+            );
+        }
 
         let extra = extra.unwrap_or_else(|| CallExtra {
             progress_token: None,

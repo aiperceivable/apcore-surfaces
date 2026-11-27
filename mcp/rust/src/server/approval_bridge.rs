@@ -2,7 +2,8 @@
 //!
 //! Symmetric with AsyncTaskBridge.
 
-use apcore::approval::{ApprovalHandler, ApprovalResult};
+use apcore::approval::{ApprovalHandler, ApprovalRequest, ApprovalResult};
+use apcore::context::SharedData;
 use apcore::{ErrorCode, Identity, ModuleError};
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -20,46 +21,107 @@ struct PendingApproval {
     credential: String,
 }
 
+struct ApprovalReply {
+    pending: Option<PendingApproval>,
+    confirmed: bool,
+}
+
+struct ForegroundCall {
+    module_id: String,
+    data: SharedData,
+}
+
 tokio::task_local! {
-    static PENDING_APPROVAL: RefCell<Option<PendingApproval>>;
+    static APPROVAL_REPLY: RefCell<ApprovalReply>;
+    static FOREGROUND_CALL: ForegroundCall;
 }
 
 /// Capture the pending decision separately from ordinary result content and errors.
 pub(crate) async fn capture_pending_approval<T>(
     operation: impl Future<Output = T>,
 ) -> (T, Option<Value>) {
-    PENDING_APPROVAL
-        .scope(RefCell::new(None), async {
-            let result = operation.await;
-            let approval = PENDING_APPROVAL.with(|pending| pending.borrow_mut().take());
-            let metadata = approval.map(|approval| {
-                json!({"approvalId": approval.audit_id, "resumeToken": approval.credential})
-            });
-            (result, metadata)
-        })
+    APPROVAL_REPLY
+        .scope(
+            RefCell::new(ApprovalReply {
+                pending: None,
+                confirmed: false,
+            }),
+            async {
+                let result = operation.await;
+                let metadata = APPROVAL_REPLY.with(|reply| {
+                    let mut reply = reply.borrow_mut();
+                    let approval = reply.pending.take()?;
+                    reply.confirmed.then(|| {
+                    json!({"approvalId": approval.audit_id, "resumeToken": approval.credential})
+                })
+                });
+                (result, metadata)
+            },
+        )
         .await
 }
 
 pub(crate) fn has_tool_response_context() -> bool {
-    PENDING_APPROVAL.try_with(|_| ()).is_ok()
+    APPROVAL_REPLY.try_with(|_| ()).is_ok()
+}
+
+pub(crate) async fn run_foreground_approval<T>(
+    module_id: &str,
+    context: &apcore::Context<Value>,
+    operation: impl Future<Output = T>,
+) -> T {
+    if !has_tool_response_context() {
+        return operation.await;
+    }
+    FOREGROUND_CALL
+        .scope(
+            ForegroundCall {
+                module_id: module_id.to_owned(),
+                data: Arc::clone(&context.data),
+            },
+            operation,
+        )
+        .await
+}
+
+pub(crate) fn is_foreground_approval(request: &ApprovalRequest) -> bool {
+    request.caller_id.is_none()
+        && FOREGROUND_CALL
+            .try_with(|call| {
+                call.module_id == request.module_id
+                    && request
+                        .context
+                        .as_ref()
+                        .is_some_and(|context| Arc::ptr_eq(&call.data, &context.data))
+            })
+            .unwrap_or(false)
+}
+
+pub(crate) fn record_pending_approval(request: &ApprovalRequest, audit_id: &str, credential: &str) {
+    if is_foreground_approval(request) {
+        let _ = APPROVAL_REPLY.try_with(|reply| {
+            reply.borrow_mut().pending = Some(PendingApproval {
+                audit_id: audit_id.to_owned(),
+                credential: credential.to_owned(),
+            });
+        });
+    }
 }
 
 pub(crate) fn safe_execution_message(error: &ModuleError) -> String {
     if error.code != ErrorCode::ApprovalPending {
         return error.to_string();
     }
-    if let Some((audit_id, credential)) = error.details.get("result").and_then(|result| {
-        let audit_id = result.get("audit_id")?.as_str()?;
-        let credential = result.get("approval_id")?.as_str()?;
-        (resume_audit_id(credential) == Some(audit_id)).then_some((audit_id, credential))
-    }) {
-        let _ = PENDING_APPROVAL.try_with(|pending| {
-            pending.replace(Some(PendingApproval {
-                audit_id: audit_id.to_owned(),
-                credential: credential.to_owned(),
-            }));
+    let _ = APPROVAL_REPLY.try_with(|reply| {
+        let mut reply = reply.borrow_mut();
+        reply.confirmed = reply.pending.as_ref().is_some_and(|pending| {
+            error.details.get("result").is_some_and(|result| {
+                result.get("audit_id").and_then(Value::as_str) == Some(&pending.audit_id)
+                    && result.get("approval_id").and_then(Value::as_str)
+                        == Some(&pending.credential)
+            })
         });
-    }
+    });
     "APPROVAL_PENDING: Approval is pending".to_string()
 }
 

@@ -1857,6 +1857,11 @@ impl APCoreMCPBuilder {
         let retained_store = self.approval_store.clone();
         let approval_handler = if let Some(store) = self.approval_store {
             use crate::adapters::approval::StorageBackedApprovalHandler;
+            if !store.supports_scoped_approval() {
+                return Err(APCoreMCPError::Config(
+                    "Phase B approval requires a scoped approval store".to_string(),
+                ));
+            }
             let owned_executor = Arc::get_mut(&mut executor).ok_or_else(|| {
                 APCoreMCPError::Config("Phase B approval requires an unshared Executor".to_string())
             })?;
@@ -1865,7 +1870,16 @@ impl APCoreMCPBuilder {
                     "The Executor already has an approval handler".to_string(),
                 ));
             }
-            let mut handler = StorageBackedApprovalHandler::new(store);
+            if !owned_executor
+                .governance_state()
+                .builtin_approval_gate_wired
+            {
+                return Err(APCoreMCPError::Config(
+                    "Phase B approval requires the built-in approval gate in the Executor"
+                        .to_string(),
+                ));
+            }
+            let mut handler = StorageBackedApprovalHandler::new(store).for_tool_responses();
             if let Some(cb) = self.approval_notify_callback {
                 handler = handler.with_notify(move |id, module, args| cb(id, module, args));
             }
@@ -1967,6 +1981,20 @@ impl APCoreMCPBuilder {
                     }
                 }
             });
+
+        if retained_store.is_some()
+            && self.config.trace
+            && resolved_strategy.as_ref().is_some_and(|strategy| {
+                !strategy.steps().iter().any(|step| {
+                    step.builtin_gate() == Some(apcore::pipeline::BuiltinGate::Approval)
+                })
+            })
+        {
+            return Err(APCoreMCPError::Config(
+                "Phase B approval requires the built-in approval gate in the traced strategy"
+                    .to_string(),
+            ));
+        }
 
         Ok(APCoreMCP {
             config: self.config,
@@ -2678,6 +2706,29 @@ mod tests {
         verify_wire_phase_b(true).await;
     }
 
+    #[test]
+    fn phase_b_requires_the_builtin_approval_gate_for_default_and_traced_calls() {
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let executor =
+            Executor::with_strategy_name(Registry::new(), Config::default(), "internal").unwrap();
+        let default = APCoreMCP::builder()
+            .backend(Arc::new(executor))
+            .approval_store(Arc::new(InMemoryApprovalStore::new()))
+            .build();
+        assert!(matches!(default, Err(APCoreMCPError::Config(message))
+            if message.contains("built-in approval gate")));
+
+        let traced = APCoreMCP::builder()
+            .backend(Arc::new(Registry::new()))
+            .strategy("internal")
+            .trace(true)
+            .approval_store(Arc::new(InMemoryApprovalStore::new()))
+            .build();
+        assert!(matches!(traced, Err(APCoreMCPError::Config(message))
+            if message.contains("built-in approval gate")));
+    }
+
     #[tokio::test]
     async fn phase_b_approval_requires_an_identity_aware_transport() {
         let bridge = APCoreMCP::builder()
@@ -2758,17 +2809,34 @@ mod tests {
             )
             .unwrap();
         let store = Arc::new(InMemoryApprovalStore::new());
+        let notified = Arc::new(AtomicUsize::new(0));
+        let notices = Arc::clone(&notified);
         let bridge = APCoreMCP::builder()
             .backend(registry)
             .approval_store(store.clone())
+            .approval_notify(move |_, _, _| {
+                notices.fetch_add(1, Ordering::SeqCst);
+            })
             .validate_inputs(true)
             .build()
             .unwrap();
-        let (server, _, _, init, _, _) = bridge.build_server_components().unwrap();
+        let (server, router, tools, init, _, _) = bridge.build_server_components().unwrap();
         let handler = ServerHandler::from_server(&server, init).unwrap();
         let identity =
             apcore::Identity::new("editor".into(), "user".into(), vec![], Default::default());
         let arguments = json!({"label": "draft"});
+
+        let explorer =
+            bridge.build_explorer_config(&tools, &router, "/explorer", true, "Sample", None, None);
+        let (content, is_error, _) =
+            (explorer.handle_call.unwrap())("demo.render".into(), arguments.clone()).await;
+        assert!(is_error);
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Phase B approval requires a direct MCP tool call"));
+        assert_eq!(notified.load(Ordering::SeqCst), 0);
+
         let call = |name, args, metadata| {
             handler.handle_message(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -2787,6 +2855,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let approval = &pending["result"]["_meta"]["apcore"]["approval"];
         let audit_id = approval["approvalId"].as_str().expect("public approval ID");
+        assert_eq!(notified.load(Ordering::SeqCst), 1);
         let token = approval["resumeToken"]
             .as_str()
             .expect("caller resume credential");

@@ -1211,6 +1211,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn explicit_task_submission_rejects_the_reserved_input_before_creating_a_task() {
+        let bridge =
+            AsyncTaskBridge::new(make_executor_with_async_approval("sample.render", false));
+        let error = bridge
+            .handle_meta_tool(
+                META_TOOL_SUBMIT,
+                &json!({
+                    "module_id": "sample.render",
+                    "arguments": {"_approval_token": "reserved field placeholder"}
+                }),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error
+            .message
+            .contains("Background tasks do not support approval resumption"));
+        assert!(bridge.list_tasks(None).unwrap().is_empty());
+    }
+
     /// Regression test for [A-D-008].
     ///
     /// `__apcore_task_submit` against a module that is NOT async-hinted

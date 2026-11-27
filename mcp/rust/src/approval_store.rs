@@ -93,6 +93,11 @@ pub type ApprovalVerifier = [u8; 32];
 /// Pluggable storage for Phase B approval state.
 #[async_trait]
 pub trait ApprovalStore: Send + Sync + 'static {
+    /// Opt in only when all scoped storage operations below are implemented.
+    fn supports_scoped_approval(&self) -> bool {
+        false
+    }
+
     /// Persist a new pending approval record.
     async fn save_pending(
         &self,
@@ -311,6 +316,10 @@ impl Default for InMemoryApprovalStore {
 
 #[async_trait]
 impl ApprovalStore for InMemoryApprovalStore {
+    fn supports_scoped_approval(&self) -> bool {
+        true
+    }
+
     async fn save_pending(
         &self,
         approval_id: &str,

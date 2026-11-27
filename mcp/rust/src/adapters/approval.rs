@@ -280,6 +280,7 @@ pub type ApprovalNotifyCallback =
 pub struct StorageBackedApprovalHandler {
     store: Arc<dyn ApprovalStore>,
     notify_callback: Option<ApprovalNotifyCallback>,
+    require_foreground: bool,
 }
 
 impl StorageBackedApprovalHandler {
@@ -288,7 +289,18 @@ impl StorageBackedApprovalHandler {
         Self {
             store,
             notify_callback: None,
+            require_foreground: false,
         }
+    }
+
+    /// Only the server-owned handler depends on MCP's private reply channel.
+    pub(crate) fn for_tool_responses(mut self) -> Self {
+        self.require_foreground = true;
+        self
+    }
+
+    fn allows_foreground_scope(&self, request: &ApprovalRequest) -> bool {
+        !self.require_foreground || crate::server::approval_bridge::is_foreground_approval(request)
     }
 
     /// Attach an optional notification callback.
@@ -323,7 +335,7 @@ pub(crate) async fn scoped_approval_status(
     }
     let principal = identity.map(ApprovalPrincipal::from);
     match store.get_scoped_result(audit_id, principal.as_ref()).await {
-        Ok(Some(record)) => stored_result(record, Some(audit_id)),
+        Ok(Some(record)) => stored_result(&record, Some(audit_id)),
         Ok(None) => rejected("Approval record not found"),
         Err(_) => store_error(),
     }
@@ -356,13 +368,10 @@ fn credential_verifier(credential: &str) -> ApprovalVerifier {
     Sha256::digest(credential.as_bytes()).into()
 }
 
-fn stored_result(record: ApprovalRecord, audit_id: Option<&str>) -> ApprovalResult {
+fn stored_result(record: &ApprovalRecord, audit_id: Option<&str>) -> ApprovalResult {
     let mut result = ApprovalResult::default();
     result.status = record.status.to_string();
     result.audit_id = audit_id.map(str::to_owned);
-    if record.status == ApprovalStatus::Rejected {
-        result.reason = record.reason;
-    }
     result
 }
 
@@ -391,6 +400,9 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
         if is_background_call(request) {
             return Ok(rejected("Background tasks do not support Phase B approval"));
         }
+        if !self.allows_foreground_scope(request) {
+            return Ok(rejected("Phase B approval requires a direct MCP tool call"));
+        }
         let audit_id = Uuid::new_v4().to_string();
         let credential = format!("{audit_id}.{}", Uuid::new_v4().simple());
         let verifier = credential_verifier(&credential);
@@ -412,6 +424,7 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
             );
         }
 
+        crate::server::approval_bridge::record_pending_approval(request, &audit_id, &credential);
         let mut result = ApprovalResult::default();
         result.status = "pending".to_string();
         result.approval_id = Some(credential);
@@ -426,7 +439,11 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
         Ok(match self.store.get_result(audit_id).await {
             Ok(Some(record)) => {
                 let public_id = Uuid::parse_str(audit_id).is_ok().then_some(audit_id);
-                stored_result(record, public_id)
+                let mut result = stored_result(&record, public_id);
+                if record.status == ApprovalStatus::Rejected {
+                    result.reason = record.reason;
+                }
+                result
             }
             Ok(None) => rejected("Approval record not found"),
             Err(_) => store_error(),
@@ -441,6 +458,9 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
         if is_background_call(request) {
             return Ok(rejected("Background tasks do not support Phase B approval"));
         }
+        if !self.allows_foreground_scope(request) {
+            return Ok(rejected("Phase B approval requires a direct MCP tool call"));
+        }
         let Some(audit_id) = resume_audit_id(credential) else {
             return Ok(rejected("Approval credential unavailable for this call"));
         };
@@ -450,8 +470,11 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
             match self.store.consume_scoped(audit_id, &verifier, &scope).await {
                 Ok(Some(record)) => {
                     let pending = record.status == ApprovalStatus::Pending;
-                    let mut result = stored_result(record, Some(audit_id));
+                    let mut result = stored_result(&record, Some(audit_id));
                     if pending {
+                        crate::server::approval_bridge::record_pending_approval(
+                            request, audit_id, credential,
+                        );
                         result.approval_id = Some(credential.to_owned());
                     }
                     result
@@ -604,6 +627,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_rejection_keeps_the_operator_note_in_the_store() {
+        let store = Arc::new(crate::approval_store::InMemoryApprovalStore::new());
+        let handler = StorageBackedApprovalHandler::new(store.clone());
+        let request = scoped_request();
+        let pending = handler.request_approval(&request).await.unwrap();
+        let id = pending.audit_id.unwrap();
+        let note = "Sample internal review note";
+        assert!(store.resolve(&id, false, Some(note.into())).await.unwrap());
+
+        let decision = handler
+            .check_approval_for_call(&pending.approval_id.unwrap(), &request)
+            .await
+            .unwrap();
+        assert_eq!(decision.status, "rejected");
+        assert_eq!(decision.audit_id.as_deref(), Some(id.as_str()));
+        assert!(decision.reason.is_none());
+        assert!(decision.approval_id.is_none());
+        assert_eq!(
+            store
+                .get_result(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some(note)
+        );
+    }
+
+    #[tokio::test]
     async fn status_only_store_remains_queryable_and_declines_scoped_approval() {
         use crate::approval_store::StoreResult;
 
@@ -633,7 +686,16 @@ mod tests {
             }
         }
 
-        let handler = StorageBackedApprovalHandler::new(Arc::new(StatusOnly));
+        let store = Arc::new(StatusOnly);
+        let bridge = crate::APCoreMCP::builder()
+            .backend(Arc::new(apcore::Registry::new()))
+            .approval_store(store.clone())
+            .build();
+        assert!(
+            matches!(bridge, Err(crate::apcore_mcp::APCoreMCPError::Config(message))
+            if message.contains("requires a scoped approval store"))
+        );
+        let handler = StorageBackedApprovalHandler::new(store);
         let id = Uuid::new_v4().to_string();
         let legacy_status = handler.check_approval(&id).await.unwrap();
         assert_eq!(legacy_status.status, "approved");
