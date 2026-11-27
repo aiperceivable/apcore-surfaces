@@ -669,6 +669,12 @@ impl ExecutionRouter {
         self
     }
 
+    pub(crate) fn supports_scoped_approval(&self) -> bool {
+        self.approval_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.supports_scoped_approval())
+    }
+
     /// Cooperatively cancel an in-flight tool call. [B-002]
     ///
     /// Looks up the [`CancelToken`] registered for `call_id` in
@@ -780,10 +786,14 @@ impl ExecutionRouter {
     /// `"***REDACTED***"`. Returns the original inputs unchanged when no
     /// schema is available.
     fn redact_inputs(&self, tool_name: &str, inputs: &Value) -> Value {
-        match self.tool_schemas.get(tool_name) {
+        let mut redacted = match self.tool_schemas.get(tool_name) {
             Some(schema) => apcore::redact_sensitive(inputs, schema),
             None => inputs.clone(),
+        };
+        if let Some(fields) = redacted.as_object_mut() {
+            fields.remove("_approval_token");
         }
+        redacted
     }
 
     /// Redact sensitive fields from tool output before formatting.
@@ -976,12 +986,32 @@ impl ExecutionRouter {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let (_cancel_guard, cancel_token) = self._cancel_guard(&call_id);
 
-        let redacted = self.redact_inputs(tool_name, arguments);
-        tracing::debug!(
-            tool = tool_name,
-            inputs = %redacted,
-            "Executing tool call"
-        );
+        if !ApprovalBridge::is_meta_tool(tool_name) {
+            let redacted = self.redact_inputs(tool_name, arguments);
+            tracing::debug!(
+                tool = tool_name,
+                inputs = %redacted,
+                "Executing tool call"
+            );
+        }
+
+        let credential = match extra.and_then(|extra| extra.get("approvalId")) {
+            None => None,
+            Some(value) => match value.as_str() {
+                Some(token)
+                    if crate::adapters::approval::resume_audit_id(token).is_some()
+                        && self.supports_scoped_approval()
+                        && !AsyncTaskBridge::is_reserved_id(tool_name) =>
+                {
+                    Some(token)
+                }
+                _ => {
+                    return Self::stream_error(
+                        "Approval resumption is unavailable for this call".into(),
+                    )
+                }
+            },
+        };
 
         // Extract streaming helpers and identity from extra
         let (progress_token, send_notification, session, identity) = self.extract_extra(extra);
@@ -1040,7 +1070,13 @@ impl ExecutionRouter {
         if let Some(approval_bridge) = &self.approval_bridge {
             if ApprovalBridge::is_meta_tool(tool_name) {
                 let (value, is_error) =
-                    approval_bridge.handle_meta_tool(tool_name, arguments).await;
+                    if crate::server::approval_bridge::has_tool_response_context() {
+                        approval_bridge
+                            .check_wire_status(arguments, apcore_ctx.identity.as_ref())
+                            .await
+                    } else {
+                        approval_bridge.handle_meta_tool(tool_name, arguments).await
+                    };
                 let result = if is_error {
                     Err(apcore::errors::ModuleError::new(
                         apcore::errors::ErrorCode::GeneralInvalidInput,
@@ -1097,6 +1133,11 @@ impl ExecutionRouter {
             // registration) — the pre-fix static `async_module_ids` set
             // was frozen at startup and stale on mutations. [A-D-031]
             if bridge.is_async_module_registered_self(tool_name) {
+                if credential.is_some() {
+                    return Self::stream_error(
+                        "Background tasks do not support approval resumption".into(),
+                    );
+                }
                 let res = bridge
                     .submit(
                         tool_name,
@@ -1163,9 +1204,23 @@ impl ExecutionRouter {
             }
         }
 
+        let resumed_arguments;
+        let execution_arguments = if let Some(credential) = credential {
+            let Some(mut fields) = arguments.as_object().cloned() else {
+                return Self::stream_error("Tool arguments must be a JSON object".into());
+            };
+            fields.insert(
+                "_approval_token".into(),
+                Value::String(credential.to_owned()),
+            );
+            resumed_arguments = Value::Object(fields);
+            &resumed_arguments
+        } else {
+            arguments
+        };
         self.dispatch_stream_or_call(
             tool_name,
-            arguments,
+            execution_arguments,
             &context_value,
             version_hint.as_deref(),
             &apcore_ctx,

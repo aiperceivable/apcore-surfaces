@@ -476,6 +476,20 @@ CLI usage:
 apcore-mcp --extensions-dir ./extensions --approval elicit
 ```
 
+For Phase B, configure the builder with `approval_store`. The store supports
+stdio and Streamable HTTP direct tool calls. A supplied Core executor must be
+unshared and have no installed approval handler when the builder attaches the
+store. Background jobs that require an approval report that Phase B is
+unavailable for that job.
+
+The pending tool response provides an operator record ID at
+`_meta.apcore.approval.approvalId` and a private credential at
+`_meta.apcore.approval.resumeToken`. The notification callback receives the
+operator record ID. The approval store uses that ID for resolution, and
+`__apcore_approval_check` takes it as `approval_id` for owner-scoped status
+queries. After approval, retry the original tool inputs with the private
+credential in the request's `params._meta.approvalId`.
+
 ### Output Formatting
 
 By default, tool execution results are serialized as JSON. You can customize this by passing an `output_format` name or a custom `output_formatter` closure.

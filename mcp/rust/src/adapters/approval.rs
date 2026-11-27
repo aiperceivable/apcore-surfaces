@@ -10,9 +10,13 @@ use std::sync::Arc;
 use apcore::approval::{ApprovalHandler, ApprovalRequest, ApprovalResult};
 use apcore::errors::ModuleError;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::approval_store::ApprovalStore;
+use crate::approval_store::{
+    ApprovalPrincipal, ApprovalRecord, ApprovalScope, ApprovalStatus, ApprovalStore,
+    ApprovalVerifier,
+};
 use crate::helpers::{ElicitAction, ElicitCallback, MCP_ELICIT_CALL_ID_KEY};
 use crate::server::elicit_registry::{self, SharedElicitCallback};
 
@@ -262,18 +266,17 @@ impl ApprovalHandler for ElicitationApprovalHandler {
 
 // ── StorageBackedApprovalHandler ─────────────────────────────────────────────
 
-/// Callback type for out-of-band approval notifications (approval_id, module_id, arguments).
+pub(crate) const BACKGROUND_APPROVAL_CONTEXT_KEY: &str = "mcp.background_task";
+
+/// Callback type for out-of-band approval notifications (audit_id, module_id, arguments).
 pub type ApprovalNotifyCallback =
     Arc<dyn Fn(String, String, serde_json::Value) + Send + Sync + 'static>;
 
 /// Phase B approval handler backed by a pluggable [`ApprovalStore`].
 ///
-/// On `request_approval`, generates a UUID, writes a pending record to the
-/// store, fires an optional notify callback, and returns
-/// `ApprovalResult { status: "pending", approval_id: Some(uuid) }`.
-///
-/// On `check_approval`, reads the record from the store and maps its status
-/// to the corresponding `ApprovalResult`.
+/// The public `audit_id` identifies the record for human resolution and status.
+/// Only the pending result given to the caller carries the resume credential
+/// in `approval_id`. Scoped resumption verifies and consumes it through the store.
 pub struct StorageBackedApprovalHandler {
     store: Arc<dyn ApprovalStore>,
     notify_callback: Option<ApprovalNotifyCallback>,
@@ -290,7 +293,7 @@ impl StorageBackedApprovalHandler {
 
     /// Attach an optional notification callback.
     ///
-    /// The callback receives `(approval_id, module_id, arguments)` and can
+    /// The callback receives `(audit_id, module_id, arguments)` and can
     /// be used to send an out-of-band notification (e.g. Slack, email).
     pub fn with_notify<F>(mut self, callback: F) -> Self
     where
@@ -299,6 +302,40 @@ impl StorageBackedApprovalHandler {
         self.notify_callback = Some(Arc::new(callback));
         self
     }
+
+    /// Read a public approval record scoped to the current authenticated principal.
+    pub async fn check_scoped_approval(
+        &self,
+        audit_id: &str,
+        identity: Option<&apcore::Identity>,
+    ) -> ApprovalResult {
+        scoped_approval_status(self.store.as_ref(), audit_id, identity).await
+    }
+}
+
+pub(crate) async fn scoped_approval_status(
+    store: &dyn ApprovalStore,
+    audit_id: &str,
+    identity: Option<&apcore::Identity>,
+) -> ApprovalResult {
+    if !is_public_approval_id(audit_id) {
+        return rejected("Approval record not found");
+    }
+    let principal = identity.map(ApprovalPrincipal::from);
+    match store.get_scoped_result(audit_id, principal.as_ref()).await {
+        Ok(Some(record)) => stored_result(record, Some(audit_id)),
+        Ok(None) => rejected("Approval record not found"),
+        Err(_) => store_error(),
+    }
+}
+
+pub(crate) fn is_public_approval_id(audit_id: &str) -> bool {
+    audit_id.len() == 36
+        && Uuid::parse_str(audit_id).is_ok_and(|id| {
+            id.get_version_num() == 4
+                && id.get_variant() == uuid::Variant::RFC4122
+                && id.hyphenated().to_string() == audit_id
+        })
 }
 
 impl fmt::Debug for StorageBackedApprovalHandler {
@@ -309,71 +346,120 @@ impl fmt::Debug for StorageBackedApprovalHandler {
     }
 }
 
+pub(crate) fn resume_audit_id(credential: &str) -> Option<&str> {
+    let (audit_id, secret) = credential.split_once('.')?;
+    (is_public_approval_id(audit_id) && secret.len() == 32 && Uuid::parse_str(secret).is_ok())
+        .then_some(audit_id)
+}
+
+fn credential_verifier(credential: &str) -> ApprovalVerifier {
+    Sha256::digest(credential.as_bytes()).into()
+}
+
+fn stored_result(record: ApprovalRecord, audit_id: Option<&str>) -> ApprovalResult {
+    let mut result = ApprovalResult::default();
+    result.status = record.status.to_string();
+    result.audit_id = audit_id.map(str::to_owned);
+    if record.status == ApprovalStatus::Rejected {
+        result.reason = record.reason;
+    }
+    result
+}
+
+fn store_error() -> ApprovalResult {
+    tracing::error!("Approval store operation failed");
+    rejected("internal store error")
+}
+
+fn is_background_call(request: &ApprovalRequest) -> bool {
+    request.context.as_ref().is_some_and(|context| {
+        context
+            .data
+            .read()
+            .get(BACKGROUND_APPROVAL_CONTEXT_KEY)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    })
+}
+
 #[async_trait]
 impl ApprovalHandler for StorageBackedApprovalHandler {
     async fn request_approval(
         &self,
         request: &ApprovalRequest,
     ) -> Result<ApprovalResult, ModuleError> {
-        let approval_id = Uuid::new_v4().to_string();
-        let module_id = request.module_id.as_str();
-        let arguments = request.arguments.clone();
-
-        if let Err(e) = self
+        if is_background_call(request) {
+            return Ok(rejected("Background tasks do not support Phase B approval"));
+        }
+        let audit_id = Uuid::new_v4().to_string();
+        let credential = format!("{audit_id}.{}", Uuid::new_v4().simple());
+        let verifier = credential_verifier(&credential);
+        let scope = ApprovalScope::from(request);
+        if self
             .store
-            .save_pending(&approval_id, module_id, &arguments)
+            .save_scoped_pending(&audit_id, &verifier, &scope)
             .await
+            .is_err()
         {
-            tracing::error!("approval store save_pending failed: {e}");
-            let mut result = ApprovalResult::default();
-            result.status = "rejected".to_string();
-            result.reason = Some("internal store error".to_string());
-            return Ok(result);
+            return Ok(store_error());
         }
 
         if let Some(cb) = &self.notify_callback {
-            cb(approval_id.clone(), module_id.to_string(), arguments);
+            cb(
+                audit_id.clone(),
+                request.module_id.clone(),
+                request.arguments.clone(),
+            );
         }
 
         let mut result = ApprovalResult::default();
         result.status = "pending".to_string();
-        result.approval_id = Some(approval_id);
+        result.approval_id = Some(credential);
+        result.audit_id = Some(audit_id);
         Ok(result)
     }
 
-    async fn check_approval(&self, approval_id: &str) -> Result<ApprovalResult, ModuleError> {
-        match self.store.get_result(approval_id).await {
-            Err(e) => {
-                let mut result = ApprovalResult::default();
-                result.status = "rejected".to_string();
-                result.reason = Some(format!("store error: {e}"));
-                Ok(result)
-            }
-            Ok(None) => {
-                let mut result = ApprovalResult::default();
-                result.status = "rejected".to_string();
-                result.reason = Some("approval_id not found".to_string());
-                Ok(result)
-            }
-            Ok(Some(rec)) => {
-                use crate::approval_store::ApprovalStatus;
-                let mut result = ApprovalResult::default();
-                result.approval_id = Some(approval_id.to_string());
-                match rec.status {
-                    ApprovalStatus::Approved => {
-                        result.status = "approved".to_string();
-                    }
-                    ApprovalStatus::Rejected => {
-                        result.status = "rejected".to_string();
-                        result.reason = rec.reason;
-                    }
-                    ApprovalStatus::Pending => {
-                        result.status = "pending".to_string();
-                    }
-                }
-                Ok(result)
-            }
+    async fn check_approval(&self, audit_id: &str) -> Result<ApprovalResult, ModuleError> {
+        if resume_audit_id(audit_id).is_some() {
+            return Ok(rejected("Approval record not found"));
         }
+        Ok(match self.store.get_result(audit_id).await {
+            Ok(Some(record)) => {
+                let public_id = Uuid::parse_str(audit_id).is_ok().then_some(audit_id);
+                stored_result(record, public_id)
+            }
+            Ok(None) => rejected("Approval record not found"),
+            Err(_) => store_error(),
+        })
+    }
+
+    async fn check_approval_for_call(
+        &self,
+        credential: &str,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalResult, ModuleError> {
+        if is_background_call(request) {
+            return Ok(rejected("Background tasks do not support Phase B approval"));
+        }
+        let Some(audit_id) = resume_audit_id(credential) else {
+            return Ok(rejected("Approval credential unavailable for this call"));
+        };
+        let verifier = credential_verifier(credential);
+        let scope = ApprovalScope::from(request);
+        Ok(
+            match self.store.consume_scoped(audit_id, &verifier, &scope).await {
+                Ok(Some(record)) => {
+                    let pending = record.status == ApprovalStatus::Pending;
+                    let mut result = stored_result(record, Some(audit_id));
+                    if pending {
+                        result.approval_id = Some(credential.to_owned());
+                    }
+                    result
+                }
+                Ok(None) => rejected("Approval credential unavailable for this call"),
+                Err(_) => store_error(),
+            },
+        )
     }
 }
 
@@ -387,6 +473,219 @@ mod tests {
     use crate::helpers::ElicitResult;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    fn scoped_request() -> ApprovalRequest {
+        let mut request = ApprovalRequest::default();
+        request.module_id = "sample.render".into();
+        request.caller_id = Some("sample.caller".into());
+        request.arguments = json!({"label": "draft", "options": {"width": 12, "height": 8}});
+        request.context = Some(apcore::Context::new(apcore::Identity::new(
+            "editor".into(),
+            "user".into(),
+            vec![],
+            Default::default(),
+        )));
+        request
+    }
+
+    #[tokio::test]
+    async fn storage_approval_notifies_with_a_public_record_id() {
+        let store = Arc::new(crate::approval_store::InMemoryApprovalStore::new());
+        let notified = Arc::new(Mutex::new(None));
+        let handler = StorageBackedApprovalHandler::new(store).with_notify({
+            let notified = Arc::clone(&notified);
+            move |id, _, _| *notified.lock().unwrap() = Some(id)
+        });
+        let request = scoped_request();
+        let result = handler.request_approval(&request).await.unwrap();
+        assert_eq!(result.status, "pending");
+        let audit_id = result
+            .audit_id
+            .as_deref()
+            .expect("public approval record ID");
+        let credential = result.approval_id.as_deref().expect("resume credential");
+        assert!(Uuid::parse_str(audit_id).is_ok());
+        assert_ne!(audit_id, credential);
+        assert_eq!(notified.lock().unwrap().as_deref(), Some(audit_id));
+
+        let identity = request.context.as_ref().unwrap().identity.as_ref();
+        let status = handler.check_scoped_approval(audit_id, identity).await;
+        assert_eq!(status.status, "pending");
+        assert!(status.approval_id.is_none());
+        assert_eq!(status.audit_id.as_deref(), Some(audit_id));
+        let anonymous = handler.check_scoped_approval(audit_id, None).await;
+        assert_eq!(anonymous.status, "rejected");
+        assert!(anonymous.audit_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn approved_invocation_consumes_its_credential_once() {
+        let store = Arc::new(crate::approval_store::InMemoryApprovalStore::new());
+        let handler = StorageBackedApprovalHandler::new(store.clone());
+        let request = scoped_request();
+        let result = handler.request_approval(&request).await.unwrap();
+        let audit_id = result.audit_id.as_deref().unwrap();
+        let credential = result.approval_id.as_deref().unwrap();
+        let pending = handler
+            .check_approval_for_call(credential, &request)
+            .await
+            .unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.approval_id.as_deref(), Some(credential));
+        assert!(store.resolve(audit_id, true, None).await.unwrap());
+
+        let (first, second) = tokio::join!(
+            handler.check_approval_for_call(credential, &request),
+            handler.check_approval_for_call(credential, &request),
+        );
+        let mut statuses = [first.unwrap().status, second.unwrap().status];
+        statuses.sort();
+        assert_eq!(statuses, ["approved", "rejected"]);
+        assert_eq!(
+            handler.check_approval(audit_id).await.unwrap().status,
+            "approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_b_scope_covers_the_invocation_and_does_not_depend_on_object_key_order() {
+        let store = Arc::new(crate::approval_store::InMemoryApprovalStore::new());
+        let handler = StorageBackedApprovalHandler::new(store.clone());
+        let request = scoped_request();
+        let result = handler.request_approval(&request).await.unwrap();
+        let audit_id = result.audit_id.as_deref().unwrap();
+        let credential = result.approval_id.as_deref().unwrap();
+        assert!(store.resolve(audit_id, true, None).await.unwrap());
+
+        let mut other_module = request.clone();
+        other_module.module_id = "sample.preview".into();
+        let mut other_caller = request.clone();
+        other_caller.caller_id = None;
+        let mut other_principal = request.clone();
+        other_principal.context = Some(apcore::Context::new(apcore::Identity::new(
+            "viewer".into(),
+            "user".into(),
+            vec![],
+            Default::default(),
+        )));
+        let mut other_identity_type = request.clone();
+        other_identity_type.context = Some(apcore::Context::new(apcore::Identity::new(
+            "editor".into(),
+            "service".into(),
+            vec![],
+            Default::default(),
+        )));
+        let mut other_arguments = request.clone();
+        other_arguments.arguments["options"]["width"] = json!(24);
+        for other in [
+            other_module,
+            other_caller,
+            other_principal,
+            other_identity_type,
+            other_arguments,
+        ] {
+            let result = handler
+                .check_approval_for_call(credential, &other)
+                .await
+                .unwrap();
+            assert_eq!(result.status, "rejected");
+            assert!(result.approval_id.is_none());
+        }
+
+        let mut same = request;
+        same.arguments = json!({"options": {"height": 8, "width": 12}, "label": "draft"});
+        let result = handler
+            .check_approval_for_call(credential, &same)
+            .await
+            .unwrap();
+        assert_eq!(result.status, "approved");
+        assert_eq!(result.audit_id.as_deref(), Some(audit_id));
+        assert!(result.approval_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_only_store_remains_queryable_and_declines_scoped_approval() {
+        use crate::approval_store::StoreResult;
+
+        struct StatusOnly;
+
+        #[async_trait]
+        impl ApprovalStore for StatusOnly {
+            async fn save_pending(
+                &self,
+                _: &str,
+                _: &str,
+                _: &serde_json::Value,
+            ) -> StoreResult<()> {
+                Ok(())
+            }
+
+            async fn get_result(&self, _: &str) -> StoreResult<Option<ApprovalRecord>> {
+                Ok(Some(ApprovalRecord {
+                    status: ApprovalStatus::Approved,
+                    module_id: "sample.render".into(),
+                    reason: None,
+                }))
+            }
+
+            async fn resolve(&self, _: &str, _: bool, _: Option<String>) -> StoreResult<bool> {
+                Ok(true)
+            }
+        }
+
+        let handler = StorageBackedApprovalHandler::new(Arc::new(StatusOnly));
+        let id = Uuid::new_v4().to_string();
+        let legacy_status = handler.check_approval(&id).await.unwrap();
+        assert_eq!(legacy_status.status, "approved");
+        assert!(legacy_status.approval_id.is_none());
+        let request = scoped_request();
+        assert_eq!(
+            handler.request_approval(&request).await.unwrap().status,
+            "rejected"
+        );
+        let credential = format!("{id}.{}", Uuid::new_v4().simple());
+        assert_eq!(
+            handler
+                .check_approval_for_call(&credential, &request)
+                .await
+                .unwrap()
+                .status,
+            "rejected"
+        );
+        assert_eq!(
+            handler.check_scoped_approval(&id, None).await.status,
+            "rejected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn phase_b_expiry_enforces_both_deadlines_without_a_sweeper() {
+        use std::time::Duration;
+
+        for (resolved_ttl, pending_ttl) in [(60, 5), (5, 60)] {
+            let store = Arc::new(crate::approval_store::InMemoryApprovalStore::with_options(
+                Duration::from_secs(resolved_ttl),
+                Duration::from_secs(pending_ttl),
+                10,
+            ));
+            let handler = StorageBackedApprovalHandler::new(store.clone());
+            let request = scoped_request();
+            let result = handler.request_approval(&request).await.unwrap();
+            let audit_id = result.audit_id.as_deref().unwrap();
+            let credential = result.approval_id.as_deref().unwrap();
+            assert!(store.resolve(audit_id, true, None).await.unwrap());
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert_eq!(
+                handler
+                    .check_approval_for_call(credential, &request)
+                    .await
+                    .unwrap()
+                    .status,
+                "rejected"
+            );
+            assert!(store.get_result(audit_id).await.unwrap().is_none());
+        }
+    }
 
     /// Create a mock elicit callback that returns the given action.
     fn mock_elicit(action: ElicitAction) -> ElicitCallback {

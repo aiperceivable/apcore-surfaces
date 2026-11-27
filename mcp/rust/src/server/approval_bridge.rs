@@ -3,20 +3,111 @@
 //! Symmetric with AsyncTaskBridge.
 
 use apcore::approval::{ApprovalHandler, ApprovalResult};
+use apcore::{ErrorCode, Identity, ModuleError};
 use serde_json::{json, Value};
+use std::cell::RefCell;
+use std::future::Future;
 use std::sync::Arc;
 
+use crate::adapters::approval::{is_public_approval_id, resume_audit_id, scoped_approval_status};
+use crate::approval_store::ApprovalStore;
 use crate::server::types::Tool;
 
 pub const APPROVAL_META_TOOL_NAMES: &[&str] = &["__apcore_approval_check"];
 
+struct PendingApproval {
+    audit_id: String,
+    credential: String,
+}
+
+tokio::task_local! {
+    static PENDING_APPROVAL: RefCell<Option<PendingApproval>>;
+}
+
+/// Capture the pending decision separately from ordinary result content and errors.
+pub(crate) async fn capture_pending_approval<T>(
+    operation: impl Future<Output = T>,
+) -> (T, Option<Value>) {
+    PENDING_APPROVAL
+        .scope(RefCell::new(None), async {
+            let result = operation.await;
+            let approval = PENDING_APPROVAL.with(|pending| pending.borrow_mut().take());
+            let metadata = approval.map(|approval| {
+                json!({"approvalId": approval.audit_id, "resumeToken": approval.credential})
+            });
+            (result, metadata)
+        })
+        .await
+}
+
+pub(crate) fn has_tool_response_context() -> bool {
+    PENDING_APPROVAL.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn safe_execution_message(error: &ModuleError) -> String {
+    if error.code != ErrorCode::ApprovalPending {
+        return error.to_string();
+    }
+    if let Some((audit_id, credential)) = error.details.get("result").and_then(|result| {
+        let audit_id = result.get("audit_id")?.as_str()?;
+        let credential = result.get("approval_id")?.as_str()?;
+        (resume_audit_id(credential) == Some(audit_id)).then_some((audit_id, credential))
+    }) {
+        let _ = PENDING_APPROVAL.try_with(|pending| {
+            pending.replace(Some(PendingApproval {
+                audit_id: audit_id.to_owned(),
+                credential: credential.to_owned(),
+            }));
+        });
+    }
+    "APPROVAL_PENDING: Approval is pending".to_string()
+}
+
 pub struct ApprovalBridge {
     handler: Arc<dyn ApprovalHandler>,
+    store: Option<Arc<dyn ApprovalStore>>,
 }
 
 impl ApprovalBridge {
     pub fn new(handler: Arc<dyn ApprovalHandler>) -> Self {
-        Self { handler }
+        Self {
+            handler,
+            store: None,
+        }
+    }
+
+    pub(crate) fn with_store(mut self, store: Arc<dyn ApprovalStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    pub(crate) fn supports_scoped_approval(&self) -> bool {
+        self.store.is_some()
+    }
+
+    pub(crate) async fn check_wire_status(
+        &self,
+        arguments: &Value,
+        identity: Option<&Identity>,
+    ) -> (Value, bool) {
+        let Some(audit_id) = arguments
+            .get("approval_id")
+            .and_then(Value::as_str)
+            .filter(|id| is_public_approval_id(id))
+        else {
+            return (json!({"error": "A public approval_id is required"}), true);
+        };
+        let Some(store) = &self.store else {
+            return (
+                json!({"error": "Scoped approval status is unavailable"}),
+                true,
+            );
+        };
+        let result = scoped_approval_status(store.as_ref(), audit_id, identity).await;
+        (
+            json!({"approval_id": audit_id, "status": result.status}),
+            false,
+        )
     }
 
     pub fn is_meta_tool(name: &str) -> bool {
@@ -28,16 +119,16 @@ impl ApprovalBridge {
             output_schema: None,
             name: "__apcore_approval_check".to_string(),
             description: "Poll the status of a pending approval request. Returns \
-                {approval_id, status, reason}. status is 'pending', 'approved', or 'rejected'. \
-                When 'approved', retry the original tool call with _meta.approvalId set to \
-                this approval_id."
+                {approval_id, status}. status is 'pending', 'approved', or 'rejected'. \
+                When 'approved', retry the original tool call with its private resumeToken \
+                in _meta.approvalId."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "approval_id": {
                         "type": "string",
-                        "description": "The approval_id from the APPROVAL_PENDING response"
+                        "description": "The public approvalId from _meta.apcore.approval"
                     }
                 },
                 "required": ["approval_id"],
@@ -69,12 +160,15 @@ impl ApprovalBridge {
                 )
             }
         };
+        if resume_audit_id(&approval_id).is_some() {
+            return (json!({"error": "Approval record not found"}), true);
+        }
 
         let result: ApprovalResult = match self.handler.check_approval(&approval_id).await {
             Ok(r) => r,
-            Err(e) => {
+            Err(_) => {
                 return (
-                    json!({"error": format!("store error: {e}"), "is_error": true}),
+                    json!({"error": "Approval status is unavailable", "is_error": true}),
                     true,
                 )
             }

@@ -233,8 +233,21 @@ impl AsyncTaskBridge {
         send_notification: Option<SendNotificationFn>,
         session_key: Option<&str>,
     ) -> Result<SubmitResult, apcore::errors::ModuleError> {
-        let ctx: Option<Context<Value>> = identity.map(Context::new);
-        let task_id = self.manager.submit(module_id, inputs, ctx).await?;
+        if inputs.get("_approval_token").is_some() {
+            return Err(apcore::errors::ModuleError::new(
+                apcore::errors::ErrorCode::GeneralInvalidInput,
+                "Background tasks do not support approval resumption",
+            ));
+        }
+        let context: Context<Value> = identity.map_or_else(Context::anonymous, Context::new);
+        context.data.write().insert(
+            crate::adapters::approval::BACKGROUND_APPROVAL_CONTEXT_KEY.into(),
+            Value::Bool(true),
+        );
+        let task_id = self
+            .manager
+            .submit(module_id, inputs, Some(context))
+            .await?;
 
         // Store progress sink: token + sender pair, mirroring the Python
         // `_install_progress_sink` and TS inline-closure patterns. [A-D-220]
@@ -955,6 +968,13 @@ mod tests {
     /// `handle_submit` path post-A-D-008 (which now rejects non-async
     /// module ids with ASYNC_MODULE_NOT_ASYNC).
     fn make_executor_with_async(module_id: &str) -> Arc<Executor> {
+        make_executor_with_async_approval(module_id, false)
+    }
+
+    fn make_executor_with_async_approval(
+        module_id: &str,
+        requires_approval: bool,
+    ) -> Arc<Executor> {
         #[derive(Debug)]
         struct AsyncDummyModule;
 
@@ -992,7 +1012,10 @@ mod tests {
             output_schema: json!({"type": "object"}),
             version: "1.0.0".to_string(),
             tags: vec![],
-            annotations: Some(ModuleAnnotations::default()),
+            annotations: Some(ModuleAnnotations {
+                requires_approval,
+                ..Default::default()
+            }),
             examples: vec![],
             metadata,
             display: None,
@@ -1143,6 +1166,49 @@ mod tests {
             status_result.get("task_id").and_then(|v| v.as_str()),
             Some(task_id)
         );
+    }
+
+    #[tokio::test]
+    async fn background_execution_rejects_only_calls_that_require_phase_b_approval() {
+        use crate::adapters::approval::StorageBackedApprovalHandler;
+        use crate::approval_store::InMemoryApprovalStore;
+
+        for (requires_approval, expected) in
+            [(false, TaskStatus::Completed), (true, TaskStatus::Failed)]
+        {
+            let mut executor =
+                make_executor_with_async_approval("sample.render", requires_approval);
+            Arc::get_mut(&mut executor)
+                .unwrap()
+                .set_approval_handler(Box::new(
+                    StorageBackedApprovalHandler::new(Arc::new(InMemoryApprovalStore::new()))
+                        .with_notify(|_, _, _| panic!("background task must not create approval")),
+                ));
+            let bridge = AsyncTaskBridge::new(executor);
+            let task_id = bridge
+                .submit("sample.render", json!({}), None, None, None, None)
+                .await
+                .unwrap()
+                .task_id;
+            let terminal = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let task = bridge.get_status(&task_id).unwrap().unwrap();
+                    if matches!(task.status, TaskStatus::Completed | TaskStatus::Failed) {
+                        break task;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(terminal.status, expected);
+            if requires_approval {
+                assert!(terminal
+                    .error
+                    .unwrap()
+                    .contains("Background tasks do not support Phase B approval"));
+            }
+        }
     }
 
     /// Regression test for [A-D-008].

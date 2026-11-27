@@ -3956,7 +3956,6 @@ mod tests {
     #[tokio::test]
     async fn sse_cancellation_releases_a_stream_blocked_on_progress() {
         use apcore::{ChunkStream, Context, Module, ModuleError, Registry, StreamingModule};
-        use futures::StreamExt;
         use serde_json::json;
         use tokio::sync::{mpsc, Notify, Semaphore};
 
@@ -3988,12 +3987,11 @@ mod tests {
         impl StreamingModule for StreamingTool {
             fn stream_typed(&self, _: Value, _: &Context<Value>) -> ChunkStream {
                 let lease = Arc::clone(&self.0);
-                Box::pin(
-                    futures::stream::iter([Ok(json!({"value": 1}))]).map(move |chunk| {
-                        let _lease = &lease;
-                        chunk
-                    }),
-                )
+                let mut chunks = [Ok(json!({"value": 1}))].into_iter();
+                Box::pin(futures::stream::poll_fn(move |_| {
+                    let _lease = &lease;
+                    std::task::Poll::Ready(chunks.next())
+                }))
             }
         }
 

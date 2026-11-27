@@ -124,24 +124,18 @@ impl ErrorMapper {
             return resp;
         }
 
-        // Approval pending → narrow details to only approvalId
+        // The pending credential belongs only in the initiating tool response metadata.
         if code == ApcoreErrorCode::ApprovalPending {
-            let narrowed = error
-                .details
-                .get("approval_id")
-                .map(|v| serde_json::json!({ "approvalId": v }));
-            let mut resp = McpErrorResponse {
+            return McpErrorResponse {
                 is_error: true,
                 error_type,
-                message: error.message.clone(),
-                details: narrowed,
+                message: "Approval is pending".to_string(),
+                details: None,
                 retryable: None,
                 ai_guidance: None,
                 user_fixable: None,
                 suggestion: None,
             };
-            attach_ai_guidance(error, &mut resp);
-            return resp;
         }
 
         // Approval timeout → pass through with retryable=true
@@ -638,7 +632,7 @@ mod tests {
     // ---- Approval pending ----
 
     #[test]
-    fn test_approval_pending_narrowed() {
+    fn test_approval_pending_omits_confidential_details() {
         let mut details = HashMap::new();
         details.insert(
             "approval_id".to_string(),
@@ -656,11 +650,8 @@ mod tests {
         let resp = ErrorMapper::to_mcp_error(&err);
         assert!(resp.is_error);
         assert_eq!(resp.error_type, "APPROVAL_PENDING");
-        assert_eq!(resp.message, "Awaiting approval");
-        let d = resp.details.unwrap();
-        assert_eq!(d.get("approvalId").unwrap().as_str().unwrap(), "abc-123");
-        // module_id should NOT be present
-        assert!(d.get("module_id").is_none());
+        assert_eq!(resp.message, "Approval is pending");
+        assert!(resp.details.is_none());
     }
 
     // ---- Approval timeout ----
