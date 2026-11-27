@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "apcore-a2a"
-version = "0.8.7"
+version = "0.8.8a1"
 description = "Automatic A2A Protocol Adapter for apcore Module Registry"
 readme = "README.md"
 license = "Apache-2.0"
@@ -26,9 +26,9 @@ classifiers = [
     "Framework :: AsyncIO",
 ]
 dependencies = [
-    "apcore>=0.33.0",
-    "apcore-toolkit>=0.15.0",
-    "a2a-sdk[http-server]>=1.0.0",
+    "apcore>=0.33.0,<=1.0.0a1",
+    "apcore-toolkit==0.15.1a1",
+    "a2a-sdk[http-server]>=1.1.2",
     "starlette>=0.40.0",
     "uvicorn>=0.30.0",
     "httpx>=0.27.0",
@@ -39,7 +39,7 @@ dependencies = [
 # The OpenAPI backend fetches a spec over http(s) and registers each operation as
 # an HTTP proxy, both of which live behind apcore-toolkit's own extra.
 openapi = [
-    "apcore-toolkit[http-proxy]>=0.15.0",
+    "apcore-toolkit[http-proxy]==0.15.1a1",
 ]
 dev = [
     "pytest>=7.0",

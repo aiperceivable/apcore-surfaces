@@ -405,9 +405,8 @@ def openapi_backend(
 
     target = registry if registry is not None else Registry()
 
-    # Full-set preflight before the first write. Toolkit writers report per-module
-    # WriteResults and never abort, so without this a duplicate would arrive as a
-    # failed WriteResult, get logged and skipped, and leave a partial registry.
+    # Check the full set before writing so a collision leaves the registry
+    # untouched and the host can report every colliding ID.
     existing = set(_registry_ids(target))
     collisions = sorted({str(m.module_id) for m in modules} & existing)
     if collisions:
@@ -431,13 +430,16 @@ def openapi_backend(
         base_url=resolved_base,
         auth_header_factory=auth_header_factory,
     )
-    for result in writer.write(modules, target):
-        if getattr(result, "verification_error", None):
-            logger.error(
-                "apcore-a2a: %s failed to register as an HTTP proxy: %s",
-                result.module_id,
-                result.verification_error,
-            )
+    results = {result.module_id: result for result in writer.write(modules, target)}
+    failures = []
+    for module in modules:
+        result = results.get(module.module_id)
+        if result is not None and result.verified and target.get(module.module_id) is not None:
+            continue
+        detail = result.verification_error if result is not None else None
+        failures.append(f"{module.module_id}: {detail or 'module not registered'}")
+    if failures:
+        raise ValueError("OpenAPI registration incomplete: " + "; ".join(failures))
 
     _warn_unapproved_writes(
         modules,

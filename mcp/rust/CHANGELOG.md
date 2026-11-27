@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.23.5-alpha.1] - Unreleased
+
+### Fixed
+
+- Route inbound cancellation to the active request, derive terminal stream results from Core when available, and fail startup when OpenAPI tools fail to register.
+- Resume foreground Phase B calls through scoped Core approval. Keep the record ID public, return the private credential only in pending result metadata, and consume approved grants once.
+
 ## [0.23.4] - 2026-11-20
 
 ### Fixed

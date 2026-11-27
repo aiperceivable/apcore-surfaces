@@ -42,6 +42,8 @@ struct ModuleCase {
 struct ExpectedModule {
     module_id: String,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     mcp_tool_name: Option<String>,
     #[serde(default)]
     openai_function_name: Option<String>,
@@ -147,6 +149,9 @@ async fn conformance_modules() {
                     panic!("case {}: no definition for {}", case.id, want.module_id)
                 });
             let annotations = definition.annotations.clone().unwrap_or_default();
+            if let Some(description) = &want.description {
+                assert_eq!(&definition.description, description);
+            }
 
             // The MCP tool name is the module ID verbatim; OpenAI is dash-normalized.
             if let Some(tool_name) = &want.mcp_tool_name {

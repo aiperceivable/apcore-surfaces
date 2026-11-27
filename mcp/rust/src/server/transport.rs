@@ -2,9 +2,11 @@
 //!
 //! Also exposes Prometheus metrics for observability.
 
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use apcore::CancelToken;
 use axum::extract::Request;
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
@@ -15,7 +17,145 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 use tokio_stream::wrappers::LinesStream;
 
+use crate::auth::middleware::AUTH_IDENTITY;
 use crate::server::session::{McpSession, OutboundSink, SessionError, SessionRegistry};
+
+tokio::task_local! {
+    /// Wire-level parent of the router's APCore invocation token.
+    pub(super) static WIRE_CALL_CANCEL: CancelToken;
+}
+
+/// Active JSON-RPC tool calls, owned by one transport session.
+#[derive(Clone, Default)]
+struct DirectRequests(Arc<Mutex<HashMap<String, Arc<DirectCancellation>>>>);
+
+#[derive(Default)]
+struct DirectCancellation {
+    token: CancelToken,
+    wake: tokio::sync::Notify,
+}
+
+impl DirectCancellation {
+    fn cancel(&self) {
+        self.token.cancel();
+        self.wake.notify_one();
+    }
+
+    async fn cancelled(&self) {
+        if !self.token.is_cancelled() {
+            self.wake.notified().await;
+        }
+    }
+}
+
+struct DirectRequestGuard {
+    requests: DirectRequests,
+    id: String,
+    cancellation: Arc<DirectCancellation>,
+}
+
+impl Drop for DirectRequestGuard {
+    fn drop(&mut self) {
+        self.requests
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
+
+impl DirectRequests {
+    async fn dispatch(&self, handler: &dyn McpHandler, message: Value) -> Option<Value> {
+        let registration = self.register(&message);
+        self.dispatch_registered(handler, message, registration, None)
+            .await
+    }
+
+    // Registration happens on receipt, before waiting for a dispatch slot.
+    fn register(&self, message: &Value) -> Result<Option<DirectRequestGuard>, Value> {
+        if message["method"] != "tools/call" || message["jsonrpc"] != "2.0" {
+            return Ok(None);
+        }
+        let Some(id) = request_key(&message["id"]) else {
+            return Ok(None);
+        };
+        let cancellation = Arc::new(DirectCancellation::default());
+        let mut requests = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if requests.contains_key(&id) {
+            return Err(serde_json::json!({
+                "jsonrpc": "2.0", "id": message["id"],
+                "error": {"code": -32600, "message": "Duplicate in-flight request ID"}
+            }));
+        }
+        requests.insert(id.clone(), Arc::clone(&cancellation));
+        Ok(Some(DirectRequestGuard {
+            requests: self.clone(),
+            id,
+            cancellation,
+        }))
+    }
+
+    async fn dispatch_registered(
+        &self,
+        handler: &dyn McpHandler,
+        message: Value,
+        registration: Result<Option<DirectRequestGuard>, Value>,
+        slots: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> Option<Value> {
+        if message["jsonrpc"] == "2.0" && is_cancel_notification(&message) {
+            let id = request_key(&message["params"]["requestId"])?;
+            let requests = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(token) = requests.get(&id) {
+                token.cancel();
+                return None;
+            }
+        }
+        let guard = match registration {
+            Ok(guard) => guard,
+            Err(response) => return Some(response),
+        };
+        let _permit = match (slots, &guard) {
+            (Some(slots), Some(guard)) => {
+                tokio::select! {
+                    biased;
+                    _ = guard.cancellation.cancelled() => return None,
+                    permit = slots.acquire_owned() => Some(permit.ok()?),
+                }
+            }
+            (Some(slots), None) if !is_cancel_notification(&message) => {
+                Some(slots.acquire_owned().await.ok()?)
+            }
+            _ => None,
+        };
+        let Some(guard) = guard else {
+            return handler.handle_message(message).await;
+        };
+        if guard.cancellation.token.is_cancelled() {
+            return None;
+        }
+        let response = WIRE_CALL_CANCEL
+            .scope(
+                guard.cancellation.token.clone(),
+                handler.handle_message(message),
+            )
+            .await;
+        // The client's cancellation owns this request, even if the module
+        // had already prepared a late success response.
+        if guard.cancellation.token.is_cancelled() {
+            None
+        } else {
+            response
+        }
+    }
+}
+
+fn request_key(id: &Value) -> Option<String> {
+    (id.is_string() || id.is_i64() || id.is_u64()).then(|| id.to_string())
+}
+
+fn is_cancel_notification(message: &Value) -> bool {
+    message["method"] == "notifications/cancelled" && message.get("id").is_none()
+}
 
 // ---------------------------------------------------------------------------
 // Task 1: TransportError
@@ -469,6 +609,7 @@ impl TransportManager {
         };
 
         let mut lines = LinesStream::new(BufReader::new(reader).lines());
+        let requests = DirectRequests::default();
         let mut inflight = FuturesUnordered::new();
         let mut eof = false;
 
@@ -508,11 +649,19 @@ impl TransportManager {
                                 }
                             }
                             stamp_session_id(&mut message, &session_id);
-                            inflight.push(handler.handle_message(message));
+                            inflight.push(requests.dispatch(handler, message));
                         }
                     }
                 }
                 Some(response) = inflight.next(), if !inflight.is_empty() => {
+                    // Fast streamed calls can enqueue progress without ever
+                    // yielding. Write already queued notifications before the
+                    // completed reply, even when this arm wins the select.
+                    for _ in 0..outbound_rx.len() {
+                        if let Ok(outgoing) = outbound_rx.try_recv() {
+                            Self::write_stdio_message(&mut writer, &outgoing).await?;
+                        }
+                    }
                     if let Some(response) = response {
                         Self::write_stdio_message(&mut writer, &response).await?;
                     }
@@ -522,7 +671,7 @@ impl TransportManager {
                 }
             }
 
-            if eof && inflight.is_empty() {
+            if eof && inflight.is_empty() && outbound_rx.is_empty() {
                 return Ok(());
             }
         }
@@ -557,14 +706,10 @@ impl TransportManager {
         handler: Arc<dyn McpHandler>,
         extra_routes: Option<Router>,
     ) -> Router {
-        // TODO: Per MCP spec, each client connection should get its own
-        // session ID.  Currently a single ID is shared across all connections,
-        // which means DELETE (session termination) affects all clients.
-        // Requires a session store keyed by UUID.
-        let session_id = uuid::Uuid::new_v4().to_string();
         let mcp_state = StreamableHttpState {
             handler,
-            session_id,
+            unscoped_id: uuid::Uuid::new_v4().to_string(),
+            sessions: Default::default(),
         };
 
         let mcp_router = Router::new()
@@ -792,36 +937,81 @@ async fn usage_handler(
 // Streamable-HTTP state & handlers
 // ---------------------------------------------------------------------------
 
-/// Shared state for the streamable-HTTP MCP endpoint.
-///
-/// # Why this transport has no elicitation
-///
-/// `session_id` here is minted once per *application*, not once per
-/// connection, so every client that talks to this endpoint reports the same
-/// id. Registering it in the [`SessionRegistry`] would therefore point every
-/// connection at one [`McpSession`]: a prompt raised by one client's tool
-/// call would be written to whichever connection happened to own the entry,
-/// and any client could answer another's prompt. That is precisely the
-/// cross-connection leak the SSE session isolation work removed, and it must
-/// not be reintroduced here for the sake of feature parity.
-///
-/// Inbound messages are consequently not stamped with a session id either, so
-/// [`ExecutionRouter::extract_extra`] resolves no session and elicitation is
-/// simply unavailable — which fails closed: a gated call is denied rather than
-/// prompted on the wrong stream. `streamable_http_elicitation_fails_closed`
-/// pins that.
-///
-/// Making elicitation work here requires per-connection sessions first (the
-/// `TODO` in [`TransportManager::build_streamable_http_app`]), not a
-/// registration bolted onto the shared id.
-///
-/// [`SessionRegistry`]: crate::server::session::SessionRegistry
-/// [`McpSession`]: crate::server::session::McpSession
-/// [`ExecutionRouter::extract_extra`]: crate::server::router::ExecutionRouter
+/// Streamable HTTP keeps cancellation scopes independent from the live
+/// server-to-client connections used for elicitation. Legacy clients without
+/// an initialized session can still make ordinary stateless requests.
 #[derive(Clone)]
 struct StreamableHttpState {
     handler: Arc<dyn McpHandler>,
-    session_id: String,
+    unscoped_id: String,
+    sessions: Arc<Mutex<VecDeque<HttpSession>>>,
+}
+
+#[derive(Clone)]
+struct HttpSession {
+    id: String,
+    owner: Option<(String, String)>,
+    requests: DirectRequests,
+}
+
+fn http_session_owner() -> Option<(String, String)> {
+    AUTH_IDENTITY
+        .try_with(|owner| {
+            owner.as_ref().map(|identity| {
+                (
+                    identity.identity_type().to_string(),
+                    identity.id().to_string(),
+                )
+            })
+        })
+        .ok()
+        .flatten()
+}
+
+impl StreamableHttpState {
+    fn session(&self, headers: &axum::http::HeaderMap) -> Result<Option<HttpSession>, StatusCode> {
+        let Some(header) = headers.get("mcp-session-id") else {
+            return Ok(None);
+        };
+        let id = header.to_str().map_err(|_| StatusCode::NOT_FOUND)?;
+        if id == self.unscoped_id {
+            return Ok(None);
+        }
+        let owner = http_session_owner();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let index = sessions
+            .iter()
+            .position(|session| session.id == id && session.owner == owner)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let session = sessions.remove(index).ok_or(StatusCode::NOT_FOUND)?;
+        sessions.push_back(session.clone());
+        Ok(Some(session))
+    }
+
+    fn create_session(&self) -> Option<String> {
+        const MAX_HTTP_SESSIONS: usize = 1024;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if sessions.len() == MAX_HTTP_SESSIONS {
+            // Retire the least recently used session with no active dispatch.
+            let idle = sessions
+                .iter()
+                .position(|session| Arc::strong_count(&session.requests.0) == 1)?;
+            sessions.remove(idle);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        sessions.push_back(HttpSession {
+            id: id.clone(),
+            owner: http_session_owner(),
+            requests: DirectRequests::default(),
+        });
+        Some(id)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -863,19 +1053,45 @@ async fn streamable_http_post_handler(
         Err(error) => return error.into_response(),
     };
     stamp_http_protocol(&mut body, version);
-    match state.handler.handle_message(body).await {
-        Some(response) => (
-            StatusCode::OK,
-            [
-                ("content-type", "application/json"),
-                ("mcp-session-id", state.session_id.as_str()),
-            ],
-            serde_json::to_string(&response).unwrap_or_default(),
-        )
-            .into_response(),
+    let session = match state.session(&headers) {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
+    };
+    let mut session_id = session
+        .as_ref()
+        .map(|session| session.id.clone())
+        .unwrap_or_else(|| state.unscoped_id.clone());
+    let initialize = body["method"] == "initialize";
+    let response = match session {
+        Some(session) => {
+            session
+                .requests
+                .dispatch(state.handler.as_ref(), body)
+                .await
+        }
+        None => state.handler.handle_message(body).await,
+    };
+    match response {
+        Some(response) => {
+            if initialize && response.get("result").is_some() {
+                let Some(id) = state.create_session() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                session_id = id;
+            }
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/json"),
+                    ("mcp-session-id", session_id.as_str()),
+                ],
+                serde_json::to_string(&response).unwrap_or_default(),
+            )
+                .into_response()
+        }
         None => (
             StatusCode::ACCEPTED,
-            [("mcp-session-id", state.session_id.as_str())],
+            [("mcp-session-id", session_id.as_str())],
         )
             .into_response(),
     }
@@ -900,7 +1116,11 @@ async fn streamable_http_get_handler(
     use axum::response::sse::{Event, KeepAlive, Sse};
     use std::time::Duration;
 
-    let session_id = state.session_id.clone();
+    let session_id = match state.session(&headers) {
+        Ok(Some(session)) => session.id,
+        Ok(None) => state.unscoped_id,
+        Err(status) => return status.into_response(),
+    };
 
     // Per-connection channel: the first item is the `endpoint` event; the
     // stream then stays open. axum's `KeepAlive` injects SSE comment frames so
@@ -934,11 +1154,31 @@ async fn streamable_http_get_handler(
 
 /// DELETE /mcp — session termination.
 async fn streamable_http_delete_handler(
-    axum::extract::State(_state): axum::extract::State<StreamableHttpState>,
+    axum::extract::State(state): axum::extract::State<StreamableHttpState>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     if let Err(error) = http_protocol_version(&headers) {
         return error.into_response();
+    }
+    match state.session(&headers) {
+        Ok(Some(session)) => {
+            let mut sessions = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            sessions.retain(|stored| stored.id != session.id);
+            for token in session
+                .requests
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+            {
+                token.cancel();
+            }
+        }
+        Ok(None) => {}
+        Err(status) => return status.into_response(),
     }
     StatusCode::OK.into_response()
 }
@@ -1145,6 +1385,9 @@ fn stamp_http_protocol(message: &mut Value, version: &str) {
     }
     if let Some(meta) = params["_meta"].as_object_mut() {
         meta.remove("sessionId");
+        if let Some(nested) = meta.get_mut("_meta").and_then(Value::as_object_mut) {
+            nested.remove("sessionId");
+        }
         meta.insert("mcpProtocolVersion".into(), serde_json::json!(version));
     }
 }
@@ -1206,6 +1449,7 @@ async fn sse_stream_handler(
 
     let handler = state.handler.clone();
     let owned_session_id = session_id.clone();
+    let requests = DirectRequests::default();
     let dispatch_slots = Arc::new(tokio::sync::Semaphore::new(
         MAX_CONCURRENT_SESSION_DISPATCHES,
     ));
@@ -1243,14 +1487,12 @@ async fn sse_stream_handler(
                         let handler = Arc::clone(&handler);
                         let event_tx = event_tx.clone();
                         let slots = Arc::clone(&dispatch_slots);
+                        let requests = requests.clone();
+                        let registration = requests.register(&message);
                         tokio::spawn(async move {
-                            // Taken inside the task, not in the loop: taking
-                            // it above would put the loop right back to
-                            // waiting on handlers once the session saturates.
-                            let Ok(_permit) = slots.acquire().await else {
-                                return;
-                            };
-                            if let Some(response) = handler.handle_message(message).await {
+                            if let Some(response) = requests.dispatch_registered(
+                                handler.as_ref(), message, registration, Some(slots)
+                            ).await {
                                 let data = serde_json::to_string(&response).unwrap_or_default();
                                 let event = Event::default().event("message").data(data);
                                 let _ = event_tx.send(Ok(event)).await;
@@ -2392,13 +2634,17 @@ mod tests {
     #[test]
     fn test_protocol_metadata_is_transport_owned() {
         let mut message = serde_json::json!({"method":"tools/call","params":{
-            "_meta":{"sessionId":"forged","mcpProtocolVersion":"2025-06-18","progressToken":"p"}}});
+            "_meta":{"sessionId":"forged","_meta":{"sessionId":"forged-nested"},
+                     "mcpProtocolVersion":"2025-06-18","progressToken":"p"}}});
         stamp_http_protocol(&mut message, "2025-03-26");
         assert_eq!(
             message["params"]["_meta"]["mcpProtocolVersion"],
             "2025-03-26"
         );
         assert!(message["params"]["_meta"].get("sessionId").is_none());
+        assert!(message["params"]["_meta"]["_meta"]
+            .get("sessionId")
+            .is_none());
         stamp_session_id(&mut message, "real-session");
         assert!(message["params"]["_meta"]
             .get("mcpProtocolVersion")
@@ -3360,6 +3606,491 @@ mod tests {
         bytes.push(b'\n');
         writer.write_all(&bytes).await.expect("write to server");
         writer.flush().await.expect("flush");
+    }
+
+    struct GatedCalls {
+        handler: Arc<crate::server::server::ServerHandler>,
+        entries: tokio::sync::mpsc::UnboundedReceiver<String>,
+        cancellations: tokio::sync::mpsc::UnboundedReceiver<String>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    fn gated_calls() -> GatedCalls {
+        use apcore::registry::ModuleDescriptor;
+        use apcore::{Context, Module, Registry};
+        use tokio::sync::{mpsc, Semaphore};
+
+        struct GatedModule {
+            entered: mpsc::UnboundedSender<String>,
+            cancelled: mpsc::UnboundedSender<String>,
+            release: Arc<Semaphore>,
+        }
+
+        #[async_trait::async_trait]
+        impl Module for GatedModule {
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+
+            fn output_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+
+            fn description(&self) -> &str {
+                "Wait for cancellation or release"
+            }
+
+            async fn execute(
+                &self,
+                input: Value,
+                context: &Context<Value>,
+            ) -> Result<Value, apcore::errors::ModuleError> {
+                let name = input["name"].as_str().unwrap().to_string();
+                let token = context.cancel_token.as_ref().expect("execution token");
+                self.entered.send(name.clone()).unwrap();
+                loop {
+                    if token.is_cancelled() {
+                        self.cancelled.send(name).unwrap();
+                        return Err(token.check().unwrap_err().into());
+                    }
+                    if let Ok(permit) = self.release.try_acquire() {
+                        permit.forget();
+                        return Ok(input);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+        }
+
+        let (entered, entries) = mpsc::unbounded_channel();
+        let (cancelled, cancellations) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let registry = Arc::new(Registry::new());
+        registry
+            .register(
+                "test.gated",
+                Box::new(GatedModule {
+                    entered,
+                    cancelled,
+                    release: Arc::clone(&release),
+                }),
+                ModuleDescriptor {
+                    module_id: "test.gated".to_string(),
+                    description: "Wait for cancellation or release".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                    enabled: true,
+                    name: None,
+                    documentation: None,
+                    version: "1.0.0".to_string(),
+                    tags: vec![],
+                    annotations: None,
+                    examples: vec![],
+                    metadata: Default::default(),
+                    display: None,
+                    sunset_date: None,
+                    dependencies: vec![],
+                },
+            )
+            .unwrap();
+
+        let bridge = crate::APCoreMCP::builder()
+            .backend(registry)
+            .build()
+            .unwrap();
+        let (server, _, _, options, _, _) = bridge.build_server_components().unwrap();
+        let handler =
+            Arc::new(crate::server::server::ServerHandler::from_server(&server, options).unwrap());
+
+        GatedCalls {
+            handler,
+            entries,
+            cancellations,
+            release,
+        }
+    }
+
+    fn gated_call(id: Value, name: &str) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "test.gated", "arguments": {"name": name}}
+        })
+    }
+
+    fn cancel_request(id: Value) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": id}
+        })
+    }
+
+    #[tokio::test]
+    async fn stdio_notification_cancels_only_the_matching_wire_request() {
+        let GatedCalls {
+            handler,
+            mut entries,
+            mut cancellations,
+            release,
+        } = gated_calls();
+        let mut clients = Vec::new();
+        let mut transports = Vec::new();
+        for _ in 0..2 {
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(client_io);
+            let (server_reader, server_writer) = tokio::io::split(server_io);
+            let handler = Arc::clone(&handler);
+            transports.push(tokio::spawn(async move {
+                TransportManager::new(None)
+                    .run_stdio_with_io(server_reader, server_writer, handler.as_ref())
+                    .await
+                    .unwrap();
+            }));
+            clients.push((BufReader::new(reader).lines(), writer));
+        }
+
+        send(&mut clients[0].1, gated_call(7.into(), "target")).await;
+        send(&mut clients[0].1, gated_call("7".into(), "same-session")).await;
+        send(&mut clients[1].1, gated_call(7.into(), "second-session")).await;
+
+        let deadline = std::time::Duration::from_secs(3);
+        for _ in 0..3 {
+            tokio::time::timeout(deadline, entries.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        send(&mut clients[0].1, cancel_request(7.into())).await;
+        let target = tokio::time::timeout(deadline, cancellations.recv()).await;
+        release.add_permits(2);
+        assert_eq!(target.unwrap().as_deref(), Some("target"));
+        assert_eq!(recv(&mut clients[0].0).await["id"], "7");
+        let peer = recv(&mut clients[1].0).await;
+        assert_eq!(peer["id"], 7);
+        assert_eq!(peer["result"]["isError"], false);
+        assert!(cancellations.try_recv().is_err());
+
+        drop(clients);
+        for transport in transports {
+            transport.await.unwrap();
+        }
+    }
+
+    async fn post_http_rpc(
+        app: &Router,
+        session: Option<&str>,
+        body: Value,
+    ) -> axum::response::Response {
+        use tower::ServiceExt;
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json");
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        app.clone()
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_notification_cancels_only_the_request_in_the_initialized_session() {
+        use tower::ServiceExt;
+
+        let GatedCalls {
+            handler,
+            mut entries,
+            mut cancellations,
+            release,
+        } = gated_calls();
+        let app = Arc::new(TransportManager::new(None)).build_streamable_http_app(handler, None);
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let initialized = post_http_rpc(
+                &app,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                               "clientInfo": {"name": "test", "version": "1"}}
+                }),
+            )
+            .await;
+            assert_eq!(initialized.status(), StatusCode::OK);
+            sessions.push(
+                initialized.headers()["mcp-session-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_ne!(sessions[0], sessions[1]);
+
+        let a = tokio::spawn({
+            let app = app.clone();
+            let session = sessions[0].clone();
+            async move { post_http_rpc(&app, Some(&session), gated_call(2.into(), "target")).await }
+        });
+        let b = tokio::spawn({
+            let app = app.clone();
+            let session = sessions[1].clone();
+            async move { post_http_rpc(&app, Some(&session), gated_call(2.into(), "peer")).await }
+        });
+
+        let deadline = std::time::Duration::from_secs(3);
+        for _ in 0..2 {
+            tokio::time::timeout(deadline, entries.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            post_http_rpc(&app, Some(&sessions[0]), cancel_request(2.into()))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        let target = tokio::time::timeout(deadline, cancellations.recv()).await;
+        release.add_permits(1);
+        assert_eq!(target.unwrap().as_deref(), Some("target"));
+        assert_eq!(a.await.unwrap().status(), StatusCode::ACCEPTED);
+        let peer = b.await.unwrap();
+        assert_eq!(peer.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(peer.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let peer: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(peer["result"]["isError"], false);
+        assert!(cancellations.try_recv().is_err());
+
+        let delete = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header("mcp-session-id", &sessions[0])
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(delete).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_http_rpc(&app, Some(&sessions[0]), cancel_request(2.into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_http_rpc(&app, Some(&sessions[1]), cancel_request(2.into()))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_notification_bypasses_full_request_dispatch_queue() {
+        let GatedCalls {
+            handler,
+            mut entries,
+            mut cancellations,
+            release,
+        } = gated_calls();
+        #[allow(deprecated)]
+        let app = Arc::new(TransportManager::new(None)).build_sse_app(handler, None);
+        let (_body, session) = open_sse_session(&app).await;
+        for index in 0..MAX_CONCURRENT_SESSION_DISPATCHES {
+            assert_eq!(
+                post_sse_raw(&app, &session, gated_call(index.into(), &index.to_string())).await,
+                StatusCode::ACCEPTED,
+            );
+        }
+        let deadline = std::time::Duration::from_secs(3);
+        for _ in 0..MAX_CONCURRENT_SESSION_DISPATCHES {
+            tokio::time::timeout(deadline, entries.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            post_sse_raw(
+                &app,
+                &session,
+                gated_call(100.into(), "cancelled while queued")
+            )
+            .await,
+            StatusCode::ACCEPTED,
+        );
+        assert_eq!(
+            post_sse_raw(&app, &session, cancel_request(100.into())).await,
+            StatusCode::ACCEPTED,
+        );
+        assert_eq!(
+            post_sse_raw(&app, &session, cancel_request(0.into())).await,
+            StatusCode::ACCEPTED,
+        );
+        let target = tokio::time::timeout(deadline, cancellations.recv()).await;
+        release.add_permits(MAX_CONCURRENT_SESSION_DISPATCHES);
+        assert_eq!(target.unwrap().as_deref(), Some("0"));
+        assert!(cancellations.try_recv().is_err());
+        assert_eq!(
+            post_sse_raw(&app, &session, gated_call(101.into(), "control")).await,
+            StatusCode::ACCEPTED,
+        );
+        assert_eq!(
+            tokio::time::timeout(deadline, entries.recv())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("control")
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_cancellation_releases_a_stream_blocked_on_progress() {
+        use apcore::{ChunkStream, Context, Module, ModuleError, Registry, StreamingModule};
+        use serde_json::json;
+        use tokio::sync::{mpsc, Notify, Semaphore};
+
+        struct StreamingTool(Arc<()>);
+
+        #[async_trait::async_trait]
+        impl Module for StreamingTool {
+            fn input_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+
+            fn output_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+
+            fn description(&self) -> &str {
+                "Return one native stream chunk"
+            }
+
+            async fn execute(&self, _: Value, _: &Context<Value>) -> Result<Value, ModuleError> {
+                panic!("expected native streaming")
+            }
+
+            fn as_streaming(&self) -> Option<&dyn StreamingModule> {
+                Some(self)
+            }
+        }
+
+        impl StreamingModule for StreamingTool {
+            fn stream_typed(&self, _: Value, _: &Context<Value>) -> ChunkStream {
+                let lease = Arc::clone(&self.0);
+                let mut chunks = [Ok(json!({"value": 1}))].into_iter();
+                Box::pin(futures::stream::poll_fn(move |_| {
+                    let _lease = &lease;
+                    std::task::Poll::Ready(chunks.next())
+                }))
+            }
+        }
+
+        struct ObservedSseSink {
+            sink: SseSink,
+            sending: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl OutboundSink for ObservedSseSink {
+            async fn send(&self, message: Value) -> Result<(), SessionError> {
+                assert_eq!(message["method"], "notifications/progress");
+                self.sending.notify_one();
+                self.sink.send(message).await
+            }
+        }
+
+        let producer_lease = Arc::new(());
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_module(
+                "test.stream",
+                Box::new(StreamingTool(Arc::clone(&producer_lease))),
+            )
+            .unwrap();
+        let bridge = crate::APCoreMCP::builder()
+            .backend(registry)
+            .build()
+            .unwrap();
+        let (server, router, _, options, _, _) = bridge.build_server_components().unwrap();
+        let handler =
+            Arc::new(crate::server::server::ServerHandler::from_server(&server, options).unwrap());
+        let (events, pending_events) = mpsc::channel(1);
+        events
+            .try_send(Ok(axum::response::sse::Event::default()))
+            .unwrap();
+        let sending = Arc::new(Notify::new());
+        router.session_registry().insert(Arc::new(McpSession::new(
+            "test-session",
+            Arc::new(ObservedSseSink {
+                sink: SseSink { events },
+                sending: Arc::clone(&sending),
+            }),
+        )));
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "test.stream", "arguments": {}}
+        });
+        let mut blocked_request = request.clone();
+        blocked_request["params"]["_meta"] = json!({"progressToken": "test"});
+        stamp_session_id(&mut blocked_request, "test-session");
+        let requests = DirectRequests::default();
+        let slot = Arc::new(Semaphore::new(1));
+        let registration = requests.register(&blocked_request);
+        let blocked = tokio::spawn({
+            let requests = requests.clone();
+            let handler = Arc::clone(&handler);
+            let slot = Arc::clone(&slot);
+            async move {
+                requests
+                    .dispatch_registered(
+                        handler.as_ref(),
+                        blocked_request,
+                        registration,
+                        Some(slot),
+                    )
+                    .await
+            }
+        });
+        let deadline = std::time::Duration::from_secs(3);
+        tokio::time::timeout(deadline, sending.notified())
+            .await
+            .expect("stream reached the full progress sink");
+        assert_eq!(pending_events.len(), 1);
+        assert_eq!(slot.available_permits(), 0);
+        assert_eq!(Arc::strong_count(&producer_lease), 3);
+
+        assert!(requests
+            .dispatch(handler.as_ref(), cancel_request(1.into()))
+            .await
+            .is_none());
+        assert!(tokio::time::timeout(deadline, blocked)
+            .await
+            .expect("cancelled stream must release its slot without draining progress")
+            .unwrap()
+            .is_none());
+        assert_eq!(pending_events.len(), 1);
+        assert_eq!(Arc::strong_count(&producer_lease), 2);
+
+        let registration = requests.register(&request);
+        let response = tokio::time::timeout(
+            deadline,
+            requests.dispatch_registered(handler.as_ref(), request, registration, Some(slot)),
+        )
+        .await
+        .expect("a subsequent request can use the same slot")
+        .unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["isError"], false);
     }
 
     #[tokio::test]

@@ -29,6 +29,8 @@ from apcore_cli.cli import (
     _check_sandbox_options,
     _first_failed_exit_code,
     _read_module_input,
+    _run_strict_stream,
+    _strict_stream_opener,
     collect_input,
     format_preflight_result,
     validate_module_id,
@@ -355,6 +357,9 @@ def register_exec_command(
     @click.option("--trace", is_flag=True, default=False, help="Enable pipeline trace output.")
     @click.option("--dry-run", "dry_run", is_flag=True, default=False, help="Validate inputs without executing.")
     @click.option("--stream", is_flag=True, default=False, help="Stream output as JSONL.")
+    @click.option(
+        "--strict-stream", is_flag=True, default=False, help="Stream JSONL and require successful completion."
+    )
     def exec_cmd(
         module_id: str,
         output_format: str | None,
@@ -367,6 +372,7 @@ def register_exec_command(
         trace: bool,
         dry_run: bool,
         stream: bool,
+        strict_stream: bool,
     ) -> None:
         """Execute a module by ID with JSON input."""
         import time
@@ -376,6 +382,9 @@ def register_exec_command(
         merged: dict[str, Any] = {}
         audit_start = time.monotonic()
         try:
+            strict_opener = _strict_stream_opener(
+                executor, strict_stream=strict_stream, sandbox=sandbox, trace=trace, strategy=strategy, dry_run=dry_run
+            )
             _check_sandbox_options(sandbox=sandbox, trace=trace, strategy=strategy, stream=stream, dry_run=dry_run)
             _assert_valid_module_id(module_id)
 
@@ -431,7 +440,9 @@ def register_exec_command(
                 format_preflight_result(preflight, output_format)
                 return
 
-            if (trace or strategy) and hasattr(executor, "call_with_trace"):
+            if strict_opener is not None:
+                result = _run_strict_stream(strict_opener, module_id, merged, print_result=print_result)
+            elif (trace or strategy) and hasattr(executor, "call_with_trace"):
                 warn_if_acl_bypassed(strategy)
                 acl_context = cli_context()
                 if acl_context is not None:
@@ -451,7 +462,7 @@ def register_exec_command(
                 result = Sandbox(enabled=sandbox).execute(module_id, merged, executor, cli_context())
 
             # Format output FIRST (canonical order: format → audit on success)
-            if print_result:
+            if print_result and strict_opener is None:
                 format_exec_result(result, resolve_format(output_format), fields)
             if on_result is not None:
                 on_result(result, module_id)
@@ -474,7 +485,7 @@ def register_exec_command(
                 on_error=on_error,
                 exit_codes=exit_codes,
                 exit=exit,
-                error_stream=error_stream,
+                error_stream="stderr" if strict_stream else error_stream,
             )
 
     _ = exec_cmd

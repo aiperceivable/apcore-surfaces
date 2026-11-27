@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.8a1] - Unreleased
+
+### Added
+
+- Provide an opt-in A2A event subscriber for migration from Core. Preserve a single terminal task state under cancellation or backpressure and reject incomplete OpenAPI registration.
+
+### Changed
+
+- Require `a2a-sdk[http-server]` 1.1.2 or later so streaming clients receive task store write errors.
+
+### Fixed
+
+- Retire an unacknowledged terminal status when its writer exits after a save failure. A later request can complete the same task after the store recovers.
+
 ## [0.8.7] - 2026-11-20
 
 ### Changed

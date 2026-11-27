@@ -198,9 +198,9 @@ class TestLoggerNamespace:
             factory.logger,
             transport.logger,
         ]:
-            assert mod_logger.name.startswith(
-                "apcore_mcp"
-            ), f"Logger {mod_logger.name!r} does not start with 'apcore_mcp'"
+            assert mod_logger.name.startswith("apcore_mcp"), (
+                f"Logger {mod_logger.name!r} does not start with 'apcore_mcp'"
+            )
 
 
 # ===========================================================================
@@ -300,31 +300,9 @@ class TestTransportLogging:
 
         with (
             caplog.at_level(logging.INFO, logger="apcore_mcp.server.transport"),
-            patch("apcore_mcp.server.transport.StreamableHTTPServerTransport") as mock_transport_cls,
             patch("apcore_mcp.server.transport.uvicorn") as mock_uvicorn,
-            patch("apcore_mcp.server.transport.anyio") as mock_anyio,
         ):
-            mock_transport = mock_transport_cls.return_value
-            mock_read = MagicMock()
-            mock_write = MagicMock()
-            mock_ctx = MagicMock()
-            mock_ctx.__aenter__ = AsyncMock(return_value=(mock_read, mock_write))
-            mock_ctx.__aexit__ = AsyncMock(return_value=False)
-            mock_transport.connect.return_value = mock_ctx
-            mock_transport.handle_request = MagicMock()
-
-            mock_uv_server = MagicMock()
-            mock_uv_server.serve = AsyncMock()
-            mock_uvicorn.Config.return_value = MagicMock()
-            mock_uvicorn.Server.return_value = mock_uv_server
-
-            # Make the task group a no-op that doesn't start tasks
-            mock_tg = MagicMock()
-            mock_tg.start_soon = MagicMock()
-            mock_tg_ctx = MagicMock()
-            mock_tg_ctx.__aenter__ = AsyncMock(return_value=mock_tg)
-            mock_tg_ctx.__aexit__ = AsyncMock(return_value=False)
-            mock_anyio.create_task_group.return_value = mock_tg_ctx
+            mock_uvicorn.Server.return_value.serve = AsyncMock()
 
             await tm.run_streamable_http(
                 mock_server,

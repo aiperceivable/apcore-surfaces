@@ -165,6 +165,32 @@ fn merge_anyof(branches: Vec<Value>) -> Value {
     Value::Object(result)
 }
 
+// Keep the type information needed to decode JSON-valued options. The
+// dispatcher still validates against the original choice and its constraints.
+fn nullable_container_type(branches: &[Value]) -> Option<Value> {
+    let mut kinds = Vec::new();
+    for branch in branches {
+        let kind = branch.get("type")?;
+        let branch_kinds = match kind {
+            Value::Array(kinds) if !kinds.is_empty() => kinds.as_slice(),
+            _ => std::slice::from_ref(kind),
+        };
+        for kind in branch_kinds {
+            if !matches!(kind.as_str(), Some("array" | "object" | "null")) {
+                return None;
+            }
+            if !kinds.contains(kind) {
+                kinds.push(kind.clone());
+            }
+        }
+    }
+    if kinds.len() > 1 && kinds.iter().any(|kind| kind == "null") {
+        Some(Value::Array(kinds))
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // resolve_node (private helper)
 // ---------------------------------------------------------------------------
@@ -211,7 +237,11 @@ fn resolve_node(
             })?;
 
         visiting.insert(ref_path.clone());
-        let result = resolve_node(def, defs, depth + 1, max_depth, visiting, module_id)?;
+        let mut result = resolve_node(def, defs, depth + 1, max_depth, visiting, module_id)?;
+        // A default attached to the reference site configures that CLI flag.
+        if let (Some(default), Some(resolved)) = (obj.get("default"), result.as_object_mut()) {
+            resolved.insert("default".into(), default.clone());
+        }
         // Keep ref_path in visiting for the duration of this chain to detect cycles.
         // It remains in visiting intentionally — siblings go through a fresh chain
         // because we only remove entries when unwinding past the insertion point.
@@ -244,6 +274,14 @@ fn resolve_node(
             .cloned()
             .unwrap_or_default();
 
+        let mut types = resolved_branches
+            .iter()
+            .filter_map(|branch| branch.get("type"));
+        let container_type = types
+            .next()
+            .filter(|kind| matches!(kind.as_str(), Some("object" | "array")))
+            .filter(|kind| types.all(|other| other == *kind))
+            .cloned();
         let merged = merge_allof(&parent_required, resolved_branches);
         let merged_map = match merged {
             Value::Object(m) => m,
@@ -270,6 +308,9 @@ fn resolve_node(
                 result_map.insert(k.clone(), v.clone());
             }
         }
+        if let Some(container_type) = container_type {
+            result_map.entry("type").or_insert(container_type);
+        }
         return Ok(Value::Object(result_map));
     }
 
@@ -289,6 +330,7 @@ fn resolve_node(
                 resolved_branches.push(resolved_sub);
             }
 
+            let container_type = nullable_container_type(&resolved_branches);
             let merged = merge_anyof(resolved_branches);
             let merged_map = match merged {
                 Value::Object(m) => m,
@@ -334,6 +376,9 @@ fn resolve_node(
                 if k != *keyword && !result_map.contains_key(k) {
                     result_map.insert(k.clone(), v.clone());
                 }
+            }
+            if let Some(container_type) = container_type {
+                result_map.entry("type").or_insert(container_type);
             }
             return Ok(Value::Object(result_map));
         }

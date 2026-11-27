@@ -1,0 +1,56 @@
+{
+  "description": "A2A event delivery through the Core subscriber factory",
+  "contract_version": "1.0",
+  "event": {
+    "event_type": "example.updated",
+    "module_id": "example.module",
+    "timestamp": "2026-01-01T00:00:00+00:00",
+    "severity": "info",
+    "data": { "value": 42 }
+  },
+  "test_cases": [
+    {
+      "id": "bearer_success",
+      "subscriber": { "type": "a2a", "auth": "test-token" },
+      "status": 204,
+      "expected": { "requests": 1, "authorization": "Bearer test-token", "skill_id": "apevo.event_receiver", "dead_letters": 0, "circuit_opened": 0 }
+    },
+    {
+      "id": "headers_permanent_failure",
+      "subscriber": { "type": "a2a", "auth": { "Authorization": "Basic test", "X-Source": "test" }, "skill_id": "example.receiver" },
+      "status": 403,
+      "expected": { "requests": 1, "authorization": "Basic test", "source": "test", "skill_id": "example.receiver", "dead_letters": 0, "circuit_opened": 0 }
+    },
+    {
+      "id": "transient_failure",
+      "subscriber": { "type": "a2a", "retry": { "max_attempts": 2, "initial_backoff_ms": 1 } },
+      "status": 503,
+      "expected": { "requests": 2, "skill_id": "apevo.event_receiver", "dead_letters": 1, "circuit_opened": 0 }
+    },
+    {
+      "id": "circuit_breaker",
+      "subscriber": { "type": "a2a", "retry": { "max_attempts": 3, "initial_backoff_ms": 1 }, "circuit_breaker": { "open_threshold": 1 } },
+      "status": 503,
+      "expected": { "requests": 1, "skill_id": "apevo.event_receiver", "dead_letters": 1, "circuit_opened": 1 }
+    },
+    {
+      "id": "timeout",
+      "subscriber": { "type": "a2a", "timeout_ms": 200, "retry": { "max_attempts": 1 } },
+      "status": 204,
+      "delay_ms": 900,
+      "expected": { "requests": 1, "skill_id": "apevo.event_receiver", "dead_letters": 1, "circuit_opened": 0 }
+    },
+    {
+      "id": "filtered_out",
+      "subscriber": { "type": "filter", "delegate_type": "a2a", "include_events": ["other.*"] },
+      "status": 204,
+      "expected": { "requests": 0, "dead_letters": 0, "circuit_opened": 0 }
+    },
+    {
+      "id": "filter_delegates_once",
+      "subscriber": { "type": "filter", "delegate_type": "a2a", "include_events": ["example.*"] },
+      "status": 204,
+      "expected": { "requests": 1, "skill_id": "apevo.event_receiver", "dead_letters": 0, "circuit_opened": 0 }
+    }
+  ]
+}

@@ -60,13 +60,17 @@ cargo add apcore-mcp
 cargo install apcore-mcp
 ```
 
-Requires Rust 1.86+ and `apcore >= 0.32.3` + `apcore-toolkit >= 0.14.1`. The OpenAPI backend registers the module IDs emitted by `OpenAPIScanner`; toolkit 0.13 introduced the required Canonical ID normalization.
+Requires Rust 1.86+, `apcore = 1.0.0-alpha.1` and `apcore-toolkit = 0.15.1-alpha.1`.
+Registry-based installation requires a compatible APCore release on crates.io.
+When testing a locally unpacked prerelease, resolve both this crate and Toolkit against
+the same unpacked APCore package and confirm with `cargo metadata`.
 
-Complete stdio shutdown draining of core invocations after timeout/cancellation
-requires `apcore >= 0.32.3`. The `0.32.2` compatibility fallback preserves stdout
-isolation and bridge-owned callback/sweep cleanup, but cannot join late core
-module execution. See [stdio stdout ownership](docs/features/transport.md#stdio-stdout-ownership)
-for the process and platform boundaries.
+Streaming tools backed by APCore use the runtime's final merged output and
+completion status for the MCP response. A client with a progress token gets
+redacted chunks on stdio and SSE, while streamable HTTP returns the final
+result. Output validation or after-middleware failure produces an MCP error
+result even if chunks were already delivered. See [stdio stdout ownership](docs/features/transport.md#stdio-stdout-ownership)
+for process and platform boundaries.
 
 ## Quick Start
 
@@ -471,6 +475,20 @@ CLI usage:
 ```sh
 apcore-mcp --extensions-dir ./extensions --approval elicit
 ```
+
+For Phase B, configure the builder with `approval_store`. The store supports
+stdio and Streamable HTTP direct tool calls. A supplied Core executor must be
+unshared and have no installed approval handler when the builder attaches the
+store. Background jobs that require an approval report that Phase B is
+unavailable for that job.
+
+The pending tool response provides an operator record ID at
+`_meta.apcore.approval.approvalId` and a private credential at
+`_meta.apcore.approval.resumeToken`. The notification callback receives the
+operator record ID. The approval store uses that ID for resolution, and
+`__apcore_approval_check` takes it as `approval_id` for owner-scoped status
+queries. After approval, retry the original tool inputs with the private
+credential in the request's `params._meta.approvalId`.
 
 ### Output Formatting
 

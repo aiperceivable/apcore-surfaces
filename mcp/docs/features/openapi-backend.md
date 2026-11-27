@@ -65,8 +65,11 @@ load_spec(url|path) → OpenAPIScanner.scan() → HTTPProxyRegistryWriter.write(
    already-parsed document), `OpenAPIScanner.scan`, and `HTTPProxyRegistryWriter.write`, in that
    order, and returns the registry. Any behaviour difference between the three bridges that is not a
    difference in the toolkit is a defect. The bridge registers the module IDs the scanner emits as
-   they are; the one policy it adds is to [skip a module whose emitted ID apcore's registry would
-   still refuse](#module_id-tool-name), with a WARNING, rather than hand it to the writer.
+   they are. It logs a warning and [skips modules whose IDs apcore would refuse](#module_id-tool-name).
+   Before writing a proxy module, the bridge supplies a missing or blank description from the
+   effective HTTP method and path, such as `GET /pets`. The generated description occupies one
+   line, has at most 200 Unicode characters, and leaves the description supplied by the scan
+   or its hooks intact when it contains text.
 2. **Surface what the scan found.** Every `ScannedModule.warnings` entry and every failed
    `WriteResult` MUST reach the operator at startup — WARNING for a scan warning, ERROR for a write
    failure — naming the module ID. A spec with an unresolvable `$ref` produces a tool with an empty
@@ -188,9 +191,8 @@ operation whose derived ID collides with a discovered extension module fails the
 **A prefix reduces the probability of a collision; it does not eliminate one.** Nothing stops an
 extensions directory from already containing a `petstore.*` module, and a duplicate reaches the
 writer as a **failed `WriteResult`**, not an exception — the toolkit's writers report per-module
-outcomes rather than aborting. Under the "log at ERROR and keep going" rule below, that would leave
-the server running with a **partial registry**: some operations served, one silently absent, and a
-tool the agent was told about missing from `tools/list`.
+outcomes for the batch. The bridge checks collisions before writing so it can identify every
+affected ID and leave the registry untouched.
 
 Two requirements, and they are not the same mechanism:
 
@@ -211,16 +213,12 @@ Two requirements, and they are not the same mechanism:
     |---|---|---|
     | Derived ID collides with a module already in the registry | Preflight, before any write | **Fatal**, atomic, all colliding IDs named. Nothing registers |
     | Two operations in **one document** derive the same ID | Inside the scanner | Renamed `_2`, `_3`, … with a warning on the module. Never reaches the preflight |
-    | One module's schema or proxy construction fails | `WriteResult` | ERROR logged naming the module; the rest still register |
+    | A selected operation fails to register | Writer results and registry lookup | **Fatal**, names every failed or absent module |
 
-    The distinction is whether the deployment is **coherent**. A colliding ID means the operator's
-    two sources disagree about what a name means, and there is no correct answer for the bridge to
-    pick — serving either one silently is a worse outcome than refusing. A module that fails to
-    build is a defect in one operation, and dropping it costs one tool.
-
-    This is a **bridge** decision, not a writer behaviour: apcore-toolkit's writers return
-    per-module `WriteResult`s by contract and do not distinguish these cases, so the escalation has
-    to happen here.
+    The bridge checks each selected ID against the writer results and the registry before returning
+    a backend. The TypeScript bridge waits for pending host registration promises. Successful
+    writes may already be present when a later registration fails. Assemble in a startup-owned
+    registry and publish it only after backend construction succeeds.
 
 ---
 

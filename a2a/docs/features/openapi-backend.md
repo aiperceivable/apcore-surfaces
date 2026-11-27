@@ -152,13 +152,9 @@ and the `derive_module_id` / `transform_module` hooks — so a `prefix` of `Pet-
 4. One skipped operation MUST NOT fail the scan; sibling operations still register.
 
 !!! note "Why skip, when the registry would refuse it anyway"
-    Handed to `HTTPProxyRegistryWriter`, an illegal ID is rejected by apcore's registry, so the
-    module never registers either way. But it surfaces as a per-module write-failure **ERROR**
-    rather than as a report naming the segment and the remedy, and — worse — it is still in the
-    set every later diagnostic reads: FR-OAS-003's report counts it, FR-OAS-005 warns about a write
-    operation that will never be on the card, and the zero-modules warning stays silent for a
-    document none of whose operations registered. Skipping first keeps every diagnostic about the
-    modules that are actually served.
+    The scanner can report the specific invalid segment and the remedy before the registry
+    rejects it. Skipping at that stage lets the bridge accurately report how many modules will
+    register, which descriptions it synthesized, and which write operations will be served.
 
 **Collisions created by the naming rule are the scanner's to resolve.** `listPets` and `list-pets`
 are two distinct operations to OpenAPI and one module ID to apcore (`list_pets`). The toolkit
@@ -619,16 +615,17 @@ Builds a `Registry` from an OpenAPI document.
 | No usable `base_url` | `ValueError` naming both the document and the config key |
 | Derived `module_id` collides with a module already in the registry | `ValueError` naming **every** colliding ID, sorted and deduplicated, before anything is written — reporting only the first forces one restart per collision |
 | A selected operation cannot be forwarded | Backend construction fails before registration, naming the operation and reason |
+| A selected operation fails to register | Backend construction fails, naming each failed or absent module and its diagnostic |
 
-Two failures are deliberately **not** errors: a module whose emitted ID apcore's registry would
-reject is skipped with a WARNING (FR-OAS-002), and a per-module write failure is logged at ERROR
-while the remaining modules still register. Neither leaves the registry partially populated with respect to the *set* the
-preflight approved.
+A module with an unprojectable ID is skipped with a WARNING (FR-OAS-002) before determining
+which modules must register. The bridge checks each selected ID against the writer results
+and the registry. TypeScript waits for pending host registration promises.
 
 ### Returns
 
-A populated `Registry`. Never a partially-populated one: the collision preflight and every
-validation run before the first `write`.
+A populated `Registry` on success. A registration failure can occur after some selected modules
+have been written. Assemble in a startup-owned registry and publish it only after backend
+construction succeeds.
 
 ### Properties
 
@@ -639,8 +636,8 @@ validation run before the first `write`.
 - **Emits**, in this order, before returning: the FR-OAS-002 illegal-ID skip WARNINGs, the scanner's
   per-module warnings for every module that will register (a skipped module's own toolkit legality
   warning is not repeated beside its skip line), a zero-modules-produced WARNING, the FR-OAS-003
-  description-fallback INFO line, per-module write-failure ERRORs (non-fatal), and the FR-OAS-005
-  unapproved-write WARNING.
+  description-fallback INFO line, and the FR-OAS-005 unapproved-write WARNING after registration
+  succeeds.
 - **Every registered module ID is apcore-legal**, and every registered module carries a non-empty
   description. These two invariants are what FR-OAS-002 and FR-OAS-003 exist to hold, and they are
   the reason the backend cannot be a thin `scan`-then-`write` call.
@@ -649,14 +646,8 @@ validation run before the first `write`.
 
 ## Canonical diagnostic text
 
-The six report sites emit at levels that are already normative and identical across the three
-SDKs. Their **text** drifted, and a cross-language audit found five of the six carrying
-different facts rather than different phrasing — Python's drop message (now the FR-OAS-002 skip
-message) named no remedy, its collision error did not say the registry was untouched, and its no-`base_url` error
-did not say what breaks. Each of those is a fact the operator needs and one binding withheld.
-
-The table fixes what each message must **contain**. Wording may differ where a language must
-name its own API; the listed facts may not go missing.
+The three SDKs report at the same levels and include the facts listed below. Each SDK uses
+its own public API names in diagnostic messages.
 
 | Site | Level | MUST contain |
 |---|---|---|
@@ -664,16 +655,16 @@ name its own API; the listed facts may not go missing.
 | Per-module scanner warning | `warn` | the module ID and the scanner's own text, unmodified |
 | Zero modules produced | `warn` | that the Agent Card will have no skills |
 | Description synthesis (FR-OAS-003) | `info` | the count, the denominator (modules `scan` returned), and every affected ID **as emitted** — after normalisation and deduplication |
-| Per-module write failure | `error` | the module ID and the writer's `verification_error` |
 | Unapproved writes (FR-OAS-005) | `warn` | the count; the methods; the public Agent Card **and its path**; the three remedies |
 
-And for the three fatal errors:
+Fatal errors contain the following details:
 
 | Error | MUST contain |
 |---|---|
 | ID collision (FR-OAS-006) | every colliding ID, sorted and deduplicated; **"Nothing was registered."**; and the `prefix` remedy |
 | No `base_url` | that the document has no usable absolute `servers[0].url`, **that every proxied call would otherwise resolve against an unknown host**, and the config key to set |
 | Missing `prefix` in a mixed deployment | the key `prefix`, and why — a derived ID can collide with a project module ID |
+| Incomplete registration | each failed or absent module ID and the available registration error |
 
 !!! note "Why the required-pattern fragment is in the skip message"
     An operator reading *"the derived module ID has a segment (`2fa`) apcore's registry cannot

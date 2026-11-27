@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import patch
 
 import pytest
-from apcore import ModuleAnnotations, Registry
+from apcore import Executor, ModuleAnnotations, ModuleError, Registry
+from apcore.approval import AlwaysDenyHandler, AutoApproveHandler
 
 from apcore_toolkit.conformance import assert_annotations_preserved
 from apcore_toolkit.output.registry_writer import RegistryWriter
@@ -63,3 +65,27 @@ class TestAssertAnnotationsPreserved:
         mod = _module(ModuleAnnotations(readonly=True))
         with patch("apcore_toolkit.output.registry_writer.resolve_target", return_value=_handler):
             assert_annotations_preserved(RegistryWriter(), mod, Registry(), fields=("readonly",))
+
+
+def test_registered_annotation_controls_real_execution() -> None:
+    calls = 0
+
+    def handler() -> dict[str, bool]:
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    module = _module(ModuleAnnotations(destructive=True, requires_approval=True))
+    registry = Registry()
+    with patch("apcore_toolkit.output.registry_writer.resolve_target", return_value=handler):
+        assert_annotations_preserved(RegistryWriter(), module, registry)
+
+    denied = Executor(registry=registry, approval_handler=AlwaysDenyHandler())
+    with pytest.raises(ModuleError) as caught:
+        asyncio.run(denied.call_async(module.module_id, {}))
+    assert caught.value.code == "APPROVAL_DENIED"
+    assert calls == 0
+
+    approved = Executor(registry=registry, approval_handler=AutoApproveHandler())
+    assert asyncio.run(approved.call_async(module.module_id, {})) == {"ok": True}
+    assert calls == 1

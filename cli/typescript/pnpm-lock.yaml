@@ -34,11 +34,11 @@ importers:
         specifier: ^5.1.0
         version: 5.1.0(vitest@5.1.0)
       apcore-js:
-        specifier: ^0.32.3 || ^0.33.0
-        version: 0.32.3
+        specifier: ^0.33.0 || 1.0.0-alpha.1
+        version: 0.33.0
       apcore-toolkit:
-        specifier: '>=0.15.0'
-        version: 0.15.0(@sinclair/typebox@0.34.48)
+        specifier: 0.15.1-alpha.1
+        version: 0.15.1-alpha.1(@sinclair/typebox@0.34.48)
       apdev-js:
         specifier: ^0.2.4
         version: 0.2.4(typescript@5.9.3)
@@ -731,16 +731,12 @@ packages:
   any-promise@1.3.0:
     resolution: {integrity: sha512-7UvmKalWRt1wgjL1RrGxoSJW/0QZFIegpeGvZG9kjp8vrRu55XTHbwnqq2GpXm9uLbcuhxm3IqX9OB4MZR1b2A==}
 
-  apcore-js@0.32.3:
-    resolution: {integrity: sha512-kmIDULt35c4vv9fxopnUomDi2Vvb9TzX4JdO9xfv6+XAE62OxuH4a6cvIQCuu62A5ESsIiwa2evhNX+PbPyqtA==}
-    engines: {node: '>=20.0.0'}
-
   apcore-js@0.33.0:
     resolution: {integrity: sha512-+0UPovkB37qKy9kUwZmgSK6an+RqOUy+XOU9sEAauXStmQYIWmPBV7ACymQ9nwPI4RVAKiWbU4upMIqrCitxoQ==}
     engines: {node: '>=20.0.0'}
 
-  apcore-toolkit@0.15.0:
-    resolution: {integrity: sha512-PAF0NvA1TRUlS1uHyUwjfe/c7OqttgxxAyMkwcijvQqh45UhUx5V49I6LPrJpHSq1dvkY6komnEO5FeCi/CjqQ==}
+  apcore-toolkit@0.15.1-alpha.1:
+    resolution: {integrity: sha512-e8E9gtYAKLeBkpdIQisey4LogMdTR+qffL5PD5U0TyLiVl2v90xSBVXfHof3FkJWMj0/MKRqjlyzBk750xmt+w==}
     engines: {node: '>=20.10.0'}
     peerDependencies:
       '@sinclair/typebox': '>=0.31.0'
@@ -1943,19 +1939,13 @@ snapshots:
 
   any-promise@1.3.0: {}
 
-  apcore-js@0.32.3:
-    dependencies:
-      '@sinclair/typebox': 0.34.48
-      js-yaml: 4.3.2
-      uuid: 11.1.1
-
   apcore-js@0.33.0:
     dependencies:
       '@sinclair/typebox': 0.34.48
       js-yaml: 4.3.2
       uuid: 11.1.1
 
-  apcore-toolkit@0.15.0(@sinclair/typebox@0.34.48):
+  apcore-toolkit@0.15.1-alpha.1(@sinclair/typebox@0.34.48):
     dependencies:
       '@sinclair/typebox': 0.34.48
       ajv: 8.20.0

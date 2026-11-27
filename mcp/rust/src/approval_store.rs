@@ -3,14 +3,20 @@
 //! Users implement `ApprovalStore` (Redis, DB, etc.).
 //! `InMemoryApprovalStore` is provided for testing and local development only.
 
-use async_trait::async_trait;
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use apcore::{ApprovalRequest, Identity};
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify};
+use tokio::time::Instant;
 
 /// Convenience alias for the store's fallible operations.
-type StoreResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub type StoreResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Status of an approval record.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -39,9 +45,59 @@ pub struct ApprovalRecord {
     pub reason: Option<String>,
 }
 
+/// The authenticated identity used to scope approval records.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalPrincipal {
+    pub identity_type: String,
+    pub id: String,
+}
+
+impl From<&Identity> for ApprovalPrincipal {
+    fn from(identity: &Identity) -> Self {
+        Self {
+            identity_type: identity.identity_type().to_owned(),
+            id: identity.id().to_owned(),
+        }
+    }
+}
+
+/// The stable parts of the invocation for which approval was requested.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalScope {
+    pub module_id: String,
+    pub caller_id: Option<String>,
+    pub principal: Option<ApprovalPrincipal>,
+    pub arguments_sha256: [u8; 32],
+}
+
+impl From<&ApprovalRequest> for ApprovalScope {
+    fn from(request: &ApprovalRequest) -> Self {
+        let mut arguments = request.arguments.clone();
+        arguments.sort_all_objects();
+        Self {
+            module_id: request.module_id.clone(),
+            caller_id: request.caller_id.clone(),
+            principal: request
+                .context
+                .as_ref()
+                .and_then(|context| context.identity.as_ref())
+                .map(ApprovalPrincipal::from),
+            arguments_sha256: Sha256::digest(arguments.to_string().as_bytes()).into(),
+        }
+    }
+}
+
+/// SHA-256 verifier for the confidential resume credential.
+pub type ApprovalVerifier = [u8; 32];
+
 /// Pluggable storage for Phase B approval state.
 #[async_trait]
 pub trait ApprovalStore: Send + Sync + 'static {
+    /// Opt in only when all scoped storage operations below are implemented.
+    fn supports_scoped_approval(&self) -> bool {
+        false
+    }
+
     /// Persist a new pending approval record.
     async fn save_pending(
         &self,
@@ -61,6 +117,43 @@ pub trait ApprovalStore: Send + Sync + 'static {
         approved: bool,
         reason: Option<String>,
     ) -> StoreResult<bool>;
+
+    /// Persist a scoped record under its public audit ID without holding the credential.
+    /// Status-only stores reject this operation by default.
+    async fn save_scoped_pending(
+        &self,
+        _audit_id: &str,
+        _verifier: &ApprovalVerifier,
+        _scope: &ApprovalScope,
+    ) -> StoreResult<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scoped approval storage unavailable",
+        )
+        .into())
+    }
+
+    /// Read a scoped status only when the record belongs to this principal.
+    /// An absent principal is the anonymous scope.
+    async fn get_scoped_result(
+        &self,
+        _audit_id: &str,
+        _principal: Option<&ApprovalPrincipal>,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        Ok(None)
+    }
+
+    /// Match the verifier and invocation scope, check expiry, and consume an
+    /// approved credential within one transaction. Pending results remain
+    /// available. Unknown, expired, mismatched, or consumed records yield None.
+    async fn consume_scoped(
+        &self,
+        _audit_id: &str,
+        _verifier: &ApprovalVerifier,
+        _scope: &ApprovalScope,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        Ok(None)
+    }
 
     /// Start a background TTL sweep for this store, returning the spawned
     /// task handle (or `None` if the store needs no sweeping).
@@ -84,15 +177,38 @@ struct InternalRecord {
     created_at: Instant,
     resolved_at: Option<Instant>,
     notify: Arc<Notify>,
+    scoped: Option<ScopedApproval>,
+}
+
+struct ScopedApproval {
+    verifier: Option<ApprovalVerifier>,
+    scope: ApprovalScope,
+}
+
+impl InternalRecord {
+    fn expired(&self, now: Instant, pending_ttl: Duration, resolved_ttl: Duration) -> bool {
+        now.duration_since(self.created_at) >= pending_ttl
+            || self
+                .resolved_at
+                .is_some_and(|time| now.duration_since(time) >= resolved_ttl)
+    }
+
+    fn snapshot(&self) -> ApprovalRecord {
+        ApprovalRecord {
+            status: self.status.clone(),
+            module_id: self.module_id.clone(),
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 /// In-process approval store for testing and local development.
 ///
 /// NOT suitable for production.
 ///
-/// Memory management: resolved records expire after `resolved_ttl`,
-/// pending records after `pending_ttl`. A background sweep task (started
-/// via `start_sweep`) handles records whose timeouts were missed.
+/// The pending TTL caps the lifetime of a record. The resolved TTL can shorten
+/// the lifetime after a decision. Reads and writes enforce both deadlines.
+/// The optional background sweep removes expired records that are never read.
 pub struct InMemoryApprovalStore {
     records: Arc<Mutex<HashMap<String, InternalRecord>>>,
     resolved_ttl: Duration,
@@ -125,20 +241,12 @@ impl InMemoryApprovalStore {
                 tokio::time::sleep(interval).await;
                 let mut map = records.lock().await;
                 let now = Instant::now();
-                map.retain(|_, rec| {
-                    if rec.status == ApprovalStatus::Pending {
-                        now.duration_since(rec.created_at) <= pending_ttl
-                    } else {
-                        rec.resolved_at
-                            .map(|t| now.duration_since(t) <= resolved_ttl)
-                            .unwrap_or(true)
-                    }
-                });
+                map.retain(|_, record| !record.expired(now, pending_ttl, resolved_ttl));
             }
         })
     }
 
-    async fn evict_oldest_pending(map: &mut HashMap<String, InternalRecord>) {
+    fn evict_oldest_pending(map: &mut HashMap<String, InternalRecord>) {
         let oldest = map
             .iter()
             .filter(|(_, r)| r.status == ApprovalStatus::Pending)
@@ -147,6 +255,56 @@ impl InMemoryApprovalStore {
         if let Some(id) = oldest {
             map.remove(&id);
         }
+    }
+
+    fn live_record<'a>(
+        &self,
+        records: &'a mut HashMap<String, InternalRecord>,
+        audit_id: &str,
+    ) -> Option<&'a mut InternalRecord> {
+        let now = Instant::now();
+        if records
+            .get(audit_id)
+            .is_some_and(|record| record.expired(now, self.pending_ttl, self.resolved_ttl))
+        {
+            records.remove(audit_id);
+        }
+        records.get_mut(audit_id)
+    }
+
+    async fn insert_pending(
+        &self,
+        audit_id: &str,
+        module_id: &str,
+        scoped: Option<ScopedApproval>,
+    ) -> StoreResult<()> {
+        let mut records = self.records.lock().await;
+        let now = Instant::now();
+        records.retain(|_, record| !record.expired(now, self.pending_ttl, self.resolved_ttl));
+        if records.contains_key(audit_id) {
+            return Err(
+                io::Error::new(io::ErrorKind::AlreadyExists, "approval record exists").into(),
+            );
+        }
+        if records.len() >= self.max_records {
+            Self::evict_oldest_pending(&mut records);
+            if records.len() >= self.max_records {
+                return Err(io::Error::other("approval store is at capacity").into());
+            }
+        }
+        records.insert(
+            audit_id.to_owned(),
+            InternalRecord {
+                status: ApprovalStatus::Pending,
+                module_id: module_id.to_owned(),
+                reason: None,
+                created_at: now,
+                resolved_at: None,
+                notify: Arc::new(Notify::new()),
+                scoped,
+            },
+        );
+        Ok(())
     }
 }
 
@@ -158,47 +316,24 @@ impl Default for InMemoryApprovalStore {
 
 #[async_trait]
 impl ApprovalStore for InMemoryApprovalStore {
+    fn supports_scoped_approval(&self) -> bool {
+        true
+    }
+
     async fn save_pending(
         &self,
         approval_id: &str,
         module_id: &str,
         _arguments: &serde_json::Value,
     ) -> StoreResult<()> {
-        let mut map = self.records.lock().await;
-        if map.len() >= self.max_records {
-            Self::evict_oldest_pending(&mut map).await;
-        }
-        map.insert(
-            approval_id.to_string(),
-            InternalRecord {
-                status: ApprovalStatus::Pending,
-                module_id: module_id.to_string(),
-                reason: None,
-                created_at: Instant::now(),
-                resolved_at: None,
-                notify: Arc::new(Notify::new()),
-            },
-        );
-
-        // Schedule TTL cleanup
-        let records = Arc::clone(&self.records);
-        let id = approval_id.to_string();
-        let ttl = self.pending_ttl;
-        tokio::spawn(async move {
-            tokio::time::sleep(ttl).await;
-            records.lock().await.remove(&id);
-        });
-
-        Ok(())
+        self.insert_pending(approval_id, module_id, None).await
     }
 
     async fn get_result(&self, approval_id: &str) -> StoreResult<Option<ApprovalRecord>> {
-        let map = self.records.lock().await;
-        Ok(map.get(approval_id).map(|r| ApprovalRecord {
-            status: r.status.clone(),
-            module_id: r.module_id.clone(),
-            reason: r.reason.clone(),
-        }))
+        let mut records = self.records.lock().await;
+        Ok(self
+            .live_record(&mut records, approval_id)
+            .map(|record| record.snapshot()))
     }
 
     async fn resolve(
@@ -207,8 +342,8 @@ impl ApprovalStore for InMemoryApprovalStore {
         approved: bool,
         reason: Option<String>,
     ) -> StoreResult<bool> {
-        let mut map = self.records.lock().await;
-        let Some(rec) = map.get_mut(approval_id) else {
+        let mut records = self.records.lock().await;
+        let Some(rec) = self.live_record(&mut records, approval_id) else {
             return Ok(false);
         };
         if rec.status != ApprovalStatus::Pending {
@@ -223,17 +358,58 @@ impl ApprovalStore for InMemoryApprovalStore {
         rec.resolved_at = Some(Instant::now());
         rec.notify.notify_waiters();
 
-        // Schedule resolved-TTL cleanup
-        let records = Arc::clone(&self.records);
-        let id = approval_id.to_string();
-        let ttl = self.resolved_ttl;
-        drop(map); // release lock before spawning
-        tokio::spawn(async move {
-            tokio::time::sleep(ttl).await;
-            records.lock().await.remove(&id);
-        });
-
         Ok(true)
+    }
+
+    async fn save_scoped_pending(
+        &self,
+        audit_id: &str,
+        verifier: &ApprovalVerifier,
+        scope: &ApprovalScope,
+    ) -> StoreResult<()> {
+        self.insert_pending(
+            audit_id,
+            &scope.module_id,
+            Some(ScopedApproval {
+                verifier: Some(*verifier),
+                scope: scope.clone(),
+            }),
+        )
+        .await
+    }
+
+    async fn get_scoped_result(
+        &self,
+        audit_id: &str,
+        principal: Option<&ApprovalPrincipal>,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        let mut records = self.records.lock().await;
+        let result = self.live_record(&mut records, audit_id).and_then(|record| {
+            let scope = &record.scoped.as_ref()?.scope;
+            (scope.principal.as_ref() == principal).then(|| record.snapshot())
+        });
+        Ok(result)
+    }
+
+    async fn consume_scoped(
+        &self,
+        audit_id: &str,
+        verifier: &ApprovalVerifier,
+        scope: &ApprovalScope,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        let mut records = self.records.lock().await;
+        let result = self.live_record(&mut records, audit_id).and_then(|record| {
+            let scoped = record.scoped.as_mut()?;
+            let matches_verifier = bool::from(scoped.verifier.as_ref()?.ct_eq(verifier));
+            if !matches_verifier || scoped.scope != *scope {
+                return None;
+            }
+            if record.status == ApprovalStatus::Approved {
+                scoped.verifier = None;
+            }
+            Some(record.snapshot())
+        });
+        Ok(result)
     }
 
     fn start_sweep(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -248,14 +424,14 @@ impl InMemoryApprovalStore {
         approval_id: &str,
         timeout: Duration,
     ) -> Option<ApprovalRecord> {
-        let notify = {
-            let map = self.records.lock().await;
-            map.get(approval_id)
+        let notified = {
+            let mut records = self.records.lock().await;
+            self.live_record(&mut records, approval_id)
                 .filter(|r| r.status == ApprovalStatus::Pending)
-                .map(|r| Arc::clone(&r.notify))
+                .map(|r| Arc::clone(&r.notify).notified_owned())
         };
-        if let Some(n) = notify {
-            let _ = tokio::time::timeout(timeout, n.notified()).await;
+        if let Some(notification) = notified {
+            let _ = tokio::time::timeout(timeout, notification).await;
         }
         self.get_result(approval_id).await.ok().flatten()
     }

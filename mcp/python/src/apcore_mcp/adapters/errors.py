@@ -6,6 +6,7 @@ from typing import Any
 
 from apcore.cancel import ExecutionCancelledError
 from apcore.errors import (
+    ApprovalPendingError,
     ModuleError,
     TaskLimitExceededError,
 )
@@ -20,6 +21,7 @@ try:  # pragma: no cover - import shim
 except ImportError:  # pragma: no cover
     CircuitBreakerOpenError = None  # type: ignore[assignment,misc]
 
+from apcore_mcp.adapters.approval import _is_public_approval_id
 from apcore_mcp.constants import ERROR_CODES
 
 # Canonical recovery hint emitted when apcore did not populate a per-module
@@ -224,16 +226,21 @@ class ErrorMapper:
 
         # Approval errors: pass through with specific handling
         if code == ERROR_CODES["APPROVAL_PENDING"]:
-            # Narrow details to only approvalId; drop everything else.
-            # apcore uses snake_case (approval_id); output uses camelCase (approvalId) for MCP convention.
-            narrowed = {"approvalId": details["approval_id"]} if details and "approval_id" in details else None
+            # Core's approval_id is confidential. Only the non-secret record
+            # correlation ID belongs in generic error envelopes.
+            pending = error.result if isinstance(error, ApprovalPendingError) else None
+            audit_id = getattr(pending, "audit_id", None)
+            narrowed = (
+                {"approvalId": audit_id}
+                if _is_public_approval_id(audit_id) and audit_id != getattr(pending, "approval_id", None)
+                else None
+            )
             result = {
                 "isError": True,
                 "errorType": code,
-                "message": message,
+                "message": "Approval pending for this tool.",
                 "details": narrowed,
             }
-            self._attach_ai_guidance(error, result)
             return result
 
         if code == ERROR_CODES["APPROVAL_TIMEOUT"]:

@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 use tokio_stream::Stream;
 
 use apcore::trace_context::{TraceContext, TraceParent};
-use apcore::CancelToken;
+use apcore::{
+    CancelToken, StreamCompletionHandle, StreamEndReason, StreamSkipReason, StreamStepOutcome,
+};
 
 use crate::auth::middleware::AUTH_IDENTITY;
 use crate::helpers::{ElicitResult, MCP_ELICIT_CALL_ID_KEY, MCP_ELICIT_KEY, MCP_PROGRESS_KEY};
@@ -24,9 +26,18 @@ use crate::server::approval_bridge::ApprovalBridge;
 use crate::server::async_task_bridge::AsyncTaskBridge;
 use crate::server::elicit_registry::ElicitGuard;
 use crate::server::session::SessionRegistry;
+use crate::server::transport::WIRE_CALL_CANCEL;
 
 /// A boxed stream of result chunks from a streaming executor.
-pub type StreamResult = Pin<Box<dyn Stream<Item = Result<Value, ExecutorError>> + Send>>;
+pub type StreamResult = StreamChunks<'static>;
+
+/// A chunk stream that can borrow its executor.
+pub type StreamChunks<'a> = Pin<Box<dyn Stream<Item = Result<Value, ExecutorError>> + Send + 'a>>;
+
+/// Chunks and separate completion for the same execution.
+pub type CompletedStream<'a> = (StreamChunks<'a>, StreamCompletionHandle);
+
+type StreamOutcome = (Vec<ContentItem>, bool, Option<String>);
 
 // ---------------------------------------------------------------------------
 // Task 1: Executor trait
@@ -116,6 +127,18 @@ pub trait Executor: Send + Sync {
         _context: Option<&Value>,
         _version_hint: Option<&str>,
     ) -> Option<StreamResult> {
+        None
+    }
+
+    /// Open one tracked invocation, or return `None` before execution when
+    /// completion metadata is unavailable for the module.
+    fn stream_with_completion<'a>(
+        &'a self,
+        _module_id: &str,
+        _inputs: &Value,
+        _context: &apcore::Context<Value>,
+        _version_hint: Option<&str>,
+    ) -> Option<CompletedStream<'a>> {
         None
     }
 
@@ -646,6 +669,12 @@ impl ExecutionRouter {
         self
     }
 
+    pub(crate) fn supports_scoped_approval(&self) -> bool {
+        self.approval_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.supports_scoped_approval())
+    }
+
     /// Cooperatively cancel an in-flight tool call. [B-002]
     ///
     /// Looks up the [`CancelToken`] registered for `call_id` in
@@ -658,8 +687,8 @@ impl ExecutionRouter {
     ///
     /// Returns `true` when an active token was found and cancelled;
     /// `false` when the `call_id` was unknown (tombstone recorded).
-    /// Wired by transport-level handlers parsing inbound MCP
-    /// `notifications/cancelled` messages.
+    /// For programmatic router calls. Wire-level cancellation uses the
+    /// active JSON-RPC request ID and transport session.
     pub fn cancel_call(&self, call_id: &str, _reason: Option<&str>) -> bool {
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(token) = guard.get(call_id) {
@@ -679,7 +708,11 @@ impl ExecutionRouter {
     /// same cancellation state (`Arc<AtomicBool>` inside apcore::CancelToken)
     /// as the one held in the map, so `cancel_call` flips both. [B-002]
     fn _cancel_guard(&self, call_id: &str) -> (CancelGuard, CancelToken) {
-        let token = std::sync::Arc::new(CancelToken::new());
+        let token = Arc::new(
+            WIRE_CALL_CANCEL
+                .try_with(CancelToken::child)
+                .unwrap_or_default(),
+        );
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
         // Tombstone race: if a tombstone was recorded earlier via
         // cancel_call, propagate the cancelled state to the new token.
@@ -746,6 +779,15 @@ impl ExecutionRouter {
         self.async_bridge.as_ref()
     }
 
+    fn has_approval_input(tool_name: &str, arguments: &Value) -> bool {
+        arguments.get("_approval_token").is_some()
+            || (tool_name == crate::server::async_task_bridge::META_TOOL_SUBMIT
+                && arguments
+                    .get("arguments")
+                    .and_then(|value| value.get("_approval_token"))
+                    .is_some())
+    }
+
     /// Redact sensitive fields from tool inputs for safe logging.
     ///
     /// If a schema is registered for `tool_name`, uses
@@ -753,10 +795,14 @@ impl ExecutionRouter {
     /// `"***REDACTED***"`. Returns the original inputs unchanged when no
     /// schema is available.
     fn redact_inputs(&self, tool_name: &str, inputs: &Value) -> Value {
-        match self.tool_schemas.get(tool_name) {
+        let mut redacted = match self.tool_schemas.get(tool_name) {
             Some(schema) => apcore::redact_sensitive(inputs, schema),
             None => inputs.clone(),
+        };
+        if let Some(fields) = redacted.as_object_mut() {
+            fields.remove("_approval_token");
         }
+        redacted
     }
 
     /// Redact sensitive fields from tool output before formatting.
@@ -923,6 +969,9 @@ impl ExecutionRouter {
         arguments: &Value,
         extra: Option<&Value>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
+        if Self::has_approval_input(tool_name, arguments) {
+            return Self::stream_error("Approval credentials belong in request metadata".into());
+        }
         // [B-002] Register a CancelToken for this call so an inbound MCP
         // `notifications/cancelled` (forwarded into `router.cancel_call(call_id)`)
         // cooperatively cancels in-flight work. call_id sourced from
@@ -949,19 +998,40 @@ impl ExecutionRouter {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let (_cancel_guard, cancel_token) = self._cancel_guard(&call_id);
 
-        let redacted = self.redact_inputs(tool_name, arguments);
-        tracing::debug!(
-            tool = tool_name,
-            inputs = %redacted,
-            "Executing tool call"
-        );
+        if !ApprovalBridge::is_meta_tool(tool_name) {
+            let redacted = self.redact_inputs(tool_name, arguments);
+            tracing::debug!(
+                tool = tool_name,
+                inputs = %redacted,
+                "Executing tool call"
+            );
+        }
+
+        let credential = match extra.and_then(|extra| extra.get("approvalId")) {
+            None => None,
+            Some(value) => match value.as_str() {
+                Some(token)
+                    if crate::adapters::approval::resume_audit_id(token).is_some()
+                        && self.supports_scoped_approval()
+                        && crate::server::approval_bridge::has_tool_response_context()
+                        && !AsyncTaskBridge::is_reserved_id(tool_name) =>
+                {
+                    Some(token)
+                }
+                _ => {
+                    return Self::stream_error(
+                        "Approval resumption is unavailable for this call".into(),
+                    )
+                }
+            },
+        };
 
         // Extract streaming helpers and identity from extra
         let (progress_token, send_notification, session, identity) = self.extract_extra(extra);
 
         // Resolve version_hint via the spec's 3-source cascade: [A-D-006]
-        //   1. extras.version_hint  (SDK caller-supplied, highest priority)
-        //   2. extras._meta.apcore.version  (MCP client-supplied)
+        //   1. extras.version_hint (explicit SDK input or normalized wire metadata)
+        //   2. extras._meta.apcore.version (wrapped metadata supplied by SDK callers)
         //   3. registry.get_definition(tool_name).metadata.version_hint
         //      (descriptor default, lowest)
         // Pre-fix Rust read only source #2.
@@ -1012,8 +1082,15 @@ impl ExecutionRouter {
         // dispatch below.
         if let Some(approval_bridge) = &self.approval_bridge {
             if ApprovalBridge::is_meta_tool(tool_name) {
-                let (value, is_error) =
-                    approval_bridge.handle_meta_tool(tool_name, arguments).await;
+                let (value, is_error) = if approval_bridge.supports_scoped_approval()
+                    || crate::server::approval_bridge::has_tool_response_context()
+                {
+                    approval_bridge
+                        .check_wire_status(arguments, apcore_ctx.identity.as_ref())
+                        .await
+                } else {
+                    approval_bridge.handle_meta_tool(tool_name, arguments).await
+                };
                 let result = if is_error {
                     Err(apcore::errors::ModuleError::new(
                         apcore::errors::ErrorCode::GeneralInvalidInput,
@@ -1070,6 +1147,11 @@ impl ExecutionRouter {
             // registration) — the pre-fix static `async_module_ids` set
             // was frozen at startup and stale on mutations. [A-D-031]
             if bridge.is_async_module_registered_self(tool_name) {
+                if credential.is_some() {
+                    return Self::stream_error(
+                        "Background tasks do not support approval resumption".into(),
+                    );
+                }
                 let res = bridge
                     .submit(
                         tool_name,
@@ -1136,30 +1218,33 @@ impl ExecutionRouter {
             }
         }
 
-        // Select execution path: try streaming if both prerequisites present;
-        // handle_stream will fall back to non-streaming if executor doesn't
-        // support streaming.
-        if let (Some(ref pt), Some(ref sn)) = (progress_token, send_notification) {
-            self.handle_stream(
-                tool_name,
-                arguments,
-                pt,
-                sn,
-                Some(&context_value),
-                version_hint.as_deref(),
-                Some(&apcore_ctx),
-            )
-            .await
+        let resumed_arguments;
+        let execution_arguments = if let Some(credential) = credential {
+            let Some(mut fields) = arguments.as_object().cloned() else {
+                return Self::stream_error("Tool arguments must be a JSON object".into());
+            };
+            fields.insert(
+                "_approval_token".into(),
+                Value::String(credential.to_owned()),
+            );
+            resumed_arguments = Value::Object(fields);
+            &resumed_arguments
         } else {
-            self.handle_call_async_with_hint(
+            arguments
+        };
+        crate::server::approval_bridge::run_foreground_approval(
+            tool_name,
+            &apcore_ctx,
+            self.dispatch_stream_or_call(
                 tool_name,
-                arguments,
-                Some(&context_value),
+                execution_arguments,
+                &context_value,
                 version_hint.as_deref(),
-                Some(&apcore_ctx),
-            )
-            .await
-        }
+                &apcore_ctx,
+                progress_token.as_ref().zip(send_notification.as_ref()),
+            ),
+        )
+        .await
     }
 
     /// Read the session id the transport stamped onto an inbound message.
@@ -1180,16 +1265,9 @@ impl ExecutionRouter {
     /// the extra `Value`. Returns `(None, None, None, None)` when extra is
     /// `None`.
     ///
-    /// `send_notification` stays `None`: it is a closure, and a plain JSON
-    /// `Value` cannot carry one. `session` no longer does. The transport
-    /// stamps its session id onto every inbound message
-    /// ([`stamp_session_id`]), and the live connection behind that id lives in
-    /// [`SessionRegistry`] — so the trait object is recovered by lookup rather
-    /// than by deserialization. Without this the `session` slot was
-    /// hard-coded `None`, which is why an interactive approval prompt could
-    /// never reach a client (apexe#29).
-    ///
-    /// [`stamp_session_id`]: crate::server::transport
+    /// Session transports stamp the live connection id on incoming messages.
+    /// The registry provides the session for elicitation and, when there is a
+    /// progress token, its sink for progress notifications.
     #[allow(clippy::type_complexity)]
     fn extract_extra(
         &self,
@@ -1200,24 +1278,42 @@ impl ExecutionRouter {
         Option<Arc<dyn SessionHandle>>,
         Option<Value>,
     ) {
-        // In the current integration the factory passes a plain JSON Value
-        // which does not carry callbacks. Real callbacks would come from a
-        // typed CallExtra.  For now we extract identity from JSON.
         let identity = extra.and_then(|v| v.get("identity")).cloned();
 
-        let progress_token = extra.and_then(|v| v.get("progress_token")).and_then(|v| {
-            if let Some(s) = v.as_str() {
-                Some(ProgressToken::String(s.to_string()))
-            } else {
-                v.as_i64().map(ProgressToken::Integer)
-            }
-        });
+        let progress_token = extra
+            .and_then(|v| v.get("progressToken").or_else(|| v.get("progress_token")))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(ProgressToken::String(s.to_string()))
+                } else {
+                    v.as_i64().map(ProgressToken::Integer)
+                }
+            });
 
-        let session = Self::session_id_from_extra(extra)
-            .and_then(|id| self.session_registry.get(id))
-            .map(|session| -> Arc<dyn SessionHandle> { session });
-
-        (progress_token, None, session, identity)
+        let session =
+            Self::session_id_from_extra(extra).and_then(|id| self.session_registry.get(id));
+        let notify = session
+            .as_ref()
+            .filter(|_| progress_token.is_some())
+            .map(|session| {
+                let session = Arc::clone(session);
+                let send: SendNotificationFn = Arc::new(move |mut message| {
+                    let session = Arc::clone(&session);
+                    // The registered transport sink owns the JSON-RPC wire.
+                    message["jsonrpc"] = json!("2.0");
+                    Box::pin(async move {
+                        session.send_notification(message).await?;
+                        Ok(())
+                    })
+                });
+                send
+            });
+        (
+            progress_token,
+            notify,
+            session.map(|session| -> Arc<dyn SessionHandle> { session }),
+            identity,
+        )
     }
 
     /// The registry of live sessions this router resolves elicitation through.
@@ -1239,12 +1335,17 @@ impl ExecutionRouter {
         arguments: &Value,
         extra: Option<CallExtra>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
-        let redacted = self.redact_inputs(tool_name, arguments);
-        tracing::debug!(
-            tool = tool_name,
-            inputs = %redacted,
-            "Executing tool call"
-        );
+        if Self::has_approval_input(tool_name, arguments) {
+            return Self::stream_error("Approval credentials belong in request metadata".into());
+        }
+        if !ApprovalBridge::is_meta_tool(tool_name) {
+            let redacted = self.redact_inputs(tool_name, arguments);
+            tracing::debug!(
+                tool = tool_name,
+                inputs = %redacted,
+                "Executing tool call"
+            );
+        }
 
         let extra = extra.unwrap_or_else(|| CallExtra {
             progress_token: None,
@@ -1295,30 +1396,18 @@ impl ExecutionRouter {
             }
         }
 
-        // Select execution path: try streaming if both prerequisites present;
-        // handle_stream will fall back to non-streaming if executor doesn't
-        // support streaming.
-        if let (Some(ref pt), Some(ref sn)) = (extra.progress_token, extra.send_notification) {
-            self.handle_stream(
-                tool_name,
-                arguments,
-                pt,
-                sn,
-                Some(&context_value),
-                None,
-                Some(&apcore_ctx),
-            )
-            .await
-        } else {
-            self.handle_call_async_with_hint(
-                tool_name,
-                arguments,
-                Some(&context_value),
-                None,
-                Some(&apcore_ctx),
-            )
-            .await
-        }
+        self.dispatch_stream_or_call(
+            tool_name,
+            arguments,
+            &context_value,
+            None,
+            &apcore_ctx,
+            extra
+                .progress_token
+                .as_ref()
+                .zip(extra.send_notification.as_ref()),
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -1836,6 +1925,61 @@ impl ExecutionRouter {
     // by apcore 0.18; when available, capture step traces during streaming
     // and attach them to `_meta.trace` like the non-streaming path.
 
+    async fn dispatch_stream_or_call(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        context: &Value,
+        version_hint: Option<&str>,
+        apcore_ctx: &apcore::Context<Value>,
+        progress: Option<(&ProgressToken, &SendNotificationFn)>,
+    ) -> StreamOutcome {
+        let tracked = Self::guard_stream(tool_name, async {
+            let (chunks, completion) = self.executor.as_ref()?.stream_with_completion(
+                tool_name,
+                arguments,
+                apcore_ctx,
+                version_hint,
+            )?;
+            Some(
+                self.consume_stream(
+                    tool_name,
+                    chunks,
+                    Some(completion),
+                    progress,
+                    Some(context),
+                    apcore_ctx.cancel_token.as_ref(),
+                )
+                .await,
+            )
+        })
+        .await;
+        if let Some(outcome) = tracked {
+            return outcome;
+        }
+        if let Some((token, send)) = progress {
+            return self
+                .handle_stream(
+                    tool_name,
+                    arguments,
+                    token,
+                    send,
+                    Some(context),
+                    version_hint,
+                    Some(apcore_ctx),
+                )
+                .await;
+        }
+        self.handle_call_async_with_hint(
+            tool_name,
+            arguments,
+            Some(context),
+            version_hint,
+            Some(apcore_ctx),
+        )
+        .await
+    }
+
     /// Streaming execution via executor.stream().
     ///
     /// Iterates the async stream, sends progress notifications for each
@@ -1856,9 +2000,7 @@ impl ExecutionRouter {
         context: Option<&Value>,
         version_hint: Option<&str>,
         apcore_ctx: Option<&apcore::Context<Value>>,
-    ) -> (Vec<ContentItem>, bool, Option<String>) {
-        use tokio_stream::StreamExt;
-
+    ) -> StreamOutcome {
         let executor = match &self.executor {
             Some(e) => e,
             None => {
@@ -1873,27 +2015,53 @@ impl ExecutionRouter {
             }
         };
 
-        let stream = match executor.stream(tool_name, arguments, context, version_hint) {
-            Some(s) => s,
-            None => {
-                // Fallback to non-streaming
-                // `ApcoreExecutorAdapter` does not implement `stream`, so the
-                // real server always lands here — which is why the typed
-                // context has to be forwarded rather than dropped.
-                return self
-                    .handle_call_async_with_hint(
-                        tool_name,
-                        arguments,
-                        context,
-                        version_hint,
-                        apcore_ctx,
-                    )
-                    .await;
+        let legacy = Self::guard_stream(tool_name, async {
+            let stream = executor.stream(tool_name, arguments, context, version_hint)?;
+            Some(
+                self.consume_stream(
+                    tool_name,
+                    stream,
+                    None,
+                    Some((progress_token, send_notification)),
+                    context,
+                    apcore_ctx.and_then(|ctx| ctx.cancel_token.as_ref()),
+                )
+                .await,
+            )
+        })
+        .await;
+        if let Some(outcome) = legacy {
+            return outcome;
+        }
+        // Legacy custom executors may have neither streaming API.
+        self.handle_call_async_with_hint(tool_name, arguments, context, version_hint, apcore_ctx)
+            .await
+    }
+
+    async fn guard_stream(
+        tool_name: &str,
+        stream: impl std::future::Future<Output = Option<StreamOutcome>>,
+    ) -> Option<StreamOutcome> {
+        use futures::FutureExt;
+        match std::panic::AssertUnwindSafe(stream).catch_unwind().await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::error!(tool_name, "streaming executor panicked");
+                Some(Self::stream_error("Streaming executor panicked.".into()))
             }
-        };
+        }
+    }
 
-        tokio::pin!(stream);
-
+    async fn consume_stream(
+        &self,
+        tool_name: &str,
+        mut stream: StreamChunks<'_>,
+        completion: Option<StreamCompletionHandle>,
+        progress: Option<(&ProgressToken, &SendNotificationFn)>,
+        context: Option<&Value>,
+        cancel_token: Option<&CancelToken>,
+    ) -> StreamOutcome {
+        use tokio_stream::StreamExt;
         let mut accumulated = Value::Object(serde_json::Map::new());
         let mut chunk_index: usize = 0;
 
@@ -1906,46 +2074,63 @@ impl ExecutionRouter {
                     // the MCP client even though the final accumulated
                     // value is later redacted. Mirrors Python's
                     // _handle_stream invariant. [A-D-003]
-                    let safe_chunk = self.redact_output(tool_name, &chunk);
-
-                    // Send progress notification
-                    let notification = serde_json::json!({
-                        "method": "notifications/progress",
-                        "params": {
-                            "progressToken": progress_token_to_value(progress_token),
-                            "progress": chunk_index + 1,
-                            "total": null,
-                            "message": serde_json::to_string(&safe_chunk).unwrap_or_default(),
+                    if let Some((progress_token, send_notification)) = progress {
+                        let safe_chunk = self.redact_output(tool_name, &chunk);
+                        let notification = serde_json::json!({
+                            "method": "notifications/progress",
+                            "params": {
+                                "progressToken": progress_token_to_value(progress_token),
+                                "progress": chunk_index + 1,
+                                "total": null,
+                                "message": serde_json::to_string(&safe_chunk).unwrap_or_default(),
+                            }
+                        });
+                        let send = send_notification(notification);
+                        let sent = match cancel_token {
+                            Some(token) => tokio::select! {
+                                biased;
+                                // The sink can wait for queue capacity while the
+                                // Core stream is suspended between chunks.
+                                _ = token.cancelled() => {
+                                    return Self::stream_error(
+                                        "Streaming execution cancelled (EXECUTION_CANCELLED).".into(),
+                                    );
+                                }
+                                result = send => result,
+                            },
+                            None => send.await,
+                        };
+                        if let Err(e) = sent {
+                            tracing::debug!("Failed to send progress notification: {e}");
                         }
-                    });
-                    if let Err(e) = send_notification(notification).await {
-                        tracing::debug!("Failed to send progress notification: {e}");
                     }
 
-                    // Accumulate the original (un-redacted) chunk so the
-                    // final result still has full fidelity for redaction
-                    // at the response boundary; redaction is reapplied
-                    // there. The mid-stream notification is the leak
-                    // vector this fix closes.
-                    accumulated = deep_merge(&accumulated, &chunk, 0);
+                    // The local legacy policy is only for custom executors
+                    // without completion, never for a tracked Core stream.
+                    if completion.is_none() {
+                        accumulated = deep_merge(&accumulated, &chunk, 0);
+                    }
                     chunk_index += 1;
                 }
                 Some(Err(error)) => {
                     tracing::error!("handle_call stream error for {tool_name}: {error}");
                     let text = Self::build_error_text(&error);
-                    return (
-                        vec![ContentItem {
-                            content_type: "text".into(),
-                            data: Value::String(text),
-                        }],
-                        true,
-                        None,
-                    );
+                    return Self::stream_error(text);
                 }
                 None => break,
             }
         }
 
+        if let Some(completion) = completion {
+            let completion = completion.await;
+            if let Some(code) = Self::stream_completion_error(&completion) {
+                return Self::stream_error(format!("Streaming completion failed ({code})."));
+            }
+            let Some(output) = completion.output else {
+                return Self::stream_error("Streaming completion produced no output.".to_string());
+            };
+            accumulated = output;
+        }
         let redacted_accumulated = self.redact_output(tool_name, &accumulated);
         let text = self.format_result(&redacted_accumulated);
         let content = vec![ContentItem {
@@ -1957,6 +2142,48 @@ impl ExecutionRouter {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         (content, false, trace_id)
+    }
+
+    fn stream_completion_error(completion: &apcore::StreamCompletion) -> Option<&str> {
+        let step_failed = |step| {
+            matches!(
+                step,
+                StreamStepOutcome::Failed { .. }
+                    | StreamStepOutcome::Skipped {
+                        reason: StreamSkipReason::NotReached
+                    }
+            )
+        };
+        match completion.reason {
+            StreamEndReason::Completed if step_failed(completion.output_validation) => {
+                Some("SCHEMA_VALIDATION_ERROR")
+            }
+            StreamEndReason::Completed if step_failed(completion.middleware_after) => {
+                Some("MODULE_EXECUTE_ERROR")
+            }
+            StreamEndReason::Completed => None,
+            StreamEndReason::Cancelled | StreamEndReason::ConsumerClosed => {
+                Some("EXECUTION_CANCELLED")
+            }
+            StreamEndReason::TimedOut => Some("MODULE_TIMEOUT"),
+            StreamEndReason::Failed => Some(
+                completion
+                    .error_code
+                    .as_deref()
+                    .unwrap_or("MODULE_EXECUTE_ERROR"),
+            ),
+        }
+    }
+
+    fn stream_error(text: String) -> StreamOutcome {
+        (
+            vec![ContentItem {
+                content_type: "text".into(),
+                data: Value::String(text),
+            }],
+            true,
+            None,
+        )
     }
 }
 
@@ -3933,6 +4160,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_e2e_legacy_stream_panics_return_tool_error_without_reexecution() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct LegacyStream(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl Executor for LegacyStream {
+            async fn call_async(
+                &self,
+                _module_id: &str,
+                _inputs: &Value,
+                _context: Option<&Value>,
+                _version_hint: Option<&str>,
+            ) -> Result<Value, ExecutorError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(json!({"unexpected_fallback": true}))
+            }
+
+            fn stream(
+                &self,
+                _module_id: &str,
+                inputs: &Value,
+                _context: Option<&Value>,
+                _version_hint: Option<&str>,
+            ) -> Option<StreamResult> {
+                let first = futures::stream::iter([Ok(json!({"first": true}))]);
+                match inputs["panic"].as_str() {
+                    Some("poll") => Some(Box::pin(first.chain(futures::stream::poll_fn(|_| {
+                        panic!("legacy producer panic")
+                    })))),
+                    Some("open") => panic!("legacy stream opening panic"),
+                    _ => Some(Box::pin(first)),
+                }
+            }
+        }
+
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let router = ExecutionRouter::new(
+            Box::new(LegacyStream(Arc::clone(&fallback_calls))),
+            false,
+            None,
+        );
+        let (send, notifications) = make_send_notification();
+        let extra = || CallExtra {
+            progress_token: Some(ProgressToken::Integer(1)),
+            send_notification: Some(Arc::clone(&send)),
+            session: None,
+            identity: None,
+            typed_identity: None,
+        };
+        for phase in ["poll", "open"] {
+            let (content, is_error, _) = router
+                .handle_call_with_extra("mod", &json!({"panic": phase}), Some(extra()))
+                .await;
+            assert!(is_error, "{phase}");
+            assert!(content[0]
+                .data
+                .as_str()
+                .unwrap()
+                .contains("executor panicked"));
+        }
+        assert_eq!(notifications.lock().unwrap().len(), 1);
+
+        let (content, is_error, _) = router
+            .handle_call_with_extra("mod", &json!({}), Some(extra()))
+            .await;
+        assert!(!is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(content[0].data.as_str().unwrap()).unwrap(),
+            json!({"first": true})
+        );
+        assert_eq!(notifications.lock().unwrap().len(), 2);
+        assert_eq!(fallback_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn test_e2e_streaming_fallback_no_support() {
         // Executor without stream support falls back to non-streaming
         let (sn, captured) = make_send_notification();
@@ -4161,9 +4465,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_version_hint_flows_through() {
-        // [A-D-002 regression] Real MCP traffic carries the apcore version
-        // hint at extras._meta.apcore.version — not at extras.apcore.version.
-        // Verifies the `_meta` hop is honored in source #2 of the cascade.
+        // SDK callers can pass wrapped metadata as source #2 of the cascade.
         let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let exec = VersionHintCapturingExecutor {
             captured: Arc::clone(&captured),
@@ -4177,9 +4479,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_version_hint_ignores_top_level_apcore() {
-        // [A-D-002 regression] Confirms that putting the apcore stanza at
-        // the TOP level (legacy shape that pre-fix Rust accidentally accepted)
-        // is now correctly ignored — the cascade only honors `_meta.apcore.version`.
+        // Top-level apcore is a wire metadata field, normalized by ServerHandler.
         let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let exec = VersionHintCapturingExecutor {
             captured: Arc::clone(&captured),
@@ -4189,6 +4489,75 @@ mod tests {
         let (_content, is_error, _) = router.handle_call("mod", &json!({}), Some(&extras)).await;
         assert!(!is_error);
         assert_eq!(captured.lock().unwrap().clone(), None);
+    }
+
+    #[tokio::test]
+    async fn tools_call_forwards_the_documented_wire_version_hint() {
+        use crate::server::factory::MCPServerFactory;
+        use crate::server::server::ServerHandler;
+        use crate::server::transport::McpHandler;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let router = Arc::new(ExecutionRouter::new(
+            Box::new(VersionHintCapturingExecutor {
+                captured: Arc::clone(&captured),
+            }),
+            false,
+            None,
+        ));
+        let factory = MCPServerFactory::new();
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
+        factory.register_handlers(&mut server, vec![], router);
+        let options = factory.build_init_options(&server, "test", "1.0.0", None);
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+
+        for (metadata, expected) in [
+            (json!({"apcore": {"version": "^2.0"}}), Some("^2.0")),
+            (
+                json!({
+                    "apcore": {"version": "2.1.0"},
+                    "version_hint": "1.0.0",
+                    "versionHint": "1.1.0",
+                    "_meta": {"apcore": {"version": "1.2.0"}},
+                }),
+                Some("2.1.0"),
+            ),
+            (
+                json!({
+                    "version_hint": "1.0.0",
+                    "versionHint": "1.1.0",
+                    "_meta": {"apcore": {"version": "1.2.0"}},
+                }),
+                None,
+            ),
+            (json!({"apcore": {"version": 2}}), None),
+            (json!({"apcore": {"version": "1".repeat(65)}}), None),
+            (json!({"apcore": {"version": "2.0/3.0"}}), None),
+        ] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "demo.echo", "arguments": {}, "_meta": metadata},
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["result"]["isError"], false);
+            assert_eq!(captured.lock().unwrap().as_deref(), expected);
+        }
+
+        let result = server
+            .call_tool(
+                "demo.echo".into(),
+                json!({}),
+                Some(json!({
+                    "versionHint": "3.0.0",
+                    "_meta": {"apcore": {"version": "2.0.0"}},
+                })),
+            )
+            .unwrap()
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("3.0.0"));
     }
 
     // ==================================================================

@@ -18,6 +18,7 @@ import { ModuleIDNormalizer } from "../src/adapters/id-normalizer.js";
 
 interface ExpectedModule {
   module_id: string;
+  description?: string;
   mcp_tool_name?: string;
   openai_function_name?: string;
   mcp_annotations?: Record<string, boolean>;
@@ -109,6 +110,9 @@ describe("conformance: openapiBackend modules", () => {
       for (const want of c.expected_modules) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const descriptor = await (registry as any).getDefinition(want.module_id);
+        if (want.description !== undefined) {
+          expect(descriptor.description).toBe(want.description);
+        }
         if (want.mcp_tool_name) expect(want.module_id).toBe(want.mcp_tool_name);
         if (want.openai_function_name) {
           expect(NORMALIZER.normalize(want.module_id)).toBe(want.openai_function_name);

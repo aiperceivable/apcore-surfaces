@@ -6,6 +6,17 @@
 
 import { CircularRefError, MaxDepthExceededError, UnresolvableRefError } from "./errors.js";
 
+type StructuredOptionType = "object" | "array" | "null";
+
+export function structuredOptionTypes(schemaType: unknown): StructuredOptionType[] | undefined {
+  const types: unknown[] = Array.isArray(schemaType) ? schemaType : [schemaType];
+  if (!types.every((type): type is StructuredOptionType =>
+    type === "object" || type === "array" || type === "null") || !types.some(type => type !== "null")) {
+    return undefined;
+  }
+  return types;
+}
+
 // ---------------------------------------------------------------------------
 // resolveRefs
 // ---------------------------------------------------------------------------
@@ -150,6 +161,7 @@ function resolveNode(
         ? (obj.required as string[]).slice()
         : [];
       const allRequiredSets: Set<string>[] = [];
+      const branchTypes: unknown[] = [];
       for (const subSchema of obj[keyword] as unknown[]) {
         const resolved = resolveNode(
           subSchema,
@@ -159,6 +171,8 @@ function resolveNode(
           maxDepth,
           moduleId,
         ) as Record<string, unknown>;
+        const type = resolved.type;
+        branchTypes.push(...(Array.isArray(type) && type.length > 0 ? type : [type]));
         if (resolved.properties) {
           Object.assign(
             merged.properties as Record<string, unknown>,
@@ -195,6 +209,11 @@ function resolveNode(
         if (k !== keyword && !(k in merged)) {
           merged[k] = v;
         }
+      }
+      // Retain the JSON shape for CLI decoding. Core validates the original schema.
+      const types = structuredOptionTypes(branchTypes);
+      if (merged.type === undefined && types) {
+        merged.type = [...new Set(types)];
       }
       return merged;
     }

@@ -1,0 +1,421 @@
+name: Core candidate compatibility
+
+on:
+  workflow_call:
+    inputs:
+      core_run_id:
+        required: true
+        type: string
+      core_sha:
+        required: true
+        type: string
+      core_example_sha:
+        description: Core commit containing the matching Golden Path example
+        required: false
+        type: string
+      surfaces_sha:
+        required: true
+        type: string
+      rust_sha256:
+        required: false
+        type: string
+      python_sha256:
+        required: false
+        type: string
+      npm_sha256:
+        required: false
+        type: string
+    secrets:
+      APCORE_ARTIFACT_READ_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: Expected Core commit, when supplied
+        required: false
+        type: string
+      core_example_sha:
+        description: Core commit containing the matching Golden Path example
+        required: false
+        type: string
+      core_run_id:
+        description: Successful APCore Core distribution verification run ID
+        required: true
+        type: string
+      rust_sha256:
+        description: Expected SHA-256 of the Rust candidate crate, when supplied
+        required: false
+        type: string
+      python_sha256:
+        description: Expected SHA-256 of the Python wheel, when supplied
+        required: false
+        type: string
+      npm_sha256:
+        description: Expected SHA-256 of the Node tarball, when supplied
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify-source:
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.source.outputs.head_sha }}
+      example_sha: ${{ steps.source.outputs.example_sha }}
+      run_id: ${{ steps.source.outputs.run_id }}
+    steps:
+      - name: Verify the upstream package run
+        id: source
+        shell: bash
+        env:
+          CORE_RUN_ID: ${{ inputs.core_run_id }}
+          EXPECTED_CORE_SHA: ${{ inputs.core_sha }}
+          EXPECTED_EXAMPLE_SHA: ${{ inputs.core_example_sha }}
+          GH_TOKEN: ${{ secrets.APCORE_ARTIFACT_READ_TOKEN || github.token }}
+        run: |
+          if [[ ! "$CORE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "core_run_id must be a numeric APCore workflow run ID." >&2
+            exit 1
+          fi
+          run=$(gh api "repos/aiperceivable/apcore/actions/runs/$CORE_RUN_ID")
+          if ! head_sha=$(jq -er '
+            select(
+              .conclusion == "success" and
+              .path == ".github/workflows/packages.yml" and
+              .head_repository.full_name == "aiperceivable/apcore" and
+              (.event == "push" or .event == "workflow_dispatch")
+            ) | .head_sha | select(test("^[0-9a-f]{40}$"))
+          ' <<< "$run"); then
+            echo "Choose a successful push or manual Core distribution verification run from aiperceivable/apcore." >&2
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_CORE_SHA" && "$head_sha" != "$EXPECTED_CORE_SHA" ]]; then
+            echo "The Core run did not build the reviewed alpha.1 commit." >&2
+            exit 1
+          fi
+          example_sha="${EXPECTED_EXAMPLE_SHA:-$head_sha}"
+          if [[ ! "$example_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "core_example_sha must be a full commit SHA." >&2
+            exit 1
+          fi
+          printf 'head_sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
+          printf 'example_sha=%s\n' "$example_sha" >> "$GITHUB_OUTPUT"
+          printf 'run_id=%s\n' "$CORE_RUN_ID" >> "$GITHUB_OUTPUT"
+          printf 'APCore package run %s at %s\n' "$CORE_RUN_ID" "$head_sha"
+
+  python:
+    name: Python / ${{ matrix.component }} / ${{ matrix.core }}
+    needs: verify-source
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [toolkit, mcp, a2a, cli]
+        core: [minimum, candidate]
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}/python
+    env:
+      CORE_MODE: ${{ matrix.core }}
+      COMPONENT: ${{ matrix.component }}
+      CORE_HEAD_SHA: ${{ needs.verify-source.outputs.head_sha }}
+      APCORE_A2A_REQUIRE_RELIABLE_DELIVERY: ${{ matrix.core == 'candidate' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aiperceivable/apcore-surfaces
+          ref: ${{ inputs.surfaces_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: matrix.core == 'candidate'
+        with:
+          repository: aiperceivable/apcore
+          run-id: ${{ needs.verify-source.outputs.run_id }}
+          github-token: ${{ secrets.APCORE_ARTIFACT_READ_TOKEN || github.token }}
+          name: core-python-distributions
+          path: ${{ runner.temp }}/apcore-wheel
+      - name: Install and verify the selected Core and local Toolkit
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ inputs.python_sha256 }}
+        run: |
+          core="apcore==0.33.0"
+          if [[ "$CORE_MODE" == candidate ]]; then
+            shopt -s nullglob
+            wheels=("$RUNNER_TEMP"/apcore-wheel/apcore-*.whl)
+            if (( ${#wheels[@]} != 1 )); then
+              echo "Expected exactly one APCore wheel." >&2
+              exit 1
+            fi
+            core="${wheels[0]}"
+            digest=$(sha256sum "$core" | cut -d ' ' -f 1)
+            printf 'APCore %s wheel SHA-256 %s %s\n' "$CORE_HEAD_SHA" "$digest" "$core"
+            expected=$(printf '%s' "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')
+            if [[ -n "$expected" && "$digest" != "$expected" ]]; then
+              echo "The APCore wheel SHA-256 differs from the expected digest." >&2
+              exit 1
+            fi
+          fi
+          args=(-e '.[dev]')
+          if [[ "$COMPONENT" != toolkit ]]; then
+            args+=(-e "$GITHUB_WORKSPACE/toolkit/python[http-proxy]")
+          fi
+          if [[ "$COMPONENT" == a2a ]]; then
+            args+=(aiohttp)
+          fi
+          if [[ -f constraints.txt ]]; then
+            args+=(-c constraints.txt)
+          fi
+          python -m pip install "$core" "${args[@]}"
+          python -m pip check
+          CORE_INSTALL="$core" python - <<'PY'
+          import json
+          import os
+          from importlib.metadata import distribution, version
+          from pathlib import Path
+
+          import apcore
+          import apcore_toolkit
+          from apcore import APCore, Executor
+          from apcore.events import CircuitBreakerWrapper
+
+          installed = distribution("apcore")
+          core_path = Path(apcore.__file__).resolve()
+          toolkit_path = Path(apcore_toolkit.__file__).resolve()
+          toolkit_expected = Path(os.environ["GITHUB_WORKSPACE"]) / "toolkit/python/src/apcore_toolkit/__init__.py"
+          print(f"apcore {installed.version} {core_path}")
+          print(f"apcore-toolkit {version('apcore-toolkit')} {toolkit_path}")
+          assert core_path == installed.locate_file("apcore/__init__.py").resolve()
+          assert toolkit_path == toolkit_expected.resolve()
+          if os.environ["CORE_MODE"] == "candidate":
+              assert installed.version == "1.0.0a1"
+              origin = json.loads(installed.read_text("direct_url.json") or "{}")
+              assert origin.get("url") == Path(os.environ["CORE_INSTALL"]).resolve().as_uri()
+              assert callable(getattr(Executor, "stream_with_completion", None))
+              assert callable(getattr(APCore, "stream_with_completion", None))
+              assert hasattr(CircuitBreakerWrapper, "retry")
+          else:
+              assert installed.version == "0.33.0"
+          PY
+      - run: ruff check src/ tests/
+      - run: python -m pytest
+      - name: Build and install the MCP wheel for the Golden Path
+        if: matrix.component == 'mcp' && matrix.core == 'candidate'
+        run: |
+          python -m pip install build
+          python -m build --wheel --outdir "$RUNNER_TEMP/surface-wheel"
+          python -m pip install --force-reinstall --no-deps "$RUNNER_TEMP"/surface-wheel/*.whl
+          python -m pip check
+      - name: Check out the pinned Core Golden Path
+        if: matrix.component == 'mcp' && matrix.core == 'candidate'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aiperceivable/apcore
+          ref: ${{ needs.verify-source.outputs.example_sha }}
+          path: core-source
+          persist-credentials: false
+      - name: Verify the Python Golden Path with the installed packages
+        if: matrix.component == 'mcp' && matrix.core == 'candidate'
+        working-directory: core-source/examples/python/golden-path
+        run: python verify.py
+
+  typescript:
+    name: TypeScript / ${{ matrix.component }} / ${{ matrix.core }}
+    needs: verify-source
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [toolkit, mcp, a2a, cli]
+        core: [minimum, candidate]
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}/typescript
+    env:
+      CORE_MODE: ${{ matrix.core }}
+      COMPONENT: ${{ matrix.component }}
+      CORE_HEAD_SHA: ${{ needs.verify-source.outputs.head_sha }}
+      APCORE_A2A_REQUIRE_RELIABLE_DELIVERY: ${{ matrix.core == 'candidate' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aiperceivable/apcore-surfaces
+          ref: ${{ inputs.surfaces_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: '10.30.1'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: matrix.core == 'candidate'
+        with:
+          repository: aiperceivable/apcore
+          run-id: ${{ needs.verify-source.outputs.run_id }}
+          github-token: ${{ secrets.APCORE_ARTIFACT_READ_TOKEN || github.token }}
+          name: core-npm-distribution
+          path: ${{ runner.temp }}/apcore-npm
+      - name: Build with the selected Core and local Toolkit
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ inputs.npm_sha256 }}
+        run: |
+          toolkit="$GITHUB_WORKSPACE/toolkit/typescript"
+          roots=("$PWD")
+          if [[ "$COMPONENT" == toolkit ]]; then
+            pnpm install --frozen-lockfile
+          else
+            pnpm --dir "$toolkit" install --frozen-lockfile
+            # The release lock refers to the registry package. Test the candidate
+            # sources before that package is published by using a local override.
+            TOOLKIT="$toolkit" node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+
+          const file = 'package.json';
+          const manifest = JSON.parse(readFileSync(file, 'utf8'));
+          manifest.pnpm ??= {};
+          manifest.pnpm.overrides ??= {};
+          manifest.pnpm.overrides['apcore-toolkit'] = 'link:' + process.env.TOOLKIT;
+          writeFileSync(file, JSON.stringify(manifest, null, 2) + '\n');
+          JS
+            pnpm install --no-frozen-lockfile
+            roots+=("$toolkit")
+          fi
+          core_package="apcore-js@0.33.0"
+          if [[ "$CORE_MODE" == candidate ]]; then
+            shopt -s nullglob
+            archives=("$RUNNER_TEMP"/apcore-npm/apcore-js-*.tgz)
+            if (( ${#archives[@]} != 1 )); then
+              echo "Expected exactly one APCore npm archive." >&2
+              exit 1
+            fi
+            archive="${archives[0]}"
+            digest=$(sha256sum "$archive" | cut -d ' ' -f 1)
+            printf 'APCore %s npm SHA-256 %s %s\n' "$CORE_HEAD_SHA" "$digest" "$archive"
+            expected=$(printf '%s' "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')
+            if [[ -n "$expected" && "$digest" != "$expected" ]]; then
+              echo "The APCore npm SHA-256 differs from the expected digest." >&2
+              exit 1
+            fi
+            core_package="$archive"
+          fi
+          installed=$(mktemp -d)
+          npm install --prefix "$installed" --ignore-scripts --no-save --no-package-lock --no-audit --no-fund "$core_package"
+          core_root="$installed/node_modules/apcore-js"
+          for root in "${roots[@]}"; do
+            rm -f "$root/node_modules/apcore-js"
+            ln -s "$core_root" "$root/node_modules/apcore-js"
+          done
+          if [[ "$COMPONENT" != toolkit ]]; then
+            pnpm --dir "$toolkit" build
+          fi
+          pnpm build
+          for root in "${roots[@]}"; do
+            (
+              cd "$root"
+              CORE_ROOT="$core_root" TOOLKIT_ROOT="$toolkit" node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync, realpathSync } from 'node:fs';
+          import { resolve, sep } from 'node:path';
+          import { fileURLToPath } from 'node:url';
+          import { APCore, Executor } from 'apcore-js';
+
+          const core = realpathSync('./node_modules/apcore-js');
+          const coreEntry = realpathSync(fileURLToPath(import.meta.resolve('apcore-js')));
+          const toolkitEntry = realpathSync(fileURLToPath(import.meta.resolve('apcore-toolkit')));
+          const coreVersion = JSON.parse(readFileSync(resolve(core, 'package.json'), 'utf8')).version;
+          const toolkitVersion = JSON.parse(readFileSync(resolve(process.env.TOOLKIT_ROOT, 'package.json'), 'utf8')).version;
+          console.log(`apcore-js ${coreVersion} ${coreEntry}`);
+          console.log(`apcore-toolkit ${toolkitVersion} ${toolkitEntry}`);
+          assert.equal(core, realpathSync(process.env.CORE_ROOT));
+          assert.ok(coreEntry.startsWith(core + sep));
+          assert.equal(toolkitEntry, realpathSync(resolve(process.env.TOOLKIT_ROOT, 'dist/index.js')));
+          if (process.env.CORE_MODE === 'candidate') {
+            assert.equal(coreVersion, '1.0.0-alpha.1');
+            assert.equal(typeof Executor.prototype.streamWithCompletion, 'function');
+            assert.equal(typeof APCore.prototype.streamWithCompletion, 'function');
+          } else {
+            assert.equal(coreVersion, '0.33.0');
+          }
+          JS
+            )
+          done
+      - run: pnpm lint
+        if: matrix.component != 'toolkit'
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  rust:
+    name: Rust / ${{ matrix.component }} / ${{ matrix.core }}
+    needs: verify-source
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [toolkit, mcp, a2a, cli]
+        core: [minimum, candidate]
+        # For C2-required packages, the first alpha is both the minimum and
+        # the current candidate. The candidate entry covers both.
+        exclude:
+          - component: mcp
+            core: minimum
+          - component: cli
+            core: minimum
+    env:
+      CORE_MODE: ${{ matrix.core }}
+      COMPONENT: ${{ matrix.component }}
+      APCORE_A2A_REQUIRE_RELIABLE_DELIVERY: ${{ matrix.core == 'candidate' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aiperceivable/apcore-surfaces
+          ref: ${{ inputs.surfaces_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: matrix.core == 'candidate'
+        with:
+          repository: aiperceivable/apcore
+          run-id: ${{ needs.verify-source.outputs.run_id }}
+          github-token: ${{ secrets.APCORE_ARTIFACT_READ_TOKEN || github.token }}
+          name: core-rust-distribution
+          path: ${{ runner.temp }}/apcore-crate
+      - name: Verify resolution and run real Executor tests
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ inputs.rust_sha256 }}
+        run: |
+          if [[ "$CORE_MODE" == minimum ]]; then
+            python scripts/verify-rust-core-candidate.py "$COMPONENT" 0.33.0
+            exit 0
+          fi
+          shopt -s nullglob
+          crates=("$RUNNER_TEMP"/apcore-crate/apcore-*.crate)
+          if (( ${#crates[@]} != 1 )); then
+            echo "Expected exactly one APCore crate." >&2
+            exit 1
+          fi
+          crate="${crates[0]}"
+          version="${crate##*/apcore-}"
+          version="${version%.crate}"
+          if [[ "$version" != 1.0.0-alpha.1 ]]; then
+            echo "Expected the alpha.1 Core crate." >&2
+            exit 1
+          fi
+          if [[ "$CORE_MODE" == candidate && -n "$EXPECTED_SHA256" ]]; then
+            digest=$(sha256sum "$crate" | cut -d ' ' -f 1)
+            [[ "$digest" == "${EXPECTED_SHA256,,}" ]]
+          fi
+          python scripts/verify-rust-core-candidate.py "$COMPONENT" "$version" --archive "$crate"

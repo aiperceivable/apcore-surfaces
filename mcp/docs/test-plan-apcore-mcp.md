@@ -3381,8 +3381,8 @@ Uses real apcore modules from `examples/extensions/` (greeting, math_calc, text_
 
 | ID | Description | Input | Expected Result | Traces to |
 |----|-------------|-------|-----------------|-----------|
-| TC-APPROVAL-010 | APPROVAL_PENDING narrows to approvalId | Error with `{approval_id: "abc"}` | `details: {approvalId: "abc"}` | FR-APPROVAL-002 |
-| TC-APPROVAL-011 | APPROVAL_PENDING snake_case fallback (TS) | Error with `{approval_id: "xyz"}` | `details: {approvalId: "xyz"}` | FR-APPROVAL-002 |
+| TC-APPROVAL-010 | APPROVAL_PENDING uses credential-free error formatting | A pending result carrying a private resume token | Generic error formatting emits the pending status. Only the initiating tool result includes the token in `_meta.apcore.approval`. | FR-APPROVAL-002 |
+| TC-APPROVAL-011 | A resolved approval authorizes one invocation | Two retries using the approved grant and its original invocation scope | One invocation executes. The status response carries the public approval record ID. | FR-APPROVAL-002 |
 | TC-APPROVAL-012 | APPROVAL_PENDING without ID → null details | Error with `{other: "data"}` | `details: null` | FR-APPROVAL-002 |
 | TC-APPROVAL-013 | APPROVAL_TIMEOUT marked retryable | Error code APPROVAL_TIMEOUT | `retryable: true` | FR-APPROVAL-002 |
 | TC-APPROVAL-014 | APPROVAL_DENIED extracts reason | Error with `{reason: "Denied"}` | `details: {reason: "Denied"}` | FR-APPROVAL-002 |

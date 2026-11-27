@@ -1,0 +1,58 @@
+{
+  "description": "Generated object and array options decode JSON before schema validation and execution",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "filters": { "type": "object" },
+      "labels": { "type": "array", "items": { "type": "string" } },
+      "note": { "type": "string" },
+      "maybe_filters": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
+      "maybe_labels": { "oneOf": [{ "type": "array", "items": { "type": "string" } }, { "type": "null" }] },
+      "nullable_labels": { "type": ["array", "null"], "items": { "type": "string" } },
+      "no_labels": { "type": "array", "items": { "type": "string" } }
+    },
+    "required": ["filters", "labels"]
+  },
+  "test_cases": [
+    {
+      "id": "objects_and_arrays",
+      "args": ["--filters", "{\"active\":true,\"limit\":3}", "--labels", "[\"a\",\"b\"]", "--note", "{\"literal\":true}"],
+      "expected": { "exit_code": 0, "calls": 1, "input": { "filters": { "active": true, "limit": 3 }, "labels": ["a", "b"], "note": "{\"literal\":true}" } }
+    },
+    {
+      "id": "empty_collections",
+      "args": ["--filters", "{}", "--labels", "[]"],
+      "expected": { "exit_code": 0, "calls": 1, "input": { "filters": {}, "labels": [] } }
+    },
+    {
+      "id": "nullable_structured_values",
+      "args": ["--filters", "{}", "--labels", "[]", "--maybe-filters", "{\"enabled\":true}", "--maybe-labels", "[\"choice\"]", "--nullable-labels", "[\"direct\"]"],
+      "expected": { "exit_code": 0, "calls": 1, "input": { "filters": {}, "labels": [], "maybe_filters": { "enabled": true }, "maybe_labels": ["choice"], "nullable_labels": ["direct"] } }
+    },
+    {
+      "id": "explicit_null_for_nullable_structured_flags",
+      "args": ["--filters", "{}", "--labels", "[]", "--maybe-filters", "null", "--maybe-labels", "null", "--nullable-labels", "null"],
+      "expected": { "exit_code": 0, "calls": 1, "input": { "filters": {}, "labels": [], "maybe_filters": null, "maybe_labels": null, "nullable_labels": null } }
+    },
+    {
+      "id": "no_prefix_is_part_of_the_property_name",
+      "args": ["--filters", "{}", "--labels", "[\"always\"]", "--no-labels", "[\"separate\"]"],
+      "expected": { "exit_code": 0, "calls": 1, "input": { "filters": {}, "labels": ["always"], "no_labels": ["separate"] } }
+    },
+    {
+      "id": "malformed_object",
+      "args": ["--filters", "{", "--labels", "[]"],
+      "expected": { "exit_code": 45, "calls": 0 }
+    },
+    {
+      "id": "wrong_container_type",
+      "args": ["--filters", "[]", "--labels", "[]"],
+      "expected": { "exit_code": 45, "calls": 0 }
+    },
+    {
+      "id": "wrong_array_items",
+      "args": ["--filters", "{}", "--labels", "[17]"],
+      "expected": { "exit_code": 45, "calls": 0 }
+    }
+  ]
+}

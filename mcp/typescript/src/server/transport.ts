@@ -14,6 +14,7 @@ import { bindStdioWork, withStdioOutput } from "./stdio-output.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { hasApprovalReplies } from "../approval-reply.js";
 import type { Authenticator } from "../auth/types.js";
 import { identityStorage } from "../auth/storage.js";
 
@@ -508,7 +509,7 @@ export class TransportManager {
         rejectClosed(error);
         void closeTransport().catch(() => {});
       };
-      transport.onerror = (error) => { console.error("MCP stdio transport error:", error); };
+      transport.onerror = () => { console.error("MCP stdio transport error"); };
       let transportClosed = false;
       transport.onclose = () => {
         if (transportClosed) return;
@@ -628,6 +629,7 @@ export class TransportManager {
     server: Server,
     options: HttpTransportOptions,
   ): Promise<void> {
+    if (hasApprovalReplies(server)) throw new Error("Phase B is unavailable on the legacy SSE transport");
     this._validateHostPort(options.host, options.port);
 
     const endpoint = options.endpoint ?? "/sse";

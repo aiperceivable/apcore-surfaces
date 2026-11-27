@@ -34,6 +34,8 @@ import type { HandleCallExtra } from "./router.js";
 import { buildTraceparent } from "./trace-context.js";
 import { APCORE_META_TOOL_PREFIX, AsyncTaskBridge } from "./async-task-bridge.js";
 import { ApprovalBridge } from "./approval-bridge.js";
+import { isApprovalResumeToken } from "../adapters/approval.js";
+import { enableApprovalReplies, type ApprovalReplyCapture, type PendingApprovalReply } from "../approval-reply.js";
 import {
   isMarkdownAvailable,
   primeMarkdownToolkit,
@@ -626,7 +628,8 @@ export class MCPServerFactory {
     observeStdioWork(server);
     // [D11-014] If asyncTaskBridge is provided, extend tools list with meta-tools.
     const bridge = options?.asyncTaskBridge;
-    const approvalBridge = options?.approvalBridge;
+    const approvalBridge = options?.approvalBridge?.available ? options.approvalBridge : undefined;
+    if (approvalBridge) enableApprovalReplies(server);
     let allTools: Tool[] = bridge ? this.attachAsyncMetaTools(tools, bridge) : tools;
 
     // Append approval bridge meta-tools if present.
@@ -674,6 +677,16 @@ export class MCPServerFactory {
       };
 
       const reqMeta = (request.params as { _meta?: Record<string, unknown> })._meta;
+      if (reqMeta && Object.hasOwn(reqMeta, "approvalId")) {
+        const token = reqMeta["approvalId"];
+        if (!approvalBridge || ApprovalBridge.isMetaTool(name) || !isApprovalResumeToken(token)) {
+          throw new McpError(ErrorCode.InvalidParams, "Invalid or unsupported approval resume metadata");
+        }
+        handleCallExtra.approvalResumeToken = token;
+      }
+      if (Object.hasOwn(toolArgs, "_approval_token")) {
+        throw new McpError(ErrorCode.InvalidParams, "Use request metadata for approval resumption");
+      }
       const apcoreMeta = reqMeta?.["apcore"] as { version?: string } | undefined;
       if (apcoreMeta?.version) {
         handleCallExtra._meta = {
@@ -712,23 +725,34 @@ export class MCPServerFactory {
       // Dispatch to approval bridge meta-tool if applicable (AFTER async bridge,
       // BEFORE the async-hint route in router.handleCall).
       if (approvalBridge && ApprovalBridge.isMetaTool(name)) {
-        const [apContent, apIsError] = await approvalBridge.handleMetaTool(name, toolArgs);
+        const [apContent, apIsError] = await approvalBridge.handleMetaTool(name, toolArgs, handleCallExtra.identity ?? null);
         const apTextContents = apContent.map(c => ({ type: "text" as const, text: c.text }));
         return { content: apTextContents, ...(apIsError ? { isError: true } : {}) };
       }
 
-      const [content, isError, traceId] = await router.handleCall(
-        name,
-        toolArgs,
-        handleCallExtra,
-      );
-
+      const reply: ApprovalReplyCapture | undefined = approvalBridge
+        ? { moduleId: name, confirmed: false }
+        : undefined;
+      handleCallExtra.approvalReply = reply;
+      let approval: PendingApprovalReply | undefined;
+      let callResult: Awaited<ReturnType<ExecutionRouter["handleCall"]>>;
+      try {
+        callResult = await router.handleCall(name, toolArgs, handleCallExtra);
+        if (reply?.confirmed) approval = reply.candidate;
+      } finally {
+        if (reply) delete reply.candidate;
+      }
+      const [content, isError, traceId] = callResult;
       const textContents = content.map(c => ({ type: "text" as const, text: c.text }));
 
       // Tool execution failures are successful JSON-RPC responses carrying
       // isError. Throwing here turns them into protocol-level internal errors.
       if (isError) {
-        return { content: textContents, isError: true };
+        return {
+          content: textContents,
+          isError: true,
+          ...(approval ? { _meta: { apcore: { approval } } } : {}),
+        };
       }
 
       const result: CallToolResult & { _meta?: Record<string, unknown> } = {

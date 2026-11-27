@@ -156,3 +156,45 @@ describe("InMemoryApprovalStore", () => {
     expect(Object.keys(rec!)).toEqual(["status", "moduleId", "reason", "createdAt", "resolvedAt"]);
   });
 });
+
+describe("scoped approval storage", () => {
+  const scope = {
+    principal: { type: "user", id: "operator" },
+    callerId: null,
+    moduleId: "test.confirm",
+    argumentsDigest: "a".repeat(64),
+  };
+  const verifier = "b".repeat(64);
+  const id = "00000000-0000-4000-8000-000000000000";
+
+  it("matches a trusted scope and consumes an approved grant once", async () => {
+    const store = new InMemoryApprovalStore();
+    await store.saveScopedPending(id, verifier, scope);
+    expect(await store.getScopedResult(id, { type: "user", id: "another" })).toBeNull();
+    expect(await store.getScopedResult(id, scope.principal)).toMatchObject({ status: "pending" });
+    expect(await store.consumeScoped(id, verifier, scope)).toMatchObject({ status: "pending" });
+    await store.resolve(id, { approved: true });
+    expect(await store.consumeScoped(id, verifier, { ...scope, argumentsDigest: "c".repeat(64) })).toBeNull();
+    const results = await Promise.all([
+      store.consumeScoped(id, verifier, scope),
+      store.consumeScoped(id, verifier, scope),
+    ]);
+    expect(results).toEqual([expect.objectContaining({ status: "approved" }), null]);
+    expect(await store.getScopedResult(id, scope.principal)).toMatchObject({ status: "approved" });
+    expect(Object.keys((await store.getResult(id)) ?? {})).not.toContain("verifier");
+  });
+
+  it("rejects expired records synchronously even before sweeping", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new InMemoryApprovalStore({ pendingTtlMs: 100, resolvedTtlMs: 25 });
+      await store.saveScopedPending(id, verifier, scope);
+      await store.resolve(id, { approved: true });
+      vi.setSystemTime(Date.now() + 26);
+      expect(await store.consumeScoped(id, verifier, scope)).toBeNull();
+      expect(await store.getScopedResult(id, scope.principal)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

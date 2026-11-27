@@ -29,7 +29,7 @@ from apcore_mcp.apcore_mcp import APCoreMCP
 from apcore_mcp.apcore_mcp import (
     _load_config_bus_overrides as _load_config_bus_overrides,  # noqa: F401 - re-export for tests
 )
-from apcore_mcp.approval_store import ApprovalStore, InMemoryApprovalStore
+from apcore_mcp.approval_store import ApprovalScope, ApprovalStore, InMemoryApprovalStore, ScopedApprovalStore
 from apcore_mcp.auth import (
     Authenticator,
     AuthMiddleware,
@@ -83,8 +83,10 @@ __all__ = [
     "META_TOOL_NAMES",
     "APCORE_META_TOOL_PREFIX",
     # ApprovalStore and Phase B polling
+    "ApprovalScope",
     "ApprovalStore",
     "InMemoryApprovalStore",
+    "ScopedApprovalStore",
     "StorageBackedApprovalHandler",
     "ApprovalBridge",
     "APPROVAL_META_TOOL_NAMES",

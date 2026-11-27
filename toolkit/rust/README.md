@@ -321,6 +321,40 @@ print!("{}", format_csv(&rows, true));
 
 See `apcore-toolkit/docs/features/formatting.md` § Tabular Formats for the full contract and `apcore-toolkit/conformance/fixtures/format_csv.json` / `format_jsonl.json` for the shared cross-SDK test corpus.
 
+### Prometheus HTTP listener
+
+Enable the `prometheus-server` feature to serve Core metrics and health probes.
+Pass a renderer backed by your application's existing collectors. The bound
+handle reports its address and provides an async `close()` that stops accepting
+connections before draining in-flight responses. The drain timeout covers
+asynchronous connection I/O. The renderer and readiness callback run on the
+Tokio runtime and must return without blocking.
+
+```rust
+use std::{io, net::SocketAddr};
+
+use apcore::{render_prometheus_metrics, MetricsCollector, UsageCollector};
+use apcore_toolkit::{PrometheusServer, PrometheusServerHandle};
+
+async fn listen_for_scrapes(
+    address: SocketAddr,
+    metrics: MetricsCollector,
+    usage: UsageCollector,
+) -> io::Result<PrometheusServerHandle> {
+    PrometheusServer::new(move || render_prometheus_metrics(&metrics, Some(&usage)))
+        .with_readiness(|| true)
+        .listen(address)
+        .await
+}
+```
+
+A GET serves `/metrics` by default, `/healthz` for liveness, and `/readyz` for
+the supplied readiness callback. Set a different scrape path with
+`with_metrics_path`. Query parameters do not affect endpoint selection.
+Readiness defaults to false. Older Core versions can supply a callback that
+invokes `PrometheusExporter::export()` on their existing exporter, with the
+Toolkit handle owning the listener.
+
 ## Requirements
 
 - See `Cargo.toml` for full dependency list
@@ -330,6 +364,7 @@ See `apcore-toolkit/docs/features/formatting.md` § Tabular Formats for the full
 | Feature | Description |
 |---------|-------------|
 | `http-proxy` | **Enabled by default.** Provides `HTTPProxyRegistryWriter` (adds the `reqwest` dependency). Disable with `default-features = false` for a leaner build. |
+| `prometheus-server` | **Opt-in.** Provides a Tokio HTTP listener for Prometheus metrics and health probes. |
 
 ## Documentation
 

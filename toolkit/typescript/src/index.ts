@@ -259,3 +259,6 @@ import type { ModuleAnnotations } from 'apcore-js';
 export function inferAnnotationsFromMethod(method: string): ModuleAnnotations {
   return _BaseScanner.inferAnnotationsFromMethod(method);
 }
+
+export { createPrometheusServer } from './prometheus-server.js';
+export type { PrometheusServerOptions } from './prometheus-server.js';

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -510,8 +511,8 @@ class TestEM3UserFixablePassthrough:
         assert result["errorType"] == "APPROVAL_TIMEOUT"
         assert result["retryable"] is True
 
-    def test_approval_pending_includes_approval_id(self, mapper: ErrorMapper) -> None:
-        """APPROVAL_PENDING includes approvalId in details (camelCase output)."""
+    def test_approval_pending_hides_the_core_resume_credential(self, mapper: ErrorMapper) -> None:
+        """A generic pending error does not serialize the credential."""
         error = ModuleError(
             code="APPROVAL_PENDING",
             message="Awaiting approval",
@@ -521,7 +522,20 @@ class TestEM3UserFixablePassthrough:
 
         assert result["isError"] is True
         assert result["errorType"] == "APPROVAL_PENDING"
-        assert result["details"]["approvalId"] == "apr-123"
+        assert result["details"] is None
+        assert "apr-123" not in str(result)
+
+    def test_scoped_pending_error_includes_only_its_public_audit_id(self, mapper: ErrorMapper) -> None:
+        from apcore.errors import ApprovalPendingError
+
+        record_id = "c5b92219-e067-485a-9752-d09cd362588d"
+        error = ApprovalPendingError(
+            result=SimpleNamespace(approval_id="confidential-synthetic-credential", audit_id=record_id),
+            module_id="example.report",
+        )
+        result = mapper.to_mcp_error(error)
+        assert result["details"] == {"approvalId": record_id}
+        assert "confidential-synthetic-credential" not in str(result)
 
     def test_approval_pending_without_approval_id_has_none_details(self, mapper: ErrorMapper) -> None:
         """APPROVAL_PENDING without approval_id narrows details to None."""

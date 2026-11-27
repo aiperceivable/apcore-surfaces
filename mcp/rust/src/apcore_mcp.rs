@@ -20,7 +20,7 @@ use crate::converters::openai::OpenAIConverter;
 use crate::explorer::{create_explorer_mount, ExplorerConfig, ToolInfo};
 use crate::server::factory::MCPServerFactory;
 use crate::server::listener::RegistryListener;
-use crate::server::router::{ExecutionRouter, ExecutorError, OutputFormatter};
+use crate::server::router::{CompletedStream, ExecutionRouter, ExecutorError, OutputFormatter};
 use crate::server::server::{MCPServer, ServerHandler};
 use crate::server::transport::{MetricsExporter, TransportManager};
 use crate::server::types::{InitializationOptions, Tool};
@@ -262,9 +262,36 @@ impl crate::server::router::Executor for ApcoreExecutorAdapter {
             .await
             .map_err(|e| ExecutorError::Execution {
                 code: format!("{:?}", e.code),
-                message: e.to_string(),
+                message: crate::server::approval_bridge::safe_execution_message(&e),
                 details: None,
             })
+    }
+
+    fn stream_with_completion<'a>(
+        &'a self,
+        module_id: &str,
+        inputs: &Value,
+        context: &apcore::Context<Value>,
+        version_hint: Option<&str>,
+    ) -> Option<CompletedStream<'a>> {
+        use tokio_stream::StreamExt;
+
+        let module = self.inner.registry().get(module_id).ok()??;
+        module.as_streaming()?;
+        let (chunks, completion) = self.inner.stream_with_completion(
+            module_id,
+            inputs.clone(),
+            Some(context),
+            version_hint,
+        );
+        let chunks = chunks.map(|item| {
+            item.map_err(|error| ExecutorError::Execution {
+                code: error.code.wire_str(),
+                message: crate::server::approval_bridge::safe_execution_message(&error),
+                details: None,
+            })
+        });
+        Some((Box::pin(chunks), completion))
     }
 
     async fn call_with_trace(
@@ -291,7 +318,7 @@ impl crate::server::router::Executor for ApcoreExecutorAdapter {
             }
             Err(e) => Err(ExecutorError::Execution {
                 code: format!("{:?}", e.code),
-                message: e.to_string(),
+                message: crate::server::approval_bridge::safe_execution_message(&e),
                 details: None,
             }),
         })
@@ -320,7 +347,7 @@ impl crate::server::router::Executor for ApcoreExecutorAdapter {
     ) -> Option<Result<(Value, Option<Value>), ExecutorError>> {
         let to_executor_error = |e: apcore::errors::ModuleError| ExecutorError::Execution {
             code: format!("{:?}", e.code),
-            message: e.to_string(),
+            message: crate::server::approval_bridge::safe_execution_message(&e),
             details: None,
         };
         if want_trace {
@@ -578,10 +605,14 @@ impl APCoreMCP {
         // `__apcore_approval_check` meta-tool so MCP clients can poll the
         // status of pending approval requests.
         let approval_bridge = self.approval_handler.as_ref().map(|handler| {
-            MCPServerFactory::append_approval_meta_tools(&mut tools);
-            Arc::new(crate::server::approval_bridge::ApprovalBridge::new(
-                Arc::clone(handler),
-            ))
+            let bridge = crate::server::approval_bridge::ApprovalBridge::new(Arc::clone(handler));
+            let bridge = if let Some(store) = &self.approval_store {
+                MCPServerFactory::append_approval_meta_tools(&mut tools);
+                bridge.with_store(Arc::clone(store))
+            } else {
+                bridge
+            };
+            Arc::new(bridge)
         });
 
         // Create execution router backed by the real apcore Executor, and
@@ -885,6 +916,11 @@ impl APCoreMCP {
         if !["stdio", "streamable-http", "sse"].contains(&transport.as_str()) {
             return Err(APCoreMCPError::UnknownTransport(
                 self.config.transport.clone(),
+            ));
+        }
+        if self.approval_store.is_some() && transport == "sse" {
+            return Err(APCoreMCPError::Config(
+                "Phase B approval requires stdio or Streamable HTTP".to_string(),
             ));
         }
 
@@ -1501,11 +1537,9 @@ impl APCoreMCPBuilder {
 
     /// Set the Phase B approval handler directly.
     ///
-    /// When set, `build()` retains the handler and `build_server_components`
-    /// instantiates an [`ApprovalBridge`](crate::server::approval_bridge::ApprovalBridge),
-    /// advertising the `__apcore_approval_check` meta-tool so MCP clients can
-    /// poll pending approvals. Prefer [`approval_store`](Self::approval_store)
-    /// for the storage-backed handler with an optional notify callback. [H-1]
+    /// When set, `build()` retains this handler for host integrations.
+    /// Use [`approval_store`](Self::approval_store) to enable scoped MCP
+    /// polling and resumption with an optional notification callback.
     pub fn approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
         self.approval_handler = Some(handler);
         self
@@ -1513,8 +1547,10 @@ impl APCoreMCPBuilder {
 
     /// Configure Phase B async approvals backed by the given store.
     ///
-    /// At `build()` time a [`StorageBackedApprovalHandler`] is created from
-    /// this store and stored as the `approval_handler`. Combine with
+    /// At `build()` time a [`StorageBackedApprovalHandler`] is installed on
+    /// the executor and on the MCP status bridge. Supported on stdio and
+    /// Streamable HTTP for direct tool calls. A supplied executor must be
+    /// unshared and must not already have an approval handler. Combine with
     /// [`approval_notify`] to attach an out-of-band notification callback.
     ///
     /// [`StorageBackedApprovalHandler`]: crate::adapters::approval::StorageBackedApprovalHandler
@@ -1525,7 +1561,7 @@ impl APCoreMCPBuilder {
 
     /// Attach a notification callback for Phase B approvals.
     ///
-    /// The callback receives `(approval_id, module_id, arguments)` and can
+    /// The callback receives `(audit_id, module_id, arguments)` and can
     /// send an out-of-band notification (e.g. Slack, email). Only takes effect
     /// when [`approval_store`] is also set.
     ///
@@ -1815,6 +1851,45 @@ impl APCoreMCPBuilder {
             BackendSource::Executor(exec) => (None, exec),
         };
 
+        // Build approval handler: approval_store takes precedence over approval_handler.
+        // The store (when supplied) is retained so the serve entry points can
+        // start its TTL sweep. [H-1]
+        let retained_store = self.approval_store.clone();
+        let approval_handler = if let Some(store) = self.approval_store {
+            use crate::adapters::approval::StorageBackedApprovalHandler;
+            if !store.supports_scoped_approval() {
+                return Err(APCoreMCPError::Config(
+                    "Phase B approval requires a scoped approval store".to_string(),
+                ));
+            }
+            let owned_executor = Arc::get_mut(&mut executor).ok_or_else(|| {
+                APCoreMCPError::Config("Phase B approval requires an unshared Executor".to_string())
+            })?;
+            if owned_executor.approval_handler.is_some() {
+                return Err(APCoreMCPError::Config(
+                    "The Executor already has an approval handler".to_string(),
+                ));
+            }
+            if !owned_executor
+                .governance_state()
+                .builtin_approval_gate_wired
+            {
+                return Err(APCoreMCPError::Config(
+                    "Phase B approval requires the built-in approval gate in the Executor"
+                        .to_string(),
+                ));
+            }
+            let mut handler = StorageBackedApprovalHandler::new(store).for_tool_responses();
+            if let Some(cb) = self.approval_notify_callback {
+                handler = handler.with_notify(move |id, module, args| cb(id, module, args));
+            }
+            let handler: Arc<dyn ApprovalHandler> = Arc::new(handler);
+            owned_executor.set_approval_handler_shared(Arc::clone(&handler));
+            Some(handler)
+        } else {
+            self.approval_handler
+        };
+
         // ── Install middleware (Config Bus entries first, then builder) ──
         let config_value = crate::config::get_middleware_config();
         let config_middleware =
@@ -1889,21 +1964,6 @@ impl APCoreMCPBuilder {
             (None, None)
         };
 
-        // Build approval handler: approval_store takes precedence over approval_handler.
-        // The store (when supplied) is retained so the serve entry points can
-        // start its TTL sweep. [H-1]
-        let retained_store = self.approval_store.clone();
-        let approval_handler = if let Some(store) = self.approval_store {
-            use crate::adapters::approval::StorageBackedApprovalHandler;
-            let mut handler = StorageBackedApprovalHandler::new(store);
-            if let Some(cb) = self.approval_notify_callback {
-                handler = handler.with_notify(move |id, module, args| cb(id, module, args));
-            }
-            Some(Arc::new(handler) as Arc<dyn ApprovalHandler>)
-        } else {
-            self.approval_handler
-        };
-
         // [L-3] Resolve the strategy preset by name (when set) so it can be
         // threaded into execution. Unknown names surface a warning and are
         // ignored (the executor keeps its default strategy) rather than
@@ -1921,6 +1981,20 @@ impl APCoreMCPBuilder {
                     }
                 }
             });
+
+        if retained_store.is_some()
+            && self.config.trace
+            && resolved_strategy.as_ref().is_some_and(|strategy| {
+                !strategy.steps().iter().any(|step| {
+                    step.builtin_gate() == Some(apcore::pipeline::BuiltinGate::Approval)
+                })
+            })
+        {
+            return Err(APCoreMCPError::Config(
+                "Phase B approval requires the built-in approval gate in the traced strategy"
+                    .to_string(),
+            ));
+        }
 
         Ok(APCoreMCP {
             config: self.config,
@@ -2624,6 +2698,466 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn wire_phase_b_keeps_approval_credentials_in_response_metadata() {
+        verify_wire_phase_b(false).await;
+        verify_wire_phase_b(true).await;
+    }
+
+    #[test]
+    fn phase_b_requires_the_builtin_approval_gate_for_default_and_traced_calls() {
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let executor =
+            Executor::with_strategy_name(Registry::new(), Config::default(), "internal").unwrap();
+        let default = APCoreMCP::builder()
+            .backend(Arc::new(executor))
+            .approval_store(Arc::new(InMemoryApprovalStore::new()))
+            .build();
+        assert!(matches!(default, Err(APCoreMCPError::Config(message))
+            if message.contains("built-in approval gate")));
+
+        let traced = APCoreMCP::builder()
+            .backend(Arc::new(Registry::new()))
+            .strategy("internal")
+            .trace(true)
+            .approval_store(Arc::new(InMemoryApprovalStore::new()))
+            .build();
+        assert!(matches!(traced, Err(APCoreMCPError::Config(message))
+            if message.contains("built-in approval gate")));
+    }
+
+    #[tokio::test]
+    async fn phase_b_approval_requires_an_identity_aware_transport() {
+        let bridge = APCoreMCP::builder()
+            .backend(Arc::new(Registry::new()))
+            .transport("sse")
+            .approval_store(Arc::new(crate::approval_store::InMemoryApprovalStore::new()))
+            .build()
+            .unwrap();
+        let result = bridge.serve_async().await;
+        assert!(matches!(result, Err(APCoreMCPError::Config(message))
+            if message == "Phase B approval requires stdio or Streamable HTTP"));
+    }
+
+    async fn verify_wire_phase_b(native_stream: bool) {
+        use crate::approval_store::{ApprovalStore, InMemoryApprovalStore};
+        use crate::auth::middleware::AUTH_IDENTITY;
+        use crate::server::transport::McpHandler;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Render(Arc<AtomicUsize>, bool);
+
+        #[async_trait::async_trait]
+        impl apcore::Module for Render {
+            fn input_schema(&self) -> Value {
+                json!({
+                    "type": "object", "properties": {"label": {"type": "string"}},
+                    "required": ["label"], "additionalProperties": false
+                })
+            }
+
+            fn output_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+
+            fn description(&self) -> &str {
+                "Render a sample label"
+            }
+
+            fn annotations(&self) -> apcore::ModuleAnnotations {
+                apcore::ModuleAnnotations {
+                    requires_approval: true,
+                    ..Default::default()
+                }
+            }
+
+            async fn execute(
+                &self,
+                inputs: Value,
+                _: &apcore::Context<Value>,
+            ) -> Result<Value, apcore::ModuleError> {
+                assert!(!self.1, "native module must stay on the streaming path");
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(inputs)
+            }
+
+            fn as_streaming(&self) -> Option<&dyn apcore::StreamingModule> {
+                self.1.then_some(self)
+            }
+        }
+
+        impl apcore::StreamingModule for Render {
+            fn stream_typed(
+                &self,
+                inputs: Value,
+                _: &apcore::Context<Value>,
+            ) -> apcore::ChunkStream {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(futures::stream::iter([Ok(inputs)]))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_module(
+                "demo.render",
+                Box::new(Render(Arc::clone(&calls), native_stream)),
+            )
+            .unwrap();
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let notified = Arc::new(AtomicUsize::new(0));
+        let notices = Arc::clone(&notified);
+        let bridge = APCoreMCP::builder()
+            .backend(registry)
+            .approval_store(store.clone())
+            .approval_notify(move |_, _, _| {
+                notices.fetch_add(1, Ordering::SeqCst);
+            })
+            .validate_inputs(true)
+            .build()
+            .unwrap();
+        let (server, router, tools, init, _, _) = bridge.build_server_components().unwrap();
+        let handler = ServerHandler::from_server(&server, init).unwrap();
+        let identity =
+            apcore::Identity::new("editor".into(), "user".into(), vec![], Default::default());
+        let arguments = json!({"label": "draft"});
+
+        let explorer =
+            bridge.build_explorer_config(&tools, &router, "/explorer", true, "Sample", None, None);
+        let (content, is_error, _) =
+            (explorer.handle_call.unwrap())("demo.render".into(), arguments.clone()).await;
+        assert!(is_error);
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Phase B approval requires a direct MCP tool call"));
+        assert_eq!(notified.load(Ordering::SeqCst), 0);
+
+        let call = |name, args, metadata| {
+            handler.handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": name, "arguments": args, "_meta": metadata}
+            }))
+        };
+
+        let pending = AUTH_IDENTITY
+            .scope(
+                Some(identity.clone()),
+                call("demo.render", arguments.clone(), json!({})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending["result"]["isError"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let approval = &pending["result"]["_meta"]["apcore"]["approval"];
+        let audit_id = approval["approvalId"].as_str().expect("public approval ID");
+        assert_eq!(notified.load(Ordering::SeqCst), 1);
+        let token = approval["resumeToken"]
+            .as_str()
+            .expect("caller resume credential");
+        assert_ne!(audit_id, token);
+        assert!(!pending["result"]["content"].to_string().contains(token));
+
+        let poll = AUTH_IDENTITY
+            .scope(
+                Some(identity.clone()),
+                call(
+                    "__apcore_approval_check",
+                    json!({"approval_id": audit_id}),
+                    json!({}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(poll["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("pending"));
+        assert!(!poll.to_string().contains(token));
+
+        let other_identity =
+            apcore::Identity::new("viewer".into(), "user".into(), vec![], Default::default());
+        let other_poll = AUTH_IDENTITY
+            .scope(
+                Some(other_identity),
+                call(
+                    "__apcore_approval_check",
+                    json!({"approval_id": audit_id}),
+                    json!({}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_poll["result"]["isError"], false);
+        let unavailable: Value =
+            serde_json::from_str(other_poll["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            unavailable,
+            json!({"approval_id": audit_id, "status": "rejected"})
+        );
+
+        let still_pending = AUTH_IDENTITY
+            .scope(
+                Some(identity.clone()),
+                call(
+                    "demo.render",
+                    arguments.clone(),
+                    json!({"approvalId": token}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            still_pending["result"]["_meta"]["apcore"]["approval"]["resumeToken"].as_str()
+                == Some(token)
+        );
+
+        assert!(store.resolve(audit_id, true, None).await.unwrap());
+
+        let invalid = AUTH_IDENTITY
+            .scope(
+                Some(identity.clone()),
+                call(
+                    "demo.render",
+                    json!({"label": 5}),
+                    json!({"approvalId": token}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid["result"]["isError"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let resumed = AUTH_IDENTITY
+            .scope(
+                Some(identity.clone()),
+                call(
+                    "demo.render",
+                    arguments.clone(),
+                    json!({"approvalId": token}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed["result"]["isError"], false);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!resumed.to_string().contains(token));
+        assert!(!resumed.to_string().contains("_approval_token"));
+
+        let repeated = AUTH_IDENTITY
+            .scope(
+                Some(identity),
+                call("demo.render", arguments, json!({"approvalId": token})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated["result"]["isError"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!repeated.to_string().contains(token));
+    }
+
+    struct CompletionFixture {
+        entries: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl apcore::Module for CompletionFixture {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn output_schema(&self) -> Value {
+            json!({"type": "object", "required": ["value"], "properties": {
+                "value": {"type": "integer"},
+                "secret": {"type": "string", "x-sensitive": true}
+            }})
+        }
+
+        fn description(&self) -> &'static str {
+            "Return tracked chunks with a canonical aggregate"
+        }
+
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::ModuleError> {
+            panic!("native streaming must not be retried by unary execution")
+        }
+
+        fn as_streaming(&self) -> Option<&dyn apcore::StreamingModule> {
+            Some(self)
+        }
+
+        fn stream(
+            &self,
+            inputs: Value,
+            ctx: &apcore::Context<Value>,
+        ) -> Option<apcore::ChunkStream> {
+            Some(apcore::StreamingModule::stream_typed(self, inputs, ctx))
+        }
+    }
+
+    impl apcore::StreamingModule for CompletionFixture {
+        fn stream_typed(
+            &self,
+            inputs: Value,
+            _ctx: &apcore::Context<Value>,
+        ) -> apcore::ChunkStream {
+            self.entries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if inputs["panic"] == true {
+                return Box::pin(futures::stream::poll_fn(|_| {
+                    panic!("simulated native producer panic")
+                }));
+            }
+            let value = if inputs["invalid"] == true {
+                json!("invalid")
+            } else {
+                json!(9)
+            };
+            Box::pin(tokio_stream::iter([
+                Ok(
+                    json!({"outer": {"inner": {"left": 1}}, "parts": [1], "secret": "progress-canary"}),
+                ),
+                Ok(json!({"outer": {"inner": {"right": 2}}, "parts": [2], "value": value})),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_wire_uses_core_completion_for_progress_and_atomic_results() {
+        use crate::server::transport::TransportManager;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let entries = Arc::new(AtomicUsize::new(0));
+        let registry = Registry::new();
+        registry
+            .register_module(
+                "demo.completion",
+                Box::new(CompletionFixture {
+                    entries: Arc::clone(&entries),
+                }),
+            )
+            .unwrap();
+        assert!(!registry
+            .get_definition("demo.completion")
+            .unwrap()
+            .unwrap()
+            .annotations
+            .is_some_and(|annotations| annotations.streaming));
+        let mut config = Config::default();
+        config.set("stream.max_merge_depth", json!(1));
+        let executor = Executor::new(registry, config);
+        executor
+            .use_middleware(Box::new(apcore::middleware::adapters::AfterAdapter::new(
+                "test_completion_after",
+                |_, inputs: Value, output: Value, _| async move {
+                    assert_eq!(output["outer"]["inner"], json!({"right": 2}));
+                    if inputs["after_failure"] == true {
+                        Err(apcore::ModuleError::new(
+                            apcore::ErrorCode::ModuleExecuteError,
+                            "after failure",
+                        ))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )))
+            .unwrap();
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(Arc::new(executor)))
+            .redact_output(true)
+            .build()
+            .unwrap();
+        let (server, _, _, options, _, _) = mcp.build_server_components().unwrap();
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+        let (client, server) = tokio::io::duplex(8192);
+        let (read, mut write) = tokio::io::split(client);
+        let mut lines = BufReader::new(read).lines();
+        let (r, w) = tokio::io::split(server);
+        let task = tokio::spawn(async move {
+            TransportManager::new(None)
+                .run_stdio_with_io(r, w, &handler)
+                .await
+                .unwrap();
+        });
+        let decode = |line: String| serde_json::from_str::<Value>(&line).unwrap();
+        let deadline = std::time::Duration::from_secs(3);
+
+        for (id, progress, error) in [
+            (1, true, None),
+            (2, false, None),
+            (3, true, Some("SCHEMA_VALIDATION_ERROR")),
+            (4, true, Some("MODULE_EXECUTE_ERROR")),
+            (5, false, Some("executor panicked")),
+            (6, false, None),
+        ] {
+            let mut request = json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+                    "name": "demo.completion", "arguments": {
+                        "invalid": error == Some("SCHEMA_VALIDATION_ERROR"),
+                        "after_failure": error == Some("MODULE_EXECUTE_ERROR"),
+                        "panic": error == Some("executor panicked"),
+                    }
+                }
+            });
+            if progress {
+                request["params"]["_meta"] = json!({"progressToken": "tracked"});
+            }
+            write
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+
+            if progress {
+                for index in 1..=2 {
+                    let progress = decode(
+                        tokio::time::timeout(deadline, lines.next_line())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    assert_eq!(progress["jsonrpc"], "2.0");
+                    assert_eq!(progress["method"], "notifications/progress");
+                    assert_eq!(progress["params"]["progressToken"], "tracked");
+                    assert_eq!(progress["params"]["progress"], index);
+                    assert!(!progress.to_string().contains("progress-canary"));
+                }
+            }
+            let reply = decode(
+                tokio::time::timeout(deadline, lines.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            );
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["result"]["isError"], error.is_some());
+            let content = reply["result"]["content"][0]["text"].as_str().unwrap();
+            if let Some(code) = error {
+                assert!(content.contains(code));
+                assert!(reply["result"].get("structuredContent").is_none());
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(content).unwrap(),
+                    json!({
+                        "outer": {"inner": {"right": 2}}, "parts": [2], "value": 9,
+                        "secret": apcore::REDACTED_VALUE,
+                    })
+                );
+            }
+            assert_eq!(entries.load(Ordering::SeqCst), usize::try_from(id).unwrap());
+        }
+        write.shutdown().await.unwrap();
+        tokio::time::timeout(deadline, task).await.unwrap().unwrap();
     }
 
     /// Create a test registry with the given modules.

@@ -735,6 +735,9 @@ For clients negotiating MCP 2025-06-18 or a later supported version, object outp
 
 Clients negotiating 2025-03-26 or 2024-11-05 retain text-only tools and results. Stdio and SSE use the negotiated session version; Streamable HTTP uses the trusted `MCP-Protocol-Version` header on each request, defaulting to 2025-03-26 when absent. Client-supplied request metadata cannot enable structured output.
 
+A `tools/call` version hint at `_meta.apcore.version` can select another registration under the same tool name when its published contract matches. A request for a different contract is rejected before execution. Core must be able to identify the selected registration's descriptor, and older Core can only preflight its default version. Background tool execution does not accept version hints.
+
+
 ## Development
 
 ```bash

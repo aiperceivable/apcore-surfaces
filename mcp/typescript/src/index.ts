@@ -32,6 +32,7 @@ import type { Authenticator } from "./auth/types.js";
 import { buildExplorerAuthHook } from "./auth/hooks.js";
 import type { ApprovalStore } from "./approval-store.js";
 import { StorageBackedApprovalHandler } from "./adapters/approval.js";
+import { ApprovalBridge } from "./server/approval-bridge.js";
 import pkg from "../package.json" with { type: "json" };
 
 export const VERSION: string = pkg.version;
@@ -101,7 +102,7 @@ export { ModuleIDNormalizer } from "./adapters/id-normalizer.js";
 export { ElicitationApprovalHandler, StorageBackedApprovalHandler } from "./adapters/approval.js";
 export type { ApprovalRequest, ApprovalResult } from "./adapters/approval.js";
 export { InMemoryApprovalStore } from "./approval-store.js";
-export type { ApprovalStore, ApprovalRecord } from "./approval-store.js";
+export type { ApprovalStore, ApprovalRecord, ApprovalPrincipal, ApprovalScope, ScopedApprovalStore } from "./approval-store.js";
 export { ApprovalBridge, APPROVAL_META_TOOL_NAMES } from "./server/approval-bridge.js";
 export type { ApprovalMetaToolName } from "./server/approval-bridge.js";
 export { McpErrorFormatter, registerMcpFormatter } from "./adapters/mcp-error-formatter.js";
@@ -123,6 +124,19 @@ export function resolveRegistry(registryOrExecutor: RegistryOrExecutor): Registr
   }
   // Assume it's a Registry
   return registryOrExecutor as Registry;
+}
+
+function configuredScopedApproval(
+  approvalHandler: unknown, backend: RegistryOrExecutor, transport?: string,
+): { handler: ReturnType<StorageBackedApprovalHandler["forMcpServer"]>; bridge: ApprovalBridge } | undefined {
+  if (!(approvalHandler instanceof StorageBackedApprovalHandler)) return undefined;
+  approvalHandler.assertScopedSupport();
+  if (transport === "sse") throw new Error("Phase B is unavailable on the legacy SSE transport");
+  if ("call" in backend || "callAsync" in backend) {
+    throw new Error("Phase B requires a Registry so the server can wire the scoped Core approval handler");
+  }
+  const handler = approvalHandler.forMcpServer();
+  return { handler, bridge: new ApprovalBridge(handler) };
 }
 
 /**
@@ -856,9 +870,10 @@ async function serveInternal(
       if (minLevel > 3) console.error = () => { };
     }
 
+    const scopedApproval = configuredScopedApproval(effectiveApprovalHandler, resolvedBackend, transport);
     const registry = resolveRegistry(resolvedBackend);
     const executor = await resolveExecutor(resolvedBackend, {
-      approvalHandler: effectiveApprovalHandler,
+      approvalHandler: scopedApproval?.handler ?? effectiveApprovalHandler,
       strategy: resolvedStrategy,
       middleware: combinedMiddleware,
       acl: effectiveAcl,
@@ -871,6 +886,9 @@ async function serveInternal(
     // warning is never silenced by `logLevel`. Warning only; never blocks
     // startup.
     const governanceState = tryGovernanceState(executor);
+    if (scopedApproval && (!governanceState?.builtinApprovalGateWired || !governanceState.approvalHandlerConfigured)) {
+      throw new Error("Phase B requires a wired Core approval gate");
+    }
     if (governanceState) {
       const warning = formatUnprotectedControlSurfaceWarning(governanceState);
       if (warning) origWarn(warning);
@@ -944,7 +962,7 @@ async function serveInternal(
       trace,
       asyncTaskBridge: asyncBridge ?? undefined,
     });
-    factory.registerHandlers(server, tools, router);
+    factory.registerHandlers(server, tools, router, scopedApproval ? { approvalBridge: scopedApproval.bridge } : undefined);
     factory.registerResourceHandlers(server, registry, router);
 
     // Start dynamic tool registration listener if enabled
@@ -1190,6 +1208,20 @@ export async function asyncServe(
   // Config-Bus-resolved values.
   validateServeOptions({ name, tags, prefix, explorer, explorerPrefix });
 
+  const scopedApproval = configuredScopedApproval(effectiveApprovalHandler, resolvedBackend);
+
+  const registry = resolveRegistry(resolvedBackend);
+  const executor = await resolveExecutor(resolvedBackend, {
+    approvalHandler: scopedApproval?.handler ?? effectiveApprovalHandler,
+    strategy: resolvedStrategy,
+    middleware: combinedMiddleware,
+    acl: effectiveAcl,
+  });
+  const governanceState = tryGovernanceState(executor);
+  if (scopedApproval && (!governanceState?.builtinApprovalGateWired || !governanceState.approvalHandlerConfigured)) {
+    throw new Error("Phase B requires a wired Core approval gate");
+  }
+
   // Apply log-level suppression (post-resolution so Config Bus values apply).
   if (logLevel) {
     const levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
@@ -1200,18 +1232,9 @@ export async function asyncServe(
     if (minLevel > 3) console.error = () => { };
   }
 
-  const registry = resolveRegistry(resolvedBackend);
-  const executor = await resolveExecutor(resolvedBackend, {
-    approvalHandler: effectiveApprovalHandler,
-    strategy: resolvedStrategy,
-    middleware: combinedMiddleware,
-    acl: effectiveAcl,
-  });
-
   // aiperceivable/apcore-mcp#15(b): see serve() for rationale — warn before
   // the app is built when system.control.* is reachable with no recognised
   // gate. Warning only; never blocks startup.
-  const governanceState = tryGovernanceState(executor);
   if (governanceState) {
     const warning = formatUnprotectedControlSurfaceWarning(governanceState);
     if (warning) origWarn(warning);
@@ -1283,7 +1306,7 @@ export async function asyncServe(
     trace,
     asyncTaskBridge: asyncBridge ?? undefined,
   });
-  factory.registerHandlers(server, tools, router);
+  factory.registerHandlers(server, tools, router, scopedApproval ? { approvalBridge: scopedApproval.bridge } : undefined);
   factory.registerResourceHandlers(server, registry, router);
 
   // Start dynamic tool registration listener if enabled. The embedded handler

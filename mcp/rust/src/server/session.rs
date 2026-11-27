@@ -215,6 +215,10 @@ impl McpSession {
         lock(&self.pending).len()
     }
 
+    pub(crate) async fn send_notification(&self, message: Value) -> Result<(), SessionError> {
+        self.sink.send(message).await
+    }
+
     /// Send a server-initiated request and await the client's answer.
     async fn request(&self, method: &str, params: Value) -> Result<Value, SessionError> {
         let id = format!("apcore-mcp-{}", uuid::Uuid::new_v4());

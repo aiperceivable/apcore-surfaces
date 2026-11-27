@@ -65,6 +65,7 @@ from apcore_toolkit.openapi_proxy import (
     detect_effective_proxy_hazards,
     validate_effective_proxy_modules,
 )
+from apcore_toolkit.prometheus_server import create_prometheus_server
 from apcore_toolkit.tui_view_model import (
     Cell,
     Column,
@@ -161,6 +162,7 @@ __all__ = [
     "YAMLWriter",
     "annotations_to_dict",
     "clone_module",
+    "create_prometheus_server",
     "create_scanned_module",
     "deduplicate_ids",
     "deep_resolve_refs",

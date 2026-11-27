@@ -161,6 +161,33 @@ let auth = JWTAuthenticator::new("your-secret-key")
 
 ---
 
+### Deliver Core events over A2A
+
+Register the optional transport before creating the Core client that loads your
+subscriber configuration:
+
+```rust
+use apcore::{APCore, ModuleError};
+use apcore_a2a::register_a2a_subscriber;
+
+fn load_core() -> Result<APCore, ModuleError> {
+    register_a2a_subscriber();
+    APCore::from_path("apcore.yaml")
+}
+```
+
+This selects the transport for subsequently created `type: a2a` subscribers,
+including `filter` entries whose `delegate_type` is `a2a`. `platform_url`,
+`auth`, `skill_id`, `timeout_ms`, and `retry` use the existing configuration
+layout. Core manages retries, circuit breaking, and dead letters. Configured
+retry and dead-letter delivery requires a Core release whose circuit wrapper
+reports failed attempts to the emitter. The A2A transport uses this crate's
+existing HTTP client dependency and works without Core's `events` feature.
+
+To restore Core's built-in transport, restart the process without the registration
+call and enable Core's `events` feature for built-in HTTP delivery. Subscribers
+created before registration retain the transport selected at creation time.
+
 ## Architecture
 
 | A2A Concept    | apcore Mapping                            |

@@ -1188,3 +1188,57 @@ async fn test_effective_openapi_registration_preflights_and_forwards_selected_op
         "GET /items/red%2Fblue?tag=red&tag=blue HTTP/1.1\r\n"
     );
 }
+
+#[tokio::test]
+async fn test_backend_refuses_startup_when_a_host_validator_rejects_a_scanned_module() {
+    use apcore::module::{Module, ValidationResult};
+    use apcore::registry::registry::{ModuleDescriptor, ModuleValidator};
+    use apcore::ValidationErrorDetail;
+
+    struct RejectUpdate;
+
+    impl ModuleValidator for RejectUpdate {
+        fn validate(
+            &self,
+            _module: &dyn Module,
+            descriptor: Option<&ModuleDescriptor>,
+        ) -> ValidationResult {
+            let mut result = ValidationResult::default();
+            result.valid =
+                !descriptor.is_some_and(|descriptor| descriptor.module_id == "update_item");
+            if !result.valid {
+                result.errors = vec![ValidationErrorDetail::message_only("rejected by host rule")];
+            }
+            result
+        }
+    }
+
+    let registry = Arc::new(Registry::new());
+    registry.set_validator(Box::new(RejectUpdate));
+    let document = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Inventory", "version": "1"},
+        "paths": {
+            "/items": {"get": {"operationId": "list_items", "summary": "List items",
+                              "responses": {"200": {"description": "OK"}}}},
+            "/updates": {"post": {"operationId": "update_item", "summary": "Update item",
+                                  "responses": {"200": {"description": "OK"}}}}
+        }
+    });
+    let message = openapi_backend(
+        &document,
+        registry,
+        OpenAPIBackendOptions {
+            base_url: Some("http://127.0.0.1:1".to_string()),
+            acknowledge_unapproved_writes: true,
+            ..OpenAPIBackendOptions::new()
+        },
+    )
+    .await
+    .expect_err("incomplete assembly must not start")
+    .to_string();
+    assert!(
+        message.contains("update_item") && message.contains("rejected by host rule"),
+        "{message}",
+    );
+}

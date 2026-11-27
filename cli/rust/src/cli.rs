@@ -342,6 +342,14 @@ pub fn add_dispatch_flags(cmd: clap::Command) -> clap::Command {
             .hide(hide),
     )
     .arg(
+        Arg::new("strict-stream")
+            .long("strict-stream")
+            .action(ArgAction::SetTrue)
+            .conflicts_with_all(["sandbox", "dry-run", "trace"])
+            .help("Stream JSONL and require successful Core completion before exiting.")
+            .hide(hide),
+    )
+    .arg(
         Arg::new("strategy")
             .long("strategy")
             .value_parser(["standard", "internal", "testing", "performance", "minimal"])
@@ -426,6 +434,7 @@ const RESERVED_FLAG_NAMES: &[&str] = &[
     "sandbox",
     "strategy",
     "stream",
+    "strict-stream",
     "trace",
     "yes",
 ];
@@ -436,7 +445,7 @@ const RESERVED_FLAG_NAMES: &[&str] = &[
 /// * its `name` set to `module_def.name`
 /// * its `about` derived from the module descriptor (empty if unavailable)
 /// * the built-in dispatch flags (`--input`, `--yes`/`-y`, `--large-input`,
-///   `--format`, `--sandbox`, `--dry-run`, `--trace`, `--stream`, `--strategy`,
+///   `--format`, `--sandbox`, `--dry-run`, `--trace`, `--stream`, `--strict-stream`, `--strategy`,
 ///   `--fields`, `--approval-timeout`, `--approval-token`)
 /// * schema-derived flags from `schema_to_clap_args`
 ///
@@ -1026,26 +1035,18 @@ pub fn reconcile_bool_pairs(
     matches: &clap::ArgMatches,
     bool_pairs: &[crate::schema_parser::BoolFlagPair],
 ) -> HashMap<String, Value> {
+    let supplied = |id: &str| {
+        // exec has no generated option IDs. For generated options, check
+        // presence rather than the bool stored by SetTrue or SetFalse.
+        matches.try_contains_id(id).unwrap_or(false)
+            && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+    };
     let mut result = HashMap::new();
     for pair in bool_pairs {
-        // Use try_get_one to avoid panicking when the flag doesn't exist
-        // in ArgMatches (e.g. exec subcommand doesn't have schema-derived flags).
-        let pos_set = matches
-            .try_get_one::<bool>(&pair.prop_name)
-            .ok()
-            .flatten()
-            .copied()
-            .unwrap_or(false);
         let neg_id = format!("no-{}", pair.prop_name);
-        let neg_set = matches
-            .try_get_one::<bool>(&neg_id)
-            .ok()
-            .flatten()
-            .copied()
-            .unwrap_or(false);
-        let val = if pos_set {
+        let val = if supplied(&pair.prop_name) {
             true
-        } else if neg_set {
+        } else if supplied(&neg_id) {
             false
         } else {
             pair.default_val
@@ -1055,47 +1056,78 @@ pub fn reconcile_bool_pairs(
     result
 }
 
-/// Extract schema-derived CLI kwargs from `ArgMatches` for a given module.
-///
-/// Iterates schema properties and extracts string values from clap matches.
-/// Boolean pairs are handled separately via `reconcile_bool_pairs`.
+#[derive(Default)]
+struct CliInputs {
+    kwargs: HashMap<String, Value>,
+    structured_flags: HashMap<String, Value>,
+    structured_defaults: HashMap<String, Value>,
+}
+
+/// Read schema-derived flags and keep explicit structured values separate from defaults.
 fn extract_cli_kwargs(
     matches: &clap::ArgMatches,
     module_def: &apcore::registry::registry::ModuleDescriptor,
-) -> HashMap<String, Value> {
-    use crate::schema_parser::schema_to_clap_args;
+) -> Result<CliInputs, String> {
+    use crate::schema_parser::{is_structured_option, schema_to_clap_args};
 
-    let schema_args = match schema_to_clap_args(&module_def.input_schema, None) {
-        Ok(sa) => sa,
-        Err(_) => return HashMap::new(),
+    let resolved = crate::ref_resolver::resolve_refs(
+        &module_def.input_schema,
+        crate::ref_resolver::MAX_REF_DEPTH,
+        &module_def.module_id,
+    )
+    .ok();
+    let schema = resolved.as_ref().unwrap_or(&module_def.input_schema);
+    let Ok(schema_args) = schema_to_clap_args(schema, None) else {
+        return Ok(CliInputs::default());
     };
 
-    let mut kwargs: HashMap<String, Value> = HashMap::new();
-
-    // Extract non-boolean schema args as strings (or Null if absent).
+    let mut inputs = CliInputs::default();
     for arg in &schema_args.args {
-        let id = arg.get_id().as_str().to_string();
-        // Skip the no- counterparts of boolean args.
-        if id.starts_with("no-") {
+        if matches!(
+            arg.get_action(),
+            clap::ArgAction::SetTrue | clap::ArgAction::SetFalse
+        ) {
             continue;
         }
+        let id = arg.get_id().as_str();
         // Use try_get_one to avoid panicking when the arg doesn't exist
         // in ArgMatches (e.g. exec subcommand doesn't have schema-derived flags).
-        if let Ok(Some(val)) = matches.try_get_one::<String>(&id) {
-            kwargs.insert(id, Value::String(val.clone()));
-        } else if let Ok(Some(val)) = matches.try_get_one::<std::path::PathBuf>(&id) {
-            kwargs.insert(id, Value::String(val.to_string_lossy().to_string()));
-        } else {
-            kwargs.insert(id, Value::Null);
+        if let Ok(Some(value)) = matches.try_get_one::<String>(id) {
+            let property = &schema["properties"][id];
+            if is_structured_option(property) {
+                if matches.value_source(id) == Some(clap::parser::ValueSource::DefaultValue) {
+                    if let Some(default) = property.get("default") {
+                        inputs
+                            .structured_defaults
+                            .insert(id.to_owned(), default.clone());
+                    }
+                } else {
+                    let value = serde_json::from_str(value).map_err(|_| {
+                        format!(
+                            "Option '--{}' must contain valid JSON.",
+                            arg.get_long().unwrap_or(id)
+                        )
+                    })?;
+                    inputs.structured_flags.insert(id.to_owned(), value);
+                }
+            } else {
+                inputs
+                    .kwargs
+                    .insert(id.to_owned(), Value::String(value.clone()));
+            }
+        } else if let Ok(Some(value)) = matches.try_get_one::<std::path::PathBuf>(id) {
+            inputs.kwargs.insert(
+                id.to_owned(),
+                Value::String(value.to_string_lossy().to_string()),
+            );
         }
     }
 
-    // Reconcile boolean pairs.
-    let bool_vals = reconcile_bool_pairs(matches, &schema_args.bool_pairs);
-    kwargs.extend(bool_vals);
-
-    // Apply enum type reconversion.
-    crate::schema_parser::reconvert_enum_values(kwargs, &schema_args)
+    inputs
+        .kwargs
+        .extend(reconcile_bool_pairs(matches, &schema_args.bool_pairs));
+    inputs.kwargs = crate::schema_parser::reconvert_enum_values(inputs.kwargs, &schema_args);
+    Ok(inputs)
 }
 
 /// Execute a script-based module by spawning the executable as a subprocess.
@@ -1169,6 +1201,39 @@ fn validate_sandbox_flags(
     }
 
     Ok(())
+}
+
+fn strict_stream_error(completion: &apcore::StreamCompletion) -> Option<&str> {
+    use apcore::{StreamEndReason, StreamSkipReason, StreamStepOutcome};
+
+    let failed = |step| {
+        matches!(
+            step,
+            StreamStepOutcome::Failed { .. }
+                | StreamStepOutcome::Skipped {
+                    reason: StreamSkipReason::NotReached
+                }
+        )
+    };
+    match completion.reason {
+        StreamEndReason::Completed if failed(completion.output_validation) => {
+            Some("SCHEMA_VALIDATION_ERROR")
+        }
+        StreamEndReason::Completed
+            if failed(completion.middleware_after) || completion.output.is_none() =>
+        {
+            Some("MODULE_EXECUTE_ERROR")
+        }
+        StreamEndReason::Completed => None,
+        StreamEndReason::Cancelled | StreamEndReason::ConsumerClosed => Some("EXECUTION_CANCELLED"),
+        StreamEndReason::TimedOut => Some("MODULE_TIMEOUT"),
+        StreamEndReason::Failed => Some(
+            completion
+                .error_code
+                .as_deref()
+                .unwrap_or("MODULE_EXECUTE_ERROR"),
+        ),
+    }
 }
 
 /// Execute a module and exit the process with the corresponding CLI exit code.
@@ -1453,7 +1518,8 @@ async fn run_module_dispatch(
     let fields_flag = matches.get_one::<String>("fields").cloned();
     let dry_run = matches.get_flag("dry-run");
     let trace_flag = matches.get_flag("trace");
-    let stream_flag = matches.get_flag("stream");
+    let strict_stream = matches.get_flag("strict-stream");
+    let stream_flag = strict_stream || matches.get_flag("stream");
     let strategy_name = matches.get_one::<String>("strategy").cloned();
     let approval_timeout_arg = matches.get_one::<String>("approval-timeout").cloned();
     let approval_token = matches.get_one::<String>("approval-token").cloned();
@@ -1473,15 +1539,21 @@ async fn run_module_dispatch(
     // presents `@external`.
     let cli_ctx = crate::acl_cmd::identity_context();
 
-    // 4. Build CLI kwargs from schema-derived flags (stub: empty map).
-    let cli_kwargs = extract_cli_kwargs(matches, &module_def);
+    // 4. Decode schema-derived flags before validation and module execution.
+    let cli_inputs = extract_cli_kwargs(matches, &module_def).map_err(|message| {
+        errors.fail(
+            EXIT_SCHEMA_VALIDATION_ERROR,
+            "SCHEMA_VALIDATION_ERROR",
+            message,
+        )
+    })?;
 
     // 5. Collect and merge input (exit 2 on errors).
     let input = match stdin_flag {
         Some(source) if source.trim_start().starts_with(['{', '[']) => {
-            collect_input_from_reader(Some("-"), cli_kwargs, large_input, source.as_bytes())
+            collect_input_from_reader(Some("-"), cli_inputs.kwargs, large_input, source.as_bytes())
         }
-        _ => collect_input(stdin_flag, cli_kwargs, large_input),
+        _ => collect_input(stdin_flag, cli_inputs.kwargs, large_input),
     };
     let mut merged = match input {
         Ok(m) => m,
@@ -1502,6 +1574,11 @@ async fn run_module_dispatch(
             return Err(errors.invalid_input(e.to_string()));
         }
     };
+
+    for (name, value) in cli_inputs.structured_defaults {
+        merged.entry(name).or_insert(value);
+    }
+    merged.extend(cli_inputs.structured_flags);
 
     // 5b. Host-injected input (program-level flags, envelope fields). Merged
     // before validation so the values are validated like any other input.
@@ -1586,6 +1663,9 @@ async fn run_module_dispatch(
         .get()
         .and_then(|map| map.get(module_id))
         .cloned();
+    if strict_stream && (script_executable.is_some() || use_sandbox) {
+        return Err(errors.invalid_input("--strict-stream requires in-process Core execution."));
+    }
 
     // 6.5 FE-14 section 4.10: gate every execution path that does not carry
     // the attached ACL.
@@ -1708,25 +1788,40 @@ async fn run_module_dispatch(
             .as_ref()
             .is_some_and(|annotations| annotations.streaming);
 
-    if stream_flag && !standalone && !supports_streaming {
+    if stream_flag && !strict_stream && !standalone && !supports_streaming {
         eprintln!(
             "Warning: Module '{module_id}' does not declare streaming support. Falling back to standard execution."
         );
     }
 
-    if stream_flag && (standalone || supports_streaming) {
+    if stream_flag && (standalone || supports_streaming || strict_stream) {
         // Streaming always outputs JSONL; --format table is ignored (spec 3.6.2).
         if format_flag.as_deref() == Some("table") {
             eprintln!("Warning: Streaming mode always outputs JSONL; --format table is ignored.");
         }
         let start = std::time::Instant::now();
-        if supports_streaming {
-            let mut chunks =
-                apcore_executor.stream(module_id, input_value.clone(), cli_ctx.as_ref(), None);
+        if supports_streaming || strict_stream {
+            let (mut chunks, completion) = if strict_stream {
+                let (chunks, completion) = apcore_executor.stream_with_completion(
+                    module_id,
+                    input_value.clone(),
+                    cli_ctx.as_ref(),
+                    None,
+                );
+                (Box::pin(chunks) as _, Some(completion))
+            } else {
+                (
+                    apcore_executor.stream(module_id, input_value.clone(), cli_ctx.as_ref(), None),
+                    None,
+                )
+            };
             loop {
                 let chunk = tokio::select! {
                     chunk = std::future::poll_fn(|cx| chunks.as_mut().poll_next(cx)) => chunk,
                     _ = &mut cancel => {
+                        if strict_stream {
+                            audit_error(module_id, &input_value, EXIT_SIGINT, start.elapsed().as_millis() as u64);
+                        }
                         eprintln!("Execution cancelled.");
                         return Err(EXIT_SIGINT);
                     }
@@ -1742,6 +1837,17 @@ async fn run_module_dispatch(
                     }
                     None => {
                         let duration_ms = start.elapsed().as_millis() as u64;
+                        if let Some(completion) = completion {
+                            let outcome = completion.await;
+                            if let Some(code) = strict_stream_error(&outcome) {
+                                return Err(errors.report(
+                                    map_apcore_error_to_exit_code(code),
+                                    &format!("Streaming completion failed ({code})."),
+                                    Some(&serde_json::json!({"code": code})),
+                                    Some((&input_value, duration_ms)),
+                                ));
+                            }
+                        }
                         audit_success(module_id, &input_value, duration_ms);
                         return Ok(None);
                     }

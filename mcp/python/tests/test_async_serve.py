@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from starlette.applications import Starlette
@@ -98,24 +98,8 @@ class TestAsyncServeValidation:
 
 
 class TestAsyncServeApp:
-    @patch("apcore_mcp.server.transport.StreamableHTTPServerTransport")
-    async def test_yields_starlette_app(self, mock_transport_cls: MagicMock) -> None:
-        """async_serve yields a Starlette ASGI application."""
-        # Mock the transport so we don't actually start MCP protocol
-        mock_transport = MagicMock()
-        mock_transport_cls.return_value = mock_transport
-
-        mock_read = MagicMock()
-        mock_write = MagicMock()
-
-        # connect() returns an async context manager yielding (read, write)
-        mock_cm = AsyncMock()
-        mock_cm.__aenter__ = AsyncMock(return_value=(mock_read, mock_write))
-        mock_cm.__aexit__ = AsyncMock(return_value=False)
-        mock_transport.connect.return_value = mock_cm
-
-        mock_transport.handle_request = AsyncMock()
-
+    async def test_yields_starlette_app(self) -> None:
+        """Start the application with its SDK session manager."""
         registry = _make_registry()
 
         async with async_serve(registry, name="test-mcp") as app:
@@ -136,21 +120,9 @@ class TestAsyncServeApp:
 
 
 class TestBuildStreamableHttpApp:
-    @patch("apcore_mcp.server.transport.StreamableHTTPServerTransport")
-    async def test_yields_starlette_app(self, mock_transport_cls: MagicMock) -> None:
+    async def test_yields_starlette_app(self) -> None:
+        """Start the application with its SDK session manager."""
         from apcore_mcp.server.transport import TransportManager
-
-        mock_transport = MagicMock()
-        mock_transport_cls.return_value = mock_transport
-
-        mock_read = MagicMock()
-        mock_write = MagicMock()
-
-        mock_cm = AsyncMock()
-        mock_cm.__aenter__ = AsyncMock(return_value=(mock_read, mock_write))
-        mock_cm.__aexit__ = AsyncMock(return_value=False)
-        mock_transport.connect.return_value = mock_cm
-        mock_transport.handle_request = AsyncMock()
 
         server = MagicMock(spec=["run"])
         server.run = AsyncMock()

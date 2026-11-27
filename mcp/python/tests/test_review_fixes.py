@@ -351,6 +351,7 @@ class TestOutputSchemaMapParity:
             mcp._async_bridge = None
             mcp._approval_handler = None
             mcp._approval_store = None
+            mcp._phase_b_handler = None
 
             mcp._build_server_components()
 

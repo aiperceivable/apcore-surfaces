@@ -549,10 +549,7 @@ pub async fn openapi_backend(
     }
 
     // --- Collision preflight, over the FULL set, before the first write ------
-    // Toolkit writers report per-module `WriteResult`s and never abort, so
-    // without this a duplicate arrives as a failed WriteResult, gets logged and
-    // skipped, and leaves a partial registry: a skill the document advertises,
-    // absent from the card, with one log line as the only notice.
+    // A collision leaves the registry untouched and reports every colliding ID.
     let existing = registry.list(None, None, Some(&["public", "hidden"]));
     let mut collisions: Vec<String> = modules
         .iter()
@@ -601,13 +598,30 @@ pub async fn openapi_backend(
     )
     .map_err(|e| APCoreA2AError::Config(format!("apcore-a2a.openapi: {e}")))?;
 
-    for result in writer.write(&modules, &registry) {
-        if let Some(error) = result.verification_error {
-            tracing::error!(
-                "apcore-a2a: {} failed to register as an HTTP proxy: {error}",
-                result.module_id
-            );
+    let results: HashMap<_, _> = writer
+        .write(&modules, &registry)
+        .into_iter()
+        .map(|result| (result.module_id.clone(), result))
+        .collect();
+    let mut failures = Vec::new();
+    for module in &modules {
+        let id = &module.module_id;
+        let result = results.get(id);
+        if result.is_some_and(|result| result.verified)
+            && registry.get(id).is_ok_and(|module| module.is_some())
+        {
+            continue;
         }
+        let detail = result
+            .and_then(|result| result.verification_error.as_deref())
+            .unwrap_or("module not registered");
+        failures.push(format!("{id}: {detail}"));
+    }
+    if !failures.is_empty() {
+        return Err(APCoreA2AError::Config(format!(
+            "OpenAPI registration incomplete: {}",
+            failures.join("; ")
+        )));
     }
 
     warn_unapproved_writes(

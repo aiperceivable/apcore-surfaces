@@ -48,7 +48,7 @@ Terminal adapter for apcore. Execute AI-Perceivable modules from the command lin
 cargo install apcore-cli
 ```
 
-Build with current stable Rust (`apcore` requires Rust 1.86+, and the checked-in lockfile includes dependencies requiring Rust 1.88+), `apcore >= 0.32.3`, and `apcore-toolkit >= 0.14.1` with the `http-proxy` feature (a required runtime dependency).
+Build with current stable Rust (`apcore` requires Rust 1.86+, and the checked-in lockfile includes dependencies requiring Rust 1.88+), `apcore = 1.0.0-alpha.1`, and `apcore-toolkit = 0.15.1-alpha.1` with `http-proxy`. Registry-based installation requires a compatible APCore release on crates.io. When testing a locally unpacked prerelease, resolve both this crate and Toolkit against the same unpacked APCore package and confirm with `cargo metadata`.
 
 > **Note:** `apcore-toolkit-rust` 0.7.0 enables `serde_json/preserve_order`. This transitively affects all `serde_json::Map` iteration in your dependency tree — code that relied on alphabetical key ordering must re-sort explicitly.
 
@@ -121,6 +121,13 @@ A successful non-streaming call returns `Ok(Some(value))` with the raw JSON
 result. Preflight and streaming calls return `Ok(None)` on success. Failures
 return `Err(exit_code)`. A non-streaming module requested with `--stream`
 falls back to buffered execution and returns its result.
+
+`--strict-stream` emits JSONL and reports success only after APCore confirms
+successful completion of each applicable output-validation and after-middleware
+step. With a non-streaming in-process module it emits the unary result as one
+JSONL record. A late failure exits nonzero and records a failure in the audit log even if stdout
+already contains chunks. Filesystem scripts and `--sandbox` are unsupported
+in strict mode. `--strict-stream` also conflicts with `--dry-run` and `--trace`.
 
 To inject host-level input, choose the failure stream, or observe failures,
 use `dispatch_module_with_options`:
@@ -259,7 +266,7 @@ apcore-cli ships with 13 built-in subcommands, all reachable under the reserved 
 
 | Command | Description | Source |
 |---------|-------------|--------|
-| `exec <module_id>` | Execute a module by ID (supports `--input`, `--yes`, `--format`, `--sandbox`, `--dry-run`, `--trace`, `--stream`, `--strategy`, `--fields`, `--approval-timeout`, `--approval-token`) | `cli` |
+| `exec <module_id>` | Execute a module by ID (supports `--input`, `--yes`, `--format`, `--sandbox`, `--dry-run`, `--trace`, `--stream`, `--strict-stream`, `--strategy`, `--fields`, `--approval-timeout`, `--approval-token`) | `cli` |
 | `list` | List available modules with filtering (`--tag`, `--search`, `--status`, `--annotation`, `--sort`, `--reverse`, `--deprecated`, `--deps`) | `discovery` |
 | `describe <module_id>` | Show full module metadata, schemas, and annotations | `discovery` |
 | `validate <module_id>` | Run preflight schema / approval / dependency validation without executing | `validate` |
@@ -303,12 +310,18 @@ When executing a module (e.g. `apcore-cli math.add` or `apcore-cli exec math.add
 | `--dry-run` | Run preflight checks without executing (FE-11, routed through the `validate` module) |
 | `--trace` | Emit a pipeline execution trace |
 | `--stream` | Stream results line-by-line instead of buffering |
+| `--strict-stream` | Stream JSONL and use APCore completion for exit status and audit |
 | `--strategy <name>` | Override execution strategy (`standard`, `internal`, `testing`, `performance`, `minimal`) |
 | `--fields <csv>` | Select output fields via dot-path notation |
 | `--approval-timeout <seconds>` | Override approval prompt timeout (default: 60) |
 | `--approval-token <token>` | Provide a pre-obtained approval token to skip the interactive prompt |
 
 Schema-generated flags (e.g. `--a`, `--b`) are added automatically from the module's `input_schema`.
+Object and array flags accept JSON, for example `--filters '{"active":true}'`
+and `--labels '["a","b"]'`. Malformed JSON or a value that fails schema
+validation exits with code 45 before module execution. An explicit structured
+flag takes precedence over `--input`, and structured schema defaults fill
+fields neither source supplied.
 
 **Enhanced `list` flags (v0.6.0):** `--search <query>`, `--status <active|disabled|deprecated>`, `--annotation <key=value>`, `--sort <field>`, `--reverse`, `--deprecated` (include deprecated modules), `--deps` (show dependency graph).
 

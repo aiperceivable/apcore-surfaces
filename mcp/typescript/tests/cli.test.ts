@@ -5,9 +5,8 @@
  * process.exit is mocked to throw a sentinel so that fail()/exit() stops
  * execution cleanly rather than continuing past the mock.
  *
- * IMPORTANT: apcore-js on npm is a stub without dist/. All test scenarios
- * must vi.doMock("apcore-js") BEFORE importing cli.ts to avoid Vite
- * resolution errors.
+ * Tests stub the registry or configuration before importing cli.ts. Leave
+ * other Core exports available for the same-checkout Toolkit.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -108,22 +107,19 @@ describe("CLI (cli.ts)", () => {
       // end to end.
       vi.doMock("apcore-js", async () => vi.importActual("apcore-js"));
     } else if (apcoreAvailable) {
-      vi.doMock("apcore-js", () => ({
+      vi.doMock("apcore-js", async (importOriginal) => ({
+        ...await importOriginal<typeof import("apcore-js")>(),
         Registry: vi.fn(function () { return {
           discover: vi.fn().mockResolvedValue(discoverCount),
         }; }),
         // Only present when a test needs to exercise the mcp.openapi
         // Config-Bus fallback (A-001) — real apcore-js's Config.getInstance()
         // shape, narrowed to just what cli.ts reads.
-        ...(configOpenapi !== undefined
-          ? {
-              Config: {
-                getInstance: () => ({
-                  get: (key: string) => (key === "mcp.openapi" ? configOpenapi : undefined),
-                }),
-              },
-            }
-          : {}),
+        Config: configOpenapi === undefined ? undefined : {
+          getInstance: () => ({
+            get: (key: string) => (key === "mcp.openapi" ? configOpenapi : undefined),
+          }),
+        },
       }));
     } else {
       vi.doMock("apcore-js", () => {

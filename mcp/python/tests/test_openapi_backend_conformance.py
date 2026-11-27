@@ -56,6 +56,8 @@ def test_conformance_modules(case: dict, caplog):
     for want in expected:
         mid = want["module_id"]
         descriptor = descriptors[mid]
+        if "description" in want:
+            assert descriptor.description == want["description"]
 
         # The MCP tool name is the module ID verbatim; OpenAI is dash-normalized.
         if "mcp_tool_name" in want:

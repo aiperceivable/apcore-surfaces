@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Registry } from 'apcore-js';
 import type { Context } from 'apcore-js';
 
@@ -80,13 +80,79 @@ describe('HTTPProxyRegistryWriter', () => {
     registry = new Registry();
   });
 
+  it('returns immediate array results for a synchronous registry', () => {
+    const writer = new HTTPProxyRegistryWriter({ baseUrl: 'https://example.invalid' });
+    const registered: string[] = [];
+    const register = (moduleId: string): void => {
+      if (moduleId === 'tasks.denied') throw new Error('Rejected synchronously');
+      registered.push(moduleId);
+    };
+    const results = writer.write([mkModule({ moduleId: 'tasks.denied' }), mkModule()], { register });
+
+    expect(Array.isArray(results)).toBe(true);
+    expect(results).toMatchObject([
+      { moduleId: 'tasks.denied', verified: false, verificationError: 'Error: Rejected synchronously' },
+      { moduleId: 'tasks.create', verified: true, verificationError: null },
+    ]);
+    expect(registered).toEqual(['tasks.create']);
+  });
+
+  it('does not report a returned thenable as verified and consumes its rejection', async () => {
+    const writer = new HTTPProxyRegistryWriter({ baseUrl: 'https://example.invalid' });
+    const then = vi.fn((_resolve: () => void, reject: (error: Error) => void) => {
+      reject(new Error('Custom registry rejected registration'));
+    });
+    const register = vi.fn(() => ({ then }));
+    const [result] = writer.write([mkModule()], { register });
+
+    expect(result.verified).toBe(false);
+    expect(result.verificationError).toContain('writeAsync()');
+    expect(register).toHaveBeenCalledOnce();
+    await Promise.resolve();
+    expect(then).toHaveBeenCalledOnce();
+  });
+
+  it('waits for Core registration, reports its rejection, and continues the batch', async () => {
+    const writer = new HTTPProxyRegistryWriter({ baseUrl: 'https://example.invalid' });
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    registry.setValidator({
+      async validate(module) {
+        if ((module as { description?: string }).description !== 'reject this module') return [];
+        started.resolve();
+        await release.promise;
+        return ['Rejected by host validation'];
+      },
+    });
+    const rejected = mkModule({ moduleId: 'tasks.denied', description: 'reject this module' });
+    const settled = vi.fn();
+    const results = writer.writeAsync([rejected, mkModule()], registry).then(settled);
+    try {
+      await started.promise;
+      expect(settled).not.toHaveBeenCalled();
+      expect(registry.get(rejected.moduleId)).toBeNull();
+    } finally {
+      release.resolve();
+      await results;
+    }
+
+    expect(settled).toHaveBeenCalledExactlyOnceWith([
+      {
+        moduleId: 'tasks.denied', path: null, verified: false,
+        verificationError: expect.stringContaining('Rejected by host validation'),
+      },
+      { moduleId: 'tasks.create', path: null, verified: true, verificationError: null },
+    ]);
+    expect(registry.list()).toEqual(['tasks.create']);
+  });
+
   it('registers each module with WriteResult verified=true', async () => {
     const { fetchImpl } = recordingFetch(() => jsonResponse(200, { ok: true }));
     const writer = new HTTPProxyRegistryWriter({
       baseUrl: 'http://localhost:8000',
       fetchImpl,
     });
-    const results = await writer.write([mkModule()], registry);
+    const results = await writer.writeAsync([mkModule()], registry);
     expect(results).toHaveLength(1);
     expect(results[0].verified).toBe(true);
     expect(results[0].moduleId).toBe('tasks.create');
@@ -98,7 +164,7 @@ describe('HTTPProxyRegistryWriter', () => {
       baseUrl: 'http://localhost:8000',
       fetchImpl,
     });
-    await writer.write([mkModule()], registry);
+    await writer.writeAsync([mkModule()], registry);
     const mod = getRegistered(registry, 'tasks.create');
     const result = await mod.execute({ title: 'a' }, {} as Context);
     expect(calls).toHaveLength(1);
@@ -114,7 +180,7 @@ describe('HTTPProxyRegistryWriter', () => {
       baseUrl: 'http://localhost:8000',
       fetchImpl,
     });
-    await writer.write(
+    await writer.writeAsync(
       [
         mkModule({
           moduleId: 'tasks.update',
@@ -138,7 +204,7 @@ describe('HTTPProxyRegistryWriter', () => {
       baseUrl: 'http://localhost:8000',
       fetchImpl,
     });
-    await writer.write(
+    await writer.writeAsync(
       [
         mkModule({
           moduleId: 'tasks.fetch',
@@ -161,7 +227,7 @@ describe('HTTPProxyRegistryWriter', () => {
       baseUrl: 'http://localhost:8000',
       fetchImpl,
     });
-    await writer.write(
+    await writer.writeAsync(
       [
         mkModule({
           moduleId: 'tasks.miss',
@@ -181,7 +247,7 @@ describe('HTTPProxyRegistryWriter', () => {
       baseUrl: 'http://localhost:8000',
       fetchImpl,
     });
-    await writer.write(
+    await writer.writeAsync(
       [
         mkModule({
           moduleId: 'tasks.list',
@@ -206,7 +272,7 @@ describe('HTTPProxyRegistryWriter', () => {
       authHeaderFactory: () => ({ Authorization: 'Bearer xxx' }),
       fetchImpl,
     });
-    await writer.write([mkModule()], registry);
+    await writer.writeAsync([mkModule()], registry);
     await getRegistered(registry, 'tasks.create').execute({}, {} as Context);
     expect(calls[0].headers['Authorization']).toBe('Bearer xxx');
   });
@@ -219,7 +285,7 @@ describe('HTTPProxyRegistryWriter', () => {
       baseUrl: 'http://localhost:8000',
       fetchImpl,
     });
-    await writer.write([mkModule()], registry);
+    await writer.writeAsync([mkModule()], registry);
     await expect(
       getRegistered(registry, 'tasks.create').execute({}, {} as Context),
     ).rejects.toThrow(/HTTP 400: invalid input/);
@@ -230,7 +296,7 @@ describe('HTTPProxyRegistryWriter', () => {
       baseUrl: 'http://localhost:8000',
       fetchImpl: recordingFetch(() => jsonResponse(200, {})).fetchImpl,
     });
-    const results = await writer.write(
+    const results = await writer.writeAsync(
       [
         mkModule({
           moduleId: 'tasks.bad',
@@ -392,7 +458,7 @@ describe('HTTPProxyRegistryWriter', () => {
         outputSchema: { type: 'object', additionalProperties: true },
         tags: [],
       });
-      await writer.write([mod], registry);
+      await writer.writeAsync([mod], registry);
       const registered = getRegistered(registry, 'snake.module');
       await registered.execute({ data: 'x' }, {} as Context);
       expect(calls).toHaveLength(1);
@@ -414,7 +480,7 @@ describe('HTTPProxyRegistryWriter', () => {
         outputSchema: { type: 'object', additionalProperties: true },
         tags: [],
       });
-      await writer.write([mod], registry);
+      await writer.writeAsync([mod], registry);
       const registered = getRegistered(registry, 'camel.module');
       await registered.execute({}, {} as Context);
       expect(calls).toHaveLength(1);

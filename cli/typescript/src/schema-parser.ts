@@ -5,9 +5,10 @@
  */
 
 import type { OptionConfig } from "./main.js";
-import { EXIT_CODES } from "./errors.js";
+import { EXIT_CODES, SchemaValidationError } from "./errors.js";
 import { exitWith } from "./exit.js";
 import { warn as logWarn } from "./logger.js";
+import { structuredOptionTypes } from "./ref-resolver.js";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -77,6 +78,18 @@ export function extractHelp(propSchema: Record<string, unknown>, maxLength = 100
   return text;
 }
 
+function parseStructuredValue(value: string, flag: string, types: readonly string[]): unknown {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value);
+  } catch {
+    throw new SchemaValidationError(`${flag} must contain valid JSON.`);
+  }
+  const type = decoded === null ? "null" : Array.isArray(decoded) ? "array" : typeof decoded;
+  if (!types.includes(type)) throw new SchemaValidationError(`${flag} must be JSON of type ${types.join(" or ")}.`);
+  return decoded;
+}
+
 // ---------------------------------------------------------------------------
 // schemaToCliOptions
 // ---------------------------------------------------------------------------
@@ -84,7 +97,7 @@ export function extractHelp(propSchema: Record<string, unknown>, maxLength = 100
 /** Reserved CLI option names that cannot be used by schema properties. */
 const RESERVED_NAMES = new Set([
   "input", "yes", "large_input", "format", "fields", "sandbox",
-  "all_options", "dry_run", "trace", "stream", "strategy",
+  "all_options", "dry_run", "trace", "stream", "strict_stream", "strategy",
   "approval_timeout", "approval_token",
 ]);
 
@@ -143,7 +156,8 @@ export function schemaToCliOptions(
     }
     flagNames[flagName] = propName;
 
-    const typeResult = mapType(propName, propSchema);
+    const structuredTypes = structuredOptionTypes(propSchema.type);
+    const typeResult = structuredTypes ? "string" : mapType(propName, propSchema);
     const isRequired = requiredList.includes(propName);
     const helpBase = extractHelp(propSchema, maxHelpLength);
     const helpText = isRequired
@@ -151,7 +165,16 @@ export function schemaToCliOptions(
       : helpBase ?? "";
     const defaultValue = propSchema.default as unknown;
 
-    if (typeResult === BOOLEAN_FLAG) {
+    if (structuredTypes) {
+      options.push({
+        name: propName,
+        flags: `${flagName} <json>`,
+        description: helpText,
+        defaultValue,
+        required: isRequired,
+        parseStructuredArg: value => parseStructuredValue(value, flagName, structuredTypes),
+      });
+    } else if (typeResult === BOOLEAN_FLAG) {
       // Boolean flag pair: --flag/--no-flag
       const flagBase = propName.replace(/_/g, "-");
       // Cross-SDK parity (D11-005): Rust schema_parser.rs:272 also tracks

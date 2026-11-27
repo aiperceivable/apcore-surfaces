@@ -684,6 +684,42 @@ impl ServerHandler {
         None
     }
 
+    fn tool_call_extra(params: &Value) -> Option<Value> {
+        let mut extra = params.get("_meta")?.clone();
+        if let Some(metadata) = extra.as_object_mut() {
+            metadata.remove("identity");
+            // A wire call contributes a hint only at params._meta.apcore.version.
+            // The router also accepts separate SDK extra shapes from in-process callers.
+            let version = metadata
+                .get_mut("apcore")
+                .and_then(Value::as_object_mut)
+                .and_then(|apcore| apcore.remove("version"));
+            metadata.remove("version_hint");
+            metadata.remove("versionHint");
+            if let Some(apcore) = metadata
+                .get_mut("_meta")
+                .and_then(|wrapped| wrapped.get_mut("apcore"))
+                .and_then(Value::as_object_mut)
+            {
+                apcore.remove("version");
+            }
+            if let Some(version) = version {
+                let valid = version.as_str().is_some_and(|hint| {
+                    hint.len() <= 64
+                        && hint.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || b".-+_~^>=<* ".contains(&byte)
+                        })
+                });
+                if valid {
+                    metadata.insert("version_hint".into(), version);
+                } else {
+                    tracing::debug!("Ignoring invalid APCore wire version hint");
+                }
+            }
+        }
+        Some(extra)
+    }
+
     fn negotiated_protocol(message: &Value) -> &'static str {
         match message["params"]["protocolVersion"].as_str() {
             Some("2024-11-05") => "2024-11-05",
@@ -838,7 +874,19 @@ impl crate::server::transport::McpHandler for ServerHandler {
                     .get("arguments")
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
-                let extra = params.get("_meta").cloned();
+                if arguments.get("_approval_token").is_some()
+                    || (name == crate::server::async_task_bridge::META_TOOL_SUBMIT
+                        && arguments
+                            .get("arguments")
+                            .and_then(|value| value.get("_approval_token"))
+                            .is_some())
+                {
+                    return Self::wrap_response(
+                        id,
+                        Self::rpc_error(-32602, "Approval credentials belong in request metadata"),
+                    );
+                }
+                let extra = Self::tool_call_extra(params);
                 let mut call_result = (self.call_tool)(name, arguments, extra).await;
                 if !self.supports_structured_results(&message) {
                     call_result.structured_content = None;

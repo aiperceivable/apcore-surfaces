@@ -48,10 +48,10 @@
 
 ### Async
 
-- The crate itself has **no async-runtime dependency** — consumers bring their own
-  runtime (e.g. the README's quick-start example uses `#[tokio::main]`). `tokio` only
-  appears in `[dev-dependencies]`, scoped to `features = ["rt", "macros", "net", "time"]`
-  for driving async integration tests; it is not a runtime dependency of the crate.
+- Consumers bring their own async runtime. Tokio is optional in library builds.
+  The `http-proxy` and `device-auth` features use its time primitives. The
+  `prometheus-server` feature also enables the runtime features needed to serve
+  HTTP in the consumer's Tokio runtime.
 - Traits with async methods: use **`async-trait`**.
 
 ### Logging

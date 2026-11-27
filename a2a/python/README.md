@@ -178,6 +178,37 @@ serve(registry, auth=auth)
 
 ## For Developers: API Reference
 
+### A2A event subscriptions
+
+Call `register_a2a_subscriber()` during application startup, before creating the
+APCore client. Existing `sys_modules.events.subscribers` entries with
+`type: a2a` then use the adapter's HTTP transport. The same factory resolves
+`delegate_type: a2a` in a filter.
+
+```python
+from apcore import APCore, Config
+from apcore_a2a import register_a2a_subscriber
+
+register_a2a_subscriber()
+client = APCore(config=Config.discover())
+try:
+    # Use the client with the application's configured subscribers.
+    pass
+finally:
+    client.close()
+```
+
+The transport uses `httpx` and sends one delivery attempt to the configured
+`platform_url`. APCore applies retry, circuit breaker and dead-letter policy.
+Core 0.33.0's configuration-driven circuit breaker records failures without
+forwarding them to the retry and dead-letter pipeline. Use a Core release with
+that forwarding enabled when those guarantees are required.
+
+The factory change applies to future APCore clients in the process. To restore
+the built-in transport, remove the registration call and restart with the same
+subscriber configuration. The built-in transport requires the optional
+`apcore[events]` extra.
+
 ### `serve()`
 
 Blocking call — starts uvicorn and serves until SIGINT/SIGTERM.

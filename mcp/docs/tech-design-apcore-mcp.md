@@ -1932,7 +1932,7 @@ MCP Client → tools/call → ExecutionRouter → Executor
 
 | Error Code | Behavior | Wire Format |
 |------------|----------|-------------|
-| `APPROVAL_PENDING` | Narrow details to `{approvalId}` only | `{"approvalId": "..."}` |
+| `APPROVAL_PENDING` | Use a status-only diagnostic | [Phase B tool result metadata](features/approval-phase-b.md#complete-flow) carries scoped resumption information for the initiating caller. |
 | `APPROVAL_TIMEOUT` | Set `retryable: true` | AI agents should retry |
 | `APPROVAL_DENIED` | Extract `reason` from details | `{"reason": "..."}` |
 

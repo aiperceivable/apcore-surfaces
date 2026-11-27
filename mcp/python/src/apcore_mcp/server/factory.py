@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
+from contextlib import nullcontext
 from copy import deepcopy
 from decimal import Decimal, DecimalException
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
+import anyio
 import jsonschema  # type: ignore[import-untyped]  # MCP supplies jsonschema without its optional typing stubs.
+from apcore import CancelToken, Identity, ModuleError
+from apcore import Registry as CoreRegistry
 from apcore.schema.exporter import SchemaExporter
 from apcore.schema.types import SchemaDefinition
 from mcp import types as mcp_types
@@ -24,12 +29,16 @@ from referencing.jsonschema import DRAFT7, DRAFT201909, DRAFT202012
 
 import apcore_mcp.markdown as _markdown
 from apcore_mcp.adapters.annotations import AnnotationMapper
-from apcore_mcp.auth.middleware import auth_identity_var
-from apcore_mcp.server.approval_bridge import ApprovalBridge
+from apcore_mcp.auth.middleware import _REQUEST_IDENTITY_KEY, auth_identity_var
+from apcore_mcp.server.approval_bridge import ApprovalBridge, _approval_response_log, _protect_sdk_approval_logs
 from apcore_mcp.server.async_task_bridge import RESERVED_PREFIX, AsyncTaskBridge
+from apcore_mcp.server.router import ExecutionRouter, _descriptor_version_hint, _matches_registered_version
 from apcore_mcp.server.transport import _protocol_source_var, transport_session_var
 
 logger = logging.getLogger(__name__)
+
+
+_NO_APPROVAL_CREDENTIAL = object()
 
 
 _AI_INTENT_KEYS = ("x-when-to-use", "x-when-not-to-use", "x-common-mistakes", "x-workflow-hints")
@@ -113,6 +122,17 @@ _MANAGEMENT_SURFACE_ORDER = ("health", "usage", "manifest", "control")
 _PROTOCOL_SPEC_VERSION = "1.30.0"
 
 
+def _request_identity() -> Identity | None:
+    from mcp.server.lowlevel.server import request_ctx
+
+    ctx = request_ctx.get(None)
+    scope = getattr(ctx.request, "scope", None) if ctx is not None else None
+    if isinstance(scope, dict) and _REQUEST_IDENTITY_KEY in scope:
+        identity = scope[_REQUEST_IDENTITY_KEY]
+        return identity if isinstance(identity, Identity) else None
+    return auth_identity_var.get()
+
+
 def _supports_structured_output() -> bool:
     """Read protocol state from the MCP session or trusted HTTP request."""
     from mcp.server.lowlevel.server import request_ctx
@@ -194,6 +214,8 @@ def _build_call_result(
     content: list[mcp_types.TextContent],
     is_error: bool,
     output_schema: dict[str, Any] | None,
+    *,
+    approval: dict[str, str] | None = None,
 ) -> mcp_types.CallToolResult:
     """Project only the router's already-redacted JSON text as structured data."""
     structured: dict[str, Any] | None = None
@@ -231,7 +253,8 @@ def _build_call_result(
                     ],
                     isError=True,
                 )
-    return mcp_types.CallToolResult(content=[*content], structuredContent=structured, isError=is_error)
+    metadata = {"apcore": {"approval": approval}} if is_error and approval else None
+    return mcp_types.CallToolResult(content=[*content], structuredContent=structured, isError=is_error, _meta=metadata)
 
 
 class MCPServerFactory:
@@ -467,6 +490,15 @@ class MCPServerFactory:
                 logger.warning("Skipped module %s: no definition found", module_id)
                 continue
             try:
+                # Advertise the same registration used when an unhinted
+                # request takes the module's configured version default.
+                version_hint = _descriptor_version_hint(descriptor)
+                if isinstance(registry, CoreRegistry) and version_hint is not None:
+                    selected = registry.get_definition(module_id, version_hint)
+                    if selected is not None and _matches_registered_version(
+                        registry, module_id, version_hint, selected.version,
+                    ):
+                        descriptor = selected
                 # Keep compatibility arguments while preserving the runtime schema.
                 tools.append(self.build_tool(descriptor, registry=registry, strict=strict))
             except ValueError as e:
@@ -481,6 +513,45 @@ class MCPServerFactory:
                 logger.warning("Failed to build tool for %s: %s", module_id, e)
                 continue
         return tools
+
+    def _bind_requested_version(
+        self,
+        router: ExecutionRouter,
+        published: mcp_types.Tool,
+        extra: dict[str, Any],
+        *,
+        async_enabled: bool,
+    ) -> str | None:
+        try:
+            selection = router._select_wire_version(published.name, extra)
+        except ModuleError as error:
+            return self._error_mapper.to_mcp_error(error)["message"]
+        if selection is None:
+            return None
+        selected, default, can_pin = selection
+        mismatch = f"Requested version {selected.version} does not match the advertised tool contract."
+        try:
+            selected_tool = self.build_tool(selected)
+        except ValueError:
+            return mismatch
+        fields = {"inputSchema", "annotations", "meta"}
+        if _supports_structured_output():
+            fields.add("outputSchema")
+        published_contract = json.dumps(published.model_dump(mode="json", include=fields), sort_keys=True)
+        selected_contract = json.dumps(selected_tool.model_dump(mode="json", include=fields), sort_keys=True)
+        if selected_tool.name != published.name or published_contract != selected_contract:
+            return mismatch
+        if not can_pin:
+            return "This Core version cannot confirm the requested tool registration."
+        if async_enabled:
+            default_async = AsyncTaskBridge.is_async_module(default)
+            if default_async != AsyncTaskBridge.is_async_module(selected):
+                return mismatch
+            if default_async:
+                return "Version hints are unavailable for background tool execution."
+        extra["version_hint"] = selected.version
+        extra["_mcp_wire_version"] = True
+        return None
 
     def register_handlers(
         self,
@@ -522,6 +593,9 @@ class MCPServerFactory:
             combined_tools.extend(async_bridge.build_meta_tools())
         if approval_bridge is not None:
             combined_tools.extend(approval_bridge.build_meta_tools())
+            _protect_sdk_approval_logs(server)
+
+        regular_tool_ids = {id(tool) for tool in tools}
 
         @server.list_tools()
         async def handle_list_tools() -> list[mcp_types.Tool]:
@@ -539,13 +613,16 @@ class MCPServerFactory:
             # Always pass session for elicitation support
             extra: dict[str, Any] = {"session": ctx.session}
 
+            approval_token = _NO_APPROVAL_CREDENTIAL
             if ctx.meta is not None:
+                approval_token = getattr(ctx.meta, "approvalId", _NO_APPROVAL_CREDENTIAL)
                 meta_dump = ctx.meta.model_dump(exclude_none=True)
+                meta_dump.pop("approvalId", None)
                 if meta_dump:
                     extra["_meta"] = meta_dump
 
             # Bridge authenticated identity from ASGI middleware
-            identity = auth_identity_var.get()
+            identity = _request_identity()
             if identity is not None:
                 extra["identity"] = identity
 
@@ -562,8 +639,52 @@ class MCPServerFactory:
                 extra["send_notification"] = send_notification
                 extra["progress_token"] = progress_token
 
+            published = next((tool for tool in reversed(combined_tools) if tool.name == name), None)
+            regular_tool = published is not None and id(published) in regular_tool_ids
+            if published is not None and regular_tool and isinstance(router, ExecutionRouter):
+                error = self._bind_requested_version(
+                    router,
+                    published,
+                    extra,
+                    async_enabled=async_bridge is not None and descriptor_lookup is not None,
+                )
+                if error is not None:
+                    return _build_call_result([mcp_types.TextContent(type="text", text=error)], True, None)
+
+            async_meta_tool = async_bridge is not None and async_bridge.is_meta_tool(name)
+            approval_meta_tool = approval_bridge is not None and approval_bridge.is_meta_tool(name)
+            background_tool = (
+                not async_meta_tool
+                and not approval_meta_tool
+                and async_bridge is not None
+                and descriptor_lookup is not None
+                and async_bridge.is_async_module(descriptor_lookup(name))
+            )
+            response_log = _approval_response_log(ctx.request)
+            can_deliver_approval = ctx.request is None or (
+                _protocol_source_var.get() != "session" and response_log is not None
+            )
+            scoped_approval = (
+                approval_bridge is not None
+                and regular_tool
+                and can_deliver_approval
+                and not background_tool
+                and isinstance(router, ExecutionRouter)
+            )
+            credential_error = None
+            if approval_token is not _NO_APPROVAL_CREDENTIAL:
+                if not scoped_approval:
+                    credential_error = "Scoped approval is unavailable for this call."
+                elif not isinstance(approval_token, str) or not 0 < len(approval_token) <= 256:
+                    credential_error = "Invalid approval credential."
+                else:
+                    extra["_mcp_approval_token"] = approval_token
+            if credential_error is not None:
+                return _build_call_result([mcp_types.TextContent(type="text", text=credential_error)], True, None)
+
+            pending_approval = None
             # Meta-tool route: handled entirely by the async bridge.
-            if async_bridge is not None and async_bridge.is_meta_tool(name):
+            if async_bridge is not None and async_meta_tool:
                 content, is_error, _trace_id = await async_bridge.handle_meta_tool(
                     name,
                     arguments or {},
@@ -571,14 +692,12 @@ class MCPServerFactory:
                     router_extra=extra,
                 )
             # Approval meta-tool route: handled by the approval bridge.
-            elif approval_bridge is not None and approval_bridge.is_meta_tool(name):
-                content, is_error, _trace_id = await approval_bridge.handle_meta_tool(name, arguments or {})
+            elif approval_bridge is not None and approval_meta_tool:
+                content, is_error, _trace_id = await approval_bridge.handle_meta_tool(
+                    name, arguments or {}, identity=identity,
+                )
             # Async-hint route: submit to AsyncTaskManager, return task envelope.
-            elif (
-                async_bridge is not None
-                and descriptor_lookup is not None
-                and async_bridge.is_async_module(descriptor_lookup(name))
-            ):
+            elif async_bridge is not None and background_tool:
                 from apcore import Context
                 from apcore.trace_context import TraceContext, TraceParent
 
@@ -615,7 +734,27 @@ class MCPServerFactory:
                     content = [{"type": "text", "text": info["message"]}]
                     is_error = True
             else:
-                content, is_error, _trace_id = await router.handle_call(name, arguments or {}, extra=extra)
+                # The SDK cancels the request coroutine for its own session and
+                # JSON-RPC request ID. Signal the linked APCore invocation
+                # before letting that cancellation interrupt its cleanup.
+                token = CancelToken()
+                extra["_transport_cancel_token"] = token
+                extra["call_id"] = f"mcp:{id(ctx.session)}:{ctx.request_id!r}"
+                capture = approval_bridge.delivery(name) if scoped_approval and approval_bridge else nullcontext()
+                with capture as delivery:
+                    call = asyncio.create_task(router.handle_call(name, arguments or {}, extra=extra))
+                    try:
+                        content, is_error, _trace_id = await asyncio.shield(call)
+                    except asyncio.CancelledError:
+                        token.cancel()
+                        call.cancel()
+                        with anyio.CancelScope(shield=True):
+                            await asyncio.gather(call, return_exceptions=True)
+                        raise
+                if delivery is not None:
+                    pending_approval = delivery.metadata
+                    if pending_approval is not None and response_log is not None:
+                        response_log.carries_credential = True
 
             # A direct CallToolResult preserves error status and text metadata.
             text_contents: list[mcp_types.TextContent] = []
@@ -627,8 +766,30 @@ class MCPServerFactory:
                     text_contents.append(mcp_types.TextContent(type="text", text=item["text"], _meta=item_meta))
                 else:
                     text_contents.append(mcp_types.TextContent(type="text", text=item["text"]))
-            output_schema = next((tool.outputSchema for tool in reversed(combined_tools) if tool.name == name), None)
-            return _build_call_result(text_contents, is_error, output_schema)
+            output_schema = published.outputSchema if published is not None else None
+            return _build_call_result(text_contents, is_error, output_schema, approval=pending_approval)
+
+        sdk_call_tool = server.request_handlers[mcp_types.CallToolRequest]
+
+        async def check_reserved_approval_input(request: mcp_types.CallToolRequest) -> mcp_types.ServerResult:
+            arguments = request.params.arguments or {}
+            nested_arguments = (
+                arguments.get("arguments")
+                if request.params.name in {"__apcore_task_submit", "__apcore_module_preview"}
+                else None
+            )
+            if "_approval_token" in arguments or (
+                isinstance(nested_arguments, dict) and "_approval_token" in nested_arguments
+            ):
+                message = mcp_types.TextContent(
+                    type="text", text="Send the approval credential in MCP request metadata."
+                )
+                return mcp_types.ServerResult(_build_call_result([message], True, None))
+            return await sdk_call_tool(request)
+
+        # The SDK validates the business schema before its decorated callback.
+        # Check reserved fields first so SDK validation cannot print them.
+        server.request_handlers[mcp_types.CallToolRequest] = check_reserved_approval_input
 
     def register_resource_handlers(
         self,
@@ -784,7 +945,7 @@ class MCPServerFactory:
             raise ValueError(f"Resource not found: {uri_str}")
 
         extra: dict[str, Any] = {}
-        identity = auth_identity_var.get()
+        identity = _request_identity()
         if identity is not None:
             extra["identity"] = identity
 

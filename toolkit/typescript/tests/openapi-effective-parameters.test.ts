@@ -42,7 +42,7 @@ async function captureProxyRequests(exercise: (writer: HTTPProxyRegistryWriter) 
 }
 
 describe('effective OpenAPI parameters', () => {
-  it('preserves boolean inputs reached directly and through schema and Parameter Object references', () => {
+  it('preserves boolean inputs reached directly and through schema and Parameter Object references', async () => {
     const spec = {
       openapi: '3.1.0',
       components: {
@@ -115,7 +115,9 @@ describe('effective OpenAPI parameters', () => {
 
     const registry = new Registry();
     const writer = new HTTPProxyRegistryWriter({ baseUrl: 'https://example.invalid' });
-    expect(writer.write([module], registry)[0].verified).toBe(true);
+    const [registration] = await writer.writeAsync([module], registry);
+    expect(registration.verified, registration.verificationError ?? undefined).toBe(true);
+    expect(registry.get(module.moduleId)?.description).toBe('GET /boolean');
     const inputSchema = registry.get(module.moduleId)?.inputSchema;
     expect(inputSchema).toBeDefined();
     if (inputSchema === undefined) throw new Error('Expected the HTTP proxy input schema');
@@ -189,7 +191,7 @@ describe('effective OpenAPI parameters', () => {
     ]);
   });
 
-  it('preserves conjunctive reference assertions and resolves fragment and array pointers', () => {
+  it('preserves conjunctive reference assertions and resolves fragment and array pointers', async () => {
     const spec = {
       openapi: '3.1.0',
       components: { schemas: {
@@ -219,7 +221,7 @@ describe('effective OpenAPI parameters', () => {
     expect(module.outputSchema).toEqual({});
     const registry = new Registry();
     const writer = new HTTPProxyRegistryWriter({ baseUrl: 'https://example.invalid' });
-    expect(writer.write([module], registry)[0].verified).toBe(true);
+    expect((await writer.writeAsync([module], registry))[0].verified).toBe(true);
     const schema = registry.get(module.moduleId)?.inputSchema;
     if (schema === undefined) throw new Error('Expected the HTTP proxy input schema');
     expect(Value.Check(schema, { color: 'red' })).toBe(true);
@@ -286,7 +288,7 @@ describe('effective OpenAPI parameters', () => {
     const requests = await captureProxyRequests(async writer => {
       for (const module of [selected, legacy]) {
         const registry = new Registry();
-        expect(writer.write([module], registry)[0].verified).toBe(true);
+        expect((await writer.writeAsync([module], registry))[0].verified).toBe(true);
         const runtime = registry.get(module.moduleId);
         if (runtime === undefined) throw new Error('Expected the HTTP proxy module');
         await runtime.execute({ tag: ['red', 'blue'] }, Context.create());
@@ -315,7 +317,7 @@ describe('effective OpenAPI parameters', () => {
     const requests = await captureProxyRequests(async writer => {
       for (const module of [effective, legacy]) {
         const registry = new Registry();
-        expect(writer.write([module], registry)[0].verified).toBe(true);
+        expect((await writer.writeAsync([module], registry))[0].verified).toBe(true);
         const runtime = registry.get(module.moduleId);
         if (runtime === undefined) throw new Error('Expected the HTTP proxy module');
         await runtime.execute({}, Context.create());
@@ -372,7 +374,7 @@ it('forwards literal OpenAPI colons and uses only brace placeholders', async () 
   expect(detectEffectiveProxyHazards(modules)).toEqual([]);
   const requests = await captureProxyRequests(async writer => {
     const registry = new Registry();
-    expect(writer.write(modules, registry).every(result => result.verified)).toBe(true);
+    expect((await writer.writeAsync(modules, registry)).every(result => result.verified)).toBe(true);
     await registry.get('inventory_search')!.execute({ item: 'a/b' }, Context.create());
     await registry.get('static_search')!.execute({}, Context.create());
 
@@ -380,7 +382,7 @@ it('forwards literal OpenAPI colons and uses only brace placeholders', async () 
     const legacyModules = new OpenAPIScanner().scan({ openapi: '3.1.0', paths: {
       '/legacy/:item': { get: { parameters: [parameter('item', 'path', 'string', true)], responses: response } },
     } });
-    expect(writer.write(legacyModules, legacy)[0].verified).toBe(true);
+    expect((await writer.writeAsync(legacyModules, legacy))[0].verified).toBe(true);
     await legacy.get(legacyModules[0].moduleId)!.execute({ item: 'a/b' }, Context.create());
   });
   expect(requests.map(request => request.url)).toEqual([
@@ -439,7 +441,7 @@ it('refuses complex effective input to an otherwise scalar path or query at exec
   });
   const requests = await captureProxyRequests(async writer => {
     const registry = new Registry();
-    expect(writer.write([module], registry)[0].verified).toBe(true);
+    expect((await writer.writeAsync([module], registry))[0].verified).toBe(true);
     const proxy = registry.get(module.moduleId)!;
     await expect(proxy.execute({ id: ['one'] }, Context.create())).rejects.toThrow(/Path parameter "id"/);
     await expect(proxy.execute({ id: 'one', filter: { color: 'red' } }, Context.create())).rejects.toThrow(/Query parameter "filter"/);

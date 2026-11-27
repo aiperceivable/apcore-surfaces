@@ -306,6 +306,14 @@ apcore-cli --extensions-dir ./extensions apcli list
 apcore-cli --extensions-dir ./extensions math add --a 5 --b 10
 ```
 
+For a generated command, pass object and array flags as quoted JSON. A flag
+value overrides the corresponding property from `--input`. Invalid JSON or
+values that fail schema validation exit with code `45` before execution.
+
+```bash
+apcore-cli report create --filters '{"active":true}' --labels '["weekly","ops"]'
+```
+
 ### STDIN piping (Unix pipes)
 
 ```bash

@@ -1,5 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
-import { Registry, FunctionModule, createAnnotations } from 'apcore-js';
+import {
+  AlwaysDenyHandler,
+  AutoApproveHandler,
+  createAnnotations,
+  Executor,
+  FunctionModule,
+  jsonSchemaToTypeBox,
+  Registry,
+} from 'apcore-js';
+import { resolveTarget } from '../src/resolve-target.js';
 import { createScannedModule } from '../src/types.js';
 
 vi.mock('../src/resolve-target.js', () => ({
@@ -31,9 +40,15 @@ describe('assertAnnotationsPreserved', () => {
     const droppingWriter = {
       async write(mods: ReturnType<typeof createScannedModule>[], registry: Registry) {
         for (const m of mods) {
-          registry.register(
+          await registry.register(
             m.moduleId,
-            new FunctionModule({ moduleId: m.moduleId, description: m.description, execute: async () => ({}) }),
+            new FunctionModule({
+              moduleId: m.moduleId,
+              description: m.description,
+              inputSchema: jsonSchemaToTypeBox(m.inputSchema),
+              outputSchema: jsonSchemaToTypeBox(m.outputSchema),
+              execute: async () => ({}),
+            }),
           );
         }
         return [];
@@ -51,4 +66,24 @@ describe('assertAnnotationsPreserved', () => {
       /annotations to be set/,
     );
   });
+});
+
+
+it('enforces a Toolkit-registered approval annotation through the real Executor', async () => {
+  const registry = new Registry();
+  const handler = vi.fn(() => ({ result: 'ok' }));
+  vi.mocked(resolveTarget).mockResolvedValueOnce(handler);
+  const module = createScannedModule({
+    ...BASE,
+    annotations: createAnnotations({ destructive: true, requiresApproval: true }),
+  });
+  await assertAnnotationsPreserved(new RegistryWriter(), module, registry);
+
+  const denied = new Executor({ registry, approvalHandler: new AlwaysDenyHandler() });
+  await expect(denied.call(module.moduleId, {})).rejects.toMatchObject({ code: 'APPROVAL_DENIED' });
+  expect(handler).not.toHaveBeenCalled();
+
+  const approved = new Executor({ registry, approvalHandler: new AutoApproveHandler() });
+  await expect(approved.call(module.moduleId, {})).resolves.toEqual({ result: 'ok' });
+  expect(handler).toHaveBeenCalledTimes(1);
 });

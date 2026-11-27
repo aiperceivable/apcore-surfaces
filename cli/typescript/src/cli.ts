@@ -126,6 +126,8 @@ export interface Executor {
   callWithTrace?(moduleId: string, input: Record<string, unknown>, options?: { strategy?: string }): Promise<[unknown, PipelineTrace]>;
   /** Stream execution — async iterator of chunks. */
   stream?(moduleId: string, input: Record<string, unknown>): AsyncIterable<unknown>;
+  /** Optional Core API used by --strict-stream. */
+  streamWithCompletion?(moduleId: string, input: Record<string, unknown>, context?: unknown): import("./strict-stream.js").StreamExecution;
   /**
    * Describe the executor's currently-set strategy. Returns StrategyInfo
    * (apcore-js >= 0.18.0). Takes no arguments — to introspect a different

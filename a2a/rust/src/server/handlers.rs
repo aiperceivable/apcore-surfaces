@@ -23,7 +23,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -64,7 +64,7 @@ pub struct AppState {
     /// Filtered per caller like the extended card: the Explorer sits behind the
     /// auth middleware whenever one is configured.
     pub(crate) explorer_card: Arc<FilteredCard>,
-    pub(crate) cancel_tokens: Arc<Mutex<HashMap<String, CancelToken>>>,
+    pub(crate) running_tasks: RunningTasks,
     /// Per-task push-notification webhook configs
     /// (`tasks/pushNotificationConfig/*`), scoped to their owner by the store.
     pub(crate) push_config_store: Arc<dyn PushConfigStore>,
@@ -715,7 +715,7 @@ async fn fail_task(
     context_id: &str,
     ctx: &CallContext,
     message: impl Into<String>,
-) -> Value {
+) -> Result<Value, (i32, String)> {
     let status = TaskStatus::with_message(TaskState::Failed, Message::agent_text(message));
     let task = Task {
         id: task_id.to_string(),
@@ -725,7 +725,7 @@ async fn fail_task(
         history: vec![],
     };
     let task_json = serde_json::to_value(&task).unwrap();
-    save_task(state, task_id, task_json.clone(), ctx).await;
+    save_task(state, task_id, task_json.clone(), ctx).await?;
     notify_push(
         state,
         task_id,
@@ -737,7 +737,7 @@ async fn fail_task(
         }),
     )
     .await;
-    task_json
+    Ok(task_json)
 }
 
 /// Emit a task-level failure as an SSE stream (SUBMITTED then terminal FAILED),
@@ -759,7 +759,11 @@ async fn failed_task_stream(
         artifacts: vec![],
         history: vec![],
     };
-    save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await;
+    if let Err((code, message)) =
+        save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await
+    {
+        return Json(rpc_error(&id, code, &message)).into_response();
+    }
     let terminal = StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
         task_id: task_id.clone(),
         context_id: context_id.clone(),
@@ -805,38 +809,39 @@ async fn handle_send(
             task_id,
             context_id,
             message,
-        }) => return Ok(fail_task(state, &task_id, &context_id, ctx, message).await),
+        }) => return fail_task(state, &task_id, &context_id, ctx, message).await,
     };
 
     // Reject unknown skills with a FAILED task (Python/TS parity).
     if !state.skill_ids.contains(&skill_id) {
-        return Ok(fail_task(
+        return fail_task(
             state,
             &task_id,
             &context_id,
             ctx,
             format!("Skill not found: {skill_id}"),
         )
-        .await);
+        .await;
     }
 
     let mut task = submitted_task(&task_id, &context_id);
 
-    let cancel = CancelToken::new();
-    register_cancel(state, &task_id, cancel.clone());
-    // Unregister the cancel token on every exit path (success, error, panic);
-    // a Drop guard mirrors handle_stream and avoids leaking the token.
-    let _cancel_guard = CancelGuard {
-        state: state.clone(),
-        task_id: task_id.clone(),
-    };
+    let running = state.running_tasks.register(&task_id, ctx);
+    let execution = &running.execution;
 
-    save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await;
+    save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await?;
 
     let result = state
         .executor
-        .call(&skill_id, inputs, identity, cancel)
+        .call(&skill_id, inputs, identity, execution.token.clone())
         .await;
+
+    let terminal = execution.terminal.lock().await;
+    if execution.canceled_status().is_some() {
+        return read_task(state, &task_id, ctx)
+            .await?
+            .ok_or((CODE_TASK_NOT_FOUND, "Task not found".to_string()));
+    }
 
     match result {
         Ok(output) => {
@@ -852,11 +857,8 @@ async fn handle_send(
         }
     }
     let task_json = serde_json::to_value(&task).unwrap();
-    state
-        .task_store
-        .save(&task_id, task_json.clone(), ctx)
-        .await
-        .map_err(|e| store_failure(&format!("task store write for {task_id}"), e))?;
+    save_task(state, &task_id, task_json.clone(), ctx).await?;
+    drop(terminal);
 
     // Deliver the terminal status to any registered webhook.
     notify_push(
@@ -893,36 +895,49 @@ async fn handle_stream(
         }) => return failed_task_stream(state, task_id, context_id, ctx, id, message).await,
     };
 
-    let cancel = CancelToken::new();
-    register_cancel(state, &task_id, cancel.clone());
+    let running = state.running_tasks.register(&task_id, ctx);
 
-    let (tx, rx) = mpsc::channel::<StreamEvent>(16);
+    // Reserve capacity for the terminal status and successful end marker.
+    // Artifact backpressure must not block either after the decision is made.
+    let (tx, rx) = mpsc::channel::<Event>(18);
+    let terminal_slot = tx.clone().try_reserve_owned().ok();
+    let marker_slot = tx.clone().try_reserve_owned().ok();
     let state2 = state.clone();
     // The spawned task outlives this call, so it needs an owned context to
     // scope its own stores writes and webhook lookup.
     let ctx2 = ctx.clone();
     let skill_known = state.skill_ids.contains(&skill_id);
+    let started = tokio::time::Instant::now();
 
     tokio::spawn(async move {
-        // Unregister the cancel token on every exit path (success, error, panic).
-        let _cancel_guard = CancelGuard {
-            state: state2.clone(),
-            task_id: task_id.clone(),
-        };
-        let send = |ev: StreamEvent| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx.send(ev).await;
+        let execution = &running.execution;
+        let mut task = submitted_task(&task_id, &context_id);
+        if skill_known {
+            task.status = TaskStatus::new(TaskState::Working);
+            if let Err(error) = save_task(
+                &state2,
+                &task_id,
+                serde_json::to_value(&task).unwrap(),
+                &ctx2,
+            )
+            .await
+            {
+                publish_stream_storage_error(terminal_slot, &id, error);
+                return;
             }
-        };
+        }
 
         // submitted → working
-        send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: task_id.clone(),
-            context_id: context_id.clone(),
-            status: TaskStatus::new(TaskState::Submitted),
-        }))
-        .await;
+        let _ = tx
+            .send(sse_event(
+                &id,
+                &StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    status: TaskStatus::new(TaskState::Submitted),
+                }),
+            ))
+            .await;
 
         // Reject unknown skills with a terminal FAILED status (Python/TS parity).
         if !skill_known {
@@ -937,113 +952,175 @@ async fn handle_stream(
                 artifacts: vec![],
                 history: vec![],
             };
-            save_task(
+            if let Err(error) = save_task(
                 &state2,
                 &task_id,
                 serde_json::to_value(&task).unwrap(),
                 &ctx2,
             )
-            .await;
+            .await
+            {
+                publish_stream_storage_error(terminal_slot, &id, error);
+                return;
+            }
             let terminal_event = StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
                 status,
             });
+            if let Some(slot) = terminal_slot {
+                slot.send(sse_event(&id, &terminal_event));
+            }
+            drop(marker_slot);
+            drop(tx);
             notify_push(&state2, &task_id, &ctx2, &terminal_event).await;
-            send(terminal_event).await;
             return;
         }
 
-        send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: task_id.clone(),
-            context_id: context_id.clone(),
-            status: TaskStatus::new(TaskState::Working),
-        }))
-        .await;
-
-        let mut chunks = state2
-            .executor
-            .stream_channel(skill_id, inputs, identity, cancel);
-        let mut idx: usize = 0;
-        let mut error: Option<ModuleError> = None;
-
-        while let Some(item) = chunks.next().await {
-            match item {
-                Ok(chunk) => {
-                    // task_id is always a fresh uuid here, so the artifact id is
-                    // stable (`art-{task_id}`) across chunks.
-                    let artifact = state2
-                        .executor
-                        .part_converter()
-                        .output_to_parts(&chunk, &task_id);
-                    send(StreamEvent::ArtifactUpdate(TaskArtifactUpdateEvent {
-                        task_id: task_id.clone(),
-                        context_id: context_id.clone(),
-                        artifact,
-                        append: idx > 0,
-                        last_chunk: false,
-                    }))
-                    .await;
-                    idx += 1;
-                }
-                Err(e) => {
-                    error = Some(e);
-                    break;
-                }
-            }
-        }
-
-        // On successful completion, emit a terminal empty-artifact marker
-        // (last_chunk=true, art-{task_id}) before the COMPLETED status — required
-        // by the A2A streaming contract (streaming.md "Final chunk: lastChunk=True")
-        // and matching Python/TS. Errors skip the marker and go straight to FAILED.
-        if error.is_none() {
-            send(StreamEvent::ArtifactUpdate(TaskArtifactUpdateEvent {
-                task_id: task_id.clone(),
-                context_id: context_id.clone(),
-                artifact: Artifact::new(format!("art-{task_id}"), vec![]),
-                append: idx > 0,
-                last_chunk: true,
-            }))
+        let _ = tx
+            .send(sse_event(
+                &id,
+                &StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    status: task.status.clone(),
+                }),
+            ))
             .await;
-        }
 
-        let final_status = match &error {
-            None => TaskStatus::new(TaskState::Completed),
-            Some(e) => error_to_status(e, state2.executor.disclose_refusal_reason()),
+        let remaining = state2
+            .executor
+            .execution_timeout()
+            .saturating_sub(started.elapsed());
+        let forward = async {
+            if remaining.is_zero() {
+                return Err(Box::new(ModuleError::new(
+                    ErrorCode::ModuleTimeout,
+                    "Execution timed out",
+                )));
+            }
+            let chunks =
+                state2
+                    .executor
+                    .stream_channel(skill_id, inputs, identity, execution.token.clone());
+            forward_artifacts(&state2, &task, chunks, &tx, &id).await
         };
-        // Persist terminal task.
-        let task = Task {
-            id: task_id.clone(),
-            context_id: context_id.clone(),
-            status: final_status.clone(),
-            artifacts: vec![],
-            history: vec![],
+        let mut canceled = execution.client_canceled.subscribe();
+        let (status, append_marker) = tokio::select! {
+            biased;
+            _ = canceled.wait_for(Option::is_some) => (canceled_by_client(), None),
+            _ = tx.closed() => {
+                execution.token.cancel();
+                (TaskStatus::with_message(TaskState::Canceled, Message::agent_text("Client disconnected")), None)
+            }
+            result = tokio::time::timeout(remaining, forward) => match result {
+                Ok(Ok(append)) => (TaskStatus::new(TaskState::Completed), Some(append)),
+                Ok(Err(error)) => (error_to_status(&error, state2.executor.disclose_refusal_reason()), None),
+                Err(_) => {
+                    execution.token.cancel();
+                    (TaskStatus::with_message(TaskState::Failed, Message::agent_text("Execution timed out")), None)
+                }
+            },
         };
-        save_task(
-            &state2,
-            &task_id,
-            serde_json::to_value(&task).unwrap(),
-            &ctx2,
-        )
-        .await;
+        // Serialize the terminal store write with tasks/cancel. The accepted
+        // cancel path already persisted the status and owns push delivery.
+        let notify = {
+            let _terminal = execution.terminal.lock().await;
+            if let Some(canceled) = execution.canceled_status() {
+                task.status = canceled;
+                false
+            } else {
+                task.status = status;
+                if let Err(error) = save_task(
+                    &state2,
+                    &task_id,
+                    serde_json::to_value(&task).unwrap(),
+                    &ctx2,
+                )
+                .await
+                {
+                    publish_stream_storage_error(terminal_slot, &id, error);
+                    return;
+                }
+                true
+            }
+        };
+        // A client cancel that beat the terminal store write suppresses the
+        // successful marker just as it suppresses the completed status.
+        if let (true, Some(append), Some(slot)) = (notify, append_marker, marker_slot) {
+            slot.send(sse_event(
+                &id,
+                &StreamEvent::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    artifact: Artifact::new(format!("art-{task_id}"), vec![]),
+                    append,
+                    last_chunk: true,
+                }),
+            ));
+        }
         let terminal_event = StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.clone(),
-            context_id: context_id.clone(),
-            status: final_status,
+            context_id,
+            status: task.status,
         });
-        // Deliver the terminal status to any registered webhook.
-        notify_push(&state2, &task_id, &ctx2, &terminal_event).await;
-        send(terminal_event).await;
+        if let Some(slot) = terminal_slot {
+            slot.send(sse_event(&id, &terminal_event));
+        }
+        drop(tx);
+        if notify {
+            notify_push(&state2, &task_id, &ctx2, &terminal_event).await;
+        }
         // `_cancel_guard` unregisters the cancel token on drop (all exit paths).
     });
 
-    let event_stream =
-        ReceiverStream::new(rx).map(move |ev| Ok::<Event, Infallible>(sse_event(&id, &ev)));
+    let event_stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
 
     Sse::new(event_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+fn publish_stream_storage_error(
+    slot: Option<mpsc::OwnedPermit<Event>>,
+    id: &Value,
+    error: (i32, String),
+) {
+    if let Some(slot) = slot {
+        slot.send(Event::default().data(rpc_error(id, error.0, &error.1).to_string()));
+    }
+}
+
+/// Forward artifacts within the same host budget, including slow SSE writes.
+async fn forward_artifacts(
+    state: &AppState,
+    task: &Task,
+    mut chunks: ReceiverStream<Result<Value, ModuleError>>,
+    tx: &mpsc::Sender<Event>,
+    id: &Value,
+) -> Result<bool, Box<ModuleError>> {
+    let mut append = false;
+    while let Some(item) = chunks.next().await {
+        let chunk = item.map_err(Box::new)?;
+        let artifact = state
+            .executor
+            .part_converter()
+            .output_to_parts(&chunk, &task.id);
+        let _ = tx
+            .send(sse_event(
+                id,
+                &StreamEvent::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: task.id.clone(),
+                    context_id: task.context_id.clone(),
+                    artifact,
+                    append,
+                    last_chunk: false,
+                }),
+            ))
+            .await;
+        append = true;
+    }
+    Ok(append)
 }
 
 /// `tasks/get` — return a stored task by id, if the caller owns it.
@@ -1060,11 +1137,9 @@ async fn handle_get(
     // `ctx.owner()`. Masked as "not found" rather than "forbidden", matching
     // how ACL denials are reported (srs FR-ERR-003): a caller must not learn
     // that another principal's task id exists.
-    match state.task_store.get(task_id, ctx).await {
-        Ok(Some(task)) => Ok(task),
-        Ok(None) => Err((CODE_TASK_NOT_FOUND, "Task not found".to_string())),
-        Err(e) => Err(store_failure(&format!("task store read for {task_id}"), e)),
-    }
+    read_task(state, task_id, ctx)
+        .await?
+        .ok_or((CODE_TASK_NOT_FOUND, "Task not found".to_string()))
 }
 
 /// `ListTasks` — return the calling principal's tasks.
@@ -1104,13 +1179,17 @@ async fn handle_cancel(
         "Missing required parameter: id".to_string(),
     ))?;
 
+    let execution = state.running_tasks.get(task_id, ctx);
+    let terminal = match &execution {
+        Some(execution) => Some(execution.terminal.lock().await),
+        None => None,
+    };
+
     // Another principal's task reads back as absent, so it is reported as
     // missing rather than as forbidden.
-    let stored = match state.task_store.get(task_id, ctx).await {
-        Ok(Some(stored)) => stored,
-        Ok(None) => return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string())),
-        Err(e) => return Err(store_failure(&format!("task store read for {task_id}"), e)),
-    };
+    let stored = read_task(state, task_id, ctx)
+        .await?
+        .ok_or((CODE_TASK_NOT_FOUND, "Task not found".to_string()))?;
 
     // A task whose stored JSON cannot be read back is unusable, not cancelable.
     let mut task: Task = serde_json::from_value(stored)
@@ -1127,28 +1206,21 @@ async fn handle_cancel(
         ));
     }
 
-    if let Some(token) = state.cancel_tokens.lock().unwrap().remove(task_id) {
-        token.cancel();
-    }
-
     // Update in place: artifacts and history a non-terminal task already
     // accumulated belong to it and survive the cancellation.
-    task.status = TaskStatus::with_message(
-        TaskState::Canceled,
-        Message::agent_text("Canceled by client"),
-    );
+    task.status = canceled_by_client();
     let context_id = task.context_id.clone();
     let task_json = serde_json::to_value(&task).unwrap();
-    // Cancelling *is* this write, so unlike the send/stream paths a failure
-    // here is not "work happened but could not be recorded" — it is the
-    // operation failing. Answering CANCELED anyway would leave the caller
-    // believing a task is cancelled while the store still reads WORKING. The
-    // cancel token is already signalled, so retrying is the right response.
-    state
-        .task_store
-        .save(task_id, task_json.clone(), ctx)
-        .await
-        .map_err(|e| store_failure(&format!("task store write for {task_id}"), e))?;
+    // Persist the accepted cancellation before waking the worker. The store
+    // write is serialized with local execution's competing terminal write.
+    save_task(state, task_id, task_json.clone(), ctx).await?;
+    if let Some(execution) = &execution {
+        execution
+            .client_canceled
+            .send_replace(Some(task.status.clone()));
+        execution.token.cancel();
+    }
+    drop(terminal);
 
     // Deliver the terminal CANCELED status to any registered webhook.
     notify_push(
@@ -1257,13 +1329,16 @@ async fn handle_push_delete(
 /// Deliver an event to a task's registered webhook (if any), retrying with
 /// exponential backoff. Fire-and-forget: spawned so it never blocks the caller.
 async fn notify_push(state: &AppState, task_id: &str, ctx: &CallContext, event: &StreamEvent) {
-    let cfg = match state.push_config_store.get(task_id, ctx).await {
+    let cfg = match store_operation(
+        state,
+        &format!("push config store read for {task_id}"),
+        state.push_config_store.get(task_id, ctx),
+    )
+    .await
+    {
         Ok(Some(c)) => c,
         Ok(None) => return,
-        Err(e) => {
-            tracing::warn!("push config store read failed for {task_id}: {e}");
-            return;
-        }
+        Err(_) => return,
     };
     let url = match cfg.get("url").and_then(Value::as_str) {
         Some(u) => u.to_string(),
@@ -1311,42 +1386,117 @@ fn store_failure(what: &str, e: StoreError) -> (i32, String) {
     (CODE_INTERNAL_ERROR, "Internal server error".to_string())
 }
 
-/// Persist a task, logging rather than propagating a store failure.
-///
-/// Every call site here has already run the task to a known state, so a failed
-/// write cannot change what is returned to the caller — turning it into a
-/// JSON-RPC error would report "failed" for work that actually succeeded. It
-/// must not stay silent either: previously each of these was a bare `let _ =`,
-/// so a store outage produced tasks that `message/send` reported as COMPLETED
-/// and `tasks/get` then reported as missing, with nothing logged in between.
-async fn save_task(state: &AppState, task_id: &str, task: Value, ctx: &CallContext) {
-    if let Err(e) = state.task_store.save(task_id, task, ctx).await {
-        tracing::warn!("task store write failed for {task_id}: {e}");
+async fn store_operation<T>(
+    state: &AppState,
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T, StoreError>>,
+) -> Result<T, (i32, String)> {
+    // Each store operation has a bounded budget of its own. A failed or timed-out
+    // execution still needs a chance to durably record its terminal state.
+    match tokio::time::timeout(state.executor.execution_timeout(), future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(store_failure(operation, error)),
+        Err(_) => Err(store_failure(
+            operation,
+            StoreError::backend_msg("operation timed out"),
+        )),
     }
 }
 
-fn register_cancel(state: &AppState, task_id: &str, token: CancelToken) {
-    state
-        .cancel_tokens
-        .lock()
-        .unwrap()
-        .insert(task_id.to_string(), token);
+async fn save_task(
+    state: &AppState,
+    task_id: &str,
+    task: Value,
+    ctx: &CallContext,
+) -> Result<(), (i32, String)> {
+    store_operation(
+        state,
+        &format!("task store write for {task_id}"),
+        state.task_store.save(task_id, task, ctx),
+    )
+    .await
 }
 
-fn unregister_cancel(state: &AppState, task_id: &str) {
-    state.cancel_tokens.lock().unwrap().remove(task_id);
+async fn read_task(
+    state: &AppState,
+    task_id: &str,
+    ctx: &CallContext,
+) -> Result<Option<Value>, (i32, String)> {
+    store_operation(
+        state,
+        &format!("task store read for {task_id}"),
+        state.task_store.get(task_id, ctx),
+    )
+    .await
 }
 
-/// Drop guard that unregisters a task's cancel token on all exit paths
-/// (normal return, early return, or panic), preventing token leaks.
-struct CancelGuard {
-    state: AppState,
-    task_id: String,
+fn canceled_by_client() -> TaskStatus {
+    TaskStatus::with_message(
+        TaskState::Canceled,
+        Message::agent_text("Canceled by client"),
+    )
 }
 
-impl Drop for CancelGuard {
+struct TaskExecution {
+    token: CancelToken,
+    client_canceled: watch::Sender<Option<TaskStatus>>,
+    terminal: tokio::sync::Mutex<()>,
+}
+
+impl TaskExecution {
+    fn canceled_status(&self) -> Option<TaskStatus> {
+        self.client_canceled.borrow().clone()
+    }
+}
+
+type RunningTaskKey = (OwnerId, String);
+
+/// Active executions use the same owner scope as the task store.
+#[derive(Clone, Default)]
+pub(crate) struct RunningTasks(Arc<Mutex<HashMap<RunningTaskKey, Arc<TaskExecution>>>>);
+
+impl RunningTasks {
+    fn register(&self, task_id: &str, ctx: &CallContext) -> RunningTask {
+        let (client_canceled, _) = watch::channel(None);
+        let execution = Arc::new(TaskExecution {
+            token: CancelToken::new(),
+            client_canceled,
+            terminal: tokio::sync::Mutex::new(()),
+        });
+        let key = (ctx.owner().clone(), task_id.to_string());
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.clone(), execution.clone());
+        RunningTask {
+            tasks: self.clone(),
+            key,
+            execution,
+        }
+    }
+
+    fn get(&self, task_id: &str, ctx: &CallContext) -> Option<Arc<TaskExecution>> {
+        let key = (ctx.owner().clone(), task_id.to_string());
+        self.0.lock().unwrap().get(&key).cloned()
+    }
+}
+
+/// Removes the execution from the active registry when its worker exits.
+struct RunningTask {
+    tasks: RunningTasks,
+    key: RunningTaskKey,
+    execution: Arc<TaskExecution>,
+}
+
+impl Drop for RunningTask {
     fn drop(&mut self) {
-        unregister_cancel(&self.state, &self.task_id);
+        let mut tasks = self.tasks.0.lock().unwrap();
+        if tasks
+            .get(&self.key)
+            .is_some_and(|execution| Arc::ptr_eq(execution, &self.execution))
+        {
+            tasks.remove(&self.key);
+        }
     }
 }
 
@@ -1354,6 +1504,47 @@ impl Drop for CancelGuard {
 mod tests {
     use super::*;
     use crate::types::Part;
+
+    #[test]
+    fn active_tasks_are_scoped_to_their_store_owner() {
+        let tasks = RunningTasks::default();
+        let alice = CallContext::from_identity(Some(&Identity::new(
+            "alice".into(),
+            "user".into(),
+            vec![],
+            HashMap::new(),
+        )));
+        let anonymous = CallContext::anonymous();
+        let named_run = tasks.register("task", &alice);
+        let anonymous_run = tasks.register("task", &anonymous);
+
+        let found = tasks.get("task", &alice).unwrap();
+        assert!(Arc::ptr_eq(&found, &named_run.execution));
+        let found = tasks.get("task", &anonymous).unwrap();
+        assert!(Arc::ptr_eq(&found, &anonymous_run.execution));
+
+        drop(named_run);
+        assert!(tasks.get("task", &alice).is_none());
+        assert!(tasks.get("task", &anonymous).is_some());
+        drop(anonymous_run);
+        assert!(tasks.get("task", &anonymous).is_none());
+    }
+
+    #[test]
+    fn active_task_cleanup_only_removes_its_registration() {
+        let tasks = RunningTasks::default();
+        let ctx = CallContext::anonymous();
+        let first = tasks.register("task", &ctx);
+        let replacement = tasks.register("task", &ctx);
+
+        drop(first);
+        let found = tasks
+            .get("task", &ctx)
+            .expect("replacement is still active");
+        assert!(Arc::ptr_eq(&found, &replacement.execution));
+        drop(replacement);
+        assert!(tasks.get("task", &ctx).is_none());
+    }
 
     /// Extract the status message's text (if any).
     fn status_text(status: &TaskStatus) -> Option<String> {

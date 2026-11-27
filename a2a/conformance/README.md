@@ -48,6 +48,8 @@ every SDK's conformance runner.
 | `fixtures/part_conversion.json` | A-PART | A2A `Part` ⇄ module input/output conversion |
 | `fixtures/openapi_backend.json` | A-OAS | OpenAPI backend (feature F-12), contract 2.0 (apcore-toolkit >= 0.13.0): registered IDs are the scanner's own, illegal IDs skipped with a warning, the empty-description repair and its report, the path-typed `spec` key, the unapproved-write warning, the collision preflight, public-card exposure |
 
+The separate [event subscriber fixture](fixtures/event_subscriber.json) checks the opt-in A2A event POST transport through the Core subscriber factory and a local HTTP receiver. The cases cover configuration, single delivery, headers, retries, timeouts, circuit breaking, dead letters and filter delegation.
+
 ### JSON-RPC Error Code Table
 
 | Code | A2A meaning | apcore source exception |

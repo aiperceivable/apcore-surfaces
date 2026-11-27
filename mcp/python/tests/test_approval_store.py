@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
-from apcore_mcp.approval_store import ApprovalStore, InMemoryApprovalStore
+from apcore_mcp import approval_store
+from apcore_mcp.approval_store import ApprovalScope, ApprovalStore, InMemoryApprovalStore, ScopedApprovalStore
 
 # ---------------------------------------------------------------------------
 # Protocol check
@@ -16,6 +18,42 @@ from apcore_mcp.approval_store import ApprovalStore, InMemoryApprovalStore
 def test_in_memory_store_implements_protocol() -> None:
     store = InMemoryApprovalStore()
     assert isinstance(store, ApprovalStore)
+    assert isinstance(store, ScopedApprovalStore)
+
+
+@pytest.mark.asyncio
+async def test_scoped_approval_has_one_successful_consumer() -> None:
+    store = InMemoryApprovalStore()
+    scope = ApprovalScope(("user", "reviewer"), None, "notebook.archive", "archive-example")
+    await store.save_scoped_pending("archive-review", {"note": 1}, scope, "test-verifier")
+
+    pending = await store.consume_scoped("archive-review", scope, "test-verifier")
+    assert pending is not None and pending["status"] == "pending"
+    assert await store.resolve("archive-review", approved=True)
+    decisions = await asyncio.gather(
+        store.consume_scoped("archive-review", scope, "test-verifier"),
+        store.consume_scoped("archive-review", scope, "test-verifier"),
+    )
+
+    approved = [decision for decision in decisions if decision is not None]
+    assert len(approved) == 1 and approved[0]["status"] == "approved"
+    assert "verifier" not in approved[0]
+    assert "arguments" not in approved[0]
+    assert (await store.get_scoped_result("archive-review", scope.principal))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_scoped_approval_checks_deadline_on_read_and_use(monkeypatch) -> None:
+    now = 100.0
+    monkeypatch.setattr(approval_store, "time", SimpleNamespace(monotonic=lambda: now))
+    store = InMemoryApprovalStore(pending_ttl=10.0, resolved_ttl=20.0)
+    scope = ApprovalScope(("user", "reviewer"), None, "notebook.archive", "archive-example")
+    await store.save_scoped_pending("archive-review", {"note": 1}, scope, "test-verifier")
+    assert await store.resolve("archive-review", approved=True)
+
+    now = 110.0
+    assert await store.get_scoped_result("archive-review", scope.principal) is None
+    assert await store.consume_scoped("archive-review", scope, "test-verifier") is None
 
 
 # ---------------------------------------------------------------------------

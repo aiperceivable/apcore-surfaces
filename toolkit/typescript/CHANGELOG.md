@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.1-alpha.1] - Unreleased
+
+### Added
+
+- Add a standalone Prometheus listener with liveness and readiness endpoints and isolate it from Core metrics rendering.
+
+### Fixed
+
+- Await Core registry validation with `HTTPProxyRegistryWriter.writeAsync()`, which records per-module registration failures. The synchronous `write()` still returns a result array and reports promise-like registrations as unverified.
+
 ## [0.15.0] - Unreleased
 
 ### Added

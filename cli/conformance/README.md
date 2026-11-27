@@ -35,6 +35,8 @@ Each entry in `test_cases` is an object with the following fields:
 
 ---
 
+[Structured flags](fixtures/structured_flags.json) runs against the generated command and a real Executor. It checks typed input, exit 45 on malformed JSON or a schema mismatch, and the number of module calls.
+
 ## Algorithm C01
 
 **Algorithm C01** is the CLI argument and output parity algorithm. It is the normative specification that all SDK implementations must conform to.

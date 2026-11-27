@@ -248,14 +248,12 @@ async fn collect_sse(router: axum::Router, body: Value) -> Vec<Value> {
 
 /// Every fixture in the spec repo that this crate claims to drive.
 ///
-/// All but one are driven by this file. `openapi_backend.json` is driven by
-/// `tests/openapi_backend_conformance.rs`, because the whole backend sits behind
-/// the `openapi` cargo feature and its driver has to be gated with it — but the
-/// guard below still refuses to let the *file* go undriven, and the second
-/// assertion below refuses to let the driver go missing.
+/// External drivers are listed separately so the guard checks that their
+/// test binaries exist as well as the fixtures themselves.
 const DRIVEN_FIXTURES: &[&str] = &[
     "agent_card.json",
     "error_mapping.json",
+    "event_subscriber.json",
     "jwt_claim_coercion.json",
     // Driven by tests/openapi_backend_conformance.rs (feature `openapi`).
     "openapi_backend.json",
@@ -268,10 +266,16 @@ const DRIVEN_FIXTURES: &[&str] = &[
 ///
 /// Listing a name in `DRIVEN_FIXTURES` is a claim; for a fixture this file does
 /// not itself load, the claim is checked by requiring the driver to exist.
-const EXTERNAL_DRIVERS: &[(&str, &str)] = &[(
-    "openapi_backend.json",
-    "tests/openapi_backend_conformance.rs",
-)];
+const EXTERNAL_DRIVERS: &[(&str, &str)] = &[
+    (
+        "event_subscriber.json",
+        "tests/event_subscriber_conformance.rs",
+    ),
+    (
+        "openapi_backend.json",
+        "tests/openapi_backend_conformance.rs",
+    ),
+];
 
 #[test]
 fn every_spec_fixture_has_a_driver() {

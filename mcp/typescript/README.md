@@ -481,6 +481,18 @@ await serve(registry, {
 - **Custom prefix** — use `explorerPrefix: "/browse"` to mount at a different path.
 - **Authorization UI** — Swagger-UI-style Authorization input field. Paste a Bearer token to authenticate tool execution requests. Generated cURL commands automatically include the Authorization header.
 
+### Stored approvals (Phase B)
+
+Pass a Registry and an `approvalStore` to `serve()` or `asyncServe()`. Phase B uses Core scoped approval support with stdio or Streamable HTTP. Use `InMemoryApprovalStore` for local runs. A persistent store must implement the scoped methods on `ScopedApprovalStore` and atomically verify and consume an approved credential.
+
+For a foreground `tools/call` awaiting an operator decision:
+
+1. Read `approvalId` and `resumeToken` from the result's `_meta.apcore.approval`.
+2. Let the operator resolve `approvalId` in the store, or pass it as `approval_id` to `__apcore_approval_check` to poll.
+3. Once approved, call the same tool with the same arguments and principal. Put `resumeToken` in the request's `_meta.approvalId` and keep it confidential.
+
+The operator callback receives the public ID. Authenticate callers with distinct principals on shared HTTP deployments. Unauthenticated calls share the anonymous principal and are suitable for a single trust domain.
+
 ### JWT Authentication
 
 apcore-mcp supports JWT Bearer token authentication for HTTP-based transports.
@@ -645,6 +657,17 @@ await reportProgress(context, 5, 10, "Processing item 5 of 10");
 - `progress` — Current progress value
 - `total` — Optional total for percentage calculation
 - `message` — Optional human-readable progress message
+
+When the executor supports streaming completion, a streaming tool uses a
+single invocation and returns the executor's final output snapshot. A progress
+token enables provisional chunk notifications. Sensitive output fields are
+redacted in both notifications and the terminal result. Output-validation and
+after-middleware failures make the tool call fail even after provisional
+progress has been sent.
+
+An installed Core executor without streaming completion support uses one
+ordinary invocation. Custom executors with only the legacy streaming interface
+can still emit progress with a progress token.
 
 ### `elicit(context, message, requestedSchema?)`
 

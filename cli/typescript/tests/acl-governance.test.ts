@@ -822,11 +822,13 @@ describe("apcli acl status (FE-14 §4.7)", () => {
 
 describe("an attached ACL makes existing surfaces live (FE-14 §4.9)", () => {
   /** Real APCore holding `db.migrate` behind a deny rule. */
-  function deniedApp() {
+  async function deniedApp() {
     const app = new APCore();
-    app.registry.register("db.migrate", {
+    await app.registry.register("db.migrate", {
       moduleId: "db.migrate",
+      description: "Migrate the test database",
       inputSchema: { type: "object", properties: {} },
+      outputSchema: { type: "object", properties: { migrated: { type: "boolean" } } },
       execute: async () => ({ migrated: true }),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);
@@ -844,7 +846,7 @@ describe("an attached ACL makes existing surfaces live (FE-14 §4.9)", () => {
   }
 
   it("T-ACL-22: a denied call raises ACL_DENIED, which the CLI maps to exit 77", async () => {
-    const executor = deniedApp();
+    const executor = await deniedApp();
     let caught: unknown;
     try {
       await executor.call("db.migrate", {});
@@ -858,7 +860,7 @@ describe("an attached ACL makes existing surfaces live (FE-14 §4.9)", () => {
 
   it("T-ACL-23: preflight reports the acl check as failed, and 77 is the first failed code", async () => {
     const { firstFailedExitCode } = await import("../src/output.js");
-    const executor = deniedApp();
+    const executor = await deniedApp();
     const preflight = await executor.validate("db.migrate", {});
     expect(preflight.valid).toBe(false);
     const aclCheck = preflight.checks.find(
@@ -943,9 +945,11 @@ rules:
     // case above would be proving nothing about the ACL.
     attach(SANDBOX_ACL);
     const app = new APCore();
-    app.registry.register("ops.control", {
+    await app.registry.register("ops.control", {
       moduleId: "ops.control",
+      description: "Run the test control operation",
       inputSchema: { type: "object", properties: {} },
+      outputSchema: { type: "object", properties: { ran: { type: "boolean" } } },
       execute: async () => ({ ran: true }),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);

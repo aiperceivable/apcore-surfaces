@@ -1,7 +1,7 @@
 //! A2AServerFactory — wires all components into an axum Router (A2A 1.0).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::{
     extract::State,
@@ -241,7 +241,7 @@ impl A2AServerFactory {
             agent_card: public_card_value,
             extended_card,
             explorer_card,
-            cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
+            running_tasks: Default::default(),
             push_config_store,
             http: reqwest::Client::new(),
         };

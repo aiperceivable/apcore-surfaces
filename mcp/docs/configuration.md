@@ -507,11 +507,10 @@ interactive MCP clients.
 
 ### Phase B — storage-backed approvals
 
-Phase A needs the caller to stay connected while a human decides. Phase B does not: the call returns
-immediately with an `APPROVAL_PENDING` response carrying an `approval_id`, the decision is recorded
-out-of-band, and the agent polls until it resolves. Pass an `approval_store` — and optionally an
-`approval_notify` callback that fires when a request is created, so you can push it to Slack, email,
-or a review queue.
+Phase B requires Core's scoped approval gate and a store that can consume a grant atomically.
+Set `approval_store` and optionally configure an `approval_notify` callback to send the public
+approval record ID to a review queue. The tool call returns `APPROVAL_PENDING` while a reviewer
+records a decision.
 
 === "Python"
 
@@ -559,24 +558,14 @@ or a review queue.
     mcp.serve()?;
     ```
 
-**The agent-side flow.** When a store is configured the bridge also exposes a meta-tool,
-`__apcore_approval_check`:
+The pending result carries `approvalId` and the private `resumeToken` in
+`_meta.apcore.approval`. Resolve the record or query `__apcore_approval_check` with the public
+ID. Once approved, send the original business arguments again with the private token in
+`params._meta.approvalId`. Core checks the invocation scope and consumes the approval on use.
 
-1. The agent calls the gated tool. It comes back with an `APPROVAL_PENDING` response containing an
-   `approval_id`.
-2. A human resolves the request out-of-band — `store.resolve(approval_id, approved=True)`, or
-   whatever your backend does.
-3. The agent polls `__apcore_approval_check({"approval_id": "..."})`, which returns
-   `{approval_id, status, reason?}` where `status` is `pending`, `approved`, or `rejected`.
-4. Once `approved`, the agent retries the original tool call with `_meta.approvalId` set to that
-   `approval_id`.
-
-`InMemoryApprovalStore` is process-local and non-durable: pending records expire, resolved records
-are kept only briefly, and everything is lost on restart. It is the right default for a single
-process and the wrong one for anything horizontally scaled — implement the `ApprovalStore` interface
-against Redis or a database for that. See
-[Approval Handler (Phase B)](features/approval-phase-b.md) for the full contract, including the
-Redis-backed pseudocode.
+`InMemoryApprovalStore` holds approvals for the lifetime of the process. Use a shared durable
+store when requests can be handled by multiple instances or must survive restarts. See the
+[Phase B approval contract](features/approval-phase-b.md) for the wire and storage behavior.
 
 ## Tool Explorer
 

@@ -2,8 +2,6 @@ import express from "express";
 import type { Express, Request, Response } from "express";
 import type { AgentCard, AgentCapabilities } from "@a2a-js/sdk";
 import {
-  DefaultRequestHandler,
-  DefaultExecutionEventBusManager,
   InMemoryTaskStore,
   type ServerCallContext,
   type TaskStore,
@@ -33,6 +31,7 @@ import { getAuthIdentity } from "../auth/storage.js";
 import { PartConverter } from "../adapters/parts.js";
 import { ErrorMapper } from "../adapters/errors.js";
 import { ApCoreAgentExecutor } from "./executor.js";
+import { A2ATaskRequestHandler } from "./task-persistence.js";
 import { createAuthMiddleware } from "../auth/middleware.js";
 import { anonymousContext, identityOf, identityUserBuilder } from "./context.js";
 import { createExplorerRouter } from "../explorer/handler.js";
@@ -343,15 +342,7 @@ export class A2AServerFactory {
             Promise.resolve(buildExtendedCard(fullCard, executor, identityOf(context)))
         : undefined;
 
-    const requestHandler = new DefaultRequestHandler(
-      agentCard,
-      taskStore,
-      apcoreExecutor,
-      new DefaultExecutionEventBusManager(),
-      undefined,
-      undefined,
-      extendedAgentCardProvider,
-    );
+    const requestHandler = new A2ATaskRequestHandler(agentCard, taskStore, apcoreExecutor, extendedAgentCardProvider);
 
     // Build Express app
     const app = express();

@@ -38,6 +38,7 @@ vi.mock("../src/server/factory.js", () => ({
 
 // Import serve after mocks are set up
 import { serve } from "../src/index.js";
+import { ElicitationApprovalHandler, supportsScopedCore } from "../src/adapters/approval.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -351,6 +352,18 @@ describe("serve() onStartup/onShutdown (F4)", () => {
 // ---------------------------------------------------------------------------
 
 describe("serve() approvalStore lifecycle", () => {
+  it("declines Phase B with an unscoped store before connecting transport", async () => {
+    const store = {
+      savePending: vi.fn().mockResolvedValue(undefined),
+      getResult: vi.fn().mockResolvedValue(null),
+      resolve: vi.fn().mockResolvedValue(false),
+    };
+    await expect(serve(createMockRegistry({}), { transport: "stdio", approvalStore: store }))
+      .rejects.toThrow(supportsScopedCore() ? "scoped approval store" : "scoped approval support");
+    expect(mockRunStdio).not.toHaveBeenCalled();
+  });
+
+
   it("starts the store before the transport and stops it after", async () => {
     const registry = createMockRegistry({});
     const executor = createMockExecutor(registry);
@@ -367,7 +380,7 @@ describe("serve() approvalStore lifecycle", () => {
       order.push("transport");
     });
 
-    await serve(executor, { transport: "stdio", approvalStore: store });
+    await serve(executor, { transport: "stdio", approvalStore: store, approvalHandler: new ElicitationApprovalHandler() });
 
     expect(store.start).toHaveBeenCalledTimes(1);
     expect(store.stop).toHaveBeenCalledTimes(1);
@@ -389,7 +402,7 @@ describe("serve() approvalStore lifecycle", () => {
     mockRunStdio.mockRejectedValueOnce(new Error("transport failed"));
 
     await expect(
-      serve(executor, { transport: "stdio", approvalStore: store }),
+      serve(executor, { transport: "stdio", approvalStore: store, approvalHandler: new ElicitationApprovalHandler() }),
     ).rejects.toThrow("transport failed");
 
     expect(store.start).toHaveBeenCalledTimes(1);
@@ -407,7 +420,7 @@ describe("serve() approvalStore lifecycle", () => {
     };
 
     // Should not throw despite missing start()/stop().
-    await serve(executor, { transport: "stdio", approvalStore: store });
+    await serve(executor, { transport: "stdio", approvalStore: store, approvalHandler: new ElicitationApprovalHandler() });
 
     expect(mockRunStdio).toHaveBeenCalledTimes(1);
   });

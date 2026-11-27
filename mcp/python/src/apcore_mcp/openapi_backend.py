@@ -17,6 +17,7 @@ import logging
 import re
 import warnings
 from collections.abc import Callable
+from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -295,13 +296,24 @@ def openapi_backend(
         base_url=effective_base_url,
         auth_header_factory=auth_header_factory,
     )
-    for result in writer.write(modules, target):
-        if getattr(result, "verification_error", None):
-            logger.error(
-                "OpenAPI module %s failed to register: %s",
-                getattr(result, "module_id", "?"),
-                result.verification_error,
-            )
+    proxy_modules = []
+    for module in modules:
+        if not module.description.strip():
+            method, path = toolkit.read_proxy_route(module, default_method="GET")
+            description = " ".join(f"{method.upper()} {path or '/'}".split())[:200]
+            module = copy(module)
+            module.description = description
+        proxy_modules.append(module)
+    results = {result.module_id: result for result in writer.write(proxy_modules, target)}
+    failures = []
+    for module in modules:
+        result = results.get(module.module_id)
+        if result is not None and result.verified and target.get(module.module_id) is not None:
+            continue
+        detail = result.verification_error if result is not None else None
+        failures.append(f"{module.module_id}: {detail or 'module not registered'}")
+    if failures:
+        raise ValueError("OpenAPI registration incomplete: " + "; ".join(failures))
 
     if not acknowledge_unapproved_writes:
         _warn_if_writes_have_no_approval_path(modules, target)

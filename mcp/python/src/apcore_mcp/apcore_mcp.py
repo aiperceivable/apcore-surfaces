@@ -24,10 +24,17 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from apcore import APCore, Executor
 from starlette.routing import Mount, Route
 
 from apcore_mcp._stdio import configured_output
 from apcore_mcp._utils import resolve_executor, resolve_registry
+from apcore_mcp.adapters.approval import (
+    _CORE_SCOPED_APPROVAL,
+    StorageBackedApprovalHandler,
+    _implements_mcp_scoped_approval,
+    _MCPScopedApprovalGate,
+)
 from apcore_mcp.auth.protocol import Authenticator
 from apcore_mcp.server.transport import MetricsExporter
 
@@ -474,9 +481,11 @@ class APCoreMCP:
         # Auto-construct StorageBackedApprovalHandler when approval_store is given
         # and no explicit handler was provided.
         if approval_store is not None and approval_handler is None:
-            from apcore_mcp.adapters.approval import StorageBackedApprovalHandler
-
             approval_handler = StorageBackedApprovalHandler(approval_store, notify_callback=approval_notify)
+
+        scoped_handler = approval_handler if _implements_mcp_scoped_approval(approval_handler) else None
+        gate_handler = _MCPScopedApprovalGate(scoped_handler) if scoped_handler is not None else approval_handler
+        self._phase_b_handler = scoped_handler if _CORE_SCOPED_APPROVAL else None
 
         # Resolve mcp.openapi from the Config Bus early — before the base
         # backend is built — because an omitted extensions_dir_or_backend
@@ -560,13 +569,29 @@ class APCoreMCP:
         if strategy is not None and hasattr(backend, "call_async"):
             logger.warning("strategy parameter ignored when Executor is provided")
 
+        storage_backed = isinstance(gate_handler, (_MCPScopedApprovalGate, StorageBackedApprovalHandler))
+        supplied_executor = backend.executor if isinstance(backend, APCore) else backend
+        if (
+            storage_backed
+            and isinstance(supplied_executor, Executor)
+            and supplied_executor.governance_state().approval_handler_configured
+        ):
+            raise ValueError("The supplied Core executor already has an approval handler")
+
         self._executor = resolve_executor(
             backend,
-            approval_handler=approval_handler,
+            approval_handler=gate_handler,
             strategy=pipeline_strategy or strategy,
             middleware=combined_middleware,
             acl=effective_acl,
         )
+        if storage_backed:
+            executor = self._executor.executor if isinstance(self._executor, APCore) else self._executor
+            if not isinstance(executor, Executor) or not executor.governance_state().builtin_approval_gate_wired:
+                raise ValueError("Storage-backed approval requires a Core executor with a wired approval gate")
+            # resolve_executor preserves an executor supplied by the host. Bind
+            # the same handler to that executor and the MCP polling bridge.
+            executor.set_approval_handler(gate_handler)
 
         # Observability auto-wiring. ``metrics_collector=True`` or
         # ``observability=True`` provisions apcore's default MetricsCollector +
@@ -717,18 +742,11 @@ class APCoreMCP:
             async_bridge = AsyncTaskBridge(mgr)
             self._async_bridge = async_bridge
 
-        # Register the approval poll meta-tool whenever an approval handler is
-        # present. Phase B (async polling) is driven entirely by the handler's
-        # ``check_approval()`` — the store is an implementation detail of
-        # ``StorageBackedApprovalHandler``. Gating on ``approval_store`` here
-        # broke the legitimate "pass StorageBackedApprovalHandler(store) as
-        # approval_handler directly" usage, where ``self._approval_store`` is
-        # None but the handler still needs ``__apcore_approval_check`` exposed.
         approval_bridge = None
-        if self._approval_handler is not None:
+        if self._phase_b_handler is not None:
             from apcore_mcp.server.approval_bridge import ApprovalBridge
 
-            approval_bridge = ApprovalBridge(self._approval_handler)
+            approval_bridge = ApprovalBridge(self._phase_b_handler)
 
         descriptor_lookup = self._registry.get_definition if self._async_tasks else None
         factory.register_handlers(
@@ -803,9 +821,14 @@ class APCoreMCP:
         explorer: bool = False,
         explorer_prefix: str = "/explorer",
     ) -> list[tuple[type, dict]] | None:
-        """Build auth middleware list if authenticator is configured."""
+        """Build the HTTP middleware needed for authentication and approval responses."""
+        middleware: list[tuple[type, dict]] = []
+        if self._phase_b_handler is not None:
+            from apcore_mcp.server.approval_bridge import _ApprovalLogMiddleware
+
+            middleware.append((_ApprovalLogMiddleware, {}))
         if self._authenticator is None:
-            return None
+            return middleware or None
 
         from apcore_mcp.auth import AuthMiddleware
 
@@ -816,7 +839,8 @@ class APCoreMCP:
             mw_kwargs["exempt_paths"] = self._exempt_paths
         if explorer:
             mw_kwargs["exempt_prefixes"] = {explorer_prefix}
-        return [(AuthMiddleware, mw_kwargs)]
+        middleware.append((AuthMiddleware, mw_kwargs))
+        return middleware
 
     def _maybe_append_usage_routes(
         self,
@@ -859,6 +883,9 @@ class APCoreMCP:
         _pkg = importlib.import_module("apcore_mcp")
         TransportManager = _pkg.TransportManager  # noqa: N806
 
+        if transport.lower() == "sse" and self._phase_b_handler is not None:
+            raise ValueError("Scoped approval is unavailable on the legacy SSE transport; use Streamable HTTP or stdio")
+
         server, router, tools, init_options, version = self._build_server_components()
 
         if self._dynamic:
@@ -890,7 +917,7 @@ class APCoreMCP:
             )
 
         auth_middleware: list[tuple[type, dict]] | None = None
-        if self._authenticator is not None and transport_lower in ("streamable-http", "sse"):
+        if transport_lower in ("streamable-http", "sse"):
             auth_middleware = self._build_auth_middleware(
                 explorer=explorer,
                 explorer_prefix=explorer_prefix,
@@ -1090,12 +1117,10 @@ class APCoreMCP:
                 explorer_project_url=explorer_project_url,
             )
 
-        auth_middleware: list[tuple[type, dict]] | None = None
-        if self._authenticator is not None:
-            auth_middleware = self._build_auth_middleware(
-                explorer=explorer,
-                explorer_prefix=explorer_prefix,
-            )
+        auth_middleware = self._build_auth_middleware(
+            explorer=explorer,
+            explorer_prefix=explorer_prefix,
+        )
 
         transport_manager = TransportManager(metrics_collector=self._metrics_collector)
         transport_manager.set_module_count(len(tools))

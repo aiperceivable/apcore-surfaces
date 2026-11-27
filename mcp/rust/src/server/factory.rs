@@ -838,8 +838,11 @@ impl MCPServerFactory {
                         .and_then(|id| router.session_registry().get(id))
                         .is_some_and(|session| session.supports_structured_results());
                 let extra_ref = extra.as_ref();
-                let (content_items, is_error, trace_id) =
-                    router.handle_call(&name, &arguments, extra_ref).await;
+                let ((content_items, is_error, trace_id), pending) =
+                    crate::server::approval_bridge::capture_pending_approval(
+                        router.handle_call(&name, &arguments, extra_ref),
+                    )
+                    .await;
 
                 // Extract any pipeline trace item for `_meta.trace`.
                 let mut meta_trace: Option<Value> = None;
@@ -860,6 +863,14 @@ impl MCPServerFactory {
                 let mut meta_obj = serde_json::Map::new();
                 if let Some(t) = meta_trace {
                     meta_obj.insert("trace".to_string(), t);
+                }
+                if let Some(approval) =
+                    pending.filter(|_| is_error && router.supports_scoped_approval())
+                {
+                    meta_obj.insert(
+                        "apcore".to_string(),
+                        serde_json::json!({"approval": approval}),
+                    );
                 }
                 if let Some(tid) = trace_id.as_deref() {
                     // Synthesize a W3C traceparent from the context trace_id.

@@ -525,11 +525,8 @@ export async function openapiBackend(
   }
 
   // --- 4. Collision preflight -----------------------------------------------
-  // Full-set, before the first write. Toolkit writers report per-module
-  // WriteResults and never abort, so without this a duplicate would arrive as a
-  // failed WriteResult, get logged and skipped, and leave a partial registry: a
-  // skill the document advertises, absent from the card, with one log line as
-  // the only notice.
+  // Check the full set before writing so a collision leaves the registry
+  // untouched and the host can report every colliding ID.
   const target = options.registry ?? new Registry();
   const existing = new Set(registryIds(target));
   const collisions = [
@@ -559,13 +556,27 @@ export async function openapiBackend(
     baseUrl,
     authHeaderFactory: options.authHeaderFactory,
   });
-  for (const result of writer.write([...modules], target)) {
-    if (result.verificationError) {
-      log.error(
-        `apcore-a2a: ${result.moduleId} failed to register as an HTTP proxy: ` +
-          result.verificationError,
-      );
-    }
+  // Keep the Toolkit writer's synchronous WriteResult contract while waiting
+  // for APCore's async host validators before publishing the backend.
+  const pending: Promise<void>[] = [];
+  const asyncFailures = new Map<string, string>();
+  const writes = await writer.write([...modules], {
+    register(moduleId, module) {
+      pending.push(Promise.resolve(target.register(moduleId, module)).catch((error: unknown) => {
+        asyncFailures.set(moduleId, error instanceof Error ? error.message : String(error));
+      }));
+    },
+  });
+  await Promise.all(pending);
+  const results = new Map(writes.map(result => [result.moduleId, result]));
+  const failures = modules.flatMap(({ moduleId }) => {
+    const result = results.get(moduleId);
+    const error = asyncFailures.get(moduleId);
+    if (result?.verified && error === undefined && target.get(moduleId) != null) return [];
+    return [`${moduleId}: ${result?.verificationError ?? error ?? "module not registered"}`];
+  });
+  if (failures.length > 0) {
+    throw new Error(`OpenAPI registration incomplete: ${failures.join("; ")}`);
   }
 
   warnUnapprovedWrites(modules, {

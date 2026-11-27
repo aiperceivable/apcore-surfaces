@@ -32,6 +32,7 @@ pip install apcore-toolkit
 | `PythonWriter` | Generates `@module`-decorated Python wrapper files |
 | `RegistryWriter` | Registers modules directly into an `apcore.Registry`. Subclasses customize only the `_adapt_func` / `_build_input_schema` / `_build_output_schema` hooks; field mapping (incl. `annotations`) is centralized so no override can silently drop a field |
 | `assert_annotations_preserved` | Conformance check for adapter test suites: registers a module and asserts its behavioral annotations (`requires_approval` / `destructive`) survive `get_definition` — guards against a writer silently disabling approval/ACL gating |
+| `create_prometheus_server` | Creates an application-owned HTTP listener for Prometheus metrics, liveness and readiness |
 | `HTTPProxyRegistryWriter` | Registers HTTP proxy modules that forward requests to a running API (requires `pip install apcore-toolkit[http-proxy]`) |
 | `DeviceAuthClient` | RFC 8628 device-authorization client: `login()`, `ensure_valid()`, `refresh()`, `as_auth_header_factory()` (requires `pip install apcore-toolkit[auth]`) |
 | `DeviceAuthConfig` | Provider configuration and compatibility surface (endpoints, `discover()`, client auth, `error_aliases` / `field_aliases`, per-kind request encoding, extension hooks) |
@@ -82,6 +83,38 @@ pip install apcore-toolkit
 | `run_verifier_chain` | Runs multiple verifiers in sequence, stopping on first failure |
 
 ## Usage
+
+### Prometheus HTTP server
+
+`create_prometheus_server` binds to `127.0.0.1:9090` by default and returns a standard
+`ThreadingHTTPServer`. It serves GET requests for `/metrics`, `/healthz` and `/readyz`.
+Set `metrics_path` for a custom scrape path and supply `is_ready` to report availability.
+The application controls readiness and owns the server lifecycle.
+
+```python
+from threading import Event, Thread
+
+from apcore.observability import MetricsCollector, render_prometheus_metrics
+from apcore_toolkit import create_prometheus_server
+
+metrics = MetricsCollector()
+ready = Event()
+with create_prometheus_server(
+    lambda: render_prometheus_metrics(metrics), is_ready=ready.is_set
+) as server:
+    thread = Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        ready.set()
+        # Run the application's main loop here.
+    finally:
+        server.shutdown()
+        thread.join()
+```
+
+The context closes the listening socket and waits for accepted requests to finish.
+With a Core version that exposes `PrometheusExporter.export`, that bound method can
+also serve as the rendering callback.
 
 ### Scanning and Writing
 

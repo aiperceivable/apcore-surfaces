@@ -117,6 +117,7 @@ export interface ModuleDescriptor {
 export interface Registry {
   list(options?: { tags?: string[] | null; prefix?: string | null }): string[];
   getDefinition(moduleId: string): ModuleDescriptor | null;
+  get?(moduleId: string, versionHint?: string): unknown;
   has?(moduleId: string): boolean;
   on(event: string, callback: (...args: unknown[]) => void): void;
   discover?(): Promise<number>;
@@ -128,8 +129,29 @@ export interface Executor {
   call(moduleId: string, inputs: Record<string, unknown>, context?: unknown, versionHint?: string): Promise<Record<string, unknown>>;
   callAsync?(moduleId: string, inputs: Record<string, unknown>, context?: unknown, versionHint?: string): Promise<Record<string, unknown>>;
   stream?(moduleId: string, inputs: Record<string, unknown>, context?: unknown, versionHint?: string): AsyncIterable<Record<string, unknown>>;
+  streamWithCompletion?(moduleId: string, inputs: Record<string, unknown>, context?: unknown, versionHint?: string): StreamExecution;
   validate?(toolName: string, args: Record<string, unknown>): unknown | Promise<unknown>;
   callWithTrace?(moduleId: string, inputs: Record<string, unknown>, context?: unknown, versionHint?: string): Promise<[Record<string, unknown>, unknown]>;
+}
+
+/** Structural subset of Core's optional completion API. */
+export interface StreamExecution {
+  readonly chunks: AsyncIterable<Record<string, unknown>>;
+  readonly completion: Promise<StreamCompletion>;
+  close(): Promise<void>;
+}
+
+export interface StreamCompletion {
+  readonly reason: string;
+  readonly output: Record<string, unknown> | null;
+  readonly outputValidation: StreamStepOutcome;
+  readonly middlewareAfter: StreamStepOutcome;
+  readonly errorCode: string | null;
+}
+
+export interface StreamStepOutcome {
+  readonly status: string;
+  readonly reason?: string;
 }
 
 // ─── Error Type ──────────────────────────────────────────────────────────────

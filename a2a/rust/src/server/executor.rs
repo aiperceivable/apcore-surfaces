@@ -69,6 +69,10 @@ impl ApCoreAgentExecutor {
         &self.part_converter
     }
 
+    pub(crate) fn execution_timeout(&self) -> Duration {
+        Duration::from_secs(self.execution_timeout_secs)
+    }
+
     /// The apcore ACL backing this executor, if one is configured. Lets the
     /// Agent Card advertise only the skills a caller is allowed to invoke.
     pub fn acl(&self) -> Option<Arc<ACL>> {
@@ -188,14 +192,17 @@ impl ApCoreAgentExecutor {
         identity: Option<Identity>,
         cancel_token: CancelToken,
     ) -> Result<Value, ModuleError> {
-        let ctx = self.build_context(identity, cancel_token);
+        let ctx = self.build_context(identity, cancel_token.clone());
         let fut = self.executor.call(module_id, inputs, Some(&ctx), None);
-        match tokio::time::timeout(Duration::from_secs(self.execution_timeout_secs), fut).await {
+        match tokio::time::timeout(self.execution_timeout(), fut).await {
             Ok(result) => result,
-            Err(_) => Err(ModuleError::new(
-                ErrorCode::ModuleTimeout,
-                "Execution timed out",
-            )),
+            Err(_) => {
+                cancel_token.cancel();
+                Err(ModuleError::new(
+                    ErrorCode::ModuleTimeout,
+                    "Execution timed out",
+                ))
+            }
         }
     }
 
@@ -214,9 +221,10 @@ impl ApCoreAgentExecutor {
         cancel_token: CancelToken,
     ) -> ReceiverStream<Result<Value, ModuleError>> {
         let executor = self.executor.clone();
-        let ctx = self.build_context(identity, cancel_token);
-        let (tx, rx) = mpsc::channel::<Result<Value, ModuleError>>(16);
-        let timeout = Duration::from_secs(self.execution_timeout_secs);
+        let ctx = self.build_context(identity, cancel_token.clone());
+        let (tx, rx) = mpsc::channel::<Result<Value, ModuleError>>(17);
+        let timeout_slot = tx.clone().try_reserve_owned().ok();
+        let timeout = self.execution_timeout();
 
         tokio::spawn(async move {
             // A hard host-side timeout bounds the *entire* stream lifetime, in
@@ -234,15 +242,17 @@ impl ApCoreAgentExecutor {
                     }
                 }
             };
-            if tokio::time::timeout(timeout, drive).await.is_err() {
-                // Total budget elapsed: surface a timeout chunk so the handler
-                // emits a failed "Execution timed out" status (Python/TS parity).
-                let _ = tx
-                    .send(Err(ModuleError::new(
-                        ErrorCode::ModuleTimeout,
-                        "Execution timed out",
-                    )))
-                    .await;
+            tokio::select! {
+                biased;
+                _ = tx.closed() => cancel_token.cancel(),
+                result = tokio::time::timeout(timeout, drive) => {
+                    if result.is_err() {
+                        cancel_token.cancel();
+                        if let Some(slot) = timeout_slot {
+                            slot.send(Err(ModuleError::new(ErrorCode::ModuleTimeout, "Execution timed out")));
+                        }
+                    }
+                }
             }
         });
 

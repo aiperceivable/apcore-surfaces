@@ -224,6 +224,128 @@ async fn post(router: axum::Router, body: Value) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamWriteFault {
+    InitialTimeout,
+    TerminalTimeout,
+    TerminalRejected,
+}
+
+struct StreamFaultStore {
+    inner: InMemoryTaskStore,
+    fault: StreamWriteFault,
+}
+
+#[async_trait]
+impl TaskStore for StreamFaultStore {
+    async fn save(&self, id: &str, task: Value, ctx: &CallContext) -> Result<(), StoreError> {
+        let completed = task["status"]["state"] == "TASK_STATE_COMPLETED";
+        match self.fault {
+            StreamWriteFault::InitialTimeout => std::future::pending().await,
+            StreamWriteFault::TerminalTimeout if completed => std::future::pending().await,
+            StreamWriteFault::TerminalRejected if completed => {
+                Err(StoreError::backend_msg("terminal write rejected"))
+            }
+            _ => self.inner.save(id, task, ctx).await,
+        }
+    }
+
+    async fn get(&self, id: &str, ctx: &CallContext) -> Result<Option<Value>, StoreError> {
+        self.inner.get(id, ctx).await
+    }
+
+    async fn delete(&self, id: &str, ctx: &CallContext) -> Result<(), StoreError> {
+        self.inner.delete(id, ctx).await
+    }
+
+    async fn list(&self, params: &ListParams, ctx: &CallContext) -> Result<Vec<Value>, StoreError> {
+        self.inner.list(params, ctx).await
+    }
+}
+
+#[tokio::test]
+async fn stream_does_not_publish_unconfirmed_terminal_state_or_wait_forever_on_storage() {
+    for fault in [
+        StreamWriteFault::TerminalRejected,
+        StreamWriteFault::InitialTimeout,
+        StreamWriteFault::TerminalTimeout,
+    ] {
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_module("test.echo", Box::new(EchoModule))
+            .unwrap();
+        let executor = Arc::new(apcore::Executor::new(
+            registry.clone(),
+            apcore::Config::default(),
+        ));
+        let agent = Arc::new(apcore_a2a::ApCoreAgentExecutor::new(
+            executor,
+            apcore_a2a::PartConverter::new(apcore_a2a::SchemaConverter::new()),
+            1,
+        ));
+        let options = apcore_a2a::CreateOptions::new(
+            agent,
+            "fixture",
+            "fixture",
+            "0.0.0",
+            "http://localhost",
+        )
+        .with_task_store(Arc::new(StreamFaultStore {
+            inner: InMemoryTaskStore::new(),
+            fault,
+        }));
+        let (app, _) = apcore_a2a::A2AServerFactory::new().create(&registry, options);
+        let request = Request::post("/")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({
+                "jsonrpc": "2.0", "id": "stream", "method": "message/stream",
+                "params": {
+                    "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{"data": {}}] },
+                    "metadata": {"skillId": "test.echo"}
+                }
+            }).to_string())).unwrap();
+        let reply = app.clone().oneshot(request).await.unwrap();
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            to_bytes(reply.into_body(), usize::MAX),
+        )
+        .await
+        .expect("storage failure must finish the stream")
+        .unwrap();
+        let events: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            events.last().unwrap()["error"]["code"],
+            INTERNAL_ERROR,
+            "{events:?}"
+        );
+        assert_eq!(events.last().unwrap()["id"], "stream");
+        assert!(events
+            .iter()
+            .all(|event| event["result"]["statusUpdate"]["status"]["state"]
+                != "TASK_STATE_COMPLETED"));
+        assert!(events
+            .iter()
+            .all(|event| event["result"]["artifactUpdate"]["lastChunk"] != true));
+        if fault != StreamWriteFault::InitialTimeout {
+            let id = events
+                .iter()
+                .find_map(|e| e["result"]["statusUpdate"]["taskId"].as_str())
+                .unwrap();
+            let current = post(
+                app,
+                json!({"jsonrpc":"2.0", "id":"get", "method":"tasks/get", "params":{"id":id}}),
+            )
+            .await;
+            assert_eq!(current["result"]["status"]["state"], "TASK_STATE_WORKING");
+        }
+    }
+}
+
 /// Submit a task while both stores are healthy and return its id.
 async fn seed_task(h: &Harness) -> String {
     let sent = post(

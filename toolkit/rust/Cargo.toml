@@ -1,6 +1,6 @@
 [package]
 name = "apcore-toolkit"
-version = "0.15.0"
+version = "0.15.1-alpha.1"
 edition = "2021"
 description = "Shared scanner, schema extraction, and output toolkit for apcore framework adapters"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-apcore = ">=0.33.0"
+apcore = ">=0.33.0, <=1.0.0-alpha.1"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is required for the toolkit's byte-equivalent tabular
 # formatters (csv / jsonl): object key order MUST match insertion order to
@@ -41,6 +41,9 @@ walkdir = "2"
 # Runtime-independent, cancellable HTTP deadline watchdog for injected auth
 # transports. Poll interval SleepFn remains exclusively for protocol delays.
 futures-timer = { version = "3", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 
 # Used by ai_enhancer for synchronous SLM API calls (always included).
 ureq = { version = "3", features = ["json"] }
@@ -50,9 +53,8 @@ version = "0.12"
 features = ["json"]
 optional = true
 
-# HTTP features use the async timer for cooperative proxy cancellation and
-# the default RFC 8628 polling sleep. Only `time` is needed; reqwest already
-# requires Tokio for HTTP I/O.
+# The HTTP client features use Tokio time for cancellation and polling.
+# The optional Prometheus listener also enables its server runtime features.
 [dependencies.tokio]
 version = "1"
 features = ["time"]
@@ -72,6 +74,10 @@ default-features = false
 default = ["http-proxy", "device-auth"]
 http-proxy = ["dep:reqwest", "dep:tokio"]
 device-auth = ["dep:reqwest", "dep:tokio", "dep:futures-timer"]
+prometheus-server = [
+    "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:tokio",
+    "tokio/macros", "tokio/net", "tokio/rt", "tokio/sync",
+]
 
 [lints.clippy]
 # Match the project's pre-commit gate (Makefile + hooks/) — block warnings
@@ -86,6 +92,6 @@ tempfile = "3"
 # Test-only: driving `reqwest`'s async client against a real (loopback)
 # HTTP server in the W2 regression test (HEAD/OPTIONS/TRACE support in
 # HTTPProxyRegistryWriter) requires a real async I/O reactor — `futures`'
-# bare `block_on` executor has none. Not a runtime dependency of the
-# crate itself.
-tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+# bare `block_on` executor has none. The Prometheus server tests open and
+# read real HTTP connections using the same runtime.
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util"] }
