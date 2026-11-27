@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
+import threading
 import time
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -41,6 +45,38 @@ class ApprovalStore(Protocol):
 
         Returns False if the id is unknown or already resolved.
         """
+        ...
+
+
+ApprovalPrincipal = tuple[str, str] | None
+
+
+@dataclass(frozen=True)
+class ApprovalScope:
+    """Trusted caller and immutable snapshot of the requested invocation."""
+
+    principal: ApprovalPrincipal
+    caller_id: str | None
+    module_id: str
+    arguments_digest: str
+
+
+@runtime_checkable
+class ScopedApprovalStore(ApprovalStore, Protocol):
+    """Persistence for owner-scoped polling and one-shot resumption."""
+
+    async def save_scoped_pending(
+        self, approval_id: str, arguments: dict[str, Any], scope: ApprovalScope, verifier: str
+    ) -> None:
+        """Save a public record ID and an opaque credential verifier together."""
+        ...
+
+    async def get_scoped_result(self, approval_id: str, principal: ApprovalPrincipal) -> dict[str, Any] | None:
+        """Return a live record's status to its caller."""
+        ...
+
+    async def consume_scoped(self, approval_id: str, scope: ApprovalScope, verifier: str) -> dict[str, Any] | None:
+        """Match scope and credential before returning status. Atomically consume approved grants."""
         ...
 
 
@@ -75,6 +111,7 @@ class InMemoryApprovalStore:
         self._sweep_interval = sweep_interval
         self._max_records = max_records
 
+        self._lock = threading.RLock()
         self._records: dict[str, dict[str, Any]] = {}
         self._events: dict[str, asyncio.Event] = {}
         self._sweep_task: asyncio.Task | None = None
@@ -99,41 +136,94 @@ class InMemoryApprovalStore:
     # ── public API ───────────────────────────────────────────────────────
 
     async def save_pending(self, approval_id: str, module_id: str, arguments: dict) -> None:
-        if len(self._records) >= self._max_records:
-            self._evict_oldest_pending()
+        self._save_pending(approval_id, module_id, arguments)
 
-        now = time.monotonic()
-        self._records[approval_id] = {
-            "status": "pending",
-            "module_id": module_id,
-            "arguments": arguments,
-            "reason": None,
-            "created_at": now,
-            "resolved_at": None,
-        }
-        self._events[approval_id] = asyncio.Event()
-        self._schedule_cleanup(approval_id, self._pending_ttl)
+    async def save_scoped_pending(
+        self, approval_id: str, arguments: dict[str, Any], scope: ApprovalScope, verifier: str
+    ) -> None:
+        self._save_pending(approval_id, scope.module_id, deepcopy(arguments), scope=scope, verifier=verifier)
+
+    def _save_pending(
+        self,
+        approval_id: str,
+        module_id: str,
+        arguments: dict[str, Any],
+        *,
+        scope: ApprovalScope | None = None,
+        verifier: str | None = None,
+    ) -> None:
+        with self._lock:
+            if len(self._records) >= self._max_records:
+                self._evict_oldest_pending()
+
+            self._records[approval_id] = {
+                "status": "pending",
+                "module_id": module_id,
+                "arguments": arguments,
+                "reason": None,
+                "created_at": time.monotonic(),
+                "resolved_at": None,
+                "scope": scope,
+                "verifier": verifier,
+            }
+            self._events[approval_id] = asyncio.Event()
+            self._schedule_cleanup(approval_id, self._pending_ttl)
 
     async def get_result(self, approval_id: str) -> dict[str, Any] | None:
-        return self._project(self._records.get(approval_id))
+        with self._lock:
+            return self._project(self._records.get(approval_id))
+
+    async def get_scoped_result(self, approval_id: str, principal: ApprovalPrincipal) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._live_scoped_record(approval_id)
+            if record is None or record["scope"].principal != principal:
+                return None
+            return self._project(record)
+
+    async def consume_scoped(self, approval_id: str, scope: ApprovalScope, verifier: str) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._live_scoped_record(approval_id)
+            if record is None or record["scope"] != scope:
+                return None
+            expected = record["verifier"]
+            if expected is None or not hmac.compare_digest(expected, verifier):
+                return None
+            if record["status"] == "approved":
+                record["verifier"] = None
+            return self._project(record)
+
+    def _live_scoped_record(self, approval_id: str) -> dict[str, Any] | None:
+        record = self._records.get(approval_id)
+        if record is None or record["scope"] is None or self._expired(record, time.monotonic()):
+            return None
+        return record
+
+    def _expired(self, record: dict[str, Any], now: float) -> bool:
+        resolved_at = record["resolved_at"]
+        pending_expired = now >= record["created_at"] + self._pending_ttl
+        if resolved_at is None:
+            return pending_expired
+        return (record["scope"] is not None and pending_expired) or now >= resolved_at + self._resolved_ttl
 
     async def resolve(self, approval_id: str, *, approved: bool, reason: str | None = None) -> bool:
-        record = self._records.get(approval_id)
-        if record is None or record["status"] != "pending":
-            return False
+        with self._lock:
+            record = self._records.get(approval_id)
+            if record is None or record["status"] != "pending":
+                return False
+            if record["scope"] is not None and self._live_scoped_record(approval_id) is None:
+                return False
 
-        now = time.monotonic()
-        record["status"] = "approved" if approved else "rejected"
-        record["reason"] = reason
-        record["resolved_at"] = now
-        record.pop("arguments", None)
+            record["status"] = "approved" if approved else "rejected"
+            record["reason"] = reason
+            record["resolved_at"] = time.monotonic()
+            record.pop("arguments", None)
 
-        event = self._events.pop(approval_id, None)
-        if event:
-            event.set()
+            event = self._events.pop(approval_id, None)
+            if event:
+                event.set()
 
-        self._schedule_cleanup(approval_id, self._resolved_ttl)
-        return True
+            self._schedule_cleanup(approval_id, self._resolved_ttl)
+            return True
 
     async def wait_for_resolution(self, approval_id: str, timeout: float = 300.0) -> dict[str, Any] | None:
         """Block until resolved or timeout. Helper for tests."""
@@ -175,10 +265,11 @@ class InMemoryApprovalStore:
         loop.call_later(delay, self._delete_record, approval_id)
 
     def _delete_record(self, approval_id: str) -> None:
-        self._records.pop(approval_id, None)
-        event = self._events.pop(approval_id, None)
-        if event and not event.is_set():
-            event.set()
+        with self._lock:
+            self._records.pop(approval_id, None)
+            event = self._events.pop(approval_id, None)
+            if event and not event.is_set():
+                event.set()
 
     def _evict_oldest_pending(self) -> None:
         oldest_id = None
@@ -209,16 +300,9 @@ class InMemoryApprovalStore:
 
     def _sweep(self) -> None:
         now = time.monotonic()
-        to_delete = []
-        for aid, rec in self._records.items():
-            status = rec["status"]
-            created = rec.get("created_at", 0.0)
-            resolved = rec.get("resolved_at")
-            if (status == "pending" and (now - created) > self._pending_ttl) or (
-                status in ("approved", "rejected") and resolved is not None and (now - resolved) > self._resolved_ttl
-            ):
-                to_delete.append(aid)
-        for aid in to_delete:
-            self._delete_record(aid)
+        with self._lock:
+            to_delete = [aid for aid, record in self._records.items() if self._expired(record, now)]
+            for aid in to_delete:
+                self._delete_record(aid)
         if to_delete:
             logger.debug("approval store sweep: deleted %d expired records", len(to_delete))
