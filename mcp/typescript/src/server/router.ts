@@ -128,6 +128,8 @@ export interface HandleCallExtra {
   approvalResumeToken?: string;
   /** Per-request response handoff, created by the server factory. */
   approvalReply?: ApprovalReplyCapture;
+  /** @internal Hand off the live Core schema only after a successful invocation. */
+  onOutputDescriptor?: (descriptor: ModuleDescriptor) => void;
   /** MCP request cancellation, including transport disconnect. */
   signal?: AbortSignal;
   sendNotification?: (notification: Record<string, unknown>) => Promise<void>;
@@ -346,6 +348,7 @@ export class ExecutionRouter {
   private async _maybeRedact(
     toolName: string,
     result: unknown,
+    outputSchema = this._outputSchemaMap[toolName] ?? {},
   ): Promise<unknown> {
     if (!this._redactOutput || result == null) return result;
     try {
@@ -355,7 +358,7 @@ export class ExecutionRouter {
       if (typeof redactSensitive !== "function") {
         throw new Error("Output redaction failed");
       }
-      return redactSensitive(result, this._outputSchemaMap[toolName] ?? {});
+      return redactSensitive(result, outputSchema);
     } catch {
       // Never expose the original result or the redactor's exception details.
       throw new Error("Output redaction failed");
@@ -715,9 +718,12 @@ export class ExecutionRouter {
       let versionHint: string | undefined = extra?.versionHint
         ?? extra?._meta?.apcore?.version;
       const coreExecutor = isCoreExecutor(this._executor);
+      const registry = this._executor.registry;
+      let descriptor: ModuleDescriptor | null = null;
+      let selectedModule: unknown;
       let declaredStreaming = false;
       try {
-        const descriptor = this._executor.registry?.getDefinition?.(toolName);
+        descriptor = registry?.getDefinition?.(toolName) ?? null;
         declaredStreaming = !coreExecutor && descriptor?.annotations?.streaming === true;
         if (!versionHint) {
           const metaHint = descriptor?.metadata?.versionHint;
@@ -725,13 +731,23 @@ export class ExecutionRouter {
             versionHint = metaHint;
           }
         }
-        if (!declaredStreaming && typeof this._executor.streamWithCompletion === "function") {
-          const module = this._executor.registry?.get?.(toolName, versionHint);
-          declaredStreaming = module != null && isStreamingModule(module as Module);
+        if (coreExecutor || (!declaredStreaming && typeof this._executor.streamWithCompletion === "function")) {
+          selectedModule = registry?.get?.(toolName, versionHint);
+          declaredStreaming = selectedModule != null && isStreamingModule(selectedModule as Module);
         }
       } catch {
         // Registry lookup is best-effort for structurally compatible executors.
       }
+
+      const generation = coreExecutor ? registry.publicGeneration?.(toolName) : undefined;
+      const outputSchema = coreExecutor ? descriptor?.outputSchema ?? {} : undefined;
+      const protectOutput = (output: unknown): Promise<unknown> => {
+        if (coreExecutor && (descriptor === null || selectedModule == null ||
+            registry.get?.(toolName) !== selectedModule || registry.publicGeneration?.(toolName) !== generation)) {
+          throw new Error("Tool output registration could not be verified");
+        }
+        return this._maybeRedact(toolName, output, outputSchema);
+      };
 
       // ── Streaming path ────────────────────────────────────────────────
       const wantsProgress = progressToken !== undefined && sendNotification !== undefined;
@@ -750,9 +766,11 @@ export class ExecutionRouter {
       if (chunks) {
         const progress = wantsProgress ? { token: progressToken, send: sendNotification } : undefined;
         const output = await runApprovalInvocation(extra?.approvalReply, context.data, () =>
-          this._collectStream(toolName, chunks, execution, progress));
-        const redacted = await this._maybeRedact(toolName, output);
-        return [[{ type: "text", text: await this._formatResult(redacted) }], false, effectiveTraceId];
+          this._collectStream(chunks, execution, protectOutput, progress));
+        const redacted = await protectOutput(output);
+        const text = await this._formatResult(redacted);
+        if (coreExecutor && descriptor !== null) extra?.onOutputDescriptor?.(descriptor);
+        return [[{ type: "text", text }], false, effectiveTraceId];
       }
 
       // ── Non-streaming path ────────────────────────────────────────────
@@ -794,7 +812,7 @@ export class ExecutionRouter {
           callFn(toolName, executionArgs, context, versionHint));
       }
 
-      const redacted = await this._maybeRedact(toolName, result);
+      const redacted = await protectOutput(result);
 
       const content: TextContentDict[] = [
         {
@@ -804,8 +822,8 @@ export class ExecutionRouter {
         } as TextContentDict,
       ];
 
-      const traceId = effectiveTraceId;
-      return [content, false, traceId];
+      if (coreExecutor && descriptor !== null) extra?.onOutputDescriptor?.(descriptor);
+      return [content, false, effectiveTraceId];
     } catch (error: unknown) {
       // Error messages, stacks, codes and attached fields may contain secrets.
       console.error("Tool execution failed");
@@ -824,9 +842,9 @@ export class ExecutionRouter {
   }
 
   private async _collectStream(
-    toolName: string,
     chunks: AsyncIterable<Record<string, unknown>>,
     execution: StreamExecution | null,
+    protectOutput: (output: unknown) => Promise<unknown>,
     progress?: { token: string | number; send: NonNullable<HandleCallExtra["sendNotification"]> },
   ): Promise<Record<string, unknown>> {
     let accumulated: Record<string, unknown> = {};
@@ -835,7 +853,7 @@ export class ExecutionRouter {
       for await (const chunk of chunks) {
         if (!execution) accumulated = deepMerge(accumulated, chunk);
         if (progress) {
-          const safeChunk = await this._maybeRedact(toolName, chunk);
+          const safeChunk = await protectOutput(chunk);
           await progress.send({
             method: "notifications/progress",
             params: { progressToken: progress.token, progress: ++count, message: JSON.stringify(safeChunk) },

@@ -118,6 +118,8 @@ export interface Registry {
   list(options?: { tags?: string[] | null; prefix?: string | null }): string[];
   getDefinition(moduleId: string): ModuleDescriptor | null;
   get?(moduleId: string, versionHint?: string): unknown;
+  /** @internal Opaque generation of a public Core registration. */
+  publicGeneration?(moduleId: string): object | null;
   has?(moduleId: string): boolean;
   on(event: string, callback: (...args: unknown[]) => void): void;
   discover?(): Promise<number>;

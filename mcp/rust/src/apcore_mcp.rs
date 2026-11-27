@@ -583,9 +583,11 @@ impl APCoreMCP {
             .map(|t| t.iter().map(|s| s.as_str()).collect());
         let tags_slice: Option<&[&str]> = tags_refs.as_deref();
         let prefix = self.config.prefix.as_deref();
-        let tools = factory
-            .build_tools(self.reg(), tags_slice, prefix)
-            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?;
+        let (tool_ids, tools): (Vec<_>, Vec<_>) = factory
+            .build_tools_with_ids(self.reg(), tags_slice, prefix)
+            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?
+            .into_iter()
+            .unzip();
 
         // Build output schema map for output redaction.
         let output_schema_map: std::collections::HashMap<String, Value> = {
@@ -655,13 +657,7 @@ impl APCoreMCP {
         // Register handlers
         factory.register_handlers(&mut server, tools.clone(), Arc::clone(&router));
 
-        factory.register_governed_tools(
-            &mut server,
-            Arc::clone(&router),
-            &tools,
-            self.config.tags.clone(),
-            self.config.prefix.clone(),
-        );
+        factory.register_governed_tools(&mut server, Arc::clone(&router), &tools, tool_ids);
 
         // Register resource handlers. Reads dispatch through `router` so the
         // system.* resources added by #15(a) get the same ACL / approval /
@@ -2698,9 +2694,38 @@ mod tests {
         }
     }
 
-    fn register_discovery_fixture(registry: &Registry, property: &str) {
-        let id = "demo.governed";
-        let module = MockModule::new("Governed tool");
+    struct DiscoveryFixtureModule(String);
+
+    #[async_trait::async_trait]
+    impl Module for DiscoveryFixtureModule {
+        fn description(&self) -> &str {
+            "Governed tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+
+        fn output_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {(&self.0): {"type": "string", "x-sensitive": true}},
+                "required": [&self.0],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(
+            &self,
+            _: Value,
+            _: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::ModuleError> {
+            Ok(json!({(&self.0): "local-redaction-fixture"}))
+        }
+    }
+
+    fn register_discovery_fixture(registry: &Registry, id: &str, property: &str) {
+        let module = DiscoveryFixtureModule(property.to_owned());
         let descriptor = ModuleDescriptor {
             module_id: id.into(),
             name: None,
@@ -2756,10 +2781,10 @@ mod tests {
     #[tokio::test]
     async fn test_http_discovery_filters_tools_and_resources_for_each_identity() {
         let registry = Arc::new(Registry::new());
-        register_discovery_fixture(&registry, "stale");
+        register_discovery_fixture(&registry, "demo.governed", "stale");
         let mut rule = apcore::ACLRule::new(
             vec!["@external".into()],
-            vec!["demo.governed".into(), "system.manifest.search".into()],
+            vec!["demo.*".into(), "system.manifest.search".into()],
             "allow",
         );
         rule.conditions = Some(json!({"roles":["reader"]}));
@@ -2844,9 +2869,25 @@ mod tests {
             }
         }
         assert!(registry.unregister("demo.governed").unwrap());
-        register_discovery_fixture(&registry, "fresh");
+        register_discovery_fixture(&registry, "demo.governed", "fresh");
+        register_discovery_fixture(&registry, "demo.unpublished", "new");
         let listing = discovery_http_request(&app, "reader", "tools/list", json!({})).await;
         let tools = listing["result"]["tools"].as_array().unwrap();
+        assert!(!tools.iter().any(|tool| tool["name"] == "demo.unpublished"));
+        let docs = discovery_http_request(&app, "reader", "resources/list", json!({})).await;
+        assert!(!docs["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resource| resource["uri"] == "docs://demo.unpublished"));
+        let unknown_doc = discovery_http_request(
+            &app,
+            "reader",
+            "resources/read",
+            json!({"uri":"docs://demo.unpublished"}),
+        )
+        .await;
+        assert!(unknown_doc.get("error").is_some());
         let tool = tools
             .iter()
             .find(|tool| tool["name"] == "demo.governed")
@@ -2856,6 +2897,23 @@ mod tests {
             "#/$defs/Text"
         );
         assert!(tool["inputSchema"]["properties"].get("stale").is_none());
+        assert_eq!(tool["outputSchema"]["required"], json!(["fresh"]));
+        let response = discovery_http_request(
+            &app,
+            "reader",
+            "tools/call",
+            json!({"name":"demo.governed","arguments":{}}),
+        )
+        .await;
+        let result = &response["result"];
+        let safe = json!({"fresh": apcore::executor::REDACTED_VALUE});
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"], safe);
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            safe
+        );
+        assert!(!response.to_string().contains("local-redaction-fixture"));
         let doc = discovery_http_request(
             &app,
             "reader",

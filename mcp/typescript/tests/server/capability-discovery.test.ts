@@ -20,12 +20,19 @@ const inputSchema = {
 
 it("lists the authorized caller's tools and documentation from the live Core registration", async () => {
   const registry = new Registry();
-  const execute = vi.fn(() => ({ ok: true }));
-  async function register(documentation: string, schema = inputSchema, version = "1.1.0"): Promise<void> {
+  const execute = vi.fn<() => Record<string, unknown>>(() => ({ ok: true }));
+  const originalOutput = {
+    type: "object", properties: { ok: { type: "boolean" } },
+    required: ["ok"], additionalProperties: false,
+  };
+  async function register(
+    documentation: string, schema = inputSchema, version = "1.1.0",
+    outputSchema: Record<string, unknown> = originalOutput,
+  ): Promise<void> {
     await registry.register(moduleId, {
       description: "A role-scoped module",
       inputSchema: schema,
-      outputSchema: { type: "object" },
+      outputSchema,
       annotations: createAnnotations({ readonly: true }),
       execute,
     }, version, { documentation, display: { mcp: { alias } }, versionHint: "1.1.0" });
@@ -85,8 +92,21 @@ it("lists the authorized caller's tools and documentation from the live Core reg
 
     expect(await registry.safeUnregister(moduleId)).toBe(true);
     const replacement = { ...inputSchema, $defs: { message: { type: "string", minLength: 2 } } };
-    await register("Replacement documentation", replacement);
-    expect((await client.listTools()).tools).toMatchObject([{ name: alias, inputSchema: replacement }]);
+    const liveOutput = {
+      type: "object",
+      properties: {
+        headline: { type: "string" },
+        memo: { type: "string", "x-sensitive": true },
+        comment: { type: "string", "x-sensitive": true },
+      },
+      required: ["headline", "memo"],
+      additionalProperties: false,
+    };
+    execute.mockReturnValue({ headline: "reviewed", memo: "fixture-private-memo", comment: "fixture-private-comment" });
+    await register("Replacement documentation", replacement, "1.1.0", liveOutput);
+    expect((await client.listTools()).tools).toMatchObject([
+      { name: alias, inputSchema: replacement, outputSchema: liveOutput },
+    ]);
     expect((await client.readResource({ uri: `docs://${moduleId}` })).contents)
       .toMatchObject([{ text: "Replacement documentation" }]);
     token = "fixture-observer";
@@ -96,7 +116,11 @@ it("lists the authorized caller's tools and documentation from the live Core reg
     expect(forbidden.isError).toBe(true);
     token = "fixture-reader";
     const allowed = await client.callTool({ name: alias, arguments: { message: "hello" } });
-    expect(allowed.structuredContent).toEqual({ ok: true });
+    const redacted = { headline: "reviewed", memo: "***REDACTED***", comment: "***REDACTED***" };
+    expect(allowed.isError).not.toBe(true);
+    expect(allowed.structuredContent).toEqual(redacted);
+    expect(allowed.content).toMatchObject([{ type: "text", text: JSON.stringify(redacted) }]);
+    expect(JSON.stringify(allowed)).not.toContain("fixture-private-");
     expect(audit).toHaveBeenCalledTimes(2);
     expect(execute).toHaveBeenCalledTimes(1);
 

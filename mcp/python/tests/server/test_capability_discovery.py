@@ -113,9 +113,18 @@ async def test_discovery_reads_the_current_same_version_registration() -> None:
             "required": ["label"],
         }
         replacement.input_schema = replacement_schema
+        replacement.output_schema = {
+            "type": "object",
+            "properties": {"label": {"type": "string", "x-sensitive": True}},
+            "required": ["label"],
+        }
         registry.register(module_id, replacement, version="1.0.0", metadata={"documentation": "Updated content."})
 
         current = (await session.list_tools()).tools[0]
         assert current.inputSchema == replacement_schema
         resource = await session.read_resource(f"docs://{module_id}")
         assert resource.contents[0].text == "Updated content."
+        result = await session.call_tool(module_id, {"label": "private fixture output"})
+        assert not result.isError
+        assert result.structuredContent is not None
+        assert "private fixture output" not in result.model_dump_json()

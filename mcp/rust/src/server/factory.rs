@@ -657,6 +657,16 @@ impl MCPServerFactory {
         tags: Option<&[&str]>,
         prefix: Option<&str>,
     ) -> Result<Vec<Tool>, crate::server::server::FactoryError> {
+        self.build_tools_with_ids(registry, tags, prefix)
+            .map(|tools| tools.into_iter().map(|(_, tool)| tool).collect())
+    }
+
+    pub(crate) fn build_tools_with_ids(
+        &self,
+        registry: &Registry,
+        tags: Option<&[&str]>,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, Tool)>, FactoryError> {
         let module_ids = registry.list(tags, prefix, None);
         let mut tools = Vec::new();
 
@@ -689,7 +699,7 @@ impl MCPServerFactory {
             };
 
             match self.build_registered_tool(&descriptor) {
-                Ok(tool) => tools.push(tool),
+                Ok(tool) => tools.push((module_id, tool)),
                 Err(e) => {
                     // Reserved-prefix is fatal (matched at the loop top with
                     // an early return). Other build_tool errors are
@@ -777,8 +787,7 @@ impl MCPServerFactory {
         server: &mut MCPServer,
         router: Arc<ExecutionRouter>,
         tools: &[Tool],
-        tags: Option<Vec<String>>,
-        prefix: Option<String>,
+        module_ids: Vec<String>,
     ) {
         let factory = Self::with_rich_description(self.rich_description);
         let meta_tools = tools
@@ -791,16 +800,9 @@ impl MCPServerFactory {
             let Some(discovery) = router.core_discovery() else {
                 return fallback.as_ref().map_or_else(Vec::new, |handler| handler());
             };
-            let tag_refs = tags
-                .as_ref()
-                .map(|values| values.iter().map(String::as_str).collect::<Vec<_>>());
-            let mut tools = discovery
-                .executor
-                .registry()
-                .list(tag_refs.as_deref(), prefix.as_deref(), None)
-                .into_iter()
-                .filter(|id| !is_readonly_system_resource_module_id(id))
-                .filter_map(|id| discovery.descriptor(&id))
+            let mut tools = module_ids
+                .iter()
+                .filter_map(|id| discovery.descriptor(id))
                 .filter_map(|descriptor| factory.build_registered_tool(&descriptor).ok())
                 .filter(|tool| !AsyncTaskBridge::is_reserved_id(&tool.name))
                 .collect::<Vec<_>>();
@@ -876,9 +878,9 @@ impl MCPServerFactory {
                         .and_then(|id| router.session_registry().get(id))
                         .is_some_and(|session| session.supports_structured_results());
                 let extra_ref = extra.as_ref();
-                let ((content_items, is_error, trace_id), pending) =
+                let (((content_items, is_error, trace_id), schema), pending) =
                     crate::server::approval_bridge::capture_pending_approval(
-                        router.handle_call(&name, &arguments, extra_ref),
+                        router.handle_call_with_output_schema(&name, &arguments, extra_ref),
                     )
                     .await;
 
@@ -938,7 +940,7 @@ impl MCPServerFactory {
                     meta,
                 };
                 if structured {
-                    result.with_structured_content(output_schemas.get(&name))
+                    result.with_structured_content(schema.select(output_schemas.get(&name)))
                 } else {
                     result
                 }
@@ -1034,12 +1036,10 @@ impl MCPServerFactory {
         let router_for_list = Arc::clone(&router);
         server.list_resources_handler = Some(Arc::new(move || {
             let ids = match router_for_list.core_discovery() {
-                Some(discovery) => discovery
-                    .executor
-                    .registry()
-                    .module_ids()
-                    .into_iter()
+                Some(discovery) => docs_for_list
+                    .keys()
                     .filter(|id| discovery.documentation(id).is_some())
+                    .cloned()
                     .collect(),
                 None => docs_for_list.keys().cloned().collect::<Vec<_>>(),
             };
@@ -1085,6 +1085,9 @@ impl MCPServerFactory {
             let available = Arc::clone(&available);
             Box::pin(async move {
                 if let Some(module_id) = uri.strip_prefix("docs://") {
+                    if !docs.contains_key(module_id) {
+                        return Err(FactoryError::ResourceNotFound(uri));
+                    }
                     let documentation = match router.core_discovery() {
                         Some(discovery) => discovery.documentation(module_id),
                         None => docs.get(module_id).cloned(),

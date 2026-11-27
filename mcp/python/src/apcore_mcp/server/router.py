@@ -262,17 +262,23 @@ class ExecutionRouter:
     def _output_projection(
         self, tool_name: str, version_hint: str | None
     ) -> tuple[str | None, dict[str, Any] | None]:
-        if not self._redact_output or not self._core_backend or version_hint is None:
+        if not self._redact_output or not self._core_backend:
             return version_hint, None
         registry = self._executor.registry
         definition = registry.get_definition(tool_name, version_hint)
         if definition is None:
-            raise ModuleError("MODULE_NOT_FOUND", f"Module '{tool_name}' not found")
-        # Pin only when Core can report the actual selected version. Direct
-        # router callers can still pass the original range to older Core.
-        if _matches_registered_version(registry, tool_name, version_hint, definition.version):
+            if version_hint is not None:
+                raise ModuleError("MODULE_NOT_FOUND", f"Module '{tool_name}' not found")
+            # Let Core report its ordinary lookup error without falling back
+            # to output metadata from a removed registration.
+            return None, {}
+        # Resolve redaction against the current registered schema, even if the
+        # default version string stayed fixed during a replacement.
+        if version_hint is not None and _matches_registered_version(
+            registry, tool_name, version_hint, definition.version,
+        ):
             version_hint = definition.version
-        return version_hint, definition.output_schema
+        return version_hint, definition.output_schema or {}
 
     def _format_result(self, result: Any) -> str:
         """Format an execution result into text for LLM consumption.

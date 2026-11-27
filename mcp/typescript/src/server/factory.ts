@@ -105,6 +105,12 @@ export interface MCPServerFactoryOptions {
   richDescription?: boolean;
 }
 
+function outputSchemaForTool(descriptor: ModuleDescriptor): Tool["outputSchema"] {
+  return descriptor.outputSchema.type === "object" && !AsyncTaskBridge.isAsyncModuleDescriptor(descriptor)
+    ? descriptor.outputSchema as Tool["outputSchema"]
+    : undefined;
+}
+
 export class MCPServerFactory {
   private readonly _annotationMapper: AnnotationMapper;
   private readonly _richDescription: boolean;
@@ -316,9 +322,8 @@ export class MCPServerFactory {
       },
     };
 
-    if (descriptor.outputSchema.type === "object" && !AsyncTaskBridge.isAsyncModuleDescriptor(descriptor)) {
-      tool.outputSchema = structuredClone(descriptor.outputSchema) as Tool["outputSchema"];
-    }
+    const outputSchema = outputSchemaForTool(descriptor);
+    if (outputSchema !== undefined) tool.outputSchema = structuredClone(outputSchema);
 
     const hasStreaming = descriptor.annotations?.streaming === true;
 
@@ -694,8 +699,12 @@ export class MCPServerFactory {
       const moduleId = this._toolSources.get(tool)?.moduleId ?? name;
       const toolArgs = (args ?? {}) as Record<string, unknown>;
 
+      let responseTool = tool;
       // Build HandleCallExtra from MCP SDK extra
       const handleCallExtra: HandleCallExtra = {
+        onOutputDescriptor(descriptor) {
+          responseTool = { ...tool, outputSchema: outputSchemaForTool(descriptor) };
+        },
         signal: extra?.signal,
         sendNotification: extra?.sendNotification
           ? (notification: Record<string, unknown>) =>
@@ -808,7 +817,7 @@ export class MCPServerFactory {
       }
 
       return supportsStructuredOutput(server, extra)
-        ? addStructuredOutput(result, tool)
+        ? addStructuredOutput(result, responseTool)
         : result;
     });
   }

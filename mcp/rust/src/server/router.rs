@@ -426,7 +426,7 @@ pub struct ContentItem {
 }
 
 pub(crate) struct CoreDiscovery<'a> {
-    pub(crate) executor: &'a apcore::Executor,
+    executor: &'a apcore::Executor,
     strategy: &'a apcore::ExecutionStrategy,
     context: apcore::Context<Value>,
 }
@@ -445,6 +445,30 @@ impl CoreDiscovery<'_> {
         self.descriptor(module_id)?
             .documentation
             .filter(|text| !text.is_empty())
+    }
+}
+
+struct LiveCallOutput {
+    registration: Option<Arc<dyn apcore::Module>>,
+    schema: Option<Value>,
+    advertise: bool,
+}
+
+tokio::task_local! {
+    static LIVE_CALL_OUTPUT: Arc<LiveCallOutput>;
+}
+
+pub(crate) enum WireOutputSchema {
+    Configured,
+    Live(Option<Value>),
+}
+
+impl WireOutputSchema {
+    pub(crate) fn select<'a>(&'a self, configured: Option<&'a Value>) -> Option<&'a Value> {
+        match self {
+            Self::Configured => configured,
+            Self::Live(schema) => schema.as_ref(),
+        }
     }
 }
 
@@ -850,6 +874,39 @@ impl ExecutionRouter {
         redacted
     }
 
+    fn live_call_output(&self, name: &str) -> Option<LiveCallOutput> {
+        if AsyncTaskBridge::is_reserved_id(name) {
+            return None;
+        }
+        let (executor, _) = self.executor.as_ref()?.discovery_executor(self.trace)?;
+        let registry = executor.registry();
+        // This is internal execution metadata. A caller may know and invoke an
+        // unlisted ID, in which case Core still makes the actual ACL decision.
+        let registration = registry.get(name).ok().flatten();
+        let descriptor = registry.get_definition(name).ok().flatten();
+        let advertise = descriptor.as_ref().is_some_and(|descriptor| {
+            descriptor.output_schema["type"] == "object"
+                && !AsyncTaskBridge::is_async_module_descriptor(descriptor)
+        });
+        let schema = descriptor.map(|descriptor| descriptor.output_schema);
+        Some(LiveCallOutput {
+            registration,
+            schema,
+            advertise,
+        })
+    }
+
+    fn current_call_output(&self, name: &str) -> bool {
+        LIVE_CALL_OUTPUT
+            .try_with(|binding| {
+                let (current, _) = self.executor.as_ref()?.discovery_executor(self.trace)?;
+                let registration = current.registry().get(name).ok().flatten()?;
+                let selected = binding.registration.as_ref()?;
+                Arc::ptr_eq(selected, &registration).then_some(())
+            })
+            .map_or(true, |matched| matched.is_some())
+    }
+
     /// Redact sensitive fields from tool output before formatting.
     ///
     /// If `redact_output` is enabled and an output schema is registered for
@@ -859,6 +916,14 @@ impl ExecutionRouter {
     fn redact_output(&self, tool_name: &str, result: &Value) -> Value {
         if !self.redact_output {
             return result.clone();
+        }
+        if let Ok(redacted) = LIVE_CALL_OUTPUT.try_with(|output| {
+            output.schema.as_ref().map_or_else(
+                || result.clone(),
+                |schema| apcore::redact_sensitive(result, schema),
+            )
+        }) {
+            return redacted;
         }
         match self.output_schemas.get(tool_name) {
             Some(schema) => apcore::redact_sensitive(result, schema),
@@ -1014,6 +1079,42 @@ impl ExecutionRouter {
         arguments: &Value,
         extra: Option<&Value>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
+        self.handle_call_with_output_schema(tool_name, arguments, extra)
+            .await
+            .0
+    }
+
+    pub(crate) async fn handle_call_with_output_schema(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        extra: Option<&Value>,
+    ) -> (StreamOutcome, WireOutputSchema) {
+        let Some(output) = self.live_call_output(tool_name).map(Arc::new) else {
+            return (
+                self.dispatch_call(tool_name, arguments, extra).await,
+                WireOutputSchema::Configured,
+            );
+        };
+        let result = LIVE_CALL_OUTPUT
+            .scope(Arc::clone(&output), async {
+                let outcome = self.dispatch_call(tool_name, arguments, extra).await;
+                if !outcome.1 && !self.current_call_output(tool_name) {
+                    return Self::changed_registration();
+                }
+                outcome
+            })
+            .await;
+        let schema = output.advertise.then(|| output.schema.clone()).flatten();
+        (result, WireOutputSchema::Live(schema))
+    }
+
+    async fn dispatch_call(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        extra: Option<&Value>,
+    ) -> StreamOutcome {
         if Self::has_approval_input(tool_name, arguments) {
             return Self::stream_error("Approval credentials belong in request metadata".into());
         }
@@ -1759,6 +1860,9 @@ impl ExecutionRouter {
     ) -> (Vec<ContentItem>, bool, Option<String>) {
         match outcome {
             Ok((result, trace)) => {
+                if !self.current_call_output(tool_name) {
+                    return Self::changed_registration();
+                }
                 let redacted_result = self.redact_output(tool_name, &result);
                 let text = self.format_result(&redacted_result);
                 let mut content = vec![ContentItem {
@@ -2120,6 +2224,9 @@ impl ExecutionRouter {
                     // value is later redacted. Mirrors Python's
                     // _handle_stream invariant. [A-D-003]
                     if let Some((progress_token, send_notification)) = progress {
+                        if !self.current_call_output(tool_name) {
+                            return Self::changed_registration();
+                        }
                         let safe_chunk = self.redact_output(tool_name, &chunk);
                         let notification = serde_json::json!({
                             "method": "notifications/progress",
@@ -2176,6 +2283,9 @@ impl ExecutionRouter {
             };
             accumulated = output;
         }
+        if !self.current_call_output(tool_name) {
+            return Self::changed_registration();
+        }
         let redacted_accumulated = self.redact_output(tool_name, &accumulated);
         let text = self.format_result(&redacted_accumulated);
         let content = vec![ContentItem {
@@ -2218,6 +2328,10 @@ impl ExecutionRouter {
                     .unwrap_or("MODULE_EXECUTE_ERROR"),
             ),
         }
+    }
+
+    fn changed_registration() -> StreamOutcome {
+        Self::stream_error("The tool registration changed during this call.".into())
     }
 
     fn stream_error(text: String) -> StreamOutcome {
