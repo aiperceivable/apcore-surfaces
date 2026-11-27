@@ -802,13 +802,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_enabled_default() {
-        // Assuming env var is not set in test environment
-        env::remove_var("APCORE_AI_ENABLED");
-        assert!(!AIEnhancer::is_enabled());
-    }
-
-    #[test]
     fn test_build_prompt_contains_module_info() {
         let enhancer = AIEnhancer::new(None, None, None, None, None).unwrap();
         let module = ScannedModule::new(
@@ -853,14 +846,9 @@ mod tests {
             .contains("APCORE_AI_TIMEOUT must be a positive integer"));
     }
 
-    // All is_enabled tests are combined into one to prevent env var races
-    // when tests run in parallel (env vars are process-global).
+    // Keep all APCORE_AI_ENABLED mutations in one test because it is process-global.
     #[test]
     fn test_is_enabled_variants() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-
         // Default (unset) → disabled
         unsafe { env::remove_var("APCORE_AI_ENABLED") };
         assert!(!AIEnhancer::is_enabled(), "should be disabled by default");
