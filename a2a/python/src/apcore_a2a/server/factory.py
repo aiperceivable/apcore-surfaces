@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import time
 import warnings
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from a2a.server.context import ServerCallContext
 from a2a.server.request_handlers import DefaultRequestHandler
@@ -69,6 +70,7 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+_SaveResult = TypeVar("_SaveResult")
 
 
 class _ObservedTaskStore:
@@ -82,8 +84,16 @@ class _ObservedTaskStore:
         return getattr(self._store, name)
 
     async def save(self, task: Task, context: ServerCallContext) -> None:
-        await self._store.save(task, context)
+        await self._save(task, context, self._store.save(task, context))
+
+    async def _save(self, task: Task, context: ServerCallContext, save: Awaitable[_SaveResult]) -> _SaveResult:
+        try:
+            result = await save
+        except (Exception, asyncio.CancelledError):
+            self._executor.observe_task_save_failed(task, context)
+            raise
         self._executor.observe_task_saved(task, context)
+        return result
 
 
 class _ObservedVersionedTaskStore(_ObservedTaskStore, _SDKVersionedTaskStore):
@@ -96,9 +106,9 @@ class _ObservedVersionedTaskStore(_ObservedTaskStore, _SDKVersionedTaskStore):
         prev_version: TaskVersion,
         context: ServerCallContext,
     ) -> TaskVersion:
-        version = await self._store.save(task, event=event, prev=prev, prev_version=prev_version, context=context)
-        self._executor.observe_task_saved(task, context)
-        return version
+        return await self._save(
+            task, context, self._store.save(task, event=event, prev=prev, prev_version=prev_version, context=context)
+        )
 
     async def get(self, task_id: str, context: ServerCallContext) -> StoredTask | None:
         return await self._store.get(task_id, context)

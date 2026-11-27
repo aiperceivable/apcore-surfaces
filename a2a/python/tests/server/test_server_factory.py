@@ -1,6 +1,7 @@
 """Tests for A2AServerFactory."""
 
 import asyncio
+import contextlib
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,7 +10,15 @@ import pytest
 from a2a.server.context import ServerCallContext
 from a2a.server.events.event_queue_v2 import EventQueueSource
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.types import AgentCard, CancelTaskRequest, SendMessageRequest, Task, TaskState, TaskStatusUpdateEvent
+from a2a.types import (
+    AgentCard,
+    CancelTaskRequest,
+    GetTaskRequest,
+    SendMessageRequest,
+    Task,
+    TaskState,
+    TaskStatusUpdateEvent,
+)
 from a2a.utils.errors import TaskNotCancelableError
 from apcore import Executor, Registry
 from pydantic import BaseModel
@@ -20,7 +29,13 @@ from apcore_a2a.adapters.errors import ErrorMapper
 from apcore_a2a.adapters.parts import PartConverter
 from apcore_a2a.adapters.schema import SchemaConverter
 from apcore_a2a.server.executor import ApCoreAgentExecutor
-from apcore_a2a.server.factory import A2AServerFactory, A2ATaskStore, _ObservedTaskStore, _TerminalAwareRequestHandler
+from apcore_a2a.server.factory import (
+    A2AServerFactory,
+    A2ATaskStore,
+    _ObservedTaskStore,
+    _ObservedVersionedTaskStore,
+    _TerminalAwareRequestHandler,
+)
 
 
 @pytest.fixture
@@ -354,6 +369,111 @@ async def test_disconnected_stream_persists_the_terminal_and_retires_the_project
     persisted = await store.get(submitted.id, context)
     assert persisted.status.state == TaskState.TASK_STATE_FAILED
     assert agent.project_terminal_status(submitted, context) is submitted
+
+
+@pytest.mark.parametrize("versioned_store", [False, True])
+async def test_failed_terminal_write_does_not_block_a_recovered_task(versioned_store):
+    class Producer:
+        calls = 0
+
+        async def call_async(self, module_id, inputs, context):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("synthetic execution failure")
+            return {"value": "recovered"}
+
+    class RecoveringStore(A2ATaskStore):
+        def __init__(self):
+            super().__init__()
+            self.first_write_started = asyncio.Event()
+            self.allow_first_write = asyncio.Event()
+            self.backup_write_started = asyncio.Event()
+            self.allow_backup_write = asyncio.Event()
+            self.failed_writer = None
+            self.failed_writes = 0
+            self.completed_writes = 0
+
+        async def save(self, task, context):
+            if task.status.state == TaskState.TASK_STATE_FAILED:
+                self.failed_writes += 1
+                if self.failed_writes == 1:
+                    self.failed_writer = asyncio.current_task()
+                    self.first_write_started.set()
+                    await self.allow_first_write.wait()
+                else:
+                    self.backup_write_started.set()
+                    await self.allow_backup_write.wait()
+                raise OSError("synthetic terminal write failure")
+            await super().save(task, context)
+            if task.status.state == TaskState.TASK_STATE_COMPLETED:
+                self.completed_writes += 1
+
+    store = RecoveringStore()
+    producer = Producer()
+    agent = ApCoreAgentExecutor(
+        producer, PartConverter(SchemaConverter()), ErrorMapper(), track_terminal_status=True,
+    )
+    if versioned_store:
+        cluster = pytest.importorskip("a2a.server.cluster.task_store")
+        observed_store = _ObservedVersionedTaskStore(cluster.LegacyTaskStoreAdapter(store), agent)
+    else:
+        observed_store = _ObservedTaskStore(store, agent)
+    handler = _TerminalAwareRequestHandler(
+        agent_executor=agent,
+        task_store=observed_store,
+        agent_card=AgentCard(name="test", capabilities={"streaming": True}),
+    )
+    context = ServerCallContext()
+    request = SendMessageRequest(
+        message={
+            "message_id": "terminal-write-fails",
+            "role": "ROLE_USER",
+            "parts": [{"text": "test"}],
+            "metadata": {"skillId": "test.recovering-store"},
+        },
+    )
+    async with asyncio.timeout(2), contextlib.aclosing(handler.on_message_send_stream(request, context)) as stream:
+        submitted = await anext(stream)
+        assert isinstance(submitted, Task)
+        query = GetTaskRequest(id=submitted.id)
+        async def drain_stream():
+            async for _ in stream:
+                pass
+
+        subscriber = asyncio.create_task(drain_stream())
+        backup_write = asyncio.create_task(store.backup_write_started.wait())
+        try:
+            try:
+                await store.first_write_started.wait()
+                assert (await handler.on_get_task(query, context)).status.state == TaskState.TASK_STATE_FAILED
+                assert (await store.get(submitted.id, context)).status.state == TaskState.TASK_STATE_SUBMITTED
+                store.allow_first_write.set()
+                done, _ = await asyncio.wait(
+                    (store.failed_writer, backup_write, subscriber), return_when=asyncio.FIRST_COMPLETED,
+                )
+                if backup_write in done:
+                    assert (await handler.on_get_task(query, context)).status.state == TaskState.TASK_STATE_FAILED
+            finally:
+                store.allow_first_write.set()
+                store.allow_backup_write.set()
+            with pytest.raises(OSError, match="synthetic terminal write failure"):
+                await subscriber
+            await asyncio.gather(store.failed_writer, return_exceptions=True)
+        finally:
+            backup_write.cancel()
+            subscriber.cancel()
+            await asyncio.gather(backup_write, subscriber, return_exceptions=True)
+        assert (await handler.on_get_task(query, context)).status.state == TaskState.TASK_STATE_SUBMITTED
+        request.message.message_id = "retry-after-store-recovery"
+        request.message.task_id = submitted.id
+        request.message.context_id = submitted.context_id
+        retry = [event async for event in handler.on_message_send_stream(request, context)]
+        assert [
+            event.status.state for event in retry if isinstance(event, TaskStatusUpdateEvent)
+        ] == [TaskState.TASK_STATE_COMPLETED]
+        assert (await store.get(submitted.id, context)).status.state == TaskState.TASK_STATE_COMPLETED
+        assert producer.calls == 2
+        assert store.completed_writes == 1
 
 
 async def test_cancel_reports_one_matching_terminal_to_both_rpc_and_stream():

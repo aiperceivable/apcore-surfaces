@@ -154,6 +154,26 @@ class ApCoreAgentExecutor(AgentExecutor):
         if task.status == self._pending_terminal.get(key):
             self._pending_terminal.pop(key)
 
+    def observe_task_save_failed(self, task: Task, context: ServerCallContext) -> None:
+        """Release this execution's unacknowledged terminal after SDK persistence stops."""
+        key = (task.id, task.context_id, _owner(context))
+        status = self._pending_terminal.get(key)
+        run = self._running.get(key)
+        writer = asyncio.current_task()
+        if writer is None or (status is None and run is None):
+            return
+
+        def retire_unacknowledged_status(_: asyncio.Task[Any]) -> None:
+            abandoned = status
+            if abandoned is None and run is not None:
+                abandoned = run.terminal
+            if abandoned is not None and self._pending_terminal.get(key) is abandoned:
+                self._pending_terminal.pop(key)
+
+        # The SDK consumes each task's events in a background task. Its
+        # retries run there too, so a failed write alone does not end the claim.
+        writer.add_done_callback(retire_unacknowledged_status)
+
     async def _execute(self, context: RequestContext, event_queue: EventQueue, run: _TaskExecution) -> None:
         # a2a-sdk 1.0: Establish the Task in the store before any TaskStatusUpdateEvent
         context_id = context.context_id or context.task_id
