@@ -100,7 +100,7 @@ dependencies = [
 name = "apcore"
 version = "1.0.0-alpha.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7514b549b91d7beb83a0fefef9d4f365e4cb19b38f7a0664c4a814bcac4009bc"
+checksum = "2813101192ceac629d58114dfafd4f6b519eb7dea2313cb253e1410a2ac52f65"
 dependencies = [
  "async-stream",
  "async-trait",
