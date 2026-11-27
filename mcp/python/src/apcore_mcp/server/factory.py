@@ -439,6 +439,7 @@ class MCPServerFactory:
         prefix: str | None = None,
         *,
         strict: bool | None = None,
+        discovery_sources: dict[int, str] | None = None,
     ) -> list[mcp_types.Tool]:
         """Build Tool objects for all modules in a Registry.
 
@@ -481,7 +482,10 @@ class MCPServerFactory:
                     ):
                         descriptor = selected
                 # Keep compatibility arguments while preserving the runtime schema.
-                tools.append(self.build_tool(descriptor, registry=registry, strict=strict))
+                tool = self.build_tool(descriptor, registry=registry, strict=strict)
+                if discovery_sources is not None:
+                    discovery_sources[id(tool)] = module_id
+                tools.append(tool)
             except ValueError as e:
                 # Reserved-prefix violations are hard config errors — re-raise so
                 # misconfiguration is visible at startup rather than silently
@@ -543,6 +547,7 @@ class MCPServerFactory:
         async_bridge: AsyncTaskBridge | None = None,
         approval_bridge: ApprovalBridge | None = None,
         descriptor_lookup: Any = None,
+        discovery_sources: dict[int, str] | None = None,
     ) -> None:
         """Register list_tools and call_tool handlers on the Server.
 
@@ -577,14 +582,34 @@ class MCPServerFactory:
             _protect_sdk_approval_logs(server)
 
         regular_tool_ids = {id(tool) for tool in tools}
+        captured_sources = discovery_sources or {}
+        caller_aware = isinstance(router, ExecutionRouter) and router.supports_capability_discovery
+
+        def visible_tool(tool: mcp_types.Tool, identity: Identity | None) -> mcp_types.Tool | None:
+            if not caller_aware or id(tool) not in regular_tool_ids:
+                return tool
+            module_id = captured_sources.get(id(tool), tool.name)
+            descriptor = router.callable_descriptor(module_id, identity, tool_default=True)
+            if descriptor is None:
+                return None
+            try:
+                live_tool = self.build_tool(descriptor)
+            except ValueError:
+                return None
+            return live_tool if live_tool.name == tool.name else None
 
         @server.list_tools()
         async def handle_list_tools() -> list[mcp_types.Tool]:
+            identity = _request_identity()
+            listed = [live for tool in combined_tools if (live := visible_tool(tool, identity)) is not None]
             if _supports_structured_output():
-                return list(combined_tools)
-            return [tool.model_copy(update={"outputSchema": None}) for tool in combined_tools]
+                return listed
+            return [tool.model_copy(update={"outputSchema": None}) for tool in listed]
 
-        @server.call_tool()
+        # The MCP SDK's schema cache is shared across request identities. Core
+        # validates on dispatch, and any prevalidation here uses a live tool
+        # descriptor scoped to this caller.
+        @server.call_tool(validate_input=not caller_aware)
         async def handle_call_tool(name: str, arguments: dict[str, Any]) -> mcp_types.CallToolResult:
             from mcp.server.lowlevel.server import request_ctx
 
@@ -622,6 +647,15 @@ class MCPServerFactory:
 
             published = next((tool for tool in reversed(combined_tools) if tool.name == name), None)
             regular_tool = published is not None and id(published) in regular_tool_ids
+            if published is not None and caller_aware:
+                live_tool = visible_tool(published, identity)
+                if live_tool is not None:
+                    try:
+                        jsonschema.validate(instance=arguments or {}, schema=live_tool.inputSchema)
+                    except jsonschema.ValidationError as error:
+                        message = mcp_types.TextContent(type="text", text=f"Input validation error: {error.message}")
+                        return _build_call_result([message], True, None)
+                published = live_tool
             if published is not None and regular_tool and isinstance(router, ExecutionRouter):
                 error = self._bind_requested_version(
                     router,
@@ -827,10 +861,23 @@ class MCPServerFactory:
         static_system_ids = [mid for mid in _SYSTEM_STATIC_RESOURCE_IDS if mid in registered_ids] if router else []
         template_system_ids = [mid for mid in _SYSTEM_TEMPLATE_RESOURCE_IDS if mid in registered_ids] if router else []
 
+        caller_aware = isinstance(router, ExecutionRouter) and router.supports_capability_discovery
+
+        def visible_documentation(module_id: str, identity: Identity | None) -> str | None:
+            if module_id not in docs_map:
+                return None
+            if not caller_aware:
+                return docs_map[module_id]
+            descriptor = router.callable_descriptor(module_id, identity)
+            return descriptor.documentation if descriptor is not None else None
+
         @server.list_resources()
         async def handle_list_resources() -> list[mcp_types.Resource]:
+            identity = _request_identity()
             resources: list[mcp_types.Resource] = []
             for mid in docs_map:
+                if not visible_documentation(mid, identity):
+                    continue
                 resources.append(
                     mcp_types.Resource(
                         uri=AnyUrl(f"docs://{mid}"),
@@ -876,9 +923,10 @@ class MCPServerFactory:
             if not uri_str.startswith(docs_prefix):
                 raise ValueError(f"Unsupported URI scheme: {uri_str}")
             module_id = uri_str[len(docs_prefix) :]
-            if module_id not in docs_map:
+            documentation = visible_documentation(module_id, _request_identity())
+            if not documentation:
                 raise ValueError(f"Resource not found: {uri_str}")
-            return [ReadResourceContents(content=docs_map[module_id], mime_type="text/plain")]
+            return [ReadResourceContents(content=documentation, mime_type="text/plain")]
 
     async def _read_system_resource(
         self,

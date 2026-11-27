@@ -25,7 +25,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "apcore[config,discovery]==1.0.0a3",
+    "apcore[config,discovery]==1.0.0a4",
     "mcp>=1.26,<2.0",
     "jsonschema>=4.20,<5",
     "referencing>=0.30,<1",

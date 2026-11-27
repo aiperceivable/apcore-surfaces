@@ -22,9 +22,9 @@ permissions:
 env:
   # The released lockfiles already reference these prereleases. Bootstrap CI
   # from the reviewed Core commit while those versions are unpublished.
-  CORE_REF: 9ba719587d9a288c22b8b5ff2a10a187a9a21cee
-  CORE_CRATE_VERSION: 1.0.0-alpha.3
-  CORE_CRATE_SHA256: 2813101192ceac629d58114dfafd4f6b519eb7dea2313cb253e1410a2ac52f65
+  CORE_REF: de0c797760796daeefc1ba70d1e44263ea6519f1
+  CORE_CRATE_VERSION: 1.0.0-alpha.4
+  CORE_CRATE_SHA256: 412082f3f58f5a59165f20e1df00f7191b5e382ea59f2369eb486f963cb7d604
 
 jobs:
   source:

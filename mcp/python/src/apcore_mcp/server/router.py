@@ -12,7 +12,7 @@ from collections.abc import Callable, Coroutine
 from contextlib import aclosing
 from typing import Any
 
-from apcore import APCore, CancelToken, Context, Executor, ModuleError, StreamingModule
+from apcore import APCore, CancelToken, Context, Executor, Identity, ModuleError, StreamingModule
 from apcore.errors import ApprovalPendingError
 from apcore.registry.types import ModuleDescriptor
 from apcore.registry.version import matches_version_hint
@@ -223,6 +223,23 @@ class ExecutionRouter:
                 raise ModuleError("MODULE_EXECUTE_ERROR", "Output redaction failed") from None
             logger.warning("redact_sensitive failed for %s, returning unredacted output", tool_name, exc_info=True)
             return result
+
+    @property
+    def supports_capability_discovery(self) -> bool:
+        return self._core_backend and callable(getattr(self._executor, "get_callable_descriptor", None))
+
+    def callable_descriptor(
+        self, module_id: str, identity: Identity | None, *, tool_default: bool = False
+    ) -> ModuleDescriptor | None:
+        """Project from the same caller frame and Executor as tool invocation."""
+        context = Context.create(identity=identity)
+        descriptor = self._executor.get_callable_descriptor(module_id, context)
+        if descriptor is None or not tool_default:
+            return descriptor
+        version_hint = _descriptor_version_hint(descriptor)
+        if version_hint is None:
+            return descriptor
+        return self._executor.get_callable_descriptor(module_id, context, version_hint=version_hint)
 
     def _select_wire_version(
         self, tool_name: str, extra: dict[str, Any]

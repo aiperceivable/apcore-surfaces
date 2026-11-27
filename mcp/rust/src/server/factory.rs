@@ -688,67 +688,7 @@ impl MCPServerFactory {
                 }
             };
 
-            // apcore 0.27 changed `Registry::describe` in two ways: it became
-            // fallible, and it now returns the full generated markdown
-            // envelope (heading, tags, parameter table) rather than the
-            // module's one-line summary. This slot is the NON-rich fallback of
-            // the chain below, so adopting the new text would make
-            // `rich_description: false` emit a rich document and collapse the
-            // flag. `descriptor.description` is the exact value 0.26's
-            // `describe()` returned for a registered module
-            // (`module.description()`), so reading it preserves that text.
-            let base_description = descriptor.description.clone();
-
-            // Resolve display overlay. apcore 0.19.0 introduced a top-level
-            // `ModuleDescriptor.display` field; when present, it takes
-            // precedence over `metadata["display"]` (kept for backwards
-            // compatibility with configs that embedded the overlay in metadata).
-            let mcp_display = descriptor
-                .display
-                .as_ref()
-                .or_else(|| descriptor.metadata.get("display"))
-                .and_then(|v| v.get("mcp"));
-
-            let name_override = mcp_display
-                .and_then(|d| d.get("alias"))
-                .and_then(|v| v.as_str());
-
-            // Resolution chain for the LLM-facing description:
-            //   1. Operator-typed `display.mcp.description` (hard override).
-            //   2. apcore-toolkit `format_module(Markdown)` when
-            //      `rich_description` is on — gives the LLM a structured
-            //      tool description (parameters, returns, behavior table,
-            //      tags, examples) instead of a one-line summary.
-            //   3. Fallback to the plain `registry.describe()` text.
-            let description = match mcp_display
-                .and_then(|d| d.get("description"))
-                .and_then(|v| v.as_str())
-            {
-                Some(desc) => desc.to_string(),
-                // [A-D-MD-3] None from the helper means the render failed;
-                // fall back to the plain describe() text.
-                None if self.rich_description => {
-                    crate::markdown::render_module_markdown(&descriptor, true)
-                        .unwrap_or(base_description)
-                }
-                None => base_description,
-            };
-
-            let description = match mcp_display
-                .and_then(|d| d.get("guidance"))
-                .and_then(|v| v.as_str())
-            {
-                Some(guidance) => format!("{}\n\nGuidance: {}", description, guidance),
-                None => description,
-            };
-
-            // Keep tool construction on the descriptor's runtime schema.
-            match self.build_tool_with_registry(
-                &descriptor,
-                &description,
-                name_override,
-                Some(registry),
-            ) {
+            match self.build_registered_tool(&descriptor) {
                 Ok(tool) => tools.push(tool),
                 Err(e) => {
                     // Reserved-prefix is fatal (matched at the loop top with
@@ -769,6 +709,104 @@ impl MCPServerFactory {
         }
 
         Ok(tools)
+    }
+
+    fn build_registered_tool(
+        &self,
+        descriptor: &ModuleDescriptor,
+    ) -> Result<Tool, Box<dyn std::error::Error>> {
+        // apcore 0.27 changed `Registry::describe` in two ways: it became
+        // fallible, and it now returns the full generated markdown
+        // envelope (heading, tags, parameter table) rather than the
+        // module's one-line summary. This slot is the NON-rich fallback of
+        // the chain below, so adopting the new text would make
+        // `rich_description: false` emit a rich document and collapse the
+        // flag. `descriptor.description` is the exact value 0.26's
+        // `describe()` returned for a registered module
+        // (`module.description()`), so reading it preserves that text.
+        let base_description = descriptor.description.clone();
+
+        // Resolve display overlay. apcore 0.19.0 introduced a top-level
+        // `ModuleDescriptor.display` field; when present, it takes
+        // precedence over `metadata["display"]` (kept for backwards
+        // compatibility with configs that embedded the overlay in metadata).
+        let mcp_display = descriptor
+            .display
+            .as_ref()
+            .or_else(|| descriptor.metadata.get("display"))
+            .and_then(|v| v.get("mcp"));
+
+        let name_override = mcp_display
+            .and_then(|d| d.get("alias"))
+            .and_then(|v| v.as_str());
+
+        // Resolution chain for the LLM-facing description:
+        //   1. Operator-typed `display.mcp.description` (hard override).
+        //   2. apcore-toolkit `format_module(Markdown)` when
+        //      `rich_description` is on — gives the LLM a structured
+        //      tool description (parameters, returns, behavior table,
+        //      tags, examples) instead of a one-line summary.
+        //   3. Fallback to the plain `registry.describe()` text.
+        let description = match mcp_display
+            .and_then(|d| d.get("description"))
+            .and_then(|v| v.as_str())
+        {
+            Some(desc) => desc.to_string(),
+            // [A-D-MD-3] None from the helper means the render failed;
+            // fall back to the plain describe() text.
+            None if self.rich_description => {
+                crate::markdown::render_module_markdown(descriptor, true)
+                    .unwrap_or(base_description)
+            }
+            None => base_description,
+        };
+
+        let description = match mcp_display
+            .and_then(|d| d.get("guidance"))
+            .and_then(|v| v.as_str())
+        {
+            Some(guidance) => format!("{}\n\nGuidance: {}", description, guidance),
+            None => description,
+        };
+
+        self.build_tool(descriptor, &description, name_override)
+    }
+
+    pub(crate) fn register_governed_tools(
+        &self,
+        server: &mut MCPServer,
+        router: Arc<ExecutionRouter>,
+        tools: &[Tool],
+        tags: Option<Vec<String>>,
+        prefix: Option<String>,
+    ) {
+        let factory = Self::with_rich_description(self.rich_description);
+        let meta_tools = tools
+            .iter()
+            .filter(|tool| AsyncTaskBridge::is_reserved_id(&tool.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let fallback = server.list_tools_handler.clone();
+        server.list_tools_handler = Some(Arc::new(move || {
+            let Some(discovery) = router.core_discovery() else {
+                return fallback.as_ref().map_or_else(Vec::new, |handler| handler());
+            };
+            let tag_refs = tags
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect::<Vec<_>>());
+            let mut tools = discovery
+                .executor
+                .registry()
+                .list(tag_refs.as_deref(), prefix.as_deref(), None)
+                .into_iter()
+                .filter(|id| !is_readonly_system_resource_module_id(id))
+                .filter_map(|id| discovery.descriptor(&id))
+                .filter_map(|descriptor| factory.build_registered_tool(&descriptor).ok())
+                .filter(|tool| !AsyncTaskBridge::is_reserved_id(&tool.name))
+                .collect::<Vec<_>>();
+            tools.extend(meta_tools.iter().cloned());
+            tools
+        }));
     }
 
     // ---- Task: register_handlers ----
@@ -993,9 +1031,20 @@ impl MCPServerFactory {
         // list_resources handler
         let docs_for_list = Arc::clone(&docs);
         let available_for_list = Arc::clone(&available);
+        let router_for_list = Arc::clone(&router);
         server.list_resources_handler = Some(Arc::new(move || {
-            let mut resources: Vec<Resource> = docs_for_list
-                .keys()
+            let ids = match router_for_list.core_discovery() {
+                Some(discovery) => discovery
+                    .executor
+                    .registry()
+                    .module_ids()
+                    .into_iter()
+                    .filter(|id| discovery.documentation(id).is_some())
+                    .collect(),
+                None => docs_for_list.keys().cloned().collect::<Vec<_>>(),
+            };
+            let mut resources: Vec<Resource> = ids
+                .into_iter()
                 .map(|module_id| Resource {
                     uri: format!("docs://{}", module_id),
                     name: format!("{} documentation", module_id),
@@ -1036,9 +1085,13 @@ impl MCPServerFactory {
             let available = Arc::clone(&available);
             Box::pin(async move {
                 if let Some(module_id) = uri.strip_prefix("docs://") {
-                    return match docs.get(module_id) {
-                        Some(doc) => Ok(vec![ReadResourceContents {
-                            content: doc.clone(),
+                    let documentation = match router.core_discovery() {
+                        Some(discovery) => discovery.documentation(module_id),
+                        None => docs.get(module_id).cloned(),
+                    };
+                    return match documentation {
+                        Some(content) => Ok(vec![ReadResourceContents {
+                            content,
                             mime_type: "text/plain".to_string(),
                         }]),
                         None => Err(FactoryError::ResourceNotFound(uri.clone())),

@@ -950,22 +950,27 @@ struct StreamableHttpState {
 #[derive(Clone)]
 struct HttpSession {
     id: String,
-    owner: Option<(String, String)>,
+    owner: Option<SessionOwner>,
     requests: DirectRequests,
 }
 
-fn http_session_owner() -> Option<(String, String)> {
-    AUTH_IDENTITY
-        .try_with(|owner| {
-            owner.as_ref().map(|identity| {
-                (
-                    identity.identity_type().to_string(),
-                    identity.id().to_string(),
-                )
-            })
-        })
-        .ok()
-        .flatten()
+type SessionOwner = (String, String);
+
+fn request_identity() -> Option<apcore::Identity> {
+    AUTH_IDENTITY.try_with(Clone::clone).ok().flatten()
+}
+
+fn session_owner(identity: Option<&apcore::Identity>) -> Option<SessionOwner> {
+    identity.map(|identity| {
+        (
+            identity.identity_type().to_owned(),
+            identity.id().to_owned(),
+        )
+    })
+}
+
+fn http_session_owner() -> Option<SessionOwner> {
+    session_owner(request_identity().as_ref())
 }
 
 impl StreamableHttpState {
@@ -1187,25 +1192,21 @@ async fn streamable_http_delete_handler(
 // SSE transport state & handlers (deprecated)
 // ---------------------------------------------------------------------------
 
-/// Registry of live SSE sessions: session id → that connection's inbound queue.
-///
-/// Guarded by a `std::sync::Mutex` rather than tokio's: every critical section
-/// is a single `HashMap` operation with no `.await` inside, and a synchronous
-/// lock is what lets [`SseSessionGuard::drop`] deregister a session during a
-/// panic unwind, where awaiting is impossible.
-type SseSessions =
-    Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;
+struct SseInbound {
+    message: Value,
+    identity: Option<apcore::Identity>,
+}
 
-/// Lock the session registry, recovering from a poisoned mutex.
-///
-/// Poisoning carries no meaning here: the map holds channel senders, and a
-/// panic mid-`insert`/`remove` cannot leave a `HashMap` in a state that a
-/// later `get`/`remove` misreads. Failing every subsequent connection over it
-/// would turn one panicking session into a dead transport.
-fn lock_sessions(
-    sessions: &SseSessions,
-) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, tokio::sync::mpsc::Sender<Value>>>
-{
+struct SseSession {
+    owner: Option<SessionOwner>,
+    sender: tokio::sync::mpsc::Sender<SseInbound>,
+}
+
+/// Each live SSE session belongs to its authenticated stream owner.
+type SseSessionMap = std::collections::HashMap<String, SseSession>;
+type SseSessions = Arc<std::sync::Mutex<SseSessionMap>>;
+
+fn lock_sessions(sessions: &SseSessions) -> std::sync::MutexGuard<'_, SseSessionMap> {
     sessions
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1238,10 +1239,16 @@ impl SseSessionGuard {
         session_id: String,
         sessions: SseSessions,
         manager: Arc<TransportManager>,
-        inbound_tx: tokio::sync::mpsc::Sender<Value>,
+        inbound_tx: tokio::sync::mpsc::Sender<SseInbound>,
         session_registry: Option<Arc<SessionRegistry>>,
     ) -> Self {
-        lock_sessions(&sessions).insert(session_id.clone(), inbound_tx);
+        lock_sessions(&sessions).insert(
+            session_id.clone(),
+            SseSession {
+                owner: http_session_owner(),
+                sender: inbound_tx,
+            },
+        );
         Self {
             session_id,
             sessions,
@@ -1416,7 +1423,7 @@ async fn sse_stream_handler(
     let session_id = uuid::Uuid::new_v4().to_string();
 
     // Inbound: messages posted to /messages/?sessionId=<this session>.
-    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<Value>(256);
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<SseInbound>(256);
     // Outbound: the SSE frames this connection — and only this one — receives.
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
 
@@ -1466,7 +1473,7 @@ async fn sse_stream_handler(
                     // with it the receiving half of the event channel.
                     _ = event_tx.closed() => break,
                     inbound = inbound_rx.recv() => {
-                        let Some(mut message) = inbound else { break };
+                        let Some(SseInbound { mut message, identity }) = inbound else { break };
                         // An answer to a server-initiated request is not a
                         // request. It has to complete its waiter here; the
                         // handler would see a message with no `method` and
@@ -1490,9 +1497,11 @@ async fn sse_stream_handler(
                         let requests = requests.clone();
                         let registration = requests.register(&message);
                         tokio::spawn(async move {
-                            if let Some(response) = requests.dispatch_registered(
-                                handler.as_ref(), message, registration, Some(slots)
-                            ).await {
+                            let response = AUTH_IDENTITY.scope(
+                                identity,
+                                requests.dispatch_registered(handler.as_ref(), message, registration, Some(slots)),
+                            ).await;
+                            if let Some(response) = response {
                                 let data = serde_json::to_string(&response).unwrap_or_default();
                                 let event = Event::default().event("message").data(data);
                                 let _ = event_tx.send(Ok(event)).await;
@@ -1563,13 +1572,24 @@ async fn sse_messages_handler(
             .into_response();
     };
 
-    let sender = lock_sessions(&state.sessions).get(&session_id).cloned();
+    let identity = request_identity();
+    let owner = session_owner(identity.as_ref());
+    let sender = lock_sessions(&state.sessions)
+        .get(&session_id)
+        .filter(|session| session.owner == owner)
+        .map(|session| session.sender.clone());
     let Some(sender) = sender else {
         tracing::debug!(session_id = %session_id, "rejected sse message: unknown session");
         return (StatusCode::BAD_REQUEST, "unknown session").into_response();
     };
 
-    match sender.send(body).await {
+    match sender
+        .send(SseInbound {
+            message: body,
+            identity,
+        })
+        .await
+    {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         // The stream closed between lookup and send.
         Err(_) => {
@@ -2486,6 +2506,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_dispatch_rebinds_the_current_authenticated_owner() {
+        struct IdentityEcho;
+
+        #[async_trait::async_trait]
+        impl McpHandler for IdentityEcho {
+            async fn handle_message(&self, message: Value) -> Option<Value> {
+                Some(serde_json::json!({
+                    "id": message["id"],
+                    "roles": request_identity().as_ref().map(|identity| identity.roles()),
+                }))
+            }
+        }
+
+        let identity = |id: &str, role: &str| {
+            apcore::Identity::new(
+                id.to_owned(),
+                "user".into(),
+                vec![role.to_owned()],
+                std::collections::HashMap::new(),
+            )
+        };
+        let app = sse_test_app_parts_with(
+            Arc::new(TransportManager::new(None)),
+            Arc::new(IdentityEcho),
+        )
+        .0;
+        let (mut stream, session_id) = AUTH_IDENTITY
+            .scope(Some(identity("user", "previous")), open_sse_session(&app))
+            .await;
+        let denied = AUTH_IDENTITY
+            .scope(
+                Some(identity("other-user", "different")),
+                post_sse_message(&app, &session_id, 1),
+            )
+            .await;
+        assert_eq!(denied, StatusCode::BAD_REQUEST);
+        let accepted = AUTH_IDENTITY
+            .scope(
+                Some(identity("user", "current")),
+                post_sse_message(&app, &session_id, 2),
+            )
+            .await;
+        assert_eq!(accepted, StatusCode::ACCEPTED);
+        let responses = collect_sse_responses(&mut stream, 1).await;
+        assert_eq!(
+            responses,
+            vec![serde_json::json!({"id":2,"roles":["current"]})]
+        );
+    }
+
+    #[tokio::test]
     async fn sse_messages_post_returns_202_for_a_live_session() {
         let app = sse_test_app();
         let (_body, session_id) = open_sse_session(&app).await;
@@ -2887,7 +2958,7 @@ mod tests {
         // The panic message this prints to stderr is expected.
         let sessions: SseSessions = Arc::new(std::sync::Mutex::new(Default::default()));
         let (tm, cancelled) = recording_transport_manager();
-        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<Value>(1);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<SseInbound>(1);
 
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = SseSessionGuard::register(

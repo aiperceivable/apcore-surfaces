@@ -203,6 +203,14 @@ pub trait Executor: Send + Sync {
         None
     }
 
+    /// Return the Core executor and strategy in use for a governed projection.
+    fn discovery_executor(
+        &self,
+        _want_trace: bool,
+    ) -> Option<(&apcore::Executor, &apcore::ExecutionStrategy)> {
+        None
+    }
+
     /// Return the descriptor-default version hint for `module_id`, if any.
     ///
     /// Used by [`ExecutionRouter::handle_call`] as the lowest-priority
@@ -417,6 +425,29 @@ pub struct ContentItem {
     pub data: Value,
 }
 
+pub(crate) struct CoreDiscovery<'a> {
+    pub(crate) executor: &'a apcore::Executor,
+    strategy: &'a apcore::ExecutionStrategy,
+    context: apcore::Context<Value>,
+}
+
+impl CoreDiscovery<'_> {
+    pub(crate) fn descriptor(&self, module_id: &str) -> Option<apcore::registry::ModuleDescriptor> {
+        self.executor.get_callable_descriptor_for_strategy(
+            module_id,
+            None,
+            Some(&self.context),
+            self.strategy,
+        )
+    }
+
+    pub(crate) fn documentation(&self, module_id: &str) -> Option<String> {
+        self.descriptor(module_id)?
+            .documentation
+            .filter(|text| !text.is_empty())
+    }
+}
+
 /// Routes incoming MCP tool calls to the underlying apcore executor.
 pub struct ExecutionRouter {
     executor: Option<Box<dyn Executor>>,
@@ -489,6 +520,20 @@ impl Drop for CancelGuard {
 }
 
 impl ExecutionRouter {
+    pub(crate) fn core_discovery(&self) -> Option<CoreDiscovery<'_>> {
+        let (executor, strategy) = self.executor.as_ref()?.discovery_executor(self.trace)?;
+        let context = AUTH_IDENTITY
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .map_or_else(apcore::Context::anonymous, apcore::Context::new);
+        Some(CoreDiscovery {
+            executor,
+            strategy,
+            context,
+        })
+    }
+
     /// Create a stub router for testing.
     ///
     /// The stub router does not execute any modules. Its `handle_call`

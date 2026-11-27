@@ -41,6 +41,7 @@ If you have already built modules using the `apcore` framework (which focuses on
 - **Three transports** — stdio (default, for desktop clients), Streamable HTTP, and SSE.
 - **Annotation mapping** — apcore annotations (readonly, destructive, idempotent) map to MCP ToolHints.
 - **Schema conversion** — JSON Schema `$ref`/`$defs` inlining, strict mode for OpenAI Structured Outputs.
+- **Caller-aware discovery** — Core-backed servers filter the standard tool list and module documentation resources using the current caller's ACL visibility. The tool list retains complete input schemas. When enabled, `system.manifest.search` provides lightweight, paginated summaries under its own ACL.
 - **Tool Explorer** — Built-in browser UI for exploring and testing MCP tools (like Swagger UI for MCP).
 - **JWT Authentication** — Optional Bearer token auth for HTTP-based transports.
 - **Approval Mechanism** — Bridges MCP elicitation to apcore's runtime approval system.

@@ -16,7 +16,7 @@ import { confirmPendingApproval, runApprovalInvocation, type ApprovalReplyCaptur
 import type { Module } from "apcore-js";
 import { ErrorMapper } from "../adapters/errors.js";
 import { ErrorCodes } from "../types.js";
-import type { Executor, TextContentDict, McpErrorResponse, StreamCompletion, StreamExecution, StreamStepOutcome } from "../types.js";
+import type { Executor, ModuleDescriptor, TextContentDict, McpErrorResponse, StreamCompletion, StreamExecution, StreamStepOutcome } from "../types.js";
 import { createBridgeContext } from "./context.js";
 import { MCP_PROGRESS_KEY, MCP_ELICIT_KEY } from "../helpers.js";
 import type { ElicitResult } from "../helpers.js";
@@ -489,6 +489,15 @@ export class ExecutionRouter {
         this._releaseCancelToken(callId);
       }
     }
+  }
+
+  /** Use the invocation backend and trusted transport identity for one discovery request. */
+  discoveryResolver(): ((moduleId: string, versionHint?: string) => ModuleDescriptor | null) | undefined {
+    const backend = this._executor;
+    const lookup = backend.getCallableDescriptor;
+    if (typeof lookup !== "function") return undefined;
+    const context = createBridgeContext({}, getCurrentIdentity());
+    return (moduleId, versionHint) => lookup.call(backend, moduleId, context, versionHint);
   }
 
   private async _handleCallInner(
