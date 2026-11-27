@@ -129,6 +129,10 @@ async fn close_stops_accepting_and_drains_an_in_flight_response() {
         loop {
             match TcpStream::connect(address).await {
                 Err(error) if error.kind() == ErrorKind::ConnectionRefused => break,
+                // Linux can reset a connection already queued when the listener closes.
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => {
+                    tokio::task::yield_now().await;
+                }
                 Ok(_) => tokio::task::yield_now().await,
                 Err(error) => panic!("unexpected connect error: {error}"),
             }
