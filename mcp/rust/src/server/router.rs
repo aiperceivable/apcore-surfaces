@@ -455,7 +455,7 @@ struct LiveCallOutput {
 }
 
 tokio::task_local! {
-    static LIVE_CALL_OUTPUT: Arc<LiveCallOutput>;
+    static LIVE_CALL_OUTPUT: Option<Arc<LiveCallOutput>>;
 }
 
 pub(crate) enum WireOutputSchema {
@@ -899,12 +899,21 @@ impl ExecutionRouter {
     fn current_call_output(&self, name: &str) -> bool {
         LIVE_CALL_OUTPUT
             .try_with(|binding| {
-                let (current, _) = self.executor.as_ref()?.discovery_executor(self.trace)?;
-                let registration = current.registry().get(name).ok().flatten()?;
-                let selected = binding.registration.as_ref()?;
-                Arc::ptr_eq(selected, &registration).then_some(())
+                let Some(binding) = binding else {
+                    return true;
+                };
+                let current = self
+                    .executor
+                    .as_ref()
+                    .and_then(|executor| executor.discovery_executor(self.trace))
+                    .and_then(|(executor, _)| executor.registry().get(name).ok().flatten());
+                binding
+                    .registration
+                    .as_ref()
+                    .zip(current.as_ref())
+                    .is_some_and(|(selected, current)| Arc::ptr_eq(selected, current))
             })
-            .map_or(true, |matched| matched.is_some())
+            .unwrap_or(true)
     }
 
     /// Redact sensitive fields from tool output before formatting.
@@ -917,11 +926,13 @@ impl ExecutionRouter {
         if !self.redact_output {
             return result.clone();
         }
-        if let Ok(redacted) = LIVE_CALL_OUTPUT.try_with(|output| {
-            output.schema.as_ref().map_or_else(
-                || result.clone(),
-                |schema| apcore::redact_sensitive(result, schema),
-            )
+        if let Ok(Some(redacted)) = LIVE_CALL_OUTPUT.try_with(|output| {
+            output.as_ref().map(|output| {
+                output.schema.as_ref().map_or_else(
+                    || result.clone(),
+                    |schema| apcore::redact_sensitive(result, schema),
+                )
+            })
         }) {
             return redacted;
         }
@@ -1090,23 +1101,29 @@ impl ExecutionRouter {
         arguments: &Value,
         extra: Option<&Value>,
     ) -> (StreamOutcome, WireOutputSchema) {
-        let Some(output) = self.live_call_output(tool_name).map(Arc::new) else {
-            return (
-                self.dispatch_call(tool_name, arguments, extra).await,
-                WireOutputSchema::Configured,
-            );
-        };
+        self.with_call_output(tool_name, self.dispatch_call(tool_name, arguments, extra))
+            .await
+    }
+
+    async fn with_call_output(
+        &self,
+        tool_name: &str,
+        dispatch: impl Future<Output = StreamOutcome>,
+    ) -> (StreamOutcome, WireOutputSchema) {
+        let output = self.live_call_output(tool_name).map(Arc::new);
         let result = LIVE_CALL_OUTPUT
-            .scope(Arc::clone(&output), async {
-                let outcome = self.dispatch_call(tool_name, arguments, extra).await;
+            .scope(output.clone(), async {
+                let outcome = dispatch.await;
                 if !outcome.1 && !self.current_call_output(tool_name) {
                     return Self::changed_registration();
                 }
                 outcome
             })
             .await;
-        let schema = output.advertise.then(|| output.schema.clone()).flatten();
-        (result, WireOutputSchema::Live(schema))
+        let schema = output.map_or(WireOutputSchema::Configured, |output| {
+            WireOutputSchema::Live(output.schema.as_ref().filter(|_| output.advertise).cloned())
+        });
+        (result, schema)
     }
 
     async fn dispatch_call(
@@ -1542,18 +1559,22 @@ impl ExecutionRouter {
             }
         }
 
-        self.dispatch_stream_or_call(
+        self.with_call_output(
             tool_name,
-            arguments,
-            &context_value,
-            None,
-            &apcore_ctx,
-            extra
-                .progress_token
-                .as_ref()
-                .zip(extra.send_notification.as_ref()),
+            self.dispatch_stream_or_call(
+                tool_name,
+                arguments,
+                &context_value,
+                None,
+                &apcore_ctx,
+                extra
+                    .progress_token
+                    .as_ref()
+                    .zip(extra.send_notification.as_ref()),
+            ),
         )
         .await
+        .0
     }
 
     // -----------------------------------------------------------------------
