@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { expect, it } from "vitest";
+import { reportProgress } from "../../src/helpers.js";
 import { MCPServerFactory } from "../../src/server/factory.js";
 import { ExecutionRouter } from "../../src/server/router.js";
 
@@ -43,6 +44,15 @@ async function connect(
   const config = new sdk.Config({ stream: { max_merge_depth: 1 } });
   const executor = throughFacade ? new sdk.APCore({ registry, config }) : new sdk.Executor({ registry, config });
   if (fail === "after") executor.useAfter(() => { throw new Error("private-after-cause"); });
+  const target = await connectClient(registry, executor, outputSchema);
+  return { ...target, counts: () => ({ calls, streams }) };
+}
+
+async function connectClient(
+  registry: core.Registry,
+  executor: core.Executor | core.APCore,
+  outputSchema: Record<string, unknown>,
+) {
   const factory = new MCPServerFactory();
   const server = factory.createServer();
   const router = new ExecutionRouter(executor as never, { outputSchemaMap: { [moduleId]: outputSchema } });
@@ -53,10 +63,46 @@ async function connect(
   await client.connect(clientTransport);
   return {
     client,
-    counts: () => ({ calls, streams }),
     async close() { await client.close(); await server.close(); },
   };
 }
+
+it.each([false, true])("preserves unary output when progress is requested (facade: %s)", async (throughFacade) => {
+  const registry = new core.Registry();
+  const outputSchema = {
+    type: "object",
+    properties: { message: { type: "string" } },
+    required: ["message"],
+  };
+  let calls = 0;
+  await registry.register(moduleId, {
+    description: "Return a result and report progress independently",
+    inputSchema: { type: "object" },
+    outputSchema,
+    async execute(_inputs: Record<string, unknown>, context: core.Context) {
+      calls++;
+      await reportProgress(context, 1, 2, "running");
+      return { message: "from module" };
+    },
+  } as never);
+  const executor = throughFacade ? new core.APCore({ registry }) : new core.Executor({ registry });
+  executor.useAfter(() => ({ message: "from middleware" }));
+  const target = await connectClient(registry, executor, outputSchema);
+  const progress: unknown[] = [];
+  try {
+    const args = { name: moduleId, arguments: {} };
+    const ordinary = await target.client.callTool(args);
+    const subscribed = await target.client.callTool(args, undefined, {
+      onprogress: ({ message }) => { progress.push(message); },
+    });
+    expect(ordinary.structuredContent).toEqual({ message: "from middleware" });
+    expect(subscribed.structuredContent).toEqual(ordinary.structuredContent);
+    expect(progress).toEqual(["running"]);
+    expect(calls).toBe(2);
+  } finally {
+    await target.close();
+  }
+});
 
 it.each([false, true])("uses an independent Core package (facade: %s)", async (throughFacade) => {
   const entry = await realpath(fileURLToPath(import.meta.resolve("apcore-js")));

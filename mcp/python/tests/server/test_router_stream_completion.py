@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import closing
 from typing import Any
 
@@ -13,9 +13,11 @@ from apcore import REDACTED_VALUE, APCore, Config, Context, Executor, ModuleAnno
 from apcore.builtin_steps import BuiltinOutputValidation
 from apcore.middleware import Middleware
 from mcp import ClientSession
+from mcp.types import CallToolResult
 from pydantic import BaseModel
 
 from apcore_mcp import APCoreMCP
+from apcore_mcp.helpers import report_progress
 from apcore_mcp.server.factory import MCPServerFactory
 from apcore_mcp.server.router import ExecutionRouter
 from apcore_mcp.server.transport import TransportManager
@@ -67,6 +69,66 @@ def _setup(
     return registry, executor, router
 
 
+async def _call_wire_tool(
+    registry: Registry,
+    router: ExecutionRouter,
+    module_id: str,
+    progress_callback: Callable[[float, float | None, str | None], Awaitable[None]] | None,
+) -> CallToolResult:
+    factory = MCPServerFactory()
+    server = factory.create_server()
+    factory.register_handlers(server, factory.build_tools(registry), router)
+    init = factory.build_init_options(server, "test", "1")
+    send_client, read_server = anyio.create_memory_object_stream(10)
+    send_server, read_client = anyio.create_memory_object_stream(10)
+
+    with anyio.fail_after(5):
+        async with anyio.create_task_group() as group:
+            group.start_soon(TransportManager()._run_scoped, server, read_server, send_server, init, "test")
+            async with ClientSession(read_client, send_client) as session:
+                await session.initialize()
+                result = await session.call_tool(module_id, {}, progress_callback=progress_callback)
+            group.cancel_scope.cancel()
+    return result
+
+
+@pytest.mark.parametrize("send_progress", [False, True])
+async def test_progress_keeps_unary_output_after_middleware(send_progress: bool) -> None:
+    class UnaryTool:
+        input_schema = _Inputs
+        output_schema = {"type": "object", "properties": {"value": {"type": "integer"}}}
+        description = "Return an ordinary result and report explicit progress"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, inputs: dict[str, Any], context: Context) -> dict[str, int]:
+            self.calls += 1
+            await report_progress(context, 1, 2, "halfway")
+            return {"value": 1}
+
+    class ChangeOutput(Middleware):
+        def after(self, module_id: str, inputs: dict[str, Any], output: dict[str, Any], context: Context) -> None:
+            output["value"] = 2
+
+    tool = UnaryTool()
+    registry = Registry()
+    registry.register("test.unary", tool)
+    executor = Executor(registry)
+    executor.use(ChangeOutput())
+    router = ExecutionRouter(executor)
+    notices: list[tuple[float, float | None, str | None]] = []
+
+    async def progress(count: float, total: float | None, text: str | None) -> None:
+        notices.append((count, total, text))
+
+    result = await _call_wire_tool(registry, router, "test.unary", progress if send_progress else None)
+    assert not result.isError
+    assert json.loads(result.content[0].text) == {"value": 2}
+    assert notices == ([(1, 2, "halfway")] if send_progress else [])
+    assert tool.calls == 1
+
+
 @pytest.mark.parametrize(("send_progress", "annotated"), [(True, True), (False, True), (False, False)])
 @pytest.mark.skipif(not _HAS_COMPLETION, reason="run with the A2 wheel for the completion path")
 async def test_real_mcp_final_result_uses_core_snapshot(send_progress: bool, annotated: bool) -> None:
@@ -74,27 +136,13 @@ async def test_real_mcp_final_result_uses_core_snapshot(send_progress: bool, ann
     if not annotated:
         tool.annotations = ModuleAnnotations()
     registry, _, router = _setup(tool)
-    factory = MCPServerFactory()
-    server = factory.create_server()
-    factory.register_handlers(server, factory.build_tools(registry), router)
-    init = factory.build_init_options(server, "test", "1")
-    send_client, read_server = anyio.create_memory_object_stream(10)
-    send_server, read_client = anyio.create_memory_object_stream(10)
     messages: list[dict[str, Any]] = []
 
     async def progress(_count: float, _total: float | None, text: str | None) -> None:
         assert text is not None
         messages.append(json.loads(text))
 
-    with anyio.fail_after(5):
-        async with anyio.create_task_group() as group:
-            group.start_soon(TransportManager()._run_scoped, server, read_server, send_server, init, "test")
-            async with ClientSession(read_client, send_client) as session:
-                await session.initialize()
-                result = await session.call_tool(
-                    "test.stream", {}, progress_callback=progress if send_progress else None
-                )
-            group.cancel_scope.cancel()
+    result = await _call_wire_tool(registry, router, "test.stream", progress if send_progress else None)
 
     assert not result.isError
     assert json.loads(result.content[0].text) == {

@@ -687,10 +687,11 @@ export class ExecutionRouter {
       // ── Resolve versionHint from request metadata or descriptor ──────
       let versionHint: string | undefined = extra?.versionHint
         ?? extra?._meta?.apcore?.version;
+      const coreExecutor = isCoreExecutor(this._executor);
       let declaredStreaming = false;
       try {
         const descriptor = this._executor.registry?.getDefinition?.(toolName);
-        declaredStreaming = descriptor?.annotations?.streaming === true;
+        declaredStreaming = !coreExecutor && descriptor?.annotations?.streaming === true;
         if (!versionHint) {
           const metaHint = descriptor?.metadata?.versionHint;
           if (typeof metaHint === "string") {
@@ -707,13 +708,16 @@ export class ExecutionRouter {
 
       // ── Streaming path ────────────────────────────────────────────────
       const wantsProgress = progressToken !== undefined && sendNotification !== undefined;
+      const customStreamRequested = wantsProgress && !coreExecutor;
+      // Unary Core tools report progress through the context callback and
+      // return the ordinary call result, including after-middleware changes.
       const execution = typeof this._executor.streamWithCompletion === "function" &&
-        (declaredStreaming || wantsProgress)
+        (declaredStreaming || customStreamRequested)
         ? this._executor.streamWithCompletion(toolName, args, context, versionHint)
         : null;
       // Retain the old structural extension point for custom executors. An
       // older Core instead uses one ordinary invocation with full validation.
-      const chunks = execution?.chunks ?? (wantsProgress && !isCoreExecutor(this._executor)
+      const chunks = execution?.chunks ?? (customStreamRequested
         ? this._executor.stream?.(toolName, args, context, versionHint)
         : undefined);
       if (chunks) {

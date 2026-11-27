@@ -586,14 +586,19 @@ class ExecutionRouter:
 
         has_progress = progress_token is not None and send_notification is not None
         if callable(self._open_completed_stream):
-            native_stream = getattr(getattr(descriptor, "annotations", None), "streaming", False) is True
-            if not has_progress and self._core_backend:
+            if self._core_backend:
+                # A progress token lets any module report progress. Only native
+                # streams should use Core's pre-after completion snapshot.
                 try:
-                    native_stream = isinstance(self._executor.registry.get(tool_name, version_hint), StreamingModule)
+                    use_stream = isinstance(self._executor.registry.get(tool_name, version_hint), StreamingModule)
                 except ModuleError:
                     # Leave unknown or incompatible versions to the pipeline's normal error path.
-                    native_stream = False
-            if has_progress or native_stream:
+                    use_stream = False
+            else:
+                declared_streaming = getattr(getattr(descriptor, "annotations", None), "streaming", False) is True
+                use_stream = has_progress or declared_streaming
+
+            if use_stream:
                 return await self._handle_completed_stream(
                     tool_name, arguments, progress_token, send_notification, context, version_hint
                 )
