@@ -77,11 +77,17 @@ jobs:
           python -m build
       - name: Install and import the built wheel in isolation
         shell: bash
+        env:
+          COMPONENT: ${{ matrix.component }}
         run: |
-          wheel=( "$PWD"/dist/*.whl )
+          wheels=( "$PWD"/dist/*.whl )
           temporary=$(mktemp -d)
+          if [[ "$COMPONENT" == a2a || "$COMPONENT" == cli ]]; then
+            python -m build --wheel --outdir "$temporary/wheels" "$GITHUB_WORKSPACE/toolkit/python"
+            wheels+=( "$temporary"/wheels/apcore_toolkit-*.whl )
+          fi
           python -m venv "$temporary/venv"
           cd "$temporary"
-          "$temporary/venv/bin/python" -m pip install "${wheel[0]}"
+          "$temporary/venv/bin/python" -m pip install "${wheels[@]}"
           "$temporary/venv/bin/python" -m pip check
-          "$temporary/venv/bin/python" -c 'import importlib, sys; importlib.import_module("apcore_" + sys.argv[1])' "${{ matrix.component }}"
+          "$temporary/venv/bin/python" -c 'import importlib, sys; importlib.import_module("apcore_" + sys.argv[1])' "$COMPONENT"

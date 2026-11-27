@@ -19,7 +19,7 @@ Phase B requires Core's scoped approval gate and a store that can atomically ver
 
 ## Complete Flow
 
-1. Call a tool that requires approval. The tool returns `isError: true` and `APPROVAL_PENDING`. The result metadata contains the approval record ID and the caller's private resume token.
+1. Call a tool that requires approval. Identify a pending result by `isError: true` and the presence of `_meta.apcore.approval`. That object contains the approval record ID and the caller's private resume token.
 
     ```json
     {
