@@ -24,6 +24,40 @@ npm install apcore-toolkit
 
 ## Usage
 
+### Prometheus HTTP server
+
+The Node entry point can serve Core's existing metrics and usage collectors on
+`/metrics`, with liveness on `/healthz` and application readiness on `/readyz`.
+Set `metricsPath` to an absolute pathname. `/healthz` and `/readyz` are reserved
+for probes. Routes accept GET requests and match the
+pathname, ignoring query parameters. Readiness returns 503 until the supplied
+callback reports ready.
+
+```typescript
+import { once } from 'node:events';
+import { MetricsCollector, PrometheusExporter, UsageCollector } from 'apcore-js';
+import { createPrometheusServer } from 'apcore-toolkit';
+
+const metrics = new MetricsCollector();
+const usage = new UsageCollector();
+const exporter = new PrometheusExporter({ collector: metrics, usageCollector: usage });
+let ready = false;
+const server = createPrometheusServer({
+  renderMetrics: () => exporter.export(),
+  isReady: () => ready,
+});
+const listening = once(server, 'listening');
+server.listen(9090, '127.0.0.1');
+await listening;
+ready = true;
+process.once('SIGTERM', () => { server.close(); });
+```
+
+Use the same collector instances that your APCore middleware writes to.
+The returned Node server lets the application choose the bind address, handle
+listen errors and wait for active responses to finish on shutdown. The legacy
+Core exporter and its lifecycle API are available.
+
 ### ScannedModule
 
 The canonical representation of a scanned endpoint:

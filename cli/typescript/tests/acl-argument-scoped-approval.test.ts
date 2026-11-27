@@ -32,14 +32,19 @@ import { CliApprovalHandler } from "../src/approval.js";
  * discriminating — a call that merely succeeds proves nothing, since a gate
  * that never fired would also let it through.
  */
-function appWithArgumentScopedRule(autoApprove: boolean) {
+async function appWithArgumentScopedRule(autoApprove: boolean) {
   const app = new APCore();
-  app.registry.register("git.push", {
+  await app.registry.register("git.push", {
     moduleId: "git.push",
+    description: "Push the test branch",
     annotations: { requiresApproval: false },
     inputSchema: {
       type: "object",
       properties: { remote: { type: "string" }, force: { type: "boolean" } },
+    },
+    outputSchema: {
+      type: "object",
+      properties: { pushed: { type: "boolean" }, force: { type: "boolean" } },
     },
     execute: async (input: Record<string, unknown>) => ({
       pushed: true,
@@ -72,7 +77,7 @@ function appWithArgumentScopedRule(autoApprove: boolean) {
 
 describe("ACL argument-scoped approval reaches CliApprovalHandler", () => {
   it("runs an ungated call without consulting the handler", async () => {
-    const executor = appWithArgumentScopedRule(/*autoApprove*/ true);
+    const executor = await appWithArgumentScopedRule(/*autoApprove*/ true);
 
     await expect(
       executor.call("git.push", { remote: "origin" }),
@@ -80,7 +85,7 @@ describe("ACL argument-scoped approval reaches CliApprovalHandler", () => {
   });
 
   it("routes an ACL-gated call through the handler and runs it", async () => {
-    const executor = appWithArgumentScopedRule(/*autoApprove*/ true);
+    const executor = await appWithArgumentScopedRule(/*autoApprove*/ true);
 
     await expect(
       executor.call("git.push", { remote: "origin", force: true }),
@@ -89,7 +94,7 @@ describe("ACL argument-scoped approval reaches CliApprovalHandler", () => {
 
   it("reports the governance-effective requirement from validate()", async () => {
     // §7.9.5: the union is what `apcli validate` and `--dry-run` forward.
-    const executor = appWithArgumentScopedRule(/*autoApprove*/ true);
+    const executor = await appWithArgumentScopedRule(/*autoApprove*/ true);
 
     const plain = await executor.validate("git.push", { remote: "origin" });
     const forced = await executor.validate("git.push", {
@@ -110,7 +115,7 @@ describe("ACL argument-scoped approval reaches CliApprovalHandler", () => {
     // and lets the test assert the stronger property directly — that the gate
     // *consulted a handler at all*, and for which call.
     const seen: string[] = [];
-    const executor = appWithArgumentScopedRule(/*autoApprove*/ true);
+    const executor = await appWithArgumentScopedRule(/*autoApprove*/ true);
     executor.setApprovalHandler({
       async requestApproval(request: { moduleId: string; arguments: Record<string, unknown> }) {
         seen.push(`${request.moduleId}(${Object.keys(request.arguments).sort().join(",")})`);

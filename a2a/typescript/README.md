@@ -187,6 +187,49 @@ for await (const event of client.streamMessage(message, { contextId: "ctx-1" }))
 client.close();
 ```
 
+### Deliver APCore events to an A2A receiver
+
+Call `registerA2ASubscriber()` during startup before constructing any APCore
+client that should use the A2A transport. The existing `type: a2a` configuration
+selects one subscriber, including when used as a filter delegate. Importing
+the adapter leaves the built-in Core registration in place.
+
+```typescript
+import { APCore, Config, createEvent } from "apcore-js";
+import { registerA2ASubscriber } from "apcore-a2a";
+
+registerA2ASubscriber();
+const core = new APCore({ config: Config.load("apcore.yaml") });
+core.events?.emit(createEvent("example.updated", "example.module", "info", { value: 42 }));
+await core.events?.flush();
+```
+
+```yaml
+version: "1.0.0"
+project:
+  name: example
+sys_modules:
+  enabled: true
+  events:
+    enabled: true
+    subscribers:
+      - type: a2a
+        platform_url: https://events.example.com/receive
+        skill_id: example.event_receiver
+        timeout_ms: 5000
+        retry:
+          max_attempts: 3
+```
+
+An omitted `skill_id` defaults to `apevo.event_receiver`. A string `auth`
+sends a bearer token, and a header map supplies custom headers. The transport
+uses Node's fetch and sends one POST per attempt. APCore owns filter rules,
+retry, circuit breakers, and dead-letter delivery. Configured retries and
+dead-letter reporting require a Core build that propagates delivery failures
+through the circuit breaker. Core 0.33.0 keeps its existing configured event
+handling. To return to the built-in transport, omit the registration call
+when restarting your application.
+
 ### Add authentication
 
 ```typescript

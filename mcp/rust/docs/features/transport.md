@@ -114,7 +114,7 @@ The server supports `2024-11-05`, `2025-03-26` and `2025-06-18`. An initialize
 request for one of these receives the same version. Newer or unknown requests
 receive `2025-06-18`, allowing the client to decide whether it supports that version.
 Stdio and SSE remember the negotiated version on each live session, with
-state removed on disconnect. Stateless HTTP uses the request's
+state removed on disconnect. Streamable HTTP uses the request's
 `MCP-Protocol-Version` header, defaults to `2025-03-26` when it is absent, and
 returns HTTP 400 for present malformed or unsupported versions on POST, GET,
 and DELETE. Python and TypeScript delegate version negotiation to their native
@@ -122,9 +122,17 @@ MCP SDKs, which support additional revisions; the Rust supported set remains
 `2024-11-05`, `2025-03-26` and `2025-06-18`. A different supported fallback is valid when the
 requested revision is not implemented.
 
-Transport-injected protocol and session metadata cannot be supplied by the
-client. HTTP never accepts a caller-supplied session identity or acquires
-elicitation support from a forged metadata object.
+Transport-injected protocol and session metadata comes from the connection.
+Streamable HTTP assigns an opaque session ID on initialization. Cancellation
+uses the issued session ID from the HTTP header and preserves the authenticated
+owner of the session. A deleted or evicted session returns HTTP 404. Clients
+without an initialized session can still use stateless calls. HTTP sessions
+scope inbound cancellation without enabling elicitation.
+
+Inbound `notifications/cancelled` reaches only the active tool call with the
+same JSON-RPC request ID and session. Numeric and string IDs are distinct.
+The router forwards the signal to the Core invocation token. SSE cancellation
+can reach a call while all normal dispatch slots are occupied.
 
 - [ ] Preserve the legacy response format on old connections and headerless HTTP requests
 - [ ] Negotiate structured results independently for each live stdio/SSE session

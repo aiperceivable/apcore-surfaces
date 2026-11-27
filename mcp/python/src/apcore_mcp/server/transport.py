@@ -8,6 +8,8 @@ import time as _time
 import uuid
 from collections.abc import AsyncIterator
 from contextvars import ContextVar
+from dataclasses import dataclass
+from functools import partial
 from typing import Any, Protocol, runtime_checkable
 
 import anyio
@@ -16,12 +18,15 @@ from mcp.server.lowlevel import Server
 from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
 from mcp.server.stdio import stdio_server
-from mcp.server.streamable_http import StreamableHTTPServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
+from starlette.types import Message, Receive, Scope, Send
 
 from apcore_mcp._stdio import stdio_output
+from apcore_mcp.auth.middleware import auth_identity_var
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,85 @@ class MetricsExporter(Protocol):
     """Protocol for metrics collectors that can export Prometheus text format."""
 
     def export_prometheus(self) -> str: ...
+
+
+@dataclass
+class _HTTPSessionOpening:
+    principal: tuple[str, str] | None
+    session_id: str | None = None
+    closed: bool = False
+
+
+class _ScopedHTTPServer(Server):
+    """Delegate each SDK-managed HTTP session through transport cleanup."""
+
+    def __init__(self, manager: TransportManager, server: Server, init_options: InitializationOptions) -> None:
+        self._manager = manager
+        self._server = server
+        self._init_options = init_options
+        self._opening: ContextVar[_HTTPSessionOpening | None] = ContextVar("mcp_http_opening", default=None)
+        self._owners: dict[str, _HTTPSessionOpening] = {}
+
+    async def handle_request(
+        self, sessions: StreamableHTTPSessionManager, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        identity = auth_identity_var.get()
+        principal = (identity.type, identity.id) if identity is not None else None
+        session_id = Headers(scope=scope).get("mcp-session-id")
+        if session_id is not None:
+            opening = self._owners.get(session_id)
+            if opening is None or opening.principal != principal:
+                response = JSONResponse(
+                    {"jsonrpc": "2.0", "id": "server-error", "error": {"code": -32600, "message": "Session not found"}},
+                    status_code=404,
+                )
+                await response(scope, receive, send)
+                return
+            await sessions.handle_request(scope, receive, send)
+            return
+
+        if scope.get("method") != "POST":
+            await sessions.handle_request(scope, receive, send)
+            return
+
+        opening = _HTTPSessionOpening(principal)
+
+        async def bind_session(message: Message) -> None:
+            if message["type"] == "http.response.start" and message["status"] == 200 and not opening.closed:
+                issued = Headers(raw=message.get("headers", [])).get("mcp-session-id")
+                if issued is not None:
+                    opening.session_id = issued
+                    self._owners[issued] = opening
+            await send(message)
+
+        # AnyIO copies this context when the SDK starts the session. Bind the
+        # SDK-issued ID before exposing it, then retire it with the session.
+        state = self._opening.set(opening)
+        try:
+            await sessions.handle_request(scope, receive, bind_session)
+        finally:
+            self._opening.reset(state)
+
+    def create_initialization_options(self, *args: Any, **kwargs: Any) -> InitializationOptions:
+        return self._init_options
+
+    async def run(
+        self, read_stream: Any, write_stream: Any, initialization_options: InitializationOptions, **kwargs: Any
+    ) -> None:
+        # The session task inherits the initializing request's context. Each
+        # HTTP call reads its own verified identity from its request scope.
+        opening = self._opening.get()
+        auth_state = auth_identity_var.set(None)
+        try:
+            await self._manager._run_scoped(
+                self._server, read_stream, write_stream, initialization_options, uuid.uuid4().hex, True
+            )
+        finally:
+            auth_identity_var.reset(auth_state)
+            if opening is not None:
+                opening.closed = True
+                if opening.session_id is not None:
+                    self._owners.pop(opening.session_id, None)
 
 
 class TransportManager:
@@ -195,39 +279,30 @@ class TransportManager:
                     uvicorn.Config(combined, host="0.0.0.0", port=8000)
                 ).serve()
         """
-        session_id = uuid.uuid4().hex
-        transport = StreamableHTTPServerTransport(
-            mcp_session_id=session_id,
-        )
+        scoped_server = _ScopedHTTPServer(self, server, init_options)
+        sessions = StreamableHTTPSessionManager(scoped_server)
 
-        async with transport.connect() as (read_stream, write_stream):
+        async def _health(request: Any) -> JSONResponse:
+            return JSONResponse(self._build_health_response())
 
-            async def _health(request: Any) -> JSONResponse:
-                return JSONResponse(self._build_health_response())
+        async def _metrics(request: Any) -> Response:
+            return self._build_metrics_response()
 
-            async def _metrics(request: Any) -> Response:
-                return self._build_metrics_response()
+        routes: list[Route | Mount] = [
+            Route("/health", endpoint=_health, methods=["GET"]),
+            Route("/metrics", endpoint=_metrics, methods=["GET"]),
+        ]
+        if extra_routes:
+            routes.extend(extra_routes)
+        routes.append(Mount("/mcp", app=partial(scoped_server.handle_request, sessions)))
 
-            routes: list[Route | Mount] = [
-                Route("/health", endpoint=_health, methods=["GET"]),
-                Route("/metrics", endpoint=_metrics, methods=["GET"]),
-            ]
-            if extra_routes:
-                routes.extend(extra_routes)
-            routes.append(Mount("/mcp", app=transport.handle_request))
+        app: Any = Starlette(routes=routes)
+        if middleware:
+            for mw_cls, mw_kwargs in middleware:
+                app = mw_cls(app, **mw_kwargs)
 
-            app: Any = Starlette(routes=routes)
-            if middleware:
-                for mw_cls, mw_kwargs in middleware:
-                    app = mw_cls(app, **mw_kwargs)
-
-            # [TM-4] Bracket the protocol session so ``transport_session_var``
-            # is populated for async-task submissions and so the configured
-            # AsyncTaskBridge mass-cancels session-bound tasks on teardown.
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(self._run_scoped, server, read_stream, write_stream, init_options, session_id, True)
-                yield app
-                tg.cancel_scope.cancel()
+        async with sessions.run():
+            yield app
 
     async def run_stdio(
         self,
@@ -257,40 +332,11 @@ class TransportManager:
         self._validate_host_port(host, port)
         logger.info("Starting streamable-http transport on %s:%d", host, port)
 
-        session_id = uuid.uuid4().hex
-        transport = StreamableHTTPServerTransport(
-            mcp_session_id=session_id,
-        )
-
-        async with transport.connect() as (read_stream, write_stream):
-
-            async def _health(request: Any) -> JSONResponse:
-                return JSONResponse(self._build_health_response())
-
-            async def _metrics(request: Any) -> Response:
-                return self._build_metrics_response()
-
-            routes: list[Route | Mount] = [
-                Route("/health", endpoint=_health, methods=["GET"]),
-                Route("/metrics", endpoint=_metrics, methods=["GET"]),
-            ]
-            if extra_routes:
-                routes.extend(extra_routes)
-            routes.append(Mount("/mcp", app=transport.handle_request))
-
-            app: Any = Starlette(routes=routes)
-            if middleware:
-                for mw_cls, mw_kwargs in middleware:
-                    app = mw_cls(app, **mw_kwargs)
-
+        async with self.build_streamable_http_app(
+            server, init_options, extra_routes=extra_routes, middleware=middleware
+        ) as app:
             config = uvicorn.Config(app, host=host, port=port, log_level="info")
-            uv_server = uvicorn.Server(config)
-
-            # Run both the MCP server and HTTP server concurrently. [TM-4] The
-            # MCP protocol session is bracketed by ``_scoped_session``.
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(self._run_scoped, server, read_stream, write_stream, init_options, session_id, True)
-                tg.start_soon(uv_server.serve)
+            await uvicorn.Server(config).serve()
 
     async def run_sse(
         self,

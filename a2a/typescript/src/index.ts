@@ -18,6 +18,10 @@ export {
   TaskNotFoundError,
 } from "./client/index.js";
 
+// Events
+export { A2AEventSubscriber, registerA2ASubscriber } from "./event-subscriber.js";
+export type { A2AEventSubscriberOptions } from "./event-subscriber.js";
+
 // Auth
 export type { Authenticator, ClaimMapping } from "./auth/index.js";
 export { JWTAuthenticator } from "./auth/index.js";

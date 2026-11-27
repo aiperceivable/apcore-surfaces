@@ -301,6 +301,11 @@ export class HTTPProxyRegistryWriter {
   private buildFunctionModule(mod: ScannedModule): FunctionModule {
     const effectiveInputs = readOpenApiProxyInputs(mod);
     const { httpMethod, urlPath, openApiPath } = getHttpFields(mod, effectiveInputs !== undefined);
+    // OpenAPI makes operation descriptions optional. Supply valid registry
+    // metadata for an undocumented operation without changing its scanned data.
+    const description = (mod.description ?? '').trim()
+      ? mod.description
+      : `${httpMethod.toUpperCase()} ${urlPath}`.replace(/\s+/g, ' ').slice(0, 200);
     const pathParams = openApiPath?.parameterNames ?? extractPathParamNames(urlPath);
     const queryNames = new Set(effectiveInputs?.query);
     const baseUrl = this.baseUrl;
@@ -456,7 +461,7 @@ export class HTTPProxyRegistryWriter {
       moduleId: mod.moduleId,
       inputSchema: jsonSchemaToTypeBox(objectSchemaForTypeBox(mod.inputSchema)),
       outputSchema: jsonSchemaToTypeBox(objectSchemaForTypeBox(mod.outputSchema)),
-      description: mod.description,
+      description,
       documentation: mod.documentation,
       tags: mod.tags.length > 0 ? [...mod.tags] : null,
       version: mod.version,

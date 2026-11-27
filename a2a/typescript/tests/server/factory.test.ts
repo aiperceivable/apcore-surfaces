@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { Executor, Registry as CoreRegistry } from "apcore-js";
+import { Type } from "@sinclair/typebox";
 import request from "supertest";
 import { A2AServerFactory } from "../../src/server/factory.js";
 import type { Registry } from "../../src/adapters/agent-card.js";
@@ -48,6 +50,51 @@ describe("A2AServerFactory", () => {
       expect(agentCard.version).toBe("1.0.0");
       expect(agentCard.skills).toHaveLength(1);
     });
+  });
+
+  it("persists a real APCore stream timeout and exposes it via GetTask", async () => {
+    let release!: () => void;
+    const stalled = new Promise<void>((resume) => { release = resume; });
+    const registry = new CoreRegistry();
+    registry.register("test.stall", {
+      description: "Yields an artifact then stalls",
+      inputSchema: Type.Object({}),
+      outputSchema: Type.Object({ value: Type.String() }),
+      execute() { throw new Error("native stream must run"); },
+      async *stream() {
+        yield { value: "partial" };
+        await stalled;
+        yield { value: "late" };
+      },
+    });
+    expect(registry.list()).toContain("test.stall");
+    const { app } = new A2AServerFactory().create(
+      registry as unknown as Registry, new Executor({ registry }), { ...baseOpts, executionTimeout: 0.1 },
+    );
+    try {
+      const streamed = await request(app).post("/").set("A2A-Version", "1.0").send({
+        jsonrpc: "2.0", id: 1, method: "SendStreamingMessage",
+        params: { message: {
+          messageId: "stall", role: "ROLE_USER", parts: [{ data: {} }], metadata: { skillId: "test.stall" },
+        } },
+      }).timeout({ deadline: 2000 });
+      expect(streamed.status).toBe(200);
+      const frames = streamed.text.split("\n").filter((line: string) => line.startsWith("data:"))
+        .map((line: string) => JSON.parse(line.slice(5)).result);
+      const artifacts = frames.flatMap((frame) => frame.artifactUpdate ? [frame.artifactUpdate] : []);
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0].lastChunk ?? false).toBe(false);
+      const statuses = frames.flatMap((frame) => frame.statusUpdate ? [frame.statusUpdate] : []);
+      expect(statuses.map((update) => update.status.state)).toEqual(["TASK_STATE_FAILED"]);
+      const terminal = statuses[0];
+      expect(terminal.status.message.parts[0].text).toBe("Execution timed out");
+      const queried = await request(app).post("/").set("A2A-Version", "1.0").send({
+        jsonrpc: "2.0", id: 2, method: "GetTask", params: { id: terminal.taskId },
+      });
+      expect(queried.body.result.status).toEqual(terminal.status);
+    } finally {
+      release();
+    }
   });
 
   describe("agent card endpoint", () => {

@@ -58,6 +58,8 @@ mod openapi_parameters;
 mod openapi_proxy;
 pub mod openapi_scanner;
 pub mod output;
+#[cfg(feature = "prometheus-server")]
+pub mod prometheus_server;
 pub mod resolve_target;
 pub mod scanner;
 pub mod schema_utils;
@@ -98,6 +100,8 @@ pub use output::verifiers::{
 };
 pub use output::yaml_writer::YAMLWriter;
 pub use output::{get_writer, InvalidFormatError, OutputFormat};
+#[cfg(feature = "prometheus-server")]
+pub use prometheus_server::{PrometheusServer, PrometheusServerHandle};
 pub use resolve_target::{resolve_target, ResolveTargetError, ResolvedTarget};
 pub use scanner::{deduplicate_ids, filter_modules, infer_annotations_from_method, BaseScanner};
 pub use schema_utils::enrich_schema_descriptions;

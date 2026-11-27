@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
+import type { CancelToken } from "apcore-js";
 import { Artifact, Part, Role, TaskState } from "@a2a-js/sdk";
 import type { Message, TaskStatus } from "@a2a-js/sdk";
 import {
@@ -119,7 +120,7 @@ export class ApCoreAgentExecutor implements AgentExecutor {
   private executionTimeoutMs: number;
   private onStateChange?: (oldState: string, newState: string) => void;
   // P0-B: CancelToken map keyed by taskId
-  private cancelTokens = new Map<string, { cancel(): void }>();
+  private cancelTokens = new Map<string, CancelToken>();
   private errorMapper: ErrorMapper;
 
   constructor(opts: ApCoreAgentExecutorOptions) {
@@ -209,11 +210,12 @@ export class ApCoreAgentExecutor implements AgentExecutor {
 
     // 5. Build apcore context with identity and CancelToken (P0-B)
     const identity = getAuthIdentity();
+    let token: CancelToken | undefined;
     let apcoreCtx: unknown = undefined;
     try {
-      const { Context, CancelToken } = await import("apcore-js");
+      const { Context, CancelToken: CoreCancelToken } = await import("apcore-js");
       // P0-B: create a CancelToken per task and store it
-      const token = new CancelToken();
+      token = new CoreCancelToken();
       this.cancelTokens.set(context.taskId, token);
       // Map the A2A executionTimeout onto apcore's global_deadline so apcore
       // can stop cooperatively between streaming chunks / pipeline steps.
@@ -246,19 +248,15 @@ export class ApCoreAgentExecutor implements AgentExecutor {
 
     try {
       if (canStream) {
-        // P0-A: Streaming path. The timeout is enforced cooperatively by
-        // apcore's global_deadline (seeded above) between chunks/steps and
-        // surfaces as MODULE_TIMEOUT, so we do NOT wrap the stream in a second
-        // withTimeout (matches the Python binding, which relies on
-        // global_deadline rather than asyncio.wait_for on the streaming path).
-        await this.executeStreaming(context, eventBus, skillId, inputObj, apcoreCtx);
+        await this.executeStreaming(context, eventBus, skillId, inputObj, apcoreCtx, token?.signal);
       } else {
         // Non-streaming path (callAsync)
         let output: Record<string, unknown>;
         const coro = apcoreCtx
           ? this.executor.callAsync(skillId, inputObj, apcoreCtx)
           : this.executor.callAsync(skillId, inputObj);
-        output = await withTimeout(coro, this.executionTimeoutMs);
+        output = await withTimeout(coro, this.executionTimeoutMs, token?.signal);
+        if (token?.signal.aborted) return;
 
         // 8. Publish artifact + completed
         const artifact = this.partConverter.outputToParts(output, context.taskId);
@@ -277,7 +275,10 @@ export class ApCoreAgentExecutor implements AgentExecutor {
         this.publishCompleted(context, eventBus);
       }
     } catch (e: unknown) {
+      // cancelTask owns the CANCELED event after explicitly signaling the token.
+      if (token?.signal.aborted) return;
       if (e instanceof TimeoutError) {
+        token?.cancel();
         this.notify("working", "failed");
         this.publishFailed(context, eventBus, "Execution timed out");
         return;
@@ -285,6 +286,7 @@ export class ApCoreAgentExecutor implements AgentExecutor {
       const code = (e as { code?: string }).code;
       if (code === "MODULE_TIMEOUT") {
         // apcore enforced global_deadline (streaming or cooperative step)
+        token?.cancel();
         this.notify("working", "failed");
         this.publishFailed(context, eventBus, "Execution timed out");
         return;
@@ -334,6 +336,7 @@ export class ApCoreAgentExecutor implements AgentExecutor {
     moduleId: string,
     inputs: Record<string, unknown>,
     apcoreCtx: unknown,
+    signal?: AbortSignal,
   ): Promise<void> {
     const contextId = context.contextId || context.taskId;
     const artifactId = `art-${context.taskId}`;
@@ -348,48 +351,43 @@ export class ApCoreAgentExecutor implements AgentExecutor {
       ? streamFn.call(this.executor, moduleId, inputs, apcoreCtx)
       : streamFn.call(this.executor, moduleId, inputs);
 
-    // A-D-13: bound the entire streaming loop by a host-side wall-clock budget.
-    // apcore's cooperative global_deadline only stops well-behaved modules
-    // between chunks; this Promise.race guarantees the loop terminates even if
-    // the generator stalls (matches Rust's stream_channel tokio timeout). The
-    // deadline spans the whole stream, not just a single chunk.
-    const deadline = Date.now() + this.executionTimeoutMs;
+    // The host uses a monotonic total budget even if the producer ignores
+    // apcore's cooperative deadline.
+    const deadline = performance.now() + this.executionTimeoutMs;
     const iterator = gen[Symbol.asyncIterator]();
-    for (;;) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        await iterator.return?.(undefined);
-        throw new TimeoutError();
-      }
-      let next: IteratorResult<Record<string, unknown>>;
-      try {
-        next = await withTimeout(iterator.next(), remaining);
-      } catch (e) {
-        if (e instanceof TimeoutError) {
-          // Signal the underlying generator to stop iterating.
-          await iterator.return?.(undefined);
+    let exhausted = false;
+    try {
+      for (;;) {
+        if (signal?.aborted) return;
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) throw new TimeoutError();
+        const next = await withTimeout(iterator.next(), remaining, signal);
+        if (signal?.aborted) return;
+        if (next.done) {
+          exhausted = true;
+          break;
         }
-        throw e;
+        const artifact = this.partConverter.outputToParts(next.value, context.taskId);
+        eventBus.publish(
+          AgentEvent.artifactUpdate({
+            taskId: context.taskId,
+            contextId,
+            artifact: { ...artifact, artifactId },
+            append: chunkIndex > 0,
+            lastChunk: false,
+            metadata: undefined,
+          }),
+        );
+        chunkIndex++;
       }
-      if (next.done) break;
-      const chunk = next.value;
-
-      const artifact = this.partConverter.outputToParts(chunk, context.taskId);
-      // Override artifactId to be consistent across chunks
-      const chunkArtifact: Artifact = { ...artifact, artifactId };
-
-      eventBus.publish(
-        AgentEvent.artifactUpdate({
-          taskId: context.taskId,
-          contextId,
-          artifact: chunkArtifact,
-          append: chunkIndex > 0,
-          lastChunk: false,
-          metadata: undefined,
-        }),
-      );
-
-      chunkIndex++;
+    } finally {
+      if (!exhausted) {
+        // AsyncGenerator.return() queues behind any pending next(). A late
+        // value or cleanup failure must never change the task's terminal state.
+        void Promise.resolve().then(() => iterator.return?.(undefined)).catch((error: unknown) => {
+          console.warn(`[apcore-a2a] Stream cleanup failed for task ${context.taskId}`, error);
+        });
+      }
     }
 
     // Signal end of stream with lastChunk: true
@@ -404,7 +402,7 @@ export class ApCoreAgentExecutor implements AgentExecutor {
       }),
     );
 
-    this.publishCompleted(context, eventBus);
+    if (!signal?.aborted) this.publishCompleted(context, eventBus);
   }
 
   async cancelTask(taskId: string, eventBus: ExecutionEventBus): Promise<void> {
@@ -514,10 +512,17 @@ class TimeoutError extends Error {
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<never>((_, reject) => {
+  let onAbort: () => void;
+  const interruption = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error("Execution cancelled"));
     timer = setTimeout(() => reject(new TimeoutError()), ms);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
   });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  return Promise.race([promise, interruption]).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  });
 }

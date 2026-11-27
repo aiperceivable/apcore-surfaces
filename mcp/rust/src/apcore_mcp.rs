@@ -20,7 +20,7 @@ use crate::converters::openai::OpenAIConverter;
 use crate::explorer::{create_explorer_mount, ExplorerConfig, ToolInfo};
 use crate::server::factory::MCPServerFactory;
 use crate::server::listener::RegistryListener;
-use crate::server::router::{ExecutionRouter, ExecutorError, OutputFormatter};
+use crate::server::router::{CompletedStream, ExecutionRouter, ExecutorError, OutputFormatter};
 use crate::server::server::{MCPServer, ServerHandler};
 use crate::server::transport::{MetricsExporter, TransportManager};
 use crate::server::types::{InitializationOptions, Tool};
@@ -265,6 +265,33 @@ impl crate::server::router::Executor for ApcoreExecutorAdapter {
                 message: e.to_string(),
                 details: None,
             })
+    }
+
+    fn stream_with_completion<'a>(
+        &'a self,
+        module_id: &str,
+        inputs: &Value,
+        context: &apcore::Context<Value>,
+        version_hint: Option<&str>,
+    ) -> Option<CompletedStream<'a>> {
+        use tokio_stream::StreamExt;
+
+        let module = self.inner.registry().get(module_id).ok()??;
+        module.as_streaming()?;
+        let (chunks, completion) = self.inner.stream_with_completion(
+            module_id,
+            inputs.clone(),
+            Some(context),
+            version_hint,
+        );
+        let chunks = chunks.map(|item| {
+            item.map_err(|error| ExecutorError::Execution {
+                code: error.code.wire_str(),
+                message: error.to_string(),
+                details: None,
+            })
+        });
+        Some((Box::pin(chunks), completion))
     }
 
     async fn call_with_trace(
@@ -2624,6 +2651,205 @@ mod tests {
                 }
             }
         }
+    }
+
+    struct CompletionFixture {
+        entries: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl apcore::Module for CompletionFixture {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn output_schema(&self) -> Value {
+            json!({"type": "object", "required": ["value"], "properties": {
+                "value": {"type": "integer"},
+                "secret": {"type": "string", "x-sensitive": true}
+            }})
+        }
+
+        fn description(&self) -> &'static str {
+            "Return tracked chunks with a canonical aggregate"
+        }
+
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::ModuleError> {
+            panic!("native streaming must not be retried by unary execution")
+        }
+
+        fn as_streaming(&self) -> Option<&dyn apcore::StreamingModule> {
+            Some(self)
+        }
+
+        fn stream(
+            &self,
+            inputs: Value,
+            ctx: &apcore::Context<Value>,
+        ) -> Option<apcore::ChunkStream> {
+            Some(apcore::StreamingModule::stream_typed(self, inputs, ctx))
+        }
+    }
+
+    impl apcore::StreamingModule for CompletionFixture {
+        fn stream_typed(
+            &self,
+            inputs: Value,
+            _ctx: &apcore::Context<Value>,
+        ) -> apcore::ChunkStream {
+            self.entries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if inputs["panic"] == true {
+                return Box::pin(futures::stream::poll_fn(|_| {
+                    panic!("simulated native producer panic")
+                }));
+            }
+            let value = if inputs["invalid"] == true {
+                json!("invalid")
+            } else {
+                json!(9)
+            };
+            Box::pin(tokio_stream::iter([
+                Ok(
+                    json!({"outer": {"inner": {"left": 1}}, "parts": [1], "secret": "progress-canary"}),
+                ),
+                Ok(json!({"outer": {"inner": {"right": 2}}, "parts": [2], "value": value})),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_wire_uses_core_completion_for_progress_and_atomic_results() {
+        use crate::server::transport::TransportManager;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let entries = Arc::new(AtomicUsize::new(0));
+        let registry = Registry::new();
+        registry
+            .register_module(
+                "demo.completion",
+                Box::new(CompletionFixture {
+                    entries: Arc::clone(&entries),
+                }),
+            )
+            .unwrap();
+        assert!(!registry
+            .get_definition("demo.completion")
+            .unwrap()
+            .unwrap()
+            .annotations
+            .is_some_and(|annotations| annotations.streaming));
+        let mut config = Config::default();
+        config.set("stream.max_merge_depth", json!(1));
+        let executor = Executor::new(registry, config);
+        executor
+            .use_middleware(Box::new(apcore::middleware::adapters::AfterAdapter::new(
+                "test_completion_after",
+                |_, inputs: Value, output: Value, _| async move {
+                    assert_eq!(output["outer"]["inner"], json!({"right": 2}));
+                    if inputs["after_failure"] == true {
+                        Err(apcore::ModuleError::new(
+                            apcore::ErrorCode::ModuleExecuteError,
+                            "after failure",
+                        ))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )))
+            .unwrap();
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(Arc::new(executor)))
+            .redact_output(true)
+            .build()
+            .unwrap();
+        let (server, _, _, options, _, _) = mcp.build_server_components().unwrap();
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+        let (client, server) = tokio::io::duplex(8192);
+        let (read, mut write) = tokio::io::split(client);
+        let mut lines = BufReader::new(read).lines();
+        let (r, w) = tokio::io::split(server);
+        let task = tokio::spawn(async move {
+            TransportManager::new(None)
+                .run_stdio_with_io(r, w, &handler)
+                .await
+                .unwrap();
+        });
+        let decode = |line: String| serde_json::from_str::<Value>(&line).unwrap();
+        let deadline = std::time::Duration::from_secs(3);
+
+        for (id, progress, error) in [
+            (1, true, None),
+            (2, false, None),
+            (3, true, Some("SCHEMA_VALIDATION_ERROR")),
+            (4, true, Some("MODULE_EXECUTE_ERROR")),
+            (5, false, Some("executor panicked")),
+            (6, false, None),
+        ] {
+            let mut request = json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+                    "name": "demo.completion", "arguments": {
+                        "invalid": error == Some("SCHEMA_VALIDATION_ERROR"),
+                        "after_failure": error == Some("MODULE_EXECUTE_ERROR"),
+                        "panic": error == Some("executor panicked"),
+                    }
+                }
+            });
+            if progress {
+                request["params"]["_meta"] = json!({"progressToken": "tracked"});
+            }
+            write
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+
+            if progress {
+                for index in 1..=2 {
+                    let progress = decode(
+                        tokio::time::timeout(deadline, lines.next_line())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    assert_eq!(progress["jsonrpc"], "2.0");
+                    assert_eq!(progress["method"], "notifications/progress");
+                    assert_eq!(progress["params"]["progressToken"], "tracked");
+                    assert_eq!(progress["params"]["progress"], index);
+                    assert!(!progress.to_string().contains("progress-canary"));
+                }
+            }
+            let reply = decode(
+                tokio::time::timeout(deadline, lines.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            );
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["result"]["isError"], error.is_some());
+            let content = reply["result"]["content"][0]["text"].as_str().unwrap();
+            if let Some(code) = error {
+                assert!(content.contains(code));
+                assert!(reply["result"].get("structuredContent").is_none());
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(content).unwrap(),
+                    json!({
+                        "outer": {"inner": {"right": 2}}, "parts": [2], "value": 9,
+                        "secret": apcore::REDACTED_VALUE,
+                    })
+                );
+            }
+            assert_eq!(entries.load(Ordering::SeqCst), usize::try_from(id).unwrap());
+        }
+        write.shutdown().await.unwrap();
+        tokio::time::timeout(deadline, task).await.unwrap().unwrap();
     }
 
     /// Create a test registry with the given modules.

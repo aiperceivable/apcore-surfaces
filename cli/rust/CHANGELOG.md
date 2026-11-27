@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.14.2-alpha.1] - Unreleased
+
+### Fixed
+
+- Accept structured arguments and enforce strict stream completion on supported in-process execution paths.
+
 ## [0.14.1] - Unreleased
 
 ### Added

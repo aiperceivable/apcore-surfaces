@@ -5,7 +5,7 @@
  */
 
 import type { OptionConfig } from "./main.js";
-import { EXIT_CODES } from "./errors.js";
+import { EXIT_CODES, SchemaValidationError } from "./errors.js";
 import { exitWith } from "./exit.js";
 import { warn as logWarn } from "./logger.js";
 
@@ -77,6 +77,20 @@ export function extractHelp(propSchema: Record<string, unknown>, maxLength = 100
   return text;
 }
 
+function parseStructuredValue(value: string, flag: string, type: "object" | "array"): unknown {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value);
+  } catch {
+    throw new SchemaValidationError(`${flag} must contain valid JSON.`);
+  }
+  const matches = type === "array"
+    ? Array.isArray(decoded)
+    : typeof decoded === "object" && decoded !== null && !Array.isArray(decoded);
+  if (!matches) throw new SchemaValidationError(`${flag} must be a JSON ${type}.`);
+  return decoded;
+}
+
 // ---------------------------------------------------------------------------
 // schemaToCliOptions
 // ---------------------------------------------------------------------------
@@ -84,7 +98,7 @@ export function extractHelp(propSchema: Record<string, unknown>, maxLength = 100
 /** Reserved CLI option names that cannot be used by schema properties. */
 const RESERVED_NAMES = new Set([
   "input", "yes", "large_input", "format", "fields", "sandbox",
-  "all_options", "dry_run", "trace", "stream", "strategy",
+  "all_options", "dry_run", "trace", "stream", "strict_stream", "strategy",
   "approval_timeout", "approval_token",
 ]);
 
@@ -151,7 +165,17 @@ export function schemaToCliOptions(
       : helpBase ?? "";
     const defaultValue = propSchema.default as unknown;
 
-    if (typeResult === BOOLEAN_FLAG) {
+    const structuredType = propSchema.type;
+    if (structuredType === "object" || structuredType === "array") {
+      options.push({
+        name: propName,
+        flags: `${flagName} <json>`,
+        description: helpText,
+        defaultValue,
+        required: isRequired,
+        parseStructuredArg: value => parseStructuredValue(value, flagName, structuredType),
+      });
+    } else if (typeResult === BOOLEAN_FLAG) {
       // Boolean flag pair: --flag/--no-flag
       const flagBase = propName.replace(/_/g, "-");
       // Cross-SDK parity (D11-005): Rust schema_parser.rs:272 also tracks

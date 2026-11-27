@@ -7,6 +7,7 @@ pub mod apcore_a2a;
 pub mod auth;
 pub mod cli;
 pub mod client;
+pub mod event_subscriber;
 pub mod explorer;
 #[cfg(feature = "openapi")]
 pub mod openapi_backend;
@@ -52,6 +53,7 @@ pub use crate::adapters::{
 
 // Re-exports: client
 pub use crate::client::{A2AClient, A2AClientError, AgentCardFetcher, ClientResult};
+pub use crate::event_subscriber::{register_a2a_subscriber, A2AEventSubscriber};
 
 // Re-exports: OpenAPI backend (feature `openapi`)
 #[cfg(feature = "openapi")]

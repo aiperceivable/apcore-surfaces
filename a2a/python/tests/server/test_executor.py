@@ -7,14 +7,16 @@ import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from a2a.server.events import EventQueue
+from a2a.server.context import ServerCallContext
+from a2a.server.events.event_queue import EventQueueLegacy as EventQueue
 from a2a.server.events.in_memory_queue_manager import InMemoryQueueManager
-from a2a.types import Message, Part, Role, TaskState
+from a2a.types import Message, Part, Role, Task, TaskArtifactUpdateEvent, TaskState, TaskStatusUpdateEvent
 from apcore.errors import ErrorCodes, ModuleError
 
 from apcore_a2a.adapters.errors import ErrorMapper
 from apcore_a2a.adapters.parts import PartConverter
 from apcore_a2a.adapters.schema import SchemaConverter
+from apcore_a2a.server.context import IdentityUser
 from apcore_a2a.server.executor import ApCoreAgentExecutor
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,251 @@ async def _make_queue() -> EventQueue:
     mgr = InMemoryQueueManager()
     await mgr.create_or_tap("task-1")
     return await mgr.get("task-1")
+
+
+@pytest.mark.parametrize("partial", [False, True])
+async def test_stream_timeout_finishes_before_producer_cleanup(partial, caplog):
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    producer_closed = asyncio.Event()
+    cancellation_seen = []
+
+    class SlowExecutor:
+        async def stream(self, module_id, inputs, context):
+            try:
+                if partial:
+                    yield {"value": "partial"}
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    cancellation_seen.append(context.cancel_token.is_cancelled)
+                    cleanup_started.set()
+                    await release_cleanup.wait()
+                    yield {"value": "late"}
+            finally:
+                producer_closed.set()
+                raise RuntimeError("generator cleanup failed")
+
+    agent = ApCoreAgentExecutor(
+        SlowExecutor(),
+        PartConverter(SchemaConverter()),
+        ErrorMapper(),
+        execution_timeout=0.03,
+    )
+    queue = await _make_queue()
+    running = asyncio.create_task(agent.execute(_make_context(), queue))
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        done, _ = await asyncio.wait({running}, timeout=0.5)
+        assert running in done, "the task terminal must not wait for generator cleanup"
+        await running
+        assert not producer_closed.is_set()
+    finally:
+        release_cleanup.set()
+        await asyncio.wait_for(running, timeout=1)
+        await asyncio.wait_for(producer_closed.wait(), timeout=1)
+
+    events = await _drain_queue(queue)
+    updates = [event for event in events if isinstance(event, TaskStatusUpdateEvent)]
+    assert [event.status.state for event in updates] == [TaskState.TASK_STATE_FAILED]
+    assert updates[0].status.message.parts[0].text == "Execution timed out"
+    artifacts = [event for event in events if isinstance(event, TaskArtifactUpdateEvent)]
+    assert len(artifacts) == int(partial)
+    assert all(not event.last_chunk for event in artifacts)
+    assert cancellation_seen == [True]
+    assert "Stream cleanup failed for task task-1" in caplog.text
+
+
+async def test_client_cancel_wins_over_late_stream_completion():
+    started = asyncio.Event()
+    resume = asyncio.Event()
+
+    class SlowExecutor:
+        async def stream(self, module_id, inputs, context):
+            started.set()
+            await resume.wait()
+            yield {"value": "late"}
+
+    agent = ApCoreAgentExecutor(SlowExecutor(), PartConverter(SchemaConverter()), ErrorMapper())
+    queue = await _make_queue()
+    ctx = _make_context()
+    running = asyncio.create_task(agent.execute(ctx, queue))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await agent.cancel(ctx, queue)
+    finally:
+        resume.set()
+        await asyncio.wait_for(running, timeout=1)
+
+    events = await _drain_queue(queue)
+    updates = [event.status.state for event in events if isinstance(event, TaskStatusUpdateEvent)]
+    assert updates == [TaskState.TASK_STATE_CANCELED]
+    assert all(not isinstance(event, TaskArtifactUpdateEvent) for event in events)
+
+
+async def _read_event(queue):
+    event = await asyncio.wait_for(queue.dequeue_event(), 1)
+    queue.task_done()
+    return event
+
+
+async def test_timeout_is_queryable_while_artifacts_block_the_sdk_queue(monkeypatch):
+    timed_out = asyncio.Event()
+    queue = EventQueue(max_queue_size=1)
+    enqueue = queue.enqueue_event
+
+    async def observe_enqueue(event):
+        if isinstance(event, TaskStatusUpdateEvent):
+            timed_out.set()
+        await enqueue(event)
+
+    monkeypatch.setattr(queue, "enqueue_event", observe_enqueue)
+
+    class Producer:
+        async def stream(self, module_id, inputs, context):
+            for value in range(20):
+                yield {"value": value}
+
+    agent = ApCoreAgentExecutor(
+        Producer(), PartConverter(SchemaConverter()), ErrorMapper(), execution_timeout=0.05, track_terminal_status=True
+    )
+    context = _make_context()
+    owner = ServerCallContext(user=IdentityUser(MagicMock(id="owner")))
+    other = ServerCallContext(user=IdentityUser(MagicMock(id="other")))
+    context.call_context = owner
+    running = asyncio.create_task(agent.execute(context, queue))
+    submitted = await _read_event(queue)
+    try:
+        await asyncio.wait_for(timed_out.wait(), 1)
+        assert queue.queue.full()
+        projected = agent.project_terminal_status(submitted, owner)
+        assert projected.status.state == TaskState.TASK_STATE_FAILED
+        assert submitted.status.state == TaskState.TASK_STATE_SUBMITTED
+        assert agent.project_terminal_status(submitted, other) is submitted
+        await _read_event(queue)
+        terminal = await _read_event(queue)
+        assert terminal.status.state == TaskState.TASK_STATE_FAILED
+        await asyncio.wait_for(running, 1)
+        persisted = Task(id=submitted.id, context_id=submitted.context_id, status=terminal.status)
+        agent.observe_task_saved(persisted, other)
+        assert agent.project_terminal_status(submitted, owner).status == persisted.status
+        agent.observe_task_saved(persisted, owner)
+        assert agent.project_terminal_status(submitted, owner) is submitted
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+        await queue.close(immediate=True)
+
+
+async def test_cancel_cannot_replace_completed_status_waiting_to_be_enqueued(monkeypatch):
+    completed = asyncio.Event()
+    queue = EventQueue(max_queue_size=1)
+    enqueue = queue.enqueue_event
+
+    async def observe_enqueue(event):
+        if isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_COMPLETED:
+            completed.set()
+        await enqueue(event)
+
+    monkeypatch.setattr(queue, "enqueue_event", observe_enqueue)
+
+    class Producer:
+        async def stream(self, module_id, inputs, context):
+            yield {"value": 1}
+
+    agent = ApCoreAgentExecutor(Producer(), PartConverter(SchemaConverter()), ErrorMapper())
+    context = _make_context()
+    running = asyncio.create_task(agent.execute(context, queue))
+    cancel = None
+    try:
+        await _read_event(queue)
+        await _read_event(queue)
+        await asyncio.wait_for(completed.wait(), 1)
+        cancel = asyncio.create_task(agent.cancel(context, queue))
+        await _read_event(queue)
+        await asyncio.wait_for(cancel, 1)
+        terminal = await _read_event(queue)
+        assert terminal.status.state == TaskState.TASK_STATE_COMPLETED
+        await asyncio.wait_for(running, 1)
+        assert queue.queue.empty()
+    finally:
+        running.cancel()
+        if cancel is not None:
+            cancel.cancel()
+        await asyncio.gather(running, *([cancel] if cancel is not None else []), return_exceptions=True)
+        await queue.close(immediate=True)
+
+
+async def test_stale_cancel_cannot_replace_a_terminal_status_already_saved():
+    context = _make_context()
+    load_task = AsyncMock(
+        return_value=Task(
+            id=context.task_id,
+            context_id=context.context_id,
+            status={"state": TaskState.TASK_STATE_COMPLETED},
+        )
+    )
+    agent = ApCoreAgentExecutor(
+        MagicMock(), PartConverter(SchemaConverter()), ErrorMapper(), load_task=load_task
+    )
+    queue = EventQueue(max_queue_size=1)
+    try:
+        await agent.cancel(context, queue)
+        load_task.assert_awaited_once_with(context.task_id, context.call_context)
+        assert queue.queue.empty()
+    finally:
+        await queue.close(immediate=True)
+
+
+async def test_cancel_event_survives_queue_shutdown_when_artifacts_block_the_queue(monkeypatch):
+    parked, cancel_offered, closing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    queue = EventQueue(max_queue_size=1)
+    enqueue = queue.enqueue_event
+
+    async def observe_enqueue(event):
+        if isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_CANCELED:
+            cancel_offered.set()
+        await enqueue(event)
+
+    monkeypatch.setattr(queue, "enqueue_event", observe_enqueue)
+
+    class Producer:
+        async def stream(self, module_id, inputs, context):
+            yield {"value": 1}
+            parked.set()
+            await asyncio.Future()
+
+    agent = ApCoreAgentExecutor(Producer(), PartConverter(SchemaConverter()), ErrorMapper())
+    context = _make_context()
+
+    async def run_until_closed():
+        await agent.execute(context, queue)
+        closing.set()
+        await queue.close()
+
+    running = asyncio.create_task(run_until_closed())
+    cancel = None
+    try:
+        await _read_event(queue)
+        await asyncio.wait_for(parked.wait(), 1)
+        assert queue.queue.full()
+        cancel = asyncio.create_task(agent.cancel(context, queue))
+        await asyncio.wait_for(cancel_offered.wait(), 1)
+        # The SDK must not begin shutting down the queue while cancel is
+        # blocked on offering the one terminal event.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(closing.wait(), 0.05)
+        assert isinstance(await _read_event(queue), TaskArtifactUpdateEvent)
+        await asyncio.wait_for(cancel, 1)
+        terminal = await _read_event(queue)
+        assert terminal.status.state == TaskState.TASK_STATE_CANCELED
+        await asyncio.wait_for(running, 1)
+    finally:
+        running.cancel()
+        if cancel is not None:
+            cancel.cancel()
+        await asyncio.gather(running, *([cancel] if cancel is not None else []), return_exceptions=True)
+        await queue.close(immediate=True)
 
 
 @pytest.fixture

@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import re
 import sys
 import time
 from collections.abc import Callable, Mapping
+from contextlib import aclosing
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import click
 import jsonschema
+from apcore import ModuleError
 
 from apcore_cli.acl_loader import cli_context as _cli_acl_context
 from apcore_cli.acl_loader import enforce_acl_for_unguarded_path as _enforce_acl_for_unguarded_path
@@ -47,7 +51,7 @@ from apcore_cli.ref_resolver import (
     UnresolvableRefError,
     resolve_refs,
 )
-from apcore_cli.schema_parser import reconvert_enum_values, schema_to_click_options
+from apcore_cli.schema_parser import extract_structured_flags, reconvert_enum_values, schema_to_click_options
 
 # Re-exported: get_audit_logger/set_audit_logger live in security.audit (not
 # defined here) so that acl_loader.py — which cli.py imports above — can also
@@ -542,6 +546,56 @@ def _check_sandbox_options(*, sandbox: bool, trace: bool, strategy: str | None, 
         raise InvalidCliInputError("--sandbox cannot be combined with --trace, --stream, or --strategy.")
 
 
+def _strict_stream_opener(
+    executor: Any,
+    *,
+    strict_stream: bool,
+    sandbox: bool,
+    trace: bool,
+    strategy: str | None,
+    dry_run: bool,
+) -> Callable[..., Any] | None:
+    if not strict_stream or dry_run:
+        return None
+    if sandbox or trace or strategy is not None:
+        raise InvalidCliInputError("--strict-stream cannot be combined with --sandbox, --trace, or --strategy.")
+    opener = (
+        getattr(executor, "stream_with_completion", None)
+        if inspect.getattr_static(executor, "stream_with_completion", None) is not None
+        else None
+    )
+    if not callable(opener):
+        raise InvalidCliInputError("--strict-stream requires an executor with stream completion support.")
+    return opener
+
+
+def _run_strict_stream(
+    opener: Callable[..., Any], module_id: str, inputs: dict[str, Any], *, print_result: bool
+) -> dict[str, Any]:
+    """Emit each JSONL chunk and return only after successful completion."""
+
+    async def run() -> dict[str, Any]:
+        async with aclosing(opener(module_id, inputs, _cli_acl_context())) as execution:
+            async for chunk in execution.chunks:
+                if print_result:
+                    click.echo(json.dumps(chunk, default=str))
+                    sys.stdout.flush()
+            completion = await execution.completion()
+        output = completion.output
+        if completion.reason != "completed" or not isinstance(output, dict):
+            raise ModuleError(completion.error_code or "MODULE_EXECUTE_ERROR", "Stream did not complete")
+        allowed_skips = {"not_configured", "no_match", "strategy_skipped"}
+        for outcome, code, message in (
+            (completion.output_validation, "SCHEMA_VALIDATION_ERROR", "Stream output validation failed"),
+            (completion.middleware_after, "MODULE_EXECUTE_ERROR", "Stream after-middleware failed"),
+        ):
+            if outcome.status != "passed" and not (outcome.status == "skipped" and outcome.reason in allowed_skips):
+                raise ModuleError(code, message)
+        return output
+
+    return asyncio.run(run())
+
+
 def build_module_command(
     module_def: ModuleDescriptor,
     executor: Executor,
@@ -659,6 +713,7 @@ def build_module_command(
         dry_run = kwargs.pop("dry_run", False)
         trace_flag = kwargs.pop("trace", False)
         stream_flag = kwargs.pop("stream", False)
+        strict_stream = kwargs.pop("strict_stream", False)
         strategy_name = kwargs.pop("strategy", None)
         approval_timeout = kwargs.pop("approval_timeout", None) or 60
         approval_token = kwargs.pop("approval_token", None)
@@ -667,11 +722,20 @@ def build_module_command(
         preflight_exit_code = None
         audit_start = time.monotonic()
         try:
+            strict_opener = _strict_stream_opener(
+                executor,
+                strict_stream=strict_stream,
+                sandbox=sandbox_flag,
+                trace=trace_flag,
+                strategy=strategy_name,
+                dry_run=dry_run,
+            )
             _check_sandbox_options(
                 sandbox=sandbox_flag, trace=trace_flag, strategy=strategy_name, stream=stream_flag, dry_run=dry_run
             )
-            # 1. Collect and merge input (STDIN + CLI flags)
-            merged = _read_module_input(stdin_input, kwargs, large_input)
+            # 1. Decode explicit structured flags, then merge with JSON input.
+            structured, structured_defaults = extract_structured_flags(kwargs, schema_options)
+            merged = {**structured_defaults, **_read_module_input(stdin_input, kwargs, large_input), **structured}
 
             # 2. Reconvert enum values to original types
             merged = reconvert_enum_values(merged, schema_options)
@@ -756,10 +820,18 @@ def build_module_command(
 
             # 5. Execute (optionally sandboxed)
 
+            if strict_opener is not None:
+                result = _run_strict_stream(strict_opener, module_id, merged, print_result=print_result)
+                if on_result is not None:
+                    on_result(result, module_id)
+                audit_logger = get_audit_logger()
+                if audit_logger is not None:
+                    duration_ms = int((time.monotonic() - audit_start) * 1000)
+                    audit_logger.log_execution(module_id, merged, "success", 0, duration_ms)
+                return
+
             # -- Streaming execution --
             if stream_flag:
-                import asyncio
-
                 # Streaming always outputs JSONL; --format table is ignored (spec §3.6.2)
                 if output_format == "table":
                     logger.warning("Streaming mode always outputs JSONL; --format table is ignored.")
@@ -940,7 +1012,7 @@ def build_module_command(
                 on_error=on_error,
                 exit_codes=exit_codes,
                 exit=exit,
-                error_stream=error_stream,
+                error_stream="stderr" if strict_stream else error_stream,
             )
         finally:
             if preflight_exit_code is not None:
@@ -1045,6 +1117,15 @@ def build_module_command(
     )
     cmd.params.append(
         click.Option(
+            ["--strict-stream"],
+            is_flag=True,
+            default=False,
+            help="Stream JSONL and require successful pipeline completion.",
+            hidden=_hide,
+        )
+    )
+    cmd.params.append(
+        click.Option(
             ["--strategy"],
             type=click.Choice(["standard", "internal", "testing", "performance", "minimal"]),
             default=None,
@@ -1082,6 +1163,7 @@ def build_module_command(
         "dry_run",
         "trace",
         "stream",
+        "strict_stream",
         "strategy",
         "approval_timeout",
         "approval_token",

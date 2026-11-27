@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.1-alpha.1] - Unreleased
+
+### Added
+
+- Add a standalone Prometheus listener with liveness and readiness endpoints and isolate it from Core metrics rendering.
+
 ## [0.15.0] - Unreleased
 
 ### Added

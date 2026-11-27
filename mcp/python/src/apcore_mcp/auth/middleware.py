@@ -14,6 +14,8 @@ from apcore_mcp.auth.protocol import Authenticator, call_authenticator
 logger = logging.getLogger(__name__)
 
 # Bridge between ASGI middleware and MCP handler
+_REQUEST_IDENTITY_KEY = "apcore_mcp.auth_identity"
+
 auth_identity_var: ContextVar[Identity | None] = ContextVar("auth_identity", default=None)
 
 
@@ -81,7 +83,7 @@ class AuthMiddleware:
                 )
             token = auth_identity_var.set(identity)
             try:
-                await self._app(scope, receive, send)
+                await self._app({**scope, _REQUEST_IDENTITY_KEY: identity}, receive, send)
             finally:
                 auth_identity_var.reset(token)
             return
@@ -96,7 +98,7 @@ class AuthMiddleware:
 
         token = auth_identity_var.set(identity)
         try:
-            await self._app(scope, receive, send)
+            await self._app({**scope, _REQUEST_IDENTITY_KEY: identity}, receive, send)
         finally:
             auth_identity_var.reset(token)
 

@@ -44,7 +44,8 @@ vi.mock("../src/server/factory.js", () => ({
 
 const getInstanceSpy = vi.fn().mockReturnValue({ get: vi.fn().mockReturnValue(null) });
 
-vi.mock("apcore-js", () => ({
+vi.mock("apcore-js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("apcore-js")>(),
   Config: {
     getInstance: (...args: unknown[]) => getInstanceSpy(...args),
   },

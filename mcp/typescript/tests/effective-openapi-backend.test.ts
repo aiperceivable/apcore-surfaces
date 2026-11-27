@@ -61,3 +61,50 @@ it("forwards inherited referenced values after filtering an unsupported operatio
     }));
   }
 });
+
+
+const registrationDocument = {
+  ...document,
+  paths: {
+    "/items": { get: { operationId: "list_items", summary: "List items", responses: response } },
+    "/updates": { post: { operationId: "update_item", summary: "Update item", responses: response } },
+  },
+};
+
+it("refuses startup when a host validator rejects a scanned module", async () => {
+  const registry = new Registry();
+  registry.setValidator({
+    validate: module =>
+      (module as { description: string }).description === "Update item" ? ["rejected by host rule"] : [],
+  });
+  await expect(openapiBackend(registrationDocument, {
+    registry,
+    baseUrl: "http://127.0.0.1:1",
+    acknowledgeUnapprovedWrites: true,
+  })).rejects.toThrow(/update_item.*rejected by host rule/s);
+});
+
+
+it("waits for asynchronous host validation before publishing the backend", async () => {
+  const registry = new Registry();
+  registry.setValidator({ validate: async () => [] });
+  await expect(openapiBackend(registrationDocument, {
+    registry,
+    baseUrl: "http://127.0.0.1:1",
+    acknowledgeUnapprovedWrites: true,
+  })).resolves.toBe(registry);
+  expect(registry.list()).toEqual(["list_items", "update_item"]);
+});
+
+it("refuses publication when asynchronous host validation rejects", async () => {
+  const registry = new Registry();
+  registry.setValidator({
+    validate: async module =>
+      (module as { description: string }).description === "Update item" ? ["rejected asynchronously"] : [],
+  });
+  await expect(openapiBackend(registrationDocument, {
+    registry,
+    baseUrl: "http://127.0.0.1:1",
+    acknowledgeUnapprovedWrites: true,
+  })).rejects.toThrow(/update_item.*rejected asynchronously/s);
+});

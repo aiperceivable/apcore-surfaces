@@ -5,17 +5,293 @@
 //! task execution against a real apcore `Registry` holding an echo module.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use apcore::context::Context;
 use apcore::errors::{ErrorCode, ModuleError};
-use apcore::module::Module;
+use apcore::module::{ChunkStream, Module};
 use apcore::registry::registry::Registry;
 use apcore_a2a::{build_app, APCoreA2AConfig, BackendSource};
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+struct StallingStream {
+    chunks: usize,
+    started: Arc<tokio::sync::Notify>,
+    closed: Arc<tokio::sync::Notify>,
+}
+
+struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[async_trait]
+impl Module for StallingStream {
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    fn output_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    fn description(&self) -> &str {
+        "Yields a chosen number of chunks and then stalls"
+    }
+
+    async fn execute(&self, _: Value, _: &Context<Value>) -> Result<Value, ModuleError> {
+        panic!("the native streaming module must not run execute")
+    }
+
+    fn stream(&self, _: Value, _: &Context<Value>) -> Option<ChunkStream> {
+        let chunks = self.chunks;
+        let started = self.started.clone();
+        let closed = self.closed.clone();
+        Some(Box::pin(async_stream::stream! {
+            let _closed = NotifyOnDrop(closed);
+            started.notify_one();
+            for index in 0..chunks {
+                yield Ok(json!({ "chunk": index }));
+            }
+            std::future::pending::<()>().await;
+        }))
+    }
+}
+
+async fn stalling_server(
+    chunks: usize,
+    timeout_secs: u64,
+) -> (
+    axum::Router,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let registry = Registry::new();
+    registry
+        .register_module(
+            "test.stall",
+            Box::new(StallingStream {
+                chunks,
+                started: started.clone(),
+                closed: closed.clone(),
+            }),
+        )
+        .expect("register stalling stream");
+    let config = APCoreA2AConfig {
+        execution_timeout: timeout_secs,
+        ..Default::default()
+    };
+    let (router, _) = build_app(BackendSource::Registry(Arc::new(registry)), config)
+        .await
+        .unwrap();
+    (router, started, closed)
+}
+
+async fn open_stalling_stream(router: axum::Router) -> (String, axum::body::BodyDataStream) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "message/stream",
+                "params": {
+                    "message": {"messageId": "stall", "role": "ROLE_USER", "parts": [{"data": {}}]},
+                    "metadata": {"skillId": "test.stall"}
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let event = sse_frame(&first);
+    let id = event["statusUpdate"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (id, stream)
+}
+
+fn sse_frame(bytes: &[u8]) -> Value {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data:"))
+        .unwrap();
+    serde_json::from_str::<Value>(line.trim()).unwrap()["result"].clone()
+}
+
+async fn remaining_stream_events(mut stream: axum::body::BodyDataStream) -> Vec<Value> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut events = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            events.push(sse_frame(&bytes.unwrap()));
+        }
+        events
+    })
+    .await
+    .expect("stream must terminate")
+}
+
+#[tokio::test]
+async fn stalled_stream_timeout_persists_despite_sse_backpressure() {
+    let (router, started, closed) = stalling_server(1000, 1).await;
+    let (id, stream) = open_stalling_stream(router.clone()).await;
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+
+    // Leave the response body unread. The module will fill both bounded queues.
+    // tasks/get must observe FAILED by the deadline even though SSE cannot drain.
+    let task = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, task) = post_rpc(
+                router.clone(),
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": id}
+                }),
+            )
+            .await;
+            if task["result"]["status"]["state"] == "TASK_STATE_FAILED" {
+                break task;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timeout state must be visible without draining the SSE body");
+    assert_eq!(
+        task["result"]["status"]["message"]["parts"][0]["text"],
+        "Execution timed out"
+    );
+    tokio::time::timeout(Duration::from_secs(2), closed.notified())
+        .await
+        .unwrap();
+    let events = remaining_stream_events(stream).await;
+    let terminal: Vec<_> = events
+        .iter()
+        .filter_map(|event| event["statusUpdate"]["status"]["state"].as_str())
+        .filter(|state| *state != "TASK_STATE_WORKING")
+        .collect();
+    assert_eq!(terminal, ["TASK_STATE_FAILED"]);
+    assert_eq!(
+        events.last().unwrap()["statusUpdate"]["status"]["state"],
+        "TASK_STATE_FAILED"
+    );
+    assert!(events
+        .iter()
+        .all(|event| event["artifactUpdate"]["lastChunk"] != true));
+}
+
+#[tokio::test]
+async fn disconnected_stalled_stream_drops_the_producer_before_deadline() {
+    let (router, started, closed) = stalling_server(0, 30).await;
+    let (id, stream) = open_stalling_stream(router.clone()).await;
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), closed.notified())
+        .await
+        .expect("disconnect must drop the producer promptly");
+
+    let (_, task) = post_rpc(
+        router,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": id}
+        }),
+    )
+    .await;
+    assert_eq!(task["result"]["status"]["state"], "TASK_STATE_CANCELED");
+}
+
+#[tokio::test]
+async fn stalled_stream_timeout_terminates_before_or_after_first_artifact() {
+    for chunk_count in [0, 1] {
+        let (router, _, closed) = stalling_server(chunk_count, 1).await;
+        let (id, stream) = open_stalling_stream(router.clone()).await;
+        let events = remaining_stream_events(stream).await;
+        tokio::time::timeout(Duration::from_secs(2), closed.notified())
+            .await
+            .expect("timed out producer must be dropped");
+        let artifacts: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.get("artifactUpdate"))
+            .collect();
+        assert_eq!(artifacts.len(), chunk_count);
+        assert!(artifacts.iter().all(|event| event["lastChunk"] == false));
+        assert_eq!(
+            events.last().unwrap()["statusUpdate"]["status"]["state"],
+            "TASK_STATE_FAILED"
+        );
+        let (_, task) = post_rpc(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": id}
+            }),
+        )
+        .await;
+        assert_eq!(task["result"]["status"]["state"], "TASK_STATE_FAILED");
+    }
+}
+
+#[tokio::test]
+async fn client_cancel_persists_one_terminal_before_a_stalled_stream_deadline() {
+    let (router, started, closed) = stalling_server(0, 30).await;
+    let (id, stream) = open_stalling_stream(router.clone()).await;
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let (_, canceled) = post_rpc(
+        router.clone(),
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tasks/cancel", "params": {"id": id}
+        }),
+    )
+    .await;
+    assert_eq!(canceled["result"]["status"]["state"], "TASK_STATE_CANCELED");
+    tokio::time::timeout(Duration::from_secs(2), closed.notified())
+        .await
+        .unwrap();
+
+    let events = remaining_stream_events(stream).await;
+    let statuses: Vec<_> = events
+        .iter()
+        .filter_map(|event| event["statusUpdate"]["status"]["state"].as_str())
+        .collect();
+    assert_eq!(statuses, ["TASK_STATE_WORKING", "TASK_STATE_CANCELED"]);
+    assert_eq!(
+        events.last().unwrap()["statusUpdate"]["status"],
+        canceled["result"]["status"]
+    );
+    assert!(events
+        .iter()
+        .all(|event| event.get("artifactUpdate").is_none()));
+    let (_, task) = post_rpc(
+        router,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tasks/get", "params": {"id": id}
+        }),
+    )
+    .await;
+    assert_eq!(task["result"]["status"], canceled["result"]["status"]);
+}
 
 /// Minimal echo module: returns its inputs unchanged.
 struct EchoModule;

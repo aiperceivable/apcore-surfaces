@@ -70,3 +70,21 @@ def test_openapi_requires_toolkit_with_the_shared_preflight(monkeypatch: pytest.
     monkeypatch.delattr(apcore_toolkit, "validate_effective_proxy_modules")
     with pytest.raises(RuntimeError, match=r"apcore-toolkit >= 0\.15\.0.*apcore-mcp\[openapi\]"):
         openapi_backend(_DOCUMENT)
+
+
+def test_backend_refuses_to_start_when_registry_rejects_a_scanned_module() -> None:
+    class RejectUpdate:
+        def validate(self, module: object) -> list[str]:
+            return ["rejected by host rule"] if getattr(module, "description", None) == "Update item" else []
+
+    registry = Registry()
+    registry.set_validator(RejectUpdate())
+    document = {
+        **_DOCUMENT,
+        "paths": {
+            "/items": {"get": {"operationId": "listItems", "summary": "List items"}},
+            "/updates": {"post": {"operationId": "updateItem", "summary": "Update item"}},
+        },
+    }
+    with pytest.raises(ValueError, match=r"update_item.*rejected by host rule"):
+        openapi_backend(document, registry=registry, acknowledge_unapproved_writes=True)

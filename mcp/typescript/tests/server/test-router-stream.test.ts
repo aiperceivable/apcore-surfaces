@@ -353,7 +353,8 @@ describe("ExecutionRouter — streaming", () => {
     const chunk2 = buildDeep(33, { deep: "v2" });
 
     const executor = createStreamingExecutor([chunk1, chunk2]);
-    const router = new ExecutionRouter(executor);
+    // Isolate the legacy merge boundary from the independent redaction depth.
+    const router = new ExecutionRouter(executor, { redactOutput: false });
     const extra = createExtra("tok-depth");
 
     const [content, isError] = await router.handleCall("test.depth", {}, extra);

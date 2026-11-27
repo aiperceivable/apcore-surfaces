@@ -37,7 +37,8 @@ class WriteResult:
     Attributes:
         module_id: The module that was written.
         path: Output file path (None for RegistryWriter).
-        verified: Whether verification passed (always True if verify=False).
+        verified: False on a write or verification failure. True for a successful
+            write, including when verification is disabled, or for a dry-run result.
         verification_error: Error message if verification failed.
     """
 

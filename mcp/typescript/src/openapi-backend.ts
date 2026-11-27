@@ -18,6 +18,7 @@ import {
   HTTPProxyRegistryWriter,
   OpenAPIScanner,
   loadSpec,
+  readProxyRoute,
   validateEffectiveProxyModules,
   type ScannedModule,
 } from "apcore-toolkit";
@@ -275,9 +276,33 @@ export async function openapiBackend(
     baseUrl,
     authHeaderFactory: options.authHeaderFactory,
   });
-  for (const result of await writer.write(modules, target)) {
-    const err = (result as { verificationError?: string }).verificationError;
-    if (err) log.error(`OpenAPI module ${result.moduleId} failed to register: ${err}`);
+  // Keep the Toolkit writer's synchronous WriteResult contract while waiting
+  // for APCore's async host validators before publishing the backend.
+  const pending: Promise<void>[] = [];
+  const asyncFailures = new Map<string, string>();
+  const proxyModules = modules.map((module) => {
+    if (/\P{White_Space}/u.test(module.description)) return module;
+    const { httpMethod = "GET", urlPath = "/" } = readProxyRoute(module);
+    const route = `${httpMethod.toUpperCase()} ${urlPath}`.replace(/\p{White_Space}+/gu, " ").trimEnd();
+    return { ...module, description: Array.from(route).slice(0, 200).join("") };
+  });
+  const writes = await writer.write(proxyModules, {
+    register(moduleId, module) {
+      pending.push(Promise.resolve(target.register(moduleId, module)).catch((error: unknown) => {
+        asyncFailures.set(moduleId, error instanceof Error ? error.message : String(error));
+      }));
+    },
+  });
+  await Promise.all(pending);
+  const results = new Map(writes.map(result => [result.moduleId, result]));
+  const failures = modules.flatMap(({ moduleId }) => {
+    const result = results.get(moduleId);
+    const error = asyncFailures.get(moduleId);
+    if (result?.verified && error === undefined && target.get(moduleId) != null) return [];
+    return [`${moduleId}: ${result?.verificationError ?? error ?? "module not registered"}`];
+  });
+  if (failures.length > 0) {
+    throw new Error(`OpenAPI registration incomplete: ${failures.join("; ")}`);
   }
 
   if (!options.acknowledgeUnapprovedWrites) {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Context, ErrorCodes, ModuleError } from "apcore-js";
 import { Part, TaskState } from "@a2a-js/sdk";
-import type { ExecutionEventBus, AgentExecutionEvent } from "@a2a-js/sdk/server";
+import type { ExecutionEventBus, AgentExecutionEvent, RequestContext } from "@a2a-js/sdk/server";
 import { ApCoreAgentExecutor } from "../../src/server/executor.js";
 import { PartConverter } from "../../src/adapters/parts.js";
 
@@ -58,6 +58,12 @@ function makeExecutor(result: Record<string, unknown> = { result: "ok" }) {
   return {
     callAsync: vi.fn().mockResolvedValue(result),
   };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 describe("ApCoreAgentExecutor", () => {
@@ -159,6 +165,87 @@ describe("ApCoreAgentExecutor", () => {
       expect(event.status.state).toBe(TaskState.TASK_STATE_FAILED);
       expect(statusText(event)).toContain("timed out");
     });
+
+    it.each([false, true])("finishes a stalled stream before iterator cleanup (partial=%s)", async (partial) => {
+      const producer = deferred();
+      const closing = deferred();
+      const stalled = deferred();
+      const cleanupWarning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let cancellationSeen: boolean | undefined;
+      const executor = {
+        callAsync: vi.fn(),
+        async *stream(_moduleId: string, _inputs: Record<string, unknown>, context: Context) {
+          try {
+            if (partial) yield { value: "partial" };
+            stalled.resolve();
+            await producer.promise;
+            cancellationSeen = context.cancelToken?.isCancelled;
+            yield { value: "late" };
+          } finally {
+            closing.resolve();
+            throw new Error("generator cleanup failed");
+          }
+        },
+      };
+      const agent = new ApCoreAgentExecutor({ executor, partConverter, executionTimeout: 0.03 });
+      const bus = makeEventBus();
+      const execution = agent.execute(makeContext({ skillId: "test" }) as unknown as RequestContext, bus);
+      try {
+        await stalled.promise;
+        await vi.waitFor(() => {
+          expect((bus.events.at(-1) as AgentExecutionEvent).kind).toBe("statusUpdate");
+        }, { timeout: 500 });
+        await execution;
+        producer.resolve();
+        await closing.promise;
+        const updates = (bus.events as AgentExecutionEvent[]).filter((event) => event.kind === "statusUpdate");
+        expect(updates.map((event) => event.data.status.state)).toEqual([TaskState.TASK_STATE_FAILED]);
+        expect(statusText(updates[0].data)).toBe("Execution timed out");
+        const artifacts = (bus.events as AgentExecutionEvent[]).filter((event) => event.kind === "artifactUpdate");
+        expect(artifacts.map((event) => event.data.lastChunk)).toEqual(partial ? [false] : []);
+        expect(cancellationSeen).toBe(true);
+        await vi.waitFor(() => expect(cleanupWarning).toHaveBeenCalledWith(
+          expect.stringContaining("Stream cleanup failed"),
+          expect.objectContaining({ message: "generator cleanup failed" }),
+        ));
+      } finally {
+        producer.resolve();
+        await execution;
+        cleanupWarning.mockRestore();
+      }
+    });
+
+    it("publishes only CANCELED when the client cancels a stalled stream", async () => {
+      const stalled = deferred();
+      const resume = deferred();
+      const closed = deferred();
+      const executor = {
+        callAsync: vi.fn(),
+        async *stream() {
+          try {
+            stalled.resolve();
+            await resume.promise;
+            yield { value: "late" };
+          } finally {
+            closed.resolve();
+          }
+        },
+      };
+      const agent = new ApCoreAgentExecutor({ executor, partConverter, executionTimeout: 4 });
+      const bus = makeEventBus();
+      const task = agent.execute(makeContext({ skillId: "test" }) as unknown as RequestContext, bus);
+      try {
+        await stalled.promise;
+        await agent.cancelTask("task-1", bus);
+        await task;
+      } finally {
+        resume.resolve();
+        await closed.promise;
+      }
+      const updates = (bus.events as AgentExecutionEvent[]).filter((event) => event.kind === "statusUpdate");
+      expect(updates.map((event) => event.data.status.state)).toEqual([TaskState.TASK_STATE_CANCELED]);
+      expect(bus.events).toHaveLength(2);
+    }, 2_000);
 
     it("passes globalDeadline to Context.create as epoch seconds, not ms-since-epoch via data", async () => {
       // apcore-js >= 0.31.0 (spec D-99/D-100/D-101): `BuiltinContextCreation`

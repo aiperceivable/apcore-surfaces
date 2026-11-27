@@ -7,15 +7,26 @@ import logging
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from a2a.server.context import ServerCallContext
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes, create_rest_routes
 from a2a.server.tasks.inmemory_push_notification_config_store import (
     InMemoryPushNotificationConfigStore,
 )
 from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore as A2ATaskStore
-from a2a.types import AgentCapabilities, AgentCard
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    CancelTaskRequest,
+    GetTaskRequest,
+    ListTasksRequest,
+    ListTasksResponse,
+    Task,
+    TaskState,
+)
+from a2a.utils.errors import TaskNotCancelableError
 from apcore.error_formatter import ErrorFormatterRegistry
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -41,7 +52,73 @@ from apcore_a2a.server.context import (
 )
 from apcore_a2a.server.executor import ApCoreAgentExecutor
 
+if TYPE_CHECKING:
+    from a2a.server.cluster.task_store import StoredTask
+    from a2a.server.cluster.version import TaskVersion
+    from a2a.server.events import Event
+
+try:
+    from a2a.server.cluster.task_store import VersionedTaskStore as _SDKVersionedTaskStore
+except ImportError:
+
+    class _SDKVersionedTaskStore:
+        """Placeholder for SDK releases without versioned stores."""
+
+
 logger = logging.getLogger(__name__)
+
+
+class _ObservedTaskStore:
+    """Observe durable acknowledgments while preserving the supplied store's context."""
+
+    def __init__(self, store: Any, executor: ApCoreAgentExecutor) -> None:
+        self._store = store
+        self._executor = executor
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    async def save(self, task: Task, context: ServerCallContext) -> None:
+        await self._store.save(task, context)
+        self._executor.observe_task_saved(task, context)
+
+
+class _ObservedVersionedTaskStore(_ObservedTaskStore, _SDKVersionedTaskStore):
+    async def save(
+        self,
+        task: Task,
+        *,
+        event: Event | None,
+        prev: Task | None,
+        prev_version: TaskVersion,
+        context: ServerCallContext,
+    ) -> TaskVersion:
+        version = await self._store.save(task, event=event, prev=prev, prev_version=prev_version, context=context)
+        self._executor.observe_task_saved(task, context)
+        return version
+
+    async def get(self, task_id: str, context: ServerCallContext) -> StoredTask | None:
+        return await self._store.get(task_id, context)
+
+    async def list(self, params: ListTasksRequest, context: ServerCallContext) -> ListTasksResponse:
+        return await self._store.list(params, context)
+
+    async def delete(self, task_id: str, context: ServerCallContext) -> None:
+        await self._store.delete(task_id, context)
+
+
+class _TerminalAwareRequestHandler(DefaultRequestHandler):
+    async def on_get_task(self, params: GetTaskRequest, context: ServerCallContext) -> Task | None:
+        task = await super().on_get_task(params, context)
+        if task is not None:
+            task = self.agent_executor.project_terminal_status(task, context)
+        return task
+
+    async def on_cancel_task(self, params: CancelTaskRequest, context: ServerCallContext) -> Task | None:
+        task = await super().on_cancel_task(params, context)
+        if task is not None and task.status.state != TaskState.TASK_STATE_CANCELED:
+            raise TaskNotCancelableError(message="Task already has a terminal outcome")
+        return task
 
 
 @dataclass
@@ -255,6 +332,14 @@ class A2AServerFactory:
         ``OwnerResolver``; a third-party store must do the same. Upstream states
         the requirement as a SHOULD on the ``TaskStore`` contract, so it cannot
         be enforced here.
+
+        While the SDK drains a backpressured event queue, authenticated
+        ``GetTask`` requests can see a pending unsuccessful outcome in this
+        server process. Successful completion becomes visible once the store
+        persists it, and ``ListTasks`` reflects persisted results. The SDK
+        continues draining after a stream disconnect. A store write failure
+        remains an SDK persistence error. Until the store acknowledges the
+        terminal write, the pending outcome exists only in this process.
         """
         # C3: cancel_on_disconnect is not used by DefaultRequestHandler; warn when False
         if not cancel_on_disconnect:
@@ -372,6 +457,13 @@ class A2AServerFactory:
 
         # Build ApCoreAgentExecutor — C1: wire state-transition callback when metrics enabled
         on_state_change_cb = metrics_state.on_state_transition if metrics else None
+        sdk_task_store = task_store if task_store is not None else A2ATaskStore()
+        self._task_store = sdk_task_store
+
+        async def load_task(task_id: str, context: ServerCallContext) -> Task | None:
+            stored = await sdk_task_store.get(task_id, context)
+            return stored.task if stored is not None and isinstance(sdk_task_store, _SDKVersionedTaskStore) else stored
+
         apcore_executor = ApCoreAgentExecutor(
             executor,
             self._part_converter,
@@ -379,6 +471,8 @@ class A2AServerFactory:
             registry,
             execution_timeout,
             on_state_change=on_state_change_cb,
+            track_terminal_status=True,
+            load_task=load_task,
         )
 
         # P1-A: wire apcore observability middleware into the executor.
@@ -396,10 +490,6 @@ class A2AServerFactory:
                     executor.use(ErrorHistoryMiddleware())
             except Exception:
                 logger.debug("Could not add observability middleware", exc_info=True)
-
-        # Build task store
-        sdk_task_store = task_store if task_store is not None else A2ATaskStore()
-        self._task_store = sdk_task_store
 
         # Build push config store
         push_config_store = InMemoryPushNotificationConfigStore() if push_notifications else None
@@ -423,9 +513,13 @@ class A2AServerFactory:
                 return build_extended_card(card, executor, _identity_of(context))
 
         # Build DefaultRequestHandler (a2a-sdk 1.0: agent_card is required 3rd arg)
-        handler = DefaultRequestHandler(
+        handler = _TerminalAwareRequestHandler(
             agent_executor=apcore_executor,
-            task_store=sdk_task_store,
+            task_store=(
+                _ObservedVersionedTaskStore(sdk_task_store, apcore_executor)
+                if isinstance(sdk_task_store, _SDKVersionedTaskStore)
+                else _ObservedTaskStore(sdk_task_store, apcore_executor)
+            ),
             agent_card=agent_card,
             push_config_store=push_config_store,
             extended_agent_card=extended_card,

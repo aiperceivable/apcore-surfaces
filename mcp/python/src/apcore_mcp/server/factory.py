@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -10,7 +11,9 @@ from decimal import Decimal, DecimalException
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
+import anyio
 import jsonschema  # type: ignore[import-untyped]  # MCP supplies jsonschema without its optional typing stubs.
+from apcore import CancelToken, Identity
 from apcore.schema.exporter import SchemaExporter
 from apcore.schema.types import SchemaDefinition
 from mcp import types as mcp_types
@@ -24,7 +27,7 @@ from referencing.jsonschema import DRAFT7, DRAFT201909, DRAFT202012
 
 import apcore_mcp.markdown as _markdown
 from apcore_mcp.adapters.annotations import AnnotationMapper
-from apcore_mcp.auth.middleware import auth_identity_var
+from apcore_mcp.auth.middleware import _REQUEST_IDENTITY_KEY, auth_identity_var
 from apcore_mcp.server.approval_bridge import ApprovalBridge
 from apcore_mcp.server.async_task_bridge import RESERVED_PREFIX, AsyncTaskBridge
 from apcore_mcp.server.transport import _protocol_source_var, transport_session_var
@@ -111,6 +114,17 @@ _MANAGEMENT_SURFACE_ORDER = ("health", "usage", "manifest", "control")
 # a different number), so it must be updated here by hand when the spec the
 # management-extension contract (§6.6.5) lives in bumps.
 _PROTOCOL_SPEC_VERSION = "1.30.0"
+
+
+def _request_identity() -> Identity | None:
+    from mcp.server.lowlevel.server import request_ctx
+
+    ctx = request_ctx.get(None)
+    scope = getattr(ctx.request, "scope", None) if ctx is not None else None
+    if isinstance(scope, dict) and _REQUEST_IDENTITY_KEY in scope:
+        identity = scope[_REQUEST_IDENTITY_KEY]
+        return identity if isinstance(identity, Identity) else None
+    return auth_identity_var.get()
 
 
 def _supports_structured_output() -> bool:
@@ -545,7 +559,7 @@ class MCPServerFactory:
                     extra["_meta"] = meta_dump
 
             # Bridge authenticated identity from ASGI middleware
-            identity = auth_identity_var.get()
+            identity = _request_identity()
             if identity is not None:
                 extra["identity"] = identity
 
@@ -615,7 +629,21 @@ class MCPServerFactory:
                     content = [{"type": "text", "text": info["message"]}]
                     is_error = True
             else:
-                content, is_error, _trace_id = await router.handle_call(name, arguments or {}, extra=extra)
+                # The SDK cancels the request coroutine for its own session and
+                # JSON-RPC request ID. Signal the linked APCore invocation
+                # before letting that cancellation interrupt its cleanup.
+                token = CancelToken()
+                extra["_transport_cancel_token"] = token
+                extra["call_id"] = f"mcp:{id(ctx.session)}:{ctx.request_id!r}"
+                call = asyncio.create_task(router.handle_call(name, arguments or {}, extra=extra))
+                try:
+                    content, is_error, _trace_id = await asyncio.shield(call)
+                except asyncio.CancelledError:
+                    token.cancel()
+                    call.cancel()
+                    with anyio.CancelScope(shield=True):
+                        await asyncio.gather(call, return_exceptions=True)
+                    raise
 
             # A direct CallToolResult preserves error status and text metadata.
             text_contents: list[mcp_types.TextContent] = []
@@ -784,7 +812,7 @@ class MCPServerFactory:
             raise ValueError(f"Resource not found: {uri_str}")
 
         extra: dict[str, Any] = {}
-        identity = auth_identity_var.get()
+        identity = _request_identity()
         if identity is not None:
             extra["identity"] = identity
 

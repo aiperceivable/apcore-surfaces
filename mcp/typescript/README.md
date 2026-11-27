@@ -646,6 +646,17 @@ await reportProgress(context, 5, 10, "Processing item 5 of 10");
 - `total` — Optional total for percentage calculation
 - `message` — Optional human-readable progress message
 
+When the executor supports streaming completion, a streaming tool uses a
+single invocation and returns the executor's final output snapshot. A progress
+token enables provisional chunk notifications. Sensitive output fields are
+redacted in both notifications and the terminal result. Output-validation and
+after-middleware failures make the tool call fail even after provisional
+progress has been sent.
+
+An installed Core executor without streaming completion support uses one
+ordinary invocation. Custom executors with only the legacy streaming interface
+can still emit progress with a progress token.
+
 ### `elicit(context, message, requestedSchema?)`
 
 Ask the MCP client for user input via the elicitation protocol. Returns `null` when called outside an MCP context.

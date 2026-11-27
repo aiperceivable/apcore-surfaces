@@ -241,7 +241,7 @@ impl A2AServerFactory {
             agent_card: public_card_value,
             extended_card,
             explorer_card,
-            cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
+            running_tasks: Arc::new(Mutex::new(HashMap::new())),
             push_config_store,
             http: reqwest::Client::new(),
         };

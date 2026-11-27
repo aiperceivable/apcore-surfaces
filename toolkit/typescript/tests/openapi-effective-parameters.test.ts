@@ -115,7 +115,9 @@ describe('effective OpenAPI parameters', () => {
 
     const registry = new Registry();
     const writer = new HTTPProxyRegistryWriter({ baseUrl: 'https://example.invalid' });
-    expect(writer.write([module], registry)[0].verified).toBe(true);
+    const [registration] = writer.write([module], registry);
+    expect(registration.verified, registration.verificationError ?? undefined).toBe(true);
+    expect(registry.get(module.moduleId)?.description).toBe('GET /boolean');
     const inputSchema = registry.get(module.moduleId)?.inputSchema;
     expect(inputSchema).toBeDefined();
     if (inputSchema === undefined) throw new Error('Expected the HTTP proxy input schema');

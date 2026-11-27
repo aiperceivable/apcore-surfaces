@@ -6,6 +6,7 @@ from apcore_a2a._serve import async_serve, serve
 from apcore_a2a.adapters import AgentCardBuilder, ErrorMapper, PartConverter, SchemaConverter, SkillMapper
 from apcore_a2a.auth import Authenticator, AuthMiddleware, ClaimMapping, JWTAuthenticator, auth_identity_var
 from apcore_a2a.client import A2AClient
+from apcore_a2a.event_subscriber import A2AEventSubscriber, register_a2a_subscriber
 from apcore_a2a.openapi_backend import openapi_backend
 from apcore_a2a.server import A2AServerFactory, ApCoreAgentExecutor
 
@@ -18,6 +19,8 @@ __all__ = [
     "serve",
     "async_serve",
     "A2AClient",
+    "A2AEventSubscriber",
+    "register_a2a_subscriber",
     "__version__",
     # Auth
     "Authenticator",

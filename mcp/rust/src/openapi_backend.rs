@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use apcore::Registry;
 use apcore_toolkit::openapi_scanner::{OpenAPIScanner, ScanOptions};
-use apcore_toolkit::output::http_proxy_writer::HTTPProxyRegistryWriter;
+use apcore_toolkit::output::http_proxy_writer::{
+    http_proxy_route_metadata, HTTPProxyRegistryWriter,
+};
 use apcore_toolkit::types::ScannedModule;
 use apcore_toolkit::validate_effective_proxy_modules;
 use serde_json::Value;
@@ -497,13 +499,47 @@ pub async fn openapi_backend(
         HTTPProxyRegistryWriter::new(base_url, options.auth_header_factory, PROXY_TIMEOUT_SECS)
             .map_err(|e| APCoreMCPError::Config(format!("mcp.openapi: {e}")))?;
 
-    for result in writer.write(&modules, &registry) {
-        if let Some(err) = result.verification_error {
-            tracing::error!(
-                "OpenAPI module {} failed to register: {err}",
-                result.module_id
+    for module in &mut modules {
+        if module.description.trim().is_empty() {
+            let (method, path) = http_proxy_route_metadata(module);
+            let route = format!(
+                "{} {}",
+                method.unwrap_or("GET").to_ascii_uppercase(),
+                path.unwrap_or("/")
             );
+            module.description = route
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(200)
+                .collect();
         }
+    }
+    let results: HashMap<_, _> = writer
+        .write(&modules, &registry)
+        .into_iter()
+        .map(|result| (result.module_id.clone(), result))
+        .collect();
+    let mut failures = Vec::new();
+    for module in &modules {
+        let id = &module.module_id;
+        let result = results.get(id);
+        if result.is_some_and(|result| result.verified)
+            && registry.get(id).is_ok_and(|module| module.is_some())
+        {
+            continue;
+        }
+        let detail = result
+            .and_then(|result| result.verification_error.as_deref())
+            .unwrap_or("module not registered");
+        failures.push(format!("{id}: {detail}"));
+    }
+    if !failures.is_empty() {
+        return Err(APCoreMCPError::Config(format!(
+            "OpenAPI registration incomplete: {}",
+            failures.join("; ")
+        )));
     }
 
     if !options.acknowledge_unapproved_writes {

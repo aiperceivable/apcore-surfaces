@@ -33,13 +33,16 @@ export function resolveModuleError(
   error: unknown,
   moduleId: string,
   exitCodes: ModuleResultOptions["exitCodes"],
+  requireNonZero = false,
 ): ModuleErrorContext {
   const value = error as { code?: unknown } | null;
   const code = typeof value?.code === "string" ? value.code : null;
   const mapped = code !== null && exitCodes && Object.hasOwn(exitCodes, code)
     ? exitCodes[code]
     : undefined;
-  return { error, code, moduleId, exitCode: mapped ?? exitCodeForError(error) };
+  const usableOverride = mapped !== undefined &&
+    (!requireNonZero || (Number.isInteger(mapped) && mapped > 0 && mapped <= 255));
+  return { error, code, moduleId, exitCode: usableOverride ? mapped : exitCodeForError(error) };
 }
 
 export async function reportModuleError(

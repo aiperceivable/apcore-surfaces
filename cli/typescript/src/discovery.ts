@@ -33,6 +33,7 @@ import {
 } from "./acl-loader.js";
 import { getAuditLogger } from "./security/audit.js";
 import { sortModulesByUsage } from "./system-usage.js";
+import { executeStrictStream, validateStrictStreamOptions } from "./strict-stream.js";
 
 const TAG_PATTERN = /^[a-z][a-z0-9_-]*$/;
 
@@ -283,6 +284,7 @@ export function registerExecCommand(
     .option("--trace", "Enable pipeline trace output.", false)
     .option("--dry-run", "Validate inputs without executing the module.", false)
     .option("--stream", "Stream output as JSONL instead of buffering.", false)
+    .option("--strict-stream", "Stream JSONL and require a successful completion receipt.", false)
     .action(async (
       moduleId: string,
       opts: {
@@ -296,12 +298,16 @@ export function registerExecCommand(
         trace: boolean;
         dryRun: boolean;
         stream: boolean;
+        strictStream: boolean;
       },
     ) => {
       let merged: Record<string, unknown> = {};
       const startTime = performance.now();
       try {
-        if (!opts.dryRun) validateSandboxOptions(opts.sandbox, opts.trace, opts.stream, opts.strategy);
+        if (!opts.dryRun) {
+          validateSandboxOptions(opts.sandbox, opts.trace, opts.stream, opts.strategy);
+          if (opts.strictStream) validateStrictStreamOptions(executor, opts.sandbox, opts.trace, opts.strategy);
+        }
         assertValidModuleId(moduleId);
 
         const moduleDef = registry.getDefinition(moduleId);
@@ -352,6 +358,11 @@ export function registerExecCommand(
           return;
         }
 
+        if (opts.strictStream) {
+          await executeStrictStream(executor, moduleId, merged, startTime);
+          return;
+        }
+
         let result: unknown;
         // D11-011: --trace alone (no --strategy) must also route through
         // callWithTrace, matching Python discovery.py:382. Previously the
@@ -380,7 +391,7 @@ export function registerExecCommand(
           auditLogger.logExecution(moduleId, merged, "success", 0, durationMs);
         }
       } catch (err: unknown) {
-        const failure = resolveModuleError(err, moduleId, resultOptions.exitCodes);
+        const failure = resolveModuleError(err, moduleId, resultOptions.exitCodes, opts.strictStream);
         const durationMs = Math.round(performance.now() - startTime);
         try {
           const auditLogger = getAuditLogger();
@@ -390,7 +401,7 @@ export function registerExecCommand(
         } catch {
           // Ignore audit failures during error handling
         }
-        await reportModuleError(failure, resultOptions, opts.format);
+        await reportModuleError(failure, opts.strictStream ? { ...resultOptions, errorStream: "stderr" } : resultOptions, opts.format);
       }
     });
   apcliGroup.addCommand(execCmd);

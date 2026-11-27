@@ -382,6 +382,196 @@ fn status_registry(streaming: bool) -> apcore::Registry {
     registry
 }
 
+struct StrictStreamModule {
+    mode: String,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl apcore::Module for StrictStreamModule {
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn output_schema(&self) -> Value {
+        json!({"type": "object", "required": ["value"], "properties": {"value": {"type": "integer"}}})
+    }
+
+    fn description(&self) -> &'static str {
+        "Provide chunks for strict completion"
+    }
+
+    fn annotations(&self) -> apcore::ModuleAnnotations {
+        apcore::ModuleAnnotations {
+            streaming: self.mode != "fallback",
+            ..Default::default()
+        }
+    }
+
+    async fn execute(
+        &self,
+        _inputs: Value,
+        _ctx: &apcore::Context<Value>,
+    ) -> Result<Value, apcore::ModuleError> {
+        assert_eq!(self.mode, "fallback");
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({"value": 9}))
+    }
+
+    fn as_streaming(&self) -> Option<&dyn apcore::StreamingModule> {
+        (self.mode != "fallback").then_some(self)
+    }
+
+    fn stream(&self, inputs: Value, ctx: &apcore::Context<Value>) -> Option<apcore::ChunkStream> {
+        self.as_streaming()
+            .map(|module| module.stream_typed(inputs, ctx))
+    }
+}
+
+impl apcore::StreamingModule for StrictStreamModule {
+    fn stream_typed(&self, _inputs: Value, _ctx: &apcore::Context<Value>) -> apcore::ChunkStream {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let value = if matches!(self.mode.as_str(), "validation" | "legacy_validation") {
+            json!("invalid")
+        } else {
+            json!(9)
+        };
+        Box::pin(futures_util::stream::iter([Ok(json!({"value": value}))]))
+    }
+}
+
+#[tokio::test]
+async fn strict_stream_retains_jsonl_and_audits_only_the_completed_outcome() {
+    use apcore_cli::cli::{exec_command, set_audit_logger, set_executables};
+    use apcore_cli::discovery::ApCoreRegistryProvider;
+    use apcore_cli::dispatch_module_with_result;
+    use apcore_cli::security::AuditLogger;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    const CHILD_MODE: &str = "APCORE_CLI_TEST_STRICT_STREAM";
+    const AUDIT_PATH: &str = "APCORE_CLI_TEST_AUDIT_PATH";
+    const MODULE: &str = "test.strict_stream";
+    if let Ok(mode) = std::env::var(CHILD_MODE) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = || {
+            let registry = apcore::Registry::new();
+            registry
+                .register_module(
+                    MODULE,
+                    Box::new(StrictStreamModule {
+                        mode: mode.clone(),
+                        calls: Arc::clone(&calls),
+                    }),
+                )
+                .unwrap();
+            registry
+        };
+        let provider = ApCoreRegistryProvider::new(registry());
+        let executor = apcore::Executor::new(registry(), apcore::Config::default());
+        set_audit_logger(Some(AuditLogger::new(Some(
+            std::env::var(AUDIT_PATH).unwrap().into(),
+        ))));
+        if mode == "after" {
+            executor
+                .use_middleware(Box::new(apcore::middleware::adapters::AfterAdapter::new(
+                    "fail_after",
+                    |_, _, _, _| async {
+                        Err(apcore::ModuleError::new(
+                            apcore::ErrorCode::ModuleExecuteError,
+                            "after failure",
+                        ))
+                    },
+                )))
+                .unwrap();
+        }
+        if mode == "script" {
+            set_executables(HashMap::from([(
+                MODULE.to_string(),
+                "/not-a-test-program".into(),
+            )]));
+        }
+        let stream_flag = if mode == "legacy_validation" {
+            "--stream"
+        } else {
+            "--strict-stream"
+        };
+        let matches = exec_command().get_matches_from(["exec", MODULE, stream_flag]);
+        let result =
+            dispatch_module_with_result(MODULE, &matches, &provider, &executor, true).await;
+        assert_eq!(calls.load(Ordering::SeqCst), usize::from(mode != "script"));
+        std::process::exit(result.err().unwrap_or(0));
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    for (mode, expected_exit, expected_value, expected_error) in [
+        ("fallback", 0, Some(json!(9)), ""),
+        ("native", 0, Some(json!(9)), ""),
+        ("legacy_validation", 0, Some(json!("invalid")), ""),
+        (
+            "validation",
+            45,
+            Some(json!("invalid")),
+            "SCHEMA_VALIDATION_ERROR",
+        ),
+        ("after", 1, Some(json!(9)), "MODULE_EXECUTE_ERROR"),
+        ("script", 2, None, "requires in-process Core execution"),
+    ] {
+        let audit_path = work.path().join(format!("{mode}.jsonl"));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "strict_stream_retains_jsonl_and_audits_only_the_completed_outcome",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE, mode)
+            .env(AUDIT_PATH, &audit_path)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{mode}: {stderr}"
+        );
+        let objects: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(
+            objects,
+            expected_value
+                .map(|value| json!({"value": value}))
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        if mode == "script" {
+            assert!(stderr.contains(expected_error));
+            assert!(!audit_path.exists());
+            continue;
+        }
+        if expected_exit == 0 {
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(stderr.contains(expected_error), "{stderr}");
+        }
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert_eq!(audit.lines().count(), 1);
+        let audit: Value = serde_json::from_str(audit.trim()).unwrap();
+        assert_eq!(
+            audit["status"],
+            if expected_exit == 0 {
+                "success"
+            } else {
+                "error"
+            }
+        );
+        assert_eq!(audit["exit_code"], expected_exit);
+    }
+}
+
 #[tokio::test]
 async fn embedded_dispatch_returns_raw_result() {
     use apcore_cli::cli::exec_command;

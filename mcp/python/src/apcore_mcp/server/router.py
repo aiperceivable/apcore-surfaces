@@ -9,9 +9,10 @@ import threading
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
+from contextlib import aclosing
 from typing import Any
 
-from apcore import CancelToken, Context
+from apcore import APCore, CancelToken, Context, Executor, ModuleError, StreamingModule
 from apcore.trace_context import TraceContext, TraceParent
 
 from apcore_mcp.adapters.errors import ErrorMapper
@@ -25,6 +26,7 @@ _DEEP_MERGE_MAX_DEPTH = 32
 # in FIFO order. Tombstones for unknown call_ids accumulate here, so
 # without an eviction cap a long-running server would leak memory.
 _CANCEL_TOKENS_MAX = 4096
+_POLICY_SKIPS = {"not_configured", "no_match", "strategy_skipped"}
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any], depth: int = 0) -> dict[str, Any]:
@@ -53,11 +55,10 @@ class ExecutionRouter:
     ``(content, is_error, trace_id)`` tuple that the MCP factory can
     pass directly to ``CallToolResult``.
 
-    When the executor also exposes an async ``stream()`` method **and**
-    the caller provides a ``progress_token`` + ``send_notification``
-    callback via the *extra* dict, the router iterates the async
-    generator and forwards each chunk as a ``notifications/progress``
-    message, accumulating chunks via recursive deep merge.
+    Completion-capable executors supply the canonical stream result for
+    streaming modules even without a progress token. Progress callbacks
+    receive redacted chunks. Older Core executors use one ordinary call.
+    Custom duck-typed executors may still provide a legacy chunk stream.
 
     Args:
         executor: An apcore Executor instance (duck-typed -- must expose
@@ -85,6 +86,8 @@ class ExecutionRouter:
         descriptor_lookup: Callable[[str], Any] | None = None,
     ) -> None:
         self._executor = executor
+        self._core_backend = isinstance(executor, (Executor, APCore))
+        self._trace_executor = executor.executor if isinstance(executor, APCore) else executor
         self._error_mapper = ErrorMapper()
         self._validate_inputs = validate_inputs
         self._output_formatter = output_formatter
@@ -108,8 +111,8 @@ class ExecutionRouter:
 
         # [B-002] Per-server `call_id -> CancelToken` map. Populated on
         # tool-call entry by handle_call(); consulted by cancel(call_id).
-        # The transport layer forwards inbound MCP `notifications/cancelled`
-        # to `router.cancel(call_id, reason)` which sets the token.
+        # MCP request cancellation also signals the token passed by the
+        # server factory; direct router clients can use cancel(call_id).
         #
         # OrderedDict gives us FIFO-evicted bounded growth: when the map
         # exceeds _CANCEL_TOKENS_MAX entries (active + tombstones), the
@@ -124,6 +127,11 @@ class ExecutionRouter:
         # so we avoid a broad TypeError catch on every call.
         self._call_async_accepts_context = self._check_accepts_context(executor.call_async)
         self._stream_accepts_context = self._check_accepts_context(getattr(executor, "stream", None))
+        self._open_completed_stream = (
+            getattr(executor, "stream_with_completion", None)
+            if inspect.getattr_static(executor, "stream_with_completion", None) is not None
+            else None
+        )
 
     def _resolve_builtin_formatter(self, format_name: str) -> Callable[[Any], str]:
         """Resolve a built-in formatter name to a callable.
@@ -159,15 +167,17 @@ class ExecutionRouter:
 
         return _builtin_formatter
 
-    def _maybe_redact(self, tool_name: str, result: Any) -> Any:
+    def _maybe_redact(self, tool_name: str, result: Any, output_schema: dict[str, Any] | None = None) -> Any:
         """Apply output redaction if enabled and an output_schema exists for the tool.
 
         Uses ``apcore.redact_sensitive()`` to strip sensitive fields.
-        Fails open: if redaction raises, the original result is returned.
+        Explicit version projections propagate redaction errors as tool errors.
         """
         if not self._redact_output:
             return result
-        output_schema = self._output_schema_map.get(tool_name)
+        selected_version = output_schema is not None
+        if not selected_version:
+            output_schema = self._output_schema_map.get(tool_name)
         if output_schema is None:
             return result
         try:
@@ -175,8 +185,21 @@ class ExecutionRouter:
 
             return redact_sensitive(result, output_schema)
         except Exception:
+            if selected_version:
+                raise ModuleError("MODULE_EXECUTE_ERROR", "Output redaction failed") from None
             logger.warning("redact_sensitive failed for %s, returning unredacted output", tool_name, exc_info=True)
             return result
+
+    def _output_projection(
+        self, tool_name: str, version_hint: str | None
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        if not self._redact_output or not self._core_backend or version_hint is None:
+            return version_hint, None
+        definition = self._executor.registry.get_definition(tool_name, version_hint)
+        if definition is None:
+            raise ModuleError("MODULE_NOT_FOUND", f"Module '{tool_name}' not found")
+        # Resolve a range once, so execution and projection use the same registration.
+        return definition.version, definition.output_schema
 
     def _format_result(self, result: Any) -> str:
         """Format an execution result into text for LLM consumption.
@@ -284,14 +307,8 @@ class ExecutionRouter:
         """
         logger.debug("Executing tool call: %s", tool_name)
 
-        # [B-002] [A-D-210] Register a CancelToken FIRST — before any
-        # dispatch (async-bridge, meta-tool, or executor) — so that an
-        # inbound MCP `notifications/cancelled` (forwarded by the transport
-        # into `router.cancel(call_id, reason)`) cooperatively cancels
-        # in-flight work regardless of which dispatch path the call takes.
-        # Pre-fix this lived AFTER async-bridge dispatch, leaving bridge
-        # submits invisible to cancel. TS (router.ts:369) and Rust
-        # (router.rs:755) register the guard first.
+        # Register before dispatching so direct router and wire callers
+        # both signal the execution token rather than the result transport.
         #
         # The call_id is sourced from `extras.call_id`,
         # `_meta.progressToken`, or generated. Removed in `finally`.
@@ -308,7 +325,8 @@ class ExecutionRouter:
                         call_id = str(pt)
         if call_id is None:
             call_id = uuid.uuid4().hex
-        cancel_token = CancelToken()
+        transport_token = extra.get("_transport_cancel_token") if extra is not None else None
+        cancel_token = transport_token if isinstance(transport_token, CancelToken) else CancelToken()
         with self._cancel_lock:
             # Tombstone case: cancel arrived before the token was
             # registered (race). When `_cancel_tokens[call_id]` is already
@@ -522,21 +540,22 @@ class ExecutionRouter:
                         raw = apcore_meta.get("version")
                         if isinstance(raw, str):
                             version_hint = raw
-        # Source #3: descriptor default fallback
-        if version_hint is None:
+        # Source #3: descriptor default fallback. Read the same descriptor
+        # to route annotated streaming modules without progress metadata.
+        descriptor = None
+        if version_hint is None or callable(self._open_completed_stream):
             registry = getattr(self._executor, "registry", None)
-            if registry is not None:
-                get_def = getattr(registry, "get_definition", None)
-                if callable(get_def):
-                    try:
-                        descriptor = get_def(tool_name)
-                    except Exception:  # noqa: BLE001  # defensive — registry may raise
-                        descriptor = None
-                    if descriptor is not None:
-                        meta_attr = getattr(descriptor, "metadata", None) or {}
-                        raw = meta_attr.get("version_hint") if isinstance(meta_attr, dict) else None
-                        if isinstance(raw, str):
-                            version_hint = raw
+            get_def = self._descriptor_lookup or getattr(registry, "get_definition", None)
+            if callable(get_def):
+                try:
+                    descriptor = get_def(tool_name)
+                except Exception:  # noqa: BLE001  # defensive — registry may raise
+                    descriptor = None
+                if descriptor is not None and version_hint is None:
+                    meta_attr = getattr(descriptor, "metadata", None) or {}
+                    raw = meta_attr.get("version_hint") if isinstance(meta_attr, dict) else None
+                    if isinstance(raw, str):
+                        version_hint = raw
 
         # Pre-execution validation
         if self._validate_inputs:
@@ -565,10 +584,24 @@ class ExecutionRouter:
                 error_info = self._error_mapper.to_mcp_error(error)
                 return ([{"type": "text", "text": error_info["message"]}], True, None)
 
-        # Streaming path: executor has stream() AND we have both helpers
-        can_stream = hasattr(self._executor, "stream") and progress_token is not None and send_notification is not None
+        has_progress = progress_token is not None and send_notification is not None
+        if callable(self._open_completed_stream):
+            native_stream = getattr(getattr(descriptor, "annotations", None), "streaming", False) is True
+            if not has_progress and self._core_backend:
+                try:
+                    native_stream = isinstance(self._executor.registry.get(tool_name, version_hint), StreamingModule)
+                except ModuleError:
+                    # Leave unknown or incompatible versions to the pipeline's normal error path.
+                    native_stream = False
+            if has_progress or native_stream:
+                return await self._handle_completed_stream(
+                    tool_name, arguments, progress_token, send_notification, context, version_hint
+                )
 
-        if can_stream:
+        # Raw chunk executors predate the completion API. Keep the public
+        # embedding behavior for them, but don't merge an older Core's output
+        # locally or retry an already-started call.
+        if not self._core_backend and hasattr(self._executor, "stream") and has_progress:
             return await self._handle_stream(
                 tool_name,
                 arguments,
@@ -630,8 +663,7 @@ class ExecutionRouter:
         Returns True when a token was found and cancelled; False when
         the call_id was unknown (tombstone recorded).
 
-        Wired by transport-level handlers parsing inbound MCP
-        ``notifications/cancelled`` messages.
+        Wire requests use the MCP SDK's request-scoped cancellation.
         """
         with self._cancel_lock:
             existing = self._cancel_tokens.get(call_id)
@@ -705,13 +737,11 @@ class ExecutionRouter:
     ) -> tuple[list[dict[str, Any]], bool, str | None]:
         """Non-streaming execution via executor.call_async()."""
         try:
-            if self._trace:
-                # TODO(apcore>=0.19): plumb version_hint through call_async_with_trace
-                # (current signature only accepts strategy).
-                if self._call_async_accepts_context:
-                    result, pipeline_trace = await self._executor.call_async_with_trace(tool_name, arguments, context)
-                else:
-                    result, pipeline_trace = await self._executor.call_async_with_trace(tool_name, arguments)
+            version_hint, output_schema = self._output_projection(tool_name, version_hint)
+            call_kwargs = {"version_hint": version_hint} if version_hint is not None else {}
+            call_args = (tool_name, arguments, context) if self._call_async_accepts_context else (tool_name, arguments)
+            if self._trace and (version_hint is None or self._core_backend):
+                result, pipeline_trace = await self._trace_executor.call_async_with_trace(*call_args, **call_kwargs)
                 trace_dict = {
                     "strategy_name": pipeline_trace.strategy_name,
                     "total_duration_ms": pipeline_trace.total_duration_ms,
@@ -726,15 +756,9 @@ class ExecutionRouter:
                     ],
                 }
             else:
-                call_kwargs: dict[str, Any] = {}
-                if version_hint is not None:
-                    call_kwargs["version_hint"] = version_hint
-                if self._call_async_accepts_context:
-                    result = await self._executor.call_async(tool_name, arguments, context, **call_kwargs)
-                else:
-                    result = await self._executor.call_async(tool_name, arguments, **call_kwargs)
+                result = await self._executor.call_async(*call_args, **call_kwargs)
                 trace_dict = None
-            result = self._maybe_redact(tool_name, result)
+            result = self._maybe_redact(tool_name, result, output_schema)
             text_output = self._format_result(result)
             content: list[dict[str, Any]] = [{"type": "text", "text": text_output}]
             self._attach_traceparent(content, context)
@@ -749,6 +773,73 @@ class ExecutionRouter:
             self._attach_traceparent(error_content, context)
             return (error_content, True, context.trace_id if context is not None else None)
 
+    async def _handle_completed_stream(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        progress_token: str | int | None,
+        send_notification: Callable[[dict[str, Any]], Coroutine[Any, Any, None]] | None,
+        context: Context,
+        version_hint: str | None,
+    ) -> tuple[list[dict[str, Any]], bool, str | None]:
+        """Stream progress and take final output from the same execution."""
+        try:
+            version_hint, output_schema = self._output_projection(tool_name, version_hint)
+            kwargs = {"version_hint": version_hint} if version_hint is not None else {}
+            async with aclosing(self._open_completed_stream(tool_name, arguments, context, **kwargs)) as execution:
+                index = 0
+                async for chunk in execution.chunks:
+                    index += 1
+                    if progress_token is not None and send_notification is not None:
+                        await self._send_chunk(
+                            tool_name, chunk, index, progress_token, send_notification, output_schema
+                        )
+                completion = await execution.completion()
+            result = self._require_completed_output(completion)
+            formatted = self._format_result(self._maybe_redact(tool_name, result, output_schema))
+            content: list[dict[str, Any]] = [{"type": "text", "text": formatted}]
+            self._attach_traceparent(content, context)
+            return content, False, context.trace_id
+        except Exception as error:
+            info = self._error_mapper.to_mcp_error(error)
+            failure: list[dict[str, Any]] = [{"type": "text", "text": self._build_error_text(info)}]
+            self._attach_traceparent(failure, context)
+            return failure, True, context.trace_id
+
+    @staticmethod
+    def _require_completed_output(completion: Any) -> dict[str, Any]:
+        output = completion.output
+        if completion.reason != "completed" or not isinstance(output, dict):
+            raise ModuleError(completion.error_code or "MODULE_EXECUTE_ERROR", "Stream did not complete")
+        for outcome, code in (
+            (completion.output_validation, "SCHEMA_VALIDATION_ERROR"),
+            (completion.middleware_after, "MODULE_EXECUTE_ERROR"),
+        ):
+            if outcome.status != "passed" and not (outcome.status == "skipped" and outcome.reason in _POLICY_SKIPS):
+                raise ModuleError(code, "Stream post-processing failed")
+        return output
+
+    async def _send_chunk(
+        self,
+        tool_name: str,
+        chunk: dict[str, Any],
+        index: int,
+        progress_token: str | int,
+        send_notification: Callable[[dict[str, Any]], Coroutine[Any, Any, None]],
+        output_schema: dict[str, Any] | None = None,
+    ) -> None:
+        await send_notification(
+            {
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": progress_token,
+                    "progress": index,
+                    "total": None,
+                    "message": json.dumps(self._maybe_redact(tool_name, chunk, output_schema), default=str),
+                },
+            }
+        )
+
     async def _handle_stream(
         self,
         tool_name: str,
@@ -761,7 +852,7 @@ class ExecutionRouter:
         """Streaming execution via executor.stream().
 
         Iterates the async generator, sends each chunk as a
-        ``notifications/progress`` message, accumulates via shallow
+        ``notifications/progress`` message, accumulates via recursive
         merge, and returns the final accumulated result.
         """
         # TODO(apcore>=0.19): streaming traces pending — Executor.stream()
@@ -782,20 +873,7 @@ class ExecutionRouter:
             async for chunk in stream_iter:
                 if not isinstance(chunk, dict):
                     raise TypeError(f"stream chunk must be dict, got {type(chunk).__name__}: {chunk!r}")
-                # Redact each chunk before sending so sensitive fields never reach
-                # the client via progress notifications, even before final accumulation.
-                safe_chunk = self._maybe_redact(tool_name, chunk)
-                # Send progress notification for this chunk
-                notification: dict[str, Any] = {
-                    "method": "notifications/progress",
-                    "params": {
-                        "progressToken": progress_token,
-                        "progress": chunk_index + 1,
-                        "total": None,
-                        "message": json.dumps(safe_chunk, default=str),
-                    },
-                }
-                await send_notification(notification)
+                await self._send_chunk(tool_name, chunk, chunk_index + 1, progress_token, send_notification)
 
                 # Deep merge into accumulated result (depth-capped at 32)
                 accumulated = _deep_merge(accumulated, chunk)

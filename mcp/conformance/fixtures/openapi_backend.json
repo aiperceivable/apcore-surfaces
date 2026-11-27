@@ -57,8 +57,75 @@
       "expected_modules": [
         {
           "module_id": "list_pets",
+          "description": "GET /pets",
           "mcp_tool_name": "list_pets",
           "openai_function_name": "list_pets"
+        }
+      ],
+      "expected_skipped": []
+    },
+    {
+      "id": "registered_proxy_description_falls_back_only_when_blank",
+      "description": "Blank scanner descriptions use the effective method and path. The fallback counts Unicode characters. Supplied descriptions survive registration.",
+      "document": {
+        "openapi": "3.0.3",
+        "info": {
+          "title": "Proxy descriptions",
+          "version": "1.0.0"
+        },
+        "servers": [
+          {
+            "url": "https://api.example.com"
+          }
+        ],
+        "paths": {
+          "/blank": {
+            "get": {
+              "operationId": "getBlank",
+              "summary": " \t\u0085\u2028",
+              "responses": {
+                "200": {
+                  "description": "ok"
+                }
+              }
+            }
+          },
+          "/described": {
+            "get": {
+              "operationId": "getDescribed",
+              "summary": "List listed items.",
+              "responses": {
+                "200": {
+                  "description": "ok"
+                }
+              }
+            }
+          },
+          "/🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀": {
+            "head": {
+              "operationId": "getLong",
+              "responses": {
+                "200": {
+                  "description": "ok"
+                }
+              }
+            }
+          }
+        }
+      },
+      "options": {},
+      "expected_modules": [
+        {
+          "module_id": "get_blank",
+          "description": "GET /blank"
+        },
+        {
+          "module_id": "get_described",
+          "description": "List listed items."
+        },
+        {
+          "module_id": "get_long",
+          "description": "HEAD /🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀"
         }
       ],
       "expected_skipped": []

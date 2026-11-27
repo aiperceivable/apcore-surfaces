@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
+from copy import deepcopy
+from typing import Any, NoReturn
 
 import click
+from click.core import ParameterSource
 
 from apcore_cli.exit import exit_with
+from apcore_cli.security.sandbox import SchemaValidationError
 
 logger = logging.getLogger("apcore_cli.schema_parser")
 
 # Sentinel for boolean flag marker
 _BOOLEAN_FLAG = object()
+_JSON_CONTAINER_TYPES = {"object", "array"}
 
 # Property names that collide with built-in CLI options — schema_to_click_options
 # rejects these early so the error surfaces at schema-parse time, not at invocation.
@@ -106,6 +111,20 @@ def _map_type(prop_name: str, prop_schema: dict) -> Any:
     return result
 
 
+def _is_structured_option(prop_schema: dict[str, Any]) -> bool:
+    """Detect a container-shaped option while keeping mixed scalar unions as text."""
+    schema_type = prop_schema.get("type")
+    if isinstance(schema_type, str):
+        return schema_type in _JSON_CONTAINER_TYPES
+    if isinstance(schema_type, list):
+        types = {value for value in schema_type if isinstance(value, str) and value != "null"}
+        return bool(types) and types <= _JSON_CONTAINER_TYPES
+    branches = [
+        branch for branch in prop_schema.get("anyOf", []) if isinstance(branch, dict) and branch.get("type") != "null"
+    ]
+    return bool(branches) and all(_is_structured_option(branch) for branch in branches)
+
+
 def _extract_help(prop_schema: dict, max_length: int = 1000) -> str | None:
     """Extract help text from schema property, preferring x-llm-description."""
     text = prop_schema.get("x-llm-description")
@@ -196,6 +215,10 @@ def schema_to_click_options(schema: dict, max_help_length: int = 1000) -> list[c
                 help=help_text,
                 show_default=True,
             )
+        elif _is_structured_option(prop_schema):
+            # Keep native schema defaults intact and let the module callback
+            # decode user input via its existing schema error/exit handling.
+            option = click.Option([flag_name], type=click.UNPROCESSED, metavar="JSON", default=default, help=help_text)
         elif "enum" in prop_schema and click_type is not _BOOLEAN_FLAG:
             enum_values = prop_schema["enum"]
             if not enum_values:
@@ -233,6 +256,37 @@ def schema_to_click_options(schema: dict, max_help_length: int = 1000) -> list[c
         options.append(option)
 
     return options
+
+
+def _reject_json_constant(constant: str) -> NoReturn:
+    raise ValueError(f"Invalid JSON constant: {constant}")
+
+
+def extract_structured_flags(
+    values: dict[str, Any], options: list[click.Option]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Pop structured options and return their decoded values and native defaults."""
+    context = click.get_current_context(silent=True)
+    explicit: dict[str, Any] = {}
+    defaults: dict[str, Any] = {}
+    for option in options:
+        name = option.name
+        if option.type is not click.UNPROCESSED or name is None:
+            continue
+        value = values.pop(name, None)
+        if value is None:
+            continue
+        source = context.get_parameter_source(name) if context is not None else None
+        if source in (ParameterSource.DEFAULT, ParameterSource.DEFAULT_MAP):
+            defaults[name] = deepcopy(value)
+            continue
+        try:
+            explicit[name] = (
+                json.loads(value, parse_constant=_reject_json_constant) if isinstance(value, str) else value
+            )
+        except (ValueError, RecursionError) as error:
+            raise SchemaValidationError(f"Option '{option.opts[0]}' must contain valid JSON.") from error
+    return explicit, defaults
 
 
 def reconvert_enum_values(kwargs: dict[str, Any], options: list[click.Option]) -> dict[str, Any]:

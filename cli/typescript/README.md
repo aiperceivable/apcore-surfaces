@@ -322,12 +322,26 @@ When executing a module (e.g. `apcore-cli math.add`), these built-in options are
 | `--dry-run` | Run preflight checks (schema, ACL, approval) without executing (FE-11) |
 | `--trace` | Emit execution pipeline trace (strategy, hooks, middleware timings) |
 | `--stream` | Stream results line-by-line for stream-capable modules |
+| `--strict-stream` | Write JSONL and require a successful completion receipt |
 | `--strategy <name>` | Override execution strategy: `standard`, `internal`, `testing`, `performance`, or `minimal` |
 | `--fields <csv>` | Select output fields via dot-path notation (e.g. `result.sum,meta.duration`) |
 | `--approval-timeout <seconds>` | Override approval timeout (default `60`) |
 | `--approval-token <token>` | Provide a pre-obtained approval token (bypasses interactive prompt) |
 
 Schema-generated flags (e.g. `--a`, `--b`) are added automatically from the module's `input_schema`.
+Pass object and array values as quoted JSON, such as `--filters '{"active":true}'`
+or `--labels '["a","b"]'`. The command decodes them before validation and
+execution. Invalid JSON and values of the wrong schema type exit with code 45.
+String options keep the literal text supplied on the command line.
+
+`--strict-stream` is available on generated module commands and `apcli exec`.
+It writes provisional chunks as JSONL. A zero exit code and a successful audit
+entry require the executor to finish with a canonical output and for output
+validation and after middleware to pass or be skipped by execution policy.
+On failure, the command reports the error on stderr and keeps any JSONL already
+written. An executor without streaming completion support rejects the option
+before invocation. The option requires in-process execution and cannot be
+combined with `--sandbox`, `--trace`, or `--strategy`.
 
 #### `list` command flags (v0.6.0)
 

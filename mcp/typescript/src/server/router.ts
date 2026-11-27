@@ -4,16 +4,17 @@
  * Bridges the MCP tools/call protocol with apcore's Executor.call() or callAsync(),
  * handling success/error formatting for MCP text content responses.
  *
- * When the executor supports stream() and the caller provides a progressToken,
- * chunks are forwarded as MCP notifications/progress before returning the
- * accumulated result.
+ * Core completion supplies the authoritative stream result. When requested,
+ * provisional chunks are sent as MCP progress notifications.
  */
 
 import * as crypto from "node:crypto";
 import { registerStdioExecution } from "./stdio-output.js";
-import { CancelToken } from "apcore-js";
+import { CancelToken, isStreamingModule } from "apcore-js";
+import type { Module } from "apcore-js";
 import { ErrorMapper } from "../adapters/errors.js";
-import type { Executor, TextContentDict, McpErrorResponse } from "../types.js";
+import { ErrorCodes } from "../types.js";
+import type { Executor, TextContentDict, McpErrorResponse, StreamCompletion, StreamExecution, StreamStepOutcome } from "../types.js";
 import { createBridgeContext } from "./context.js";
 import { MCP_PROGRESS_KEY, MCP_ELICIT_KEY } from "../helpers.js";
 import type { ElicitResult } from "../helpers.js";
@@ -57,6 +58,55 @@ function deepMerge(
     }
   }
   return merged;
+}
+
+function stepSucceeded(step: StreamStepOutcome): boolean {
+  return step.status === "passed" || (step.status === "skipped" &&
+    (step.reason === "not_configured" || step.reason === "no_match" || step.reason === "strategy_skipped"));
+}
+
+type CorePipeline = Pick<Executor, "registry"> & {
+  describePipeline(): unknown;
+  governanceState(): unknown;
+};
+
+function hasCorePipeline(value: unknown): value is CorePipeline {
+  if (value === null || typeof value !== "object") return false;
+  const candidate = value as Partial<CorePipeline>;
+  return typeof candidate.describePipeline === "function" &&
+    typeof candidate.governanceState === "function" && typeof candidate.registry?.get === "function";
+}
+
+function isCoreExecutor(executor: Executor): boolean {
+  if (hasCorePipeline(executor)) return true;
+  // APCore exposes the same registry as its executor. Capability checks also
+  // recognize a separate installation of apcore-js.
+  const inner = (executor as { executor?: unknown }).executor;
+  return hasCorePipeline(inner) && inner.registry === executor.registry;
+}
+
+const streamErrorCodes: ReadonlySet<string> = new Set(Object.values(ErrorCodes));
+
+function authoritativeOutput(receipt: StreamCompletion): Record<string, unknown> {
+  if (receipt.reason === "completed" && receipt.output !== null &&
+      stepSucceeded(receipt.outputValidation) && stepSucceeded(receipt.middlewareAfter)) {
+    return receipt.output;
+  }
+
+  let code = ErrorCodes.MODULE_EXECUTE_ERROR as string;
+  let message = "Streaming invocation did not complete successfully";
+  if (receipt.errorCode !== null && streamErrorCodes.has(receipt.errorCode)) {
+    code = receipt.errorCode;
+  } else if (receipt.reason === "consumer_closed" || receipt.reason === "cancelled") {
+    code = ErrorCodes.EXECUTION_CANCELLED;
+  } else if (receipt.reason === "timed_out") {
+    code = ErrorCodes.MODULE_TIMEOUT;
+  } else if (receipt.reason === "completed" && !stepSucceeded(receipt.outputValidation)) {
+    code = ErrorCodes.SCHEMA_VALIDATION_ERROR;
+    message = "Streaming output validation did not complete successfully";
+  }
+  // Supply only a known code and a fixed diagnostic to the existing mapper.
+  throw Object.assign(new Error(message), { code, details: null });
 }
 
 /** Tuple of [content array, isError flag, traceId] returned from handleCall. */
@@ -391,10 +441,8 @@ export class ExecutionRouter {
   /**
    * Handle an MCP tools/call request by routing to the executor.
    *
-   * Streaming path: if the executor has stream(), a progressToken is present,
-   * and sendNotification is available, each chunk from stream() is forwarded as
-   * a `notifications/progress` notification. The chunks are shallow-merged into
-   * an accumulated result which is returned as the final response.
+   * For streaming modules, consume the authoritative Core completion even
+   * without a progress token. Send each chunk provisionally when requested.
    *
    * Non-streaming path: tries executor.call() first, then falls back to
    * executor.callAsync().
@@ -639,63 +687,40 @@ export class ExecutionRouter {
       // ── Resolve versionHint from request metadata or descriptor ──────
       let versionHint: string | undefined = extra?.versionHint
         ?? extra?._meta?.apcore?.version;
-      if (!versionHint) {
-        try {
-          const descriptor = this._executor.registry?.getDefinition?.(toolName);
+      let declaredStreaming = false;
+      try {
+        const descriptor = this._executor.registry?.getDefinition?.(toolName);
+        declaredStreaming = descriptor?.annotations?.streaming === true;
+        if (!versionHint) {
           const metaHint = descriptor?.metadata?.versionHint;
           if (typeof metaHint === "string") {
             versionHint = metaHint;
           }
-        } catch {
-          // ignore — registry lookup is best-effort
         }
+        if (!declaredStreaming && typeof this._executor.streamWithCompletion === "function") {
+          const module = this._executor.registry?.get?.(toolName, versionHint);
+          declaredStreaming = module != null && isStreamingModule(module as Module);
+        }
+      } catch {
+        // Registry lookup is best-effort for structurally compatible executors.
       }
 
       // ── Streaming path ────────────────────────────────────────────────
-      if (
-        this._executor.stream &&
-        progressToken !== undefined &&
-        sendNotification
-      ) {
-        let accumulated: Record<string, unknown> = {};
-        let chunkIndex = 0;
-
-        // TODO(apcore>=0.19): streaming traces via streamWithTrace
-        for await (const chunk of this._executor.stream(toolName, args, context, versionHint)) {
-          // Deep-merge each chunk into the accumulated result
-          accumulated = deepMerge(accumulated, chunk);
-
-          // Per-chunk redaction MUST happen before the chunk is serialized
-          // into the progress notification — otherwise an x-sensitive
-          // credential emitted mid-stream leaks to the MCP client even
-          // though the final accumulated result is later redacted.
-          // Mirrors Python's _handle_stream invariant. [A-D-003]
-          const safeChunk = await this._maybeRedact(toolName, chunk as Record<string, unknown>);
-
-          // Send progress notification for each chunk (redacted)
-          await sendNotification({
-            method: "notifications/progress",
-            params: {
-              progressToken,
-              progress: chunkIndex + 1,
-              message: JSON.stringify(safeChunk),
-            },
-          });
-
-          chunkIndex++;
-        }
-
-        const redacted = await this._maybeRedact(toolName, accumulated);
-
-        const content: TextContentDict[] = [
-          {
-            type: "text",
-            text: await this._formatResult(redacted),
-          },
-        ];
-
-        const traceId = effectiveTraceId;
-        return [content, false, traceId];
+      const wantsProgress = progressToken !== undefined && sendNotification !== undefined;
+      const execution = typeof this._executor.streamWithCompletion === "function" &&
+        (declaredStreaming || wantsProgress)
+        ? this._executor.streamWithCompletion(toolName, args, context, versionHint)
+        : null;
+      // Retain the old structural extension point for custom executors. An
+      // older Core instead uses one ordinary invocation with full validation.
+      const chunks = execution?.chunks ?? (wantsProgress && !isCoreExecutor(this._executor)
+        ? this._executor.stream?.(toolName, args, context, versionHint)
+        : undefined);
+      if (chunks) {
+        const progress = wantsProgress ? { token: progressToken, send: sendNotification } : undefined;
+        const output = await this._collectStream(toolName, chunks, execution, progress);
+        const redacted = await this._maybeRedact(toolName, output);
+        return [[{ type: "text", text: await this._formatResult(redacted) }], false, effectiveTraceId];
       }
 
       // ── Non-streaming path ────────────────────────────────────────────
@@ -760,6 +785,36 @@ export class ExecutionRouter {
 
       return [content, true, undefined];
     }
+  }
+
+  private async _collectStream(
+    toolName: string,
+    chunks: AsyncIterable<Record<string, unknown>>,
+    execution: StreamExecution | null,
+    progress?: { token: string | number; send: NonNullable<HandleCallExtra["sendNotification"]> },
+  ): Promise<Record<string, unknown>> {
+    let accumulated: Record<string, unknown> = {};
+    let count = 0;
+    try {
+      for await (const chunk of chunks) {
+        if (!execution) accumulated = deepMerge(accumulated, chunk);
+        if (progress) {
+          const safeChunk = await this._maybeRedact(toolName, chunk);
+          await progress.send({
+            method: "notifications/progress",
+            params: { progressToken: progress.token, progress: ++count, message: JSON.stringify(safeChunk) },
+          });
+        }
+      }
+    } catch (error) {
+      if (!execution) throw error;
+      // Core settles failures independently of iterator errors. This also
+      // closes promptly if sending a progress notification failed.
+      await execution.close();
+      authoritativeOutput(await execution.completion);
+      throw new Error("Streaming progress failed");
+    }
+    return execution ? authoritativeOutput(await execution.completion) : accumulated;
   }
 
   /**

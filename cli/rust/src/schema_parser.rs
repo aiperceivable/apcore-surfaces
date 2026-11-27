@@ -26,6 +26,7 @@ pub const RESERVED_PROPERTY_NAMES: &[&str] = &[
     "dry_run",
     "trace",
     "stream",
+    "strict_stream",
     "strategy",
     "approval_timeout",
     "approval_token",
@@ -144,6 +145,24 @@ pub fn extract_help_with_limit(prop_schema: &Value, max_len: usize) -> Option<St
 // map_type
 // ---------------------------------------------------------------------------
 
+pub(crate) fn is_structured_option(prop_schema: &Value) -> bool {
+    let is_container = |kind| matches!(kind, "object" | "array");
+    match prop_schema.get("type") {
+        Some(Value::String(kind)) => is_container(kind),
+        Some(Value::Array(kinds)) => {
+            kinds
+                .iter()
+                .any(|kind| kind.as_str().is_some_and(is_container))
+                && kinds.iter().all(|kind| match kind.as_str() {
+                    Some("null") => true,
+                    Some(kind) => is_container(kind),
+                    None => false,
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Map a single schema property to a clap::Arg.
 ///
 /// Returns an error only for flag collisions (detected at schema_to_clap_args level).
@@ -153,16 +172,18 @@ pub fn map_type(prop_name: &str, prop_schema: &Value) -> Result<Arg, SchemaParse
     let schema_type = prop_schema.get("type").and_then(|v| v.as_str());
 
     let arg = Arg::new(prop_name.to_string()).long(flag_long);
+    if is_structured_option(prop_schema) {
+        return Ok(arg.value_name("JSON").allow_negative_numbers(true));
+    }
 
-    // All types use string-based value parsers so that extract_cli_kwargs can
-    // uniformly read values with get_one::<String>. Type coercion to JSON
-    // numbers/booleans happens in reconvert_enum_values and collect_input.
+    // Keep argument values available to the dispatcher as strings, except
+    // for file paths and boolean pairs handled by their own parsers.
     let arg = match schema_type {
         Some("integer") | Some("number") => arg,
         Some("string") if is_file_property(prop_name, prop_schema) => {
             arg.value_parser(clap::value_parser!(PathBuf))
         }
-        Some("string") | Some("object") | Some("array") => arg,
+        Some("string") => arg,
         Some(unknown) => {
             warn!(
                 "Unknown schema type '{}' for property '{}', defaulting to string.",
@@ -331,7 +352,11 @@ pub fn schema_to_clap_args_with_limit(
         }
 
         // Enum handling: properties with an "enum" array (and type != "boolean").
-        if let Some(enum_values) = prop_schema.get("enum").and_then(|v| v.as_array()) {
+        if let Some(enum_values) = prop_schema
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .filter(|_| !is_structured_option(prop_schema))
+        {
             if enum_values.is_empty() {
                 warn!(
                     "Empty enum for property '{}', falling through to plain string arg.",

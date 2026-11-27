@@ -324,31 +324,6 @@ class TestTM4TransportIntegration:
         bridge.cancel_session_tasks.assert_awaited_once_with("sess-cancel")
 
     @pytest.mark.asyncio
-    async def test_build_streamable_http_app_brackets_session(self) -> None:
-        """build_streamable_http_app must run the server via _run_scoped so the
-        session is cancelled when the app context exits (client disconnect)."""
-        from unittest.mock import patch
-
-        tm = TransportManager()
-        bridge = MagicMock()
-        bridge.cancel_session_tasks = AsyncMock(return_value=0)
-        tm.set_async_task_bridge(bridge)
-
-        server = make_mock_server()
-        init_options = make_mock_init_options()
-
-        with patch.object(tm, "_run_scoped", new=AsyncMock()) as mock_scoped:
-            async with tm.build_streamable_http_app(server, init_options):
-                pass
-
-        # The protocol session is run through _run_scoped, not bare server.run.
-        mock_scoped.assert_awaited_once()
-        # A concrete session id (the transport's mcp_session_id) is passed.
-        assert isinstance(mock_scoped.await_args.args[-2], str)
-        assert mock_scoped.await_args.args[-1] is True
-        assert mock_scoped.await_args.args[-1]
-
-    @pytest.mark.asyncio
     async def test_run_stdio_uses_scoped_session(self) -> None:
         """run_stdio must drive the server through _run_scoped."""
         from contextlib import asynccontextmanager

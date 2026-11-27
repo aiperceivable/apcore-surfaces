@@ -6,12 +6,14 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.context import ServerCallContext
 from a2a.server.events.event_queue_v2 import EventQueue
 from a2a.types import (
     Artifact,
@@ -31,6 +33,23 @@ from apcore_a2a.adapters.errors import GOVERNANCE_REFUSAL_CODES, carries_caller_
 from apcore_a2a.auth.middleware import auth_identity_var
 
 logger = logging.getLogger(__name__)
+_Result = TypeVar("_Result")
+_TaskKey = tuple[str, str, str]
+_TERMINAL_STATES = {
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_REJECTED,
+}
+
+
+@dataclass
+class _TaskExecution:
+    stopped: asyncio.Event = field(default_factory=asyncio.Event)
+    token: Any = None
+    work: asyncio.Future[Any] | None = None
+    terminal: TaskStatus | None = None
+    terminal_offer_finished: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 def _make_timestamp() -> Timestamp:
@@ -55,6 +74,11 @@ def _text_message(text: str) -> Message:
     )
 
 
+def _owner(context: ServerCallContext | None) -> str:
+    name = getattr(getattr(context, "user", None), "user_name", "")
+    return name if isinstance(name, str) else ""
+
+
 class ApCoreAgentExecutor(AgentExecutor):
     """Bridges apcore executor to a2a-sdk's AgentExecutor interface."""
 
@@ -66,6 +90,9 @@ class ApCoreAgentExecutor(AgentExecutor):
         registry: Any = None,
         execution_timeout: int = 300,
         on_state_change: Callable[[str, str], None] | None = None,
+        *,
+        track_terminal_status: bool = False,
+        load_task: Callable[[str, Any], Awaitable[Task | None]] | None = None,
     ) -> None:
         self._executor = executor
         self._part_converter = part_converter
@@ -75,8 +102,11 @@ class ApCoreAgentExecutor(AgentExecutor):
         self._on_state_change = on_state_change
         # Cache inspect.signature results keyed by stable method qualified name
         self._context_accepts_cache: dict[str, bool] = {}
-        # P0-B: per-task CancelToken map
-        self._cancel_tokens: dict[str, Any] = {}
+        self._running: dict[_TaskKey, _TaskExecution] = {}
+        self._track_terminal_status = track_terminal_status
+        self._load_task = load_task
+        self._pending_terminal: dict[_TaskKey, TaskStatus] = {}
+        self._cleaning_up: set[asyncio.Future[Any]] = set()
 
     def _notify(self, old_state: str, new_state: str) -> None:
         if self._on_state_change is not None:
@@ -86,6 +116,45 @@ class ApCoreAgentExecutor(AgentExecutor):
                 logger.debug("on_state_change callback raised", exc_info=True)
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        key = self._task_key(context)
+        run = _TaskExecution()
+        self._running[key] = run
+        try:
+            await self._execute(context, event_queue, run)
+            if run.terminal is not None:
+                # The SDK closes the transport queue when execute() returns.
+                # A concurrent cancel must finish offering its winning status
+                # before that closure can discard it.
+                await run.terminal_offer_finished.wait()
+        finally:
+            if self._running.get(key) is run:
+                self._running.pop(key)
+
+    @staticmethod
+    def _task_key(context: RequestContext) -> _TaskKey:
+        return context.task_id, context.context_id or context.task_id, _owner(context.call_context)
+
+    def project_terminal_status(self, task: Task, context: ServerCallContext | None = None) -> Task:
+        """Report a claimed terminal while the transport drains its event queue."""
+        status = self._pending_terminal.get((task.id, task.context_id, _owner(context)))
+        if (
+            status is None
+            or status.state == TaskState.TASK_STATE_COMPLETED
+            or task.status.state in _TERMINAL_STATES
+        ):
+            return task
+        projected = Task()
+        projected.CopyFrom(task)
+        projected.status.CopyFrom(status)
+        return projected
+
+    def observe_task_saved(self, task: Task, context: ServerCallContext | None = None) -> None:
+        """Retire the projection only when the SDK has persisted that status."""
+        key = (task.id, task.context_id, _owner(context))
+        if task.status == self._pending_terminal.get(key):
+            self._pending_terminal.pop(key)
+
+    async def _execute(self, context: RequestContext, event_queue: EventQueue, run: _TaskExecution) -> None:
         # a2a-sdk 1.0: Establish the Task in the store before any TaskStatusUpdateEvent
         context_id = context.context_id or context.task_id
         initial_task = Task(
@@ -94,6 +163,8 @@ class ApCoreAgentExecutor(AgentExecutor):
             status=_make_status(TaskState.TASK_STATE_SUBMITTED),
         )
         await event_queue.enqueue_event(initial_task)
+        if run.stopped.is_set():
+            return
 
         # 1. Get skill_id from message metadata
         # metadata is a protobuf Struct; convert to dict for .get() access
@@ -147,8 +218,7 @@ class ApCoreAgentExecutor(AgentExecutor):
             from apcore import CancelToken, Context  # type: ignore[import]
 
             token = CancelToken()
-            if context.task_id:
-                self._cancel_tokens[context.task_id] = token
+            run.token = token
             # Map the A2A execution_timeout onto apcore's first-class
             # global_deadline (0.22.0). apcore enforces it cooperatively at
             # pipeline Step 8 AND between streaming chunks (executor.stream),
@@ -176,6 +246,7 @@ class ApCoreAgentExecutor(AgentExecutor):
 
         # 5. Execute — streaming if available, single otherwise (P0-A)
         self._notify("submitted", "working")
+        stopped = run.stopped
         try:
             stream_fn = getattr(self._executor, "stream", None)
             # Stream selection is based on the executor's stream method alone,
@@ -189,37 +260,40 @@ class ApCoreAgentExecutor(AgentExecutor):
             )
 
             if _can_stream:
-                await self._execute_streaming(context, event_queue, skill_id, inputs, apcore_ctx, context_id)
+                await self._run_with_timeout(
+                    self._execute_streaming(context, event_queue, skill_id, inputs, apcore_ctx, context_id, stopped),
+                    context.task_id,
+                    run,
+                )
             else:
-                output = await self._execute_single(skill_id, inputs, apcore_ctx)
-                # Publish artifact + completed event
-                artifact = self._part_converter.output_to_parts(output, context.task_id)
-                await event_queue.enqueue_event(
-                    TaskArtifactUpdateEvent(
-                        task_id=context.task_id,
-                        context_id=context_id,
-                        artifact=artifact,
-                        append=False,
-                        last_chunk=True,
-                    )
+                await self._run_with_timeout(
+                    self._send_single(context, event_queue, skill_id, inputs, apcore_ctx, stopped),
+                    context.task_id,
+                    run,
                 )
-                await event_queue.enqueue_event(
-                    TaskStatusUpdateEvent(
-                        task_id=context.task_id,
-                        context_id=context_id,
-                        status=_make_status(TaskState.TASK_STATE_COMPLETED),
-                    )
-                )
-                self._notify("working", "completed")
+            if run.terminal is not None:
+                return
+            await self._publish_status(context, event_queue, TaskState.TASK_STATE_COMPLETED)
+            self._notify("working", "completed")
         except asyncio.CancelledError:
+            if run.terminal is not None and run.terminal.state == TaskState.TASK_STATE_CANCELED:
+                return
             raise  # let a2a-sdk handle asyncio cancellation
         except TimeoutError:
+            if run.terminal is not None:
+                return
+            if token is not None:
+                token.cancel()
             self._notify("working", "failed")
             await self._fail(context, event_queue, "Execution timed out")
         except Exception as exc:
+            if run.terminal is not None:
+                return
             code = getattr(exc, "code", None)
             if code == "MODULE_TIMEOUT":
                 # apcore enforced global_deadline (streaming or cooperative step)
+                if token is not None:
+                    token.cancel()
                 self._notify("working", "failed")
                 await self._fail(context, event_queue, "Execution timed out")
             elif code == "EXECUTION_CANCELLED":
@@ -246,8 +320,6 @@ class ApCoreAgentExecutor(AgentExecutor):
                 logger.exception("Execution failed for task %s skill %s", context.task_id, skill_id)
                 self._notify("working", "failed")
                 await self._fail(context, event_queue, self._failure_text(exc))
-        finally:
-            self._cancel_tokens.pop(context.task_id, None)
 
     async def _execute_streaming(
         self,
@@ -257,18 +329,11 @@ class ApCoreAgentExecutor(AgentExecutor):
         inputs: Any,
         apcore_ctx: Any,
         context_id: str,
+        stopped: asyncio.Event,
     ) -> None:
-        """Stream chunks from executor.stream(), emitting TaskArtifactUpdateEvents.
-
-        Bound the whole streaming loop by a host-side wall-clock budget
-        (execution_timeout) in addition to apcore's cooperative global_deadline.
-        A monotonic deadline is computed once; each chunk fetch is wrapped with
-        asyncio.wait_for(remaining). On timeout we stop the loop and emit a failed
-        status, matching the Rust SDK's stream_channel tokio timeout.
-        """
+        """Stream artifacts. The task owner publishes the terminal status."""
         artifact_id = f"art-{context.task_id or str(uuid4())}"
         chunk_index = 0
-        deadline = time.monotonic() + self._execution_timeout
         # Mirror TS's `apcoreCtx ? ...with ctx : ...without ctx`: only pass the
         # apcore context when present, so the degraded no-binding state still
         # streams instead of erroring on a None positional argument.
@@ -277,30 +342,41 @@ class ApCoreAgentExecutor(AgentExecutor):
             if apcore_ctx is not None
             else self._executor.stream(skill_id, inputs)
         )
+        if inspect.isawaitable(stream):
+            stream = await stream
         iterator = stream.__aiter__()
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                await self._fail_stream_timeout(context, event_queue)
-                return
-            try:
-                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
-            except StopAsyncIteration:
-                break
-            except TimeoutError:
-                await self._fail_stream_timeout(context, event_queue)
-                return
-            parts = self._part_converter.output_to_parts(chunk, context.task_id).parts
-            await event_queue.enqueue_event(
-                TaskArtifactUpdateEvent(
-                    task_id=context.task_id,
-                    context_id=context_id,
-                    artifact=Artifact(artifact_id=artifact_id, parts=parts),
-                    append=(chunk_index > 0),
-                    last_chunk=False,
+        token = getattr(apcore_ctx, "cancel_token", None)
+
+        def stopping() -> bool:
+            return stopped.is_set() or (token is not None and token.is_cancelled)
+
+        exhausted = False
+        try:
+            async for chunk in iterator:
+                # A producer may catch CancelledError and yield another chunk.
+                if stopping():
+                    return
+                parts = self._part_converter.output_to_parts(chunk, context.task_id).parts
+                await event_queue.enqueue_event(
+                    TaskArtifactUpdateEvent(
+                        task_id=context.task_id,
+                        context_id=context_id,
+                        artifact=Artifact(artifact_id=artifact_id, parts=parts),
+                        append=(chunk_index > 0),
+                        last_chunk=False,
+                    )
                 )
-            )
-            chunk_index += 1
+                chunk_index += 1
+            exhausted = True
+        finally:
+            if not exhausted and (close := getattr(iterator, "aclose", None)) is not None:
+                try:
+                    await close()
+                except Exception:
+                    logger.warning("Stream cleanup failed for task %s", context.task_id, exc_info=True)
+
+        if stopping():
+            return
         # Emit last_chunk=True to signal stream end
         await event_queue.enqueue_event(
             TaskArtifactUpdateEvent(
@@ -311,31 +387,44 @@ class ApCoreAgentExecutor(AgentExecutor):
                 last_chunk=True,
             )
         )
-        await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                task_id=context.task_id,
-                context_id=context_id,
-                status=_make_status(TaskState.TASK_STATE_COMPLETED),
-            )
-        )
-        self._notify("working", "completed")
 
-    async def _fail_stream_timeout(self, context: RequestContext, event_queue: EventQueue) -> None:
-        """Emit a failed status when the streaming wall-clock budget is exceeded.
+    async def _run_with_timeout(
+        self,
+        operation: Awaitable[_Result],
+        task_id: str,
+        run: _TaskExecution,
+    ) -> _Result:
+        """Bound the whole operation. Its cancellation cleanup runs separately."""
+        work = run.work = asyncio.ensure_future(operation)
+        try:
+            done, _ = await asyncio.wait({work}, timeout=self._execution_timeout)
+        except asyncio.CancelledError:
+            run.stopped.set()
+            self._stop_work(work, run.token, task_id)
+            raise
+        if work not in done:
+            run.stopped.set()
+            self._stop_work(work, run.token, task_id)
+            raise TimeoutError
+        return work.result()
 
-        Mirrors the MODULE_TIMEOUT handling in execute(): the host-side budget
-        bounds the whole streaming loop, matching Rust's stream_channel timeout.
-        """
-        logger.warning(
-            "Streaming execution timed out after %ss for task %s",
-            self._execution_timeout,
-            context.task_id,
-        )
-        self._notify("working", "failed")
-        await self._fail(context, event_queue, "Execution timed out")
+    def _stop_work(self, work: asyncio.Future[Any], token: Any, task_id: str) -> None:
+        if work in self._cleaning_up:
+            return
+        if token is not None:
+            token.cancel()
+        self._cleaning_up.add(work)
+
+        def finished(task: asyncio.Future[Any]) -> None:
+            self._cleaning_up.discard(task)
+            if not task.cancelled() and (error := task.exception()) is not None:
+                logger.warning("Execution cleanup failed for task %s", task_id, exc_info=error)
+
+        work.add_done_callback(finished)
+        work.cancel()
 
     async def _execute_single(self, skill_id: str, inputs: Any, apcore_ctx: Any) -> Any:
-        """Single call_async() execution with timeout."""
+        """Single call_async() execution."""
         call_async = self._executor.call_async
         cache_key = getattr(call_async, "__qualname__", repr(call_async))
         accepts_ctx = self._context_accepts_cache.get(cache_key)
@@ -347,39 +436,94 @@ class ApCoreAgentExecutor(AgentExecutor):
             if (apcore_ctx is not None and accepts_ctx)
             else call_async(skill_id, inputs)
         )
-        return await asyncio.wait_for(coro, timeout=self._execution_timeout)
+        return await coro
 
-    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        # P0-B: Signal cooperative cancellation BEFORE emitting the canceled status
-        token = self._cancel_tokens.pop(context.task_id, None)
-        if token is not None:
-            token.cancel()
-        context_id = context.context_id or context.task_id
+    async def _send_single(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+        skill_id: str,
+        inputs: Any,
+        apcore_ctx: Any,
+        stopped: asyncio.Event,
+    ) -> None:
+        output = await self._execute_single(skill_id, inputs, apcore_ctx)
+        if stopped.is_set():
+            return
         await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
+            TaskArtifactUpdateEvent(
                 task_id=context.task_id,
-                context_id=context_id,
-                status=_make_status(
-                    TaskState.TASK_STATE_CANCELED,
-                    _text_message("Canceled by client"),
-                ),
+                context_id=context.context_id or context.task_id,
+                artifact=self._part_converter.output_to_parts(output, context.task_id),
+                last_chunk=True,
             )
         )
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # The SDK may have read a nonterminal snapshot before the status was
+        # persisted and our in-process claim retired. Recheck the authorized
+        # store for those late cancellations.
+        key = self._task_key(context)
+        if key not in self._running and self._load_task is not None:
+            current = await self._load_task(context.task_id, context.call_context)
+            if current is not None and current.status.state in _TERMINAL_STATES:
+                return
+        if not await self._publish_status(
+            context, event_queue, TaskState.TASK_STATE_CANCELED, "Canceled by client", stop_work=True
+        ):
+            # The SDK treats executor.cancel() exceptions as agent failures.
+            # Let it consume the already-claimed outcome and classify the
+            # cancellation at the RPC boundary instead.
+            run = self._running.get(key)
+            if run is not None and run.terminal is not None:
+                await run.terminal_offer_finished.wait()
+            return
         self._notify("working", "canceled")
 
     async def _emit_canceled(self, context: RequestContext, event_queue: EventQueue, message: str) -> None:
         """Emit CANCELED status (for cooperative cancellation via CancelToken)."""
-        context_id = context.context_id or context.task_id
-        await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                task_id=context.task_id,
-                context_id=context_id,
-                status=_make_status(
-                    TaskState.TASK_STATE_CANCELED,
-                    _text_message(message),
-                ),
-            )
-        )
+        await self._publish_status(context, event_queue, TaskState.TASK_STATE_CANCELED, message)
+
+    async def _publish_status(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+        state: int,
+        message: str | None = None,
+        *,
+        stop_work: bool = False,
+    ) -> bool:
+        key = self._task_key(context)
+        run = self._running.get(key)
+        if key in self._pending_terminal or (run is not None and run.terminal is not None):
+            return False
+        status = _make_status(state, _text_message(message) if message is not None else None)
+        if state in _TERMINAL_STATES:
+            if self._track_terminal_status:
+                self._pending_terminal[key] = status
+            if run is not None:
+                run.terminal = status
+        if stop_work and run is not None:
+            run.stopped.set()
+            if run.work is not None and not run.work.done():
+                self._stop_work(run.work, run.token, context.task_id)
+            elif run.token is not None:
+                run.token.cancel()
+        event = TaskStatusUpdateEvent(task_id=key[0], context_id=key[1], status=status)
+        if run is None or run.terminal is not status:
+            await event_queue.enqueue_event(event)
+            return True
+        # A transport may cancel the producer first. Once this attempt has
+        # claimed the outcome, preserve its terminal event through teardown.
+        offer = asyncio.create_task(event_queue.enqueue_event(event))
+        try:
+            await asyncio.shield(offer)
+        except asyncio.CancelledError:
+            await offer
+            raise
+        finally:
+            run.terminal_offer_finished.set()
+        return True
 
     def _failure_text(self, error: Exception) -> str:
         """Caller-facing text for a FAILED task status.
@@ -424,41 +568,11 @@ class ApCoreAgentExecutor(AgentExecutor):
         return message
 
     async def _fail(self, context: RequestContext, event_queue: EventQueue, message: str) -> None:
-        context_id = context.context_id or context.task_id
-        await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                task_id=context.task_id,
-                context_id=context_id,
-                status=_make_status(
-                    TaskState.TASK_STATE_FAILED,
-                    _text_message(message),
-                ),
-            )
-        )
+        await self._publish_status(context, event_queue, TaskState.TASK_STATE_FAILED, message)
 
     async def _reject(self, context: RequestContext, event_queue: EventQueue, message: str) -> None:
         """Emit REJECTED status for a governance refusal (srs FR-ERR-012)."""
-        context_id = context.context_id or context.task_id
-        await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                task_id=context.task_id,
-                context_id=context_id,
-                status=_make_status(
-                    TaskState.TASK_STATE_REJECTED,
-                    _text_message(message),
-                ),
-            )
-        )
+        await self._publish_status(context, event_queue, TaskState.TASK_STATE_REJECTED, message)
 
     async def _input_required(self, context: RequestContext, event_queue: EventQueue, message: str) -> None:
-        context_id = context.context_id or context.task_id
-        await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                task_id=context.task_id,
-                context_id=context_id,
-                status=_make_status(
-                    TaskState.TASK_STATE_INPUT_REQUIRED,
-                    _text_message(message),
-                ),
-            )
-        )
+        await self._publish_status(context, event_queue, TaskState.TASK_STATE_INPUT_REQUIRED, message)

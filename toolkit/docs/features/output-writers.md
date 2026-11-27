@@ -969,6 +969,8 @@ Each `WriteResult` has `module_id`, `path`, `ok`, `verified`, `verification_erro
 - Verifier results are likewise wrapped into `WriteResult.verification_error` (Python/Rust) / `WriteResult.verificationError` (TypeScript); verifier exceptions are caught and stored, not re-raised.
 - Rust's `write` returns a bare `Vec<WriteResult>` (not wrapped in `Result`) — per-module registration failures are reported exclusively via failed `WriteResult` entries, the same mechanism Python/TypeScript use. There is no top-level error channel in any of the three SDKs; `WriteResult.verified` is always the source of truth.
 
+When assembling a server, check the full selected ID list against the returned results and actual registry contents before publishing the backend. Failed results can coexist with successful writes. Use a startup-owned registry when failures must prevent publication.
+
 ### Returns
 - On success: list of `WriteResult` — one per module; `path` is `None`/`null` (no file written)
 

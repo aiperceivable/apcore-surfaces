@@ -62,3 +62,21 @@ def test_excluded_operation_leaves_inherited_reference_callable(monkeypatch: pyt
     assert [(request.method, request.url.raw_path) for request in requests] == [
         ("GET", b"/items/one%2Ftwo"),
     ]
+
+
+def test_backend_refuses_to_start_when_registry_rejects_a_scanned_module() -> None:
+    class RejectUpdate:
+        def validate(self, module: object) -> list[str]:
+            return ["rejected by host rule"] if getattr(module, "description", None) == "Update item" else []
+
+    registry = Registry()
+    registry.set_validator(RejectUpdate())
+    document = {
+        **_DOCUMENT,
+        "paths": {
+            "/items": {"get": {"operationId": "listItems", "summary": "List items"}},
+            "/updates": {"post": {"operationId": "updateItem", "summary": "Update item"}},
+        },
+    }
+    with pytest.raises(ValueError, match=r"update_item.*rejected by host rule"):
+        openapi_backend(document, registry=registry, acknowledge_unapproved_writes=True)

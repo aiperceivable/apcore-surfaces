@@ -43,6 +43,7 @@ import {
 import { registerPipelineCommand } from "./strategy.js";
 import { registerAclCommand } from "./acl-cmd.js";
 import { registerOpenapiCommand } from "./openapi-cmd.js";
+import { executeStrictStream, validateStrictStreamOptions } from "./strict-stream.js";
 import {
   assertDelegatedAccess,
   buildCliContext,
@@ -215,6 +216,8 @@ export interface OptionConfig {
   enumOriginalTypes?: Record<string, string>;
   /** Parser function for Commander (e.g. parseInt, parseFloat). */
   parseArg?: (value: string) => unknown;
+  /** Decode an explicit structured option in the module command's error boundary. */
+  parseStructuredArg?: (value: string) => unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1105,7 @@ export function main(progName?: string): void {
 /**
  * Build a Commander Command for a single apcore module.
  *
- * Includes all 11 FE-11 options: --dry-run, --trace, --stream, --strategy,
+ * Includes --dry-run, --trace, --stream, --strict-stream, --strategy,
  * --approval-timeout, --approval-token, --fields, and enhanced --format choices.
  */
 export function buildModuleCommand(
@@ -1163,6 +1166,7 @@ export function buildModuleCommand(
   const traceOpt = new Option("--trace", "Show execution pipeline trace with per-step timing after the result.").default(false);
   // F6: --stream
   const streamOpt = new Option("--stream", "Stream module output as JSONL (one JSON object per line, flushed immediately).").default(false);
+  const strictStreamOpt = new Option("--strict-stream", "Stream JSONL and require a successful completion receipt.").default(false);
   // F8: --strategy
   const strategyOpt = new Option("--strategy <name>", "Execution pipeline strategy: standard (default), internal, testing, performance.")
     .choices(["standard", "internal", "testing", "performance", "minimal"]);
@@ -1179,6 +1183,7 @@ export function buildModuleCommand(
     dryRunOpt.hideHelp();
     traceOpt.hideHelp();
     streamOpt.hideHelp();
+    strictStreamOpt.hideHelp();
     strategyOpt.hideHelp();
     approvalTimeoutOpt.hideHelp();
     approvalTokenOpt.hideHelp();
@@ -1193,6 +1198,7 @@ export function buildModuleCommand(
   cmd.addOption(dryRunOpt);
   cmd.addOption(traceOpt);
   cmd.addOption(streamOpt);
+  cmd.addOption(strictStreamOpt);
   cmd.addOption(strategyOpt);
   cmd.addOption(approvalTimeoutOpt);
   cmd.addOption(approvalTokenOpt);
@@ -1212,25 +1218,19 @@ export function buildModuleCommand(
     cmd.addHelpText("after", "\n" + footerParts.join("\n") + "\n");
   }
 
-  // Schema-generated options
+  // Commander gives each flag its camelCase option key. Preserve the
+  // original schema property name separately for the module input.
+  const schemaFlags: [OptionConfig, string][] = [];
   for (const opt of schemaOptions) {
+    const flagBase = opt.name.replace(/_/g, "-");
+    const option = new Option(opt.isBooleanFlag ? `--${flagBase}` : opt.flags, opt.description)
+      .default(opt.defaultValue);
+    if (opt.parseArg) option.argParser(opt.parseArg);
+    cmd.addOption(option);
+    schemaFlags.push([opt, option.attributeName()]);
     if (opt.isBooleanFlag) {
-      // Commander does not parse the combined "--flag, --no-flag" spec the
-      // way Python click does — it ends up storing `false` for both forms.
-      // Register the affirmative form (carrying the schema default and help
-      // text) and a hidden `--no-<flag>` companion; commander auto-routes
-      // both to the same camelCase attribute and applies negation correctly.
-      const flagBase = opt.name.replace(/_/g, "-");
-      cmd.addOption(
-        new Option(`--${flagBase}`, opt.description).default(
-          opt.defaultValue as boolean,
-        ),
-      );
+      // Commander needs a separate negative option for the same attribute.
       cmd.addOption(new Option(`--no-${flagBase}`).hideHelp());
-    } else if (opt.parseArg) {
-      cmd.option(opt.flags, opt.description, opt.parseArg, opt.defaultValue);
-    } else {
-      cmd.option(opt.flags, opt.description, opt.defaultValue as string | boolean | undefined);
     }
   }
 
@@ -1246,6 +1246,7 @@ export function buildModuleCommand(
     const dryRun = options.dryRun as boolean;
     const traceFlag = options.trace as boolean;
     const streamFlag = options.stream as boolean;
+    const strictStreamFlag = options.strictStream as boolean;
     const strategyName = resolveStringOption(options.strategy, process.env.APCORE_CLI_STRATEGY);
     const approvalTimeout = resolveIntOption(
       options.approvalTimeout as number | undefined,
@@ -1254,29 +1255,24 @@ export function buildModuleCommand(
     );
     const approvalToken = options.approvalToken as string | undefined;
 
-    // Build schema kwargs from parsed options. Commander stores parsed flag
-    // values under camelCase keys (e.g. `--has-solution` -> `hasSolution`),
-    // but downstream module code keys off the original schema property names
-    // (snake_case) to match Python click and Rust clap behavior. Drive the
-    // mapping from schemaOptions so each value is written back under its
-    // original propName.
-    const schemaKwargs: Record<string, unknown> = {};
-    for (const opt of schemaOptions) {
-      const commanderKey = opt.name.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
-      if (commanderKey in options) {
-        schemaKwargs[opt.name] = options[commanderKey];
-      } else if (opt.name in options) {
-        schemaKwargs[opt.name] = options[opt.name];
-      }
-    }
-
     let merged: Record<string, unknown> = {};
     let preflightExitCode: number | undefined;
     const startTime = performance.now();
 
     try {
-      if (!dryRun) validateSandboxOptions(sandboxEnabled, traceFlag, streamFlag, strategyName);
+      if (!dryRun) {
+        validateSandboxOptions(sandboxEnabled, traceFlag, streamFlag, strategyName);
+        if (strictStreamFlag) validateStrictStreamOptions(executor, sandboxEnabled, traceFlag, strategyName);
+      }
       // 1. Collect and merge input
+      const schemaKwargs: Record<string, unknown> = {};
+      for (const [opt, key] of schemaFlags) {
+        if (!Object.hasOwn(options, key)) continue;
+        const value = options[key];
+        schemaKwargs[opt.name] = opt.parseStructuredArg && typeof value === "string" && cmd.getOptionValueSource(key) === "cli"
+          ? opt.parseStructuredArg(value)
+          : value;
+      }
       merged = await readModuleInput(stdinFlag, schemaKwargs, largeInput);
 
       // 2. Reconvert enum values
@@ -1354,6 +1350,11 @@ export function buildModuleCommand(
       await checkApproval(moduleDef, autoApprove, approvalTimeout, aclRequiresApproval);
 
       // 5. Execute with timing
+
+      if (strictStreamFlag) {
+        await executeStrictStream(executor, moduleId, merged, startTime);
+        return;
+      }
 
       // -- Streaming execution (F6) --
       if (streamFlag) {
@@ -1489,7 +1490,7 @@ export function buildModuleCommand(
         auditLogger.logExecution(moduleId, merged, "success", 0, durationMs);
       }
     } catch (err: unknown) {
-      const failure = resolveModuleError(err, moduleId, resultOptions.exitCodes);
+      const failure = resolveModuleError(err, moduleId, resultOptions.exitCodes, strictStreamFlag);
       const durationMs = Math.round(performance.now() - startTime);
 
       // Audit log (error) with real elapsed duration_ms
@@ -1503,7 +1504,7 @@ export function buildModuleCommand(
         // Ignore audit failures during error handling
       }
 
-      await reportModuleError(failure, resultOptions, outputFormat);
+      await reportModuleError(failure, strictStreamFlag ? { ...resultOptions, errorStream: "stderr" } : resultOptions, outputFormat);
     } finally {
       // A preflight already wrote its result. Keep the host's exit outside
       // the dispatch catch so an exception from it is never reported again.

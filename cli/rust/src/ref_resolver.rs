@@ -211,7 +211,11 @@ fn resolve_node(
             })?;
 
         visiting.insert(ref_path.clone());
-        let result = resolve_node(def, defs, depth + 1, max_depth, visiting, module_id)?;
+        let mut result = resolve_node(def, defs, depth + 1, max_depth, visiting, module_id)?;
+        // A default attached to the reference site configures that CLI flag.
+        if let (Some(default), Some(resolved)) = (obj.get("default"), result.as_object_mut()) {
+            resolved.insert("default".into(), default.clone());
+        }
         // Keep ref_path in visiting for the duration of this chain to detect cycles.
         // It remains in visiting intentionally — siblings go through a fresh chain
         // because we only remove entries when unwinding past the insertion point.
@@ -244,6 +248,14 @@ fn resolve_node(
             .cloned()
             .unwrap_or_default();
 
+        let mut types = resolved_branches
+            .iter()
+            .filter_map(|branch| branch.get("type"));
+        let container_type = types
+            .next()
+            .filter(|kind| matches!(kind.as_str(), Some("object" | "array")))
+            .filter(|kind| types.all(|other| other == *kind))
+            .cloned();
         let merged = merge_allof(&parent_required, resolved_branches);
         let merged_map = match merged {
             Value::Object(m) => m,
@@ -269,6 +281,9 @@ fn resolve_node(
             if k != "allOf" && !result_map.contains_key(k) {
                 result_map.insert(k.clone(), v.clone());
             }
+        }
+        if let Some(container_type) = container_type {
+            result_map.entry("type").or_insert(container_type);
         }
         return Ok(Value::Object(result_map));
     }
