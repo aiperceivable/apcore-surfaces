@@ -26,7 +26,7 @@ Phase B requires Core's scoped approval gate and a store that can atomically ver
       "_meta": {
         "apcore": {
           "approval": {
-            "approvalId": "example-record-id",
+            "approvalId": "4f2c29a5-d981-4e46-9ca1-0b17535abd12",
             "resumeToken": "<private-resume-token>"
           }
         }
@@ -35,7 +35,7 @@ Phase B requires Core's scoped approval gate and a store that can atomically ver
     ```
 
 2. The reviewer calls the host application's `resolve` operation with `approvalId`. Notify callbacks also receive this record ID.
-3. The initiating caller polls `__apcore_approval_check` with `{"approval_id": "example-record-id"}`. The result reports `pending`, `approved`, or `rejected`.
+3. The initiating caller polls `__apcore_approval_check` with `{"approval_id": "4f2c29a5-d981-4e46-9ca1-0b17535abd12"}`. The result reports `pending`, `approved`, or `rejected`.
 4. On approval, call the same tool with the original business arguments. Set `params._meta.approvalId` to the private `resumeToken` from the pending response.
 
     ```json
@@ -67,6 +67,8 @@ A scoped store also supports the following operations. Python and Rust use snake
 
 Store only the verifier for the resume token. Provide an allowlisted status projection for polling. Keep the arguments available to the trusted review workflow only as long as that workflow needs them.
 
+A custom Rust store must return `true` from `supports_scoped_approval()` after implementing all three scoped operations. The builder rejects stores that supply only the unscoped operations.
+
 ## InMemoryApprovalStore
 
 The bundled store is process-local. Use it for local development and tests. It expires pending and resolved records and enforces their deadlines when checking or consuming scoped approvals.
@@ -75,7 +77,7 @@ The bundled store is process-local. Use it for local development and tests. It e
 
 Set `approval_store` in Python, `approvalStore` in TypeScript, or `approval_store(...)` on the Rust builder. The server wraps the store in a `StorageBackedApprovalHandler` and exposes the polling meta-tool when that handler owns the Core approval gate. See the [configuration examples](../configuration.md#phase-b-storage-backed-approvals).
 
-Pass a registry to have the adapter set up the approval gate. Python also accepts a Core executor with a wired gate and no existing approval handler. Rust accepts an unshared Core executor with the same gate configuration.
+Pass a registry to have the adapter set up the approval gate. The effective execution strategy must include Core's built-in approval gate. Python also accepts a Core executor with a wired gate and no existing approval handler. Rust accepts an unshared Core executor with the same gate configuration.
 
 Use Phase B for foreground tools over stdio or Streamable HTTP. Keep the caller authenticated when serving multiple principals. A background invocation that requires this approval returns a refusal and can be retried as a foreground invocation where the tool supports foreground execution.
 
@@ -84,7 +86,7 @@ Use Phase B for foreground tools over stdio or Streamable HTTP. Keep the caller 
 Pass the public `approval_id` as a tool argument. The tool uses the trusted identity from the active MCP connection. A successful poll returns a JSON object in its text content.
 
 ```json
-{"approval_id":"example-record-id","status":"pending"}
+{"approval_id":"4f2c29a5-d981-4e46-9ca1-0b17535abd12","status":"pending"}
 ```
 
 The poll contains the public ID and one of `pending`, `approved`, or `rejected`. A missing or malformed record ID is a tool error. A record unavailable to the current caller reports a rejected status.
