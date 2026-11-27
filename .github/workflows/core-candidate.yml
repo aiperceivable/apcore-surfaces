@@ -9,6 +9,10 @@ on:
       core_sha:
         required: true
         type: string
+      core_example_sha:
+        description: Core commit containing the matching Golden Path example
+        required: false
+        type: string
       surfaces_sha:
         required: true
         type: string
@@ -28,6 +32,10 @@ on:
     inputs:
       core_sha:
         description: Expected Core commit, when supplied
+        required: false
+        type: string
+      core_example_sha:
+        description: Core commit containing the matching Golden Path example
         required: false
         type: string
       core_run_id:
@@ -56,6 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       head_sha: ${{ steps.source.outputs.head_sha }}
+      example_sha: ${{ steps.source.outputs.example_sha }}
       run_id: ${{ steps.source.outputs.run_id }}
     steps:
       - name: Verify the upstream package run
@@ -64,6 +73,7 @@ jobs:
         env:
           CORE_RUN_ID: ${{ inputs.core_run_id }}
           EXPECTED_CORE_SHA: ${{ inputs.core_sha }}
+          EXPECTED_EXAMPLE_SHA: ${{ inputs.core_example_sha }}
           GH_TOKEN: ${{ secrets.APCORE_ARTIFACT_READ_TOKEN || github.token }}
         run: |
           if [[ ! "$CORE_RUN_ID" =~ ^[0-9]+$ ]]; then
@@ -86,7 +96,13 @@ jobs:
             echo "The Core run did not build the reviewed alpha.1 commit." >&2
             exit 1
           fi
+          example_sha="${EXPECTED_EXAMPLE_SHA:-$head_sha}"
+          if [[ ! "$example_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "core_example_sha must be a full commit SHA." >&2
+            exit 1
+          fi
           printf 'head_sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
+          printf 'example_sha=%s\n' "$example_sha" >> "$GITHUB_OUTPUT"
           printf 'run_id=%s\n' "$CORE_RUN_ID" >> "$GITHUB_OUTPUT"
           printf 'APCore package run %s at %s\n' "$CORE_RUN_ID" "$head_sha"
 
@@ -196,12 +212,12 @@ jobs:
           python -m build --wheel --outdir "$RUNNER_TEMP/surface-wheel"
           python -m pip install --force-reinstall --no-deps "$RUNNER_TEMP"/surface-wheel/*.whl
           python -m pip check
-      - name: Check out the verified Core source
+      - name: Check out the pinned Core Golden Path
         if: matrix.component == 'mcp' && matrix.core == 'candidate'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: aiperceivable/apcore
-          ref: ${{ needs.verify-source.outputs.head_sha }}
+          ref: ${{ needs.verify-source.outputs.example_sha }}
           path: core-source
           persist-credentials: false
       - name: Verify the Python Golden Path with the installed packages
