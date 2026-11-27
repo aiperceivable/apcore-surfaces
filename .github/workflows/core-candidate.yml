@@ -201,7 +201,7 @@ jobs:
           assert core_path == installed.locate_file("apcore/__init__.py").resolve()
           assert toolkit_path == toolkit_expected.resolve()
           if os.environ["CORE_MODE"] == "candidate":
-              assert installed.version == "1.0.0a2"
+              assert installed.version == "1.0.0a3"
               origin = json.loads(installed.read_text("direct_url.json") or "{}")
               assert origin.get("url") == Path(os.environ["CORE_INSTALL"]).resolve().as_uri()
               assert callable(getattr(Executor, "stream_with_completion", None))
@@ -340,7 +340,7 @@ jobs:
           assert.ok(coreEntry.startsWith(core + sep));
           assert.equal(toolkitEntry, realpathSync(resolve(process.env.TOOLKIT_ROOT, 'dist/index.js')));
           if (process.env.CORE_MODE === 'candidate') {
-            assert.equal(coreVersion, '1.0.0-alpha.2');
+            assert.equal(coreVersion, '1.0.0-alpha.3');
             assert.equal(typeof Executor.prototype.streamWithCompletion, 'function');
             assert.equal(typeof APCore.prototype.streamWithCompletion, 'function');
           } else {
@@ -406,8 +406,8 @@ jobs:
           crate="${crates[0]}"
           version="${crate##*/apcore-}"
           version="${version%.crate}"
-          if [[ "$version" != 1.0.0-alpha.2 ]]; then
-            echo "Expected the alpha.2 Core crate." >&2
+          if [[ "$version" != 1.0.0-alpha.3 ]]; then
+            echo "Expected the alpha.3 Core crate." >&2
             exit 1
           fi
           if [[ "$CORE_MODE" == candidate && -n "$EXPECTED_SHA256" ]]; then

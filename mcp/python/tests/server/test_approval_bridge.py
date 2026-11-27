@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -285,6 +286,31 @@ def _make_approval_request() -> Any:
         annotations=ModuleAnnotations(),
         description="x",
     )
+
+
+@_requires_scoped_core
+@pytest.mark.asyncio
+async def test_final_scope_binds_module_version_and_cannot_resume_as_legacy() -> None:
+    store = InMemoryApprovalStore()
+    handler = StorageBackedApprovalHandler(store)
+    request = _make_approval_request()
+    fields = vars(request) | {"module_version": "1.2.3", "canonical_args_digest": "a" * 64}
+    final_request = SimpleNamespace(**fields)
+    pending = await handler.request_approval(final_request)
+    assert pending.status == "pending"
+    assert await store.resolve(pending.audit_id, approved=True)
+
+    for changed in (
+        request,
+        SimpleNamespace(**(fields | {"module_version": "1.2.4"})),
+        SimpleNamespace(**(fields | {"canonical_args_digest": "b" * 64})),
+    ):
+        result = await handler.check_approval_for_call(pending.approval_id, changed)
+        assert result.status == "rejected"
+
+    assert (await handler.check_approval_for_call(pending.approval_id, final_request)).status == "approved"
+    assert (await handler.check_approval_for_call(pending.approval_id, final_request)).status == "rejected"
+    assert handler.supports_final_scope is True
 
 
 @_requires_scoped_core

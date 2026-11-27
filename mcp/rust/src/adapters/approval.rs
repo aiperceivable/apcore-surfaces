@@ -393,6 +393,10 @@ fn is_background_call(request: &ApprovalRequest) -> bool {
 
 #[async_trait]
 impl ApprovalHandler for StorageBackedApprovalHandler {
+    fn supports_final_scope(&self) -> bool {
+        self.store.supports_scoped_approval()
+    }
+
     async fn request_approval(
         &self,
         request: &ApprovalRequest,
@@ -624,6 +628,44 @@ mod tests {
         assert_eq!(result.status, "approved");
         assert_eq!(result.audit_id.as_deref(), Some(audit_id));
         assert!(result.approval_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_scope_binds_the_module_version_and_digest() {
+        let store = Arc::new(crate::approval_store::InMemoryApprovalStore::new());
+        let handler = StorageBackedApprovalHandler::new(store.clone());
+        let legacy = scoped_request();
+        let mut request = legacy.clone();
+        request.module_version = Some("1.2.3".into());
+        request.canonical_args_digest = Some("a".repeat(64));
+        let pending = handler.request_approval(&request).await.unwrap();
+        let audit_id = pending.audit_id.as_deref().unwrap();
+        let credential = pending.approval_id.as_deref().unwrap();
+        assert!(handler.supports_final_scope());
+        assert!(store.resolve(audit_id, true, None).await.unwrap());
+
+        let mut changed_version = request.clone();
+        changed_version.module_version = Some("1.2.4".into());
+        let mut changed_args = request.clone();
+        changed_args.canonical_args_digest = Some("b".repeat(64));
+        for changed in [legacy, changed_version, changed_args] {
+            let result = handler
+                .check_approval_for_call(credential, &changed)
+                .await
+                .unwrap();
+            assert_eq!(result.status, "rejected");
+        }
+
+        let result = handler
+            .check_approval_for_call(credential, &request)
+            .await
+            .unwrap();
+        assert_eq!(result.status, "approved");
+        let replay = handler
+            .check_approval_for_call(credential, &request)
+            .await
+            .unwrap();
+        assert_eq!(replay.status, "rejected");
     }
 
     #[tokio::test]

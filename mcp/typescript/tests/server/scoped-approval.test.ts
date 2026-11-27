@@ -40,7 +40,7 @@ function approvalMetadata(result: CallToolResult): PendingMetadata | undefined {
   return (result._meta?.apcore as { approval?: PendingMetadata } | undefined)?.approval;
 }
 
-async function connect(options: { streaming?: boolean; background?: boolean; trace?: boolean } = {}) {
+async function connect(options: { streaming?: boolean; background?: boolean; trace?: boolean; finalScope?: boolean } = {}) {
   const store = new InMemoryApprovalStore();
   const notify = vi.fn().mockResolvedValue(undefined);
   const handler = new StorageBackedApprovalHandler(store, { notifyCallback: notify }).forMcpServer();
@@ -73,6 +73,15 @@ async function connect(options: { streaming?: boolean; background?: boolean; tra
     execute: () => ({ job: "ordinary" }),
   } as never);
   const executor = new core.Executor({ registry, approvalHandler: handler as never, eventEmitter: events });
+  if (options.finalScope) {
+    executor.setPolicyEvaluator({ async evaluate() { return { decision: "require_approval" }; } });
+    class Normalize extends core.Middleware {
+      override before(_moduleId: string, inputs: Record<string, unknown>) {
+        return { ...inputs, copies: Number(inputs.copies) + 10 };
+      }
+    }
+    executor.use(new Normalize());
+  }
   const manager = options.background ? new AsyncTaskManager({ executor }) : undefined;
   const asyncTaskBridge = manager ? new AsyncTaskBridge(manager as never, {
     descriptorLookup: id => registry.getDefinition(id) as never,
@@ -105,8 +114,12 @@ async function connect(options: { streaming?: boolean; background?: boolean; tra
 }
 
 describe.skipIf(!supportsScopedCore())("scoped approval through the MCP wire", () => {
-  it.each(["unary", "traced", "streamed"])("completes the %s approval lifecycle with private credential delivery", async kind => {
-    const target = await connect({ trace: kind === "traced", streaming: kind === "streamed" });
+  it.each(["unary", "traced", "streamed", "final-unary", "final-streamed"])(
+    "completes the %s approval lifecycle with private credential delivery", async kind => {
+    const finalScope = kind.startsWith("final-");
+    const streaming = kind.endsWith("streamed");
+    const effective = finalScope ? { ...args, copies: 12 } : args;
+    const target = await connect({ trace: kind === "traced", streaming, finalScope });
     const run = (arguments_ = args, resumeToken?: string) => identityStorage.run(reviewer, () =>
       target.client.callTool({
         name: moduleId,
@@ -126,7 +139,7 @@ describe.skipIf(!supportsScopedCore())("scoped approval through the MCP wire", (
       const { approvalId, resumeToken } = approval!;
       expect(JSON.stringify(pending.content)).toContain("Approval is pending");
       expect(JSON.stringify(pending.content)).not.toContain(resumeToken);
-      expect(target.notify).toHaveBeenCalledExactlyOnceWith(approvalId, moduleId, args);
+      expect(target.notify).toHaveBeenCalledExactlyOnceWith(approvalId, moduleId, effective);
       expect(await poll(reviewer, approvalId)).toEqual({ approval_id: approvalId, status: "pending" });
       expect(await poll(otherReviewer, approvalId)).toEqual({ approval_id: approvalId, status: "rejected" });
       expect(await poll(null, approvalId)).toEqual({ approval_id: approvalId, status: "rejected" });
@@ -138,9 +151,9 @@ describe.skipIf(!supportsScopedCore())("scoped approval through the MCP wire", (
         run(args, resumeToken),
       ]);
       expect(completions.filter(result => result.isError !== true)).toHaveLength(1);
-      const runner = kind === "streamed" ? target.stream : target.execute;
+      const runner = streaming ? target.stream : target.execute;
       expect(runner).toHaveBeenCalledOnce();
-      expect(runner.mock.calls[0][0]).toEqual(args);
+      expect(runner.mock.calls[0][0]).toEqual(effective);
       expect(JSON.stringify(completions)).not.toContain(resumeToken);
 
       await target.events.flush();

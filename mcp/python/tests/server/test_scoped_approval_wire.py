@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
-from apcore import AlwaysDenyHandler, Executor, Identity, ModuleAnnotations, Registry
+from apcore import AlwaysDenyHandler, Executor, Identity, Middleware, ModuleAnnotations, PolicyVerdict, Registry
 from mcp.server.lowlevel import Server
 from mcp.shared import session as mcp_session
 from starlette.responses import JSONResponse
@@ -60,10 +60,11 @@ def test_phase_b_preserves_a_supplied_executors_existing_handler() -> None:
 
 @_requires_scoped_core
 @pytest.mark.parametrize("tool_type", [Report, StreamingReport])
-async def test_pending_credentials_and_status_round_trip_through_core(tool_type, caplog) -> None:
+@pytest.mark.parametrize("post_validation", [False, True])
+async def test_pending_credentials_and_status_round_trip_through_core(tool_type, post_validation, caplog) -> None:
     registry = Registry()
     report = tool_type()
-    registry.register(_TOOL, report)
+    registry.register(_TOOL, report, version="1.2.3")
     store = InMemoryApprovalStore()
     notifications = []
     audit_events = []
@@ -73,7 +74,23 @@ async def test_pending_credentials_and_status_round_trip_through_core(tool_type,
             if event.event_type == "apcore.approval.decision":
                 audit_events.append(event.data)
 
-    executor = Executor(registry, event_emitter=EventRecorder())
+    class RequireFinalApproval:
+        async def evaluate(self, request):
+            assert request.module_version == "1.2.3"
+            return PolicyVerdict("require_approval")
+
+    class Normalize(Middleware):
+        async def before(self, _module_id, inputs, _context):
+            return {**inputs, "count": inputs["count"] + 10}
+
+    executor = Executor(
+        registry,
+        event_emitter=EventRecorder(),
+        policy_evaluator=RequireFinalApproval() if post_validation else None,
+    )
+    if post_validation:
+        executor.use(Normalize())
+    effective = {"count": 11 if post_validation else 1}
 
     async def notify(approval_id, module_id, arguments):
         notifications.append((approval_id, module_id, arguments))
@@ -88,7 +105,7 @@ async def test_pending_credentials_and_status_round_trip_through_core(tool_type,
             public_id, credential = approval["approvalId"], approval["resumeToken"]
             assert public_id != credential
             assert report.inputs == []
-            assert notifications == [(public_id, _TOOL, {"count": 1})]
+            assert notifications == [(public_id, _TOOL, effective)]
             assert credential not in repr(pending.content)
             poll = await session.call_tool("__apcore_approval_check", {"approval_id": public_id})
             assert json.loads(poll.content[0].text)["status"] == "pending"
@@ -108,8 +125,8 @@ async def test_pending_credentials_and_status_round_trip_through_core(tool_type,
             first, second = await asyncio.gather(*requests)
             assert sorted(result.isError for result in (first, second)) == [False, True]
             result = next(result for result in (first, second) if not result.isError)
-            assert result.structuredContent == {"count": 1}
-    assert report.inputs == [{"count": 1}]
+            assert result.structuredContent == effective
+    assert report.inputs == [effective]
     if credential in caplog.text:
         pytest.fail("Approval credential entered debug logs")
     assert credential not in repr(audit_events)

@@ -51,6 +51,8 @@ Phase B requires Core's scoped approval gate and a store that can atomically ver
 
 Core checks its access and approval gates on the retry. The handler matches the trusted principal, `caller_id`, target module, and business arguments. It consumes the grant when it authorizes one invocation. A further attempt needs its own approval.
 
+With Core's optional post-validation policy enabled, the handler also binds approval to the selected module version and the validated arguments presented for review. A retry sends the original input, and Core applies the current trusted transformations and validation before checking the bound scope. A changed effective value or module version needs a new approval. Custom stores enforce the entire supplied scope with the same atomic consumption operation.
+
 Use the record ID for polling, review notifications, and audit correlation. Restrict the resume token to the pending result and the caller's resumption request.
 
 ## ApprovalStore Interface

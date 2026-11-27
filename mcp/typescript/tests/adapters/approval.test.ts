@@ -162,6 +162,29 @@ describe("StorageBackedApprovalHandler", () => {
     expect(await handler.requestApproval(request)).toMatchObject({ status: "rejected" });
   });
 
+  it.skipIf(!supportsScopedCore())("binds final approval to the module version and digest", async () => {
+    const store = new InMemoryApprovalStore();
+    const handler = new StorageBackedApprovalHandler(store);
+    const finalRequest = { ...request, moduleVersion: "1.2.3", canonicalArgsDigest: "a".repeat(64) };
+    try {
+      const pending = await handler.requestApproval(finalRequest);
+      expect(pending).toMatchObject({ status: "pending", auditId: expect.any(String) });
+      await store.resolve(pending.auditId!, { approved: true });
+      for (const changed of [
+        request,
+        { ...finalRequest, moduleVersion: "1.2.4" },
+        { ...finalRequest, canonicalArgsDigest: "b".repeat(64) },
+      ]) {
+        expect(await handler.checkApprovalForCall(pending.approvalId!, changed)).toMatchObject({ status: "rejected" });
+      }
+      expect(await handler.checkApprovalForCall(pending.approvalId!, finalRequest)).toMatchObject({ status: "approved" });
+      expect(await handler.checkApprovalForCall(pending.approvalId!, finalRequest)).toMatchObject({ status: "rejected" });
+      expect(handler.forMcpServer()).toMatchObject({ supportsFinalScope: true });
+    } finally {
+      store.stop();
+    }
+  });
+
   it.skipIf(!supportsScopedCore())("keeps Core credentials separate from public operator IDs", async () => {
     const store = new InMemoryApprovalStore();
     const notify = vi.fn().mockResolvedValue(undefined);

@@ -72,8 +72,17 @@ pub struct ApprovalScope {
 
 impl From<&ApprovalRequest> for ApprovalScope {
     fn from(request: &ApprovalRequest) -> Self {
-        let mut arguments = request.arguments.clone();
-        arguments.sort_all_objects();
+        let arguments_sha256 = if let Some(digest) = &request.canonical_args_digest {
+            let mut hasher = Sha256::new();
+            // Final scopes use a separate domain from legacy argument objects.
+            hasher.update(b"apcore-final-scope-v1\0");
+            hasher.update(serde_json::json!([request.module_version, digest]).to_string());
+            hasher.finalize().into()
+        } else {
+            let mut arguments = request.arguments.clone();
+            arguments.sort_all_objects();
+            Sha256::digest(arguments.to_string().as_bytes()).into()
+        };
         Self {
             module_id: request.module_id.clone(),
             caller_id: request.caller_id.clone(),
@@ -82,7 +91,7 @@ impl From<&ApprovalRequest> for ApprovalScope {
                 .as_ref()
                 .and_then(|context| context.identity.as_ref())
                 .map(ApprovalPrincipal::from),
-            arguments_sha256: Sha256::digest(arguments.to_string().as_bytes()).into(),
+            arguments_sha256,
         }
     }
 }

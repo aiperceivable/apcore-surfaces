@@ -26,7 +26,7 @@ classifiers = [
     "Framework :: AsyncIO",
 ]
 dependencies = [
-    "apcore[config,discovery]==1.0.0a2",
+    "apcore[config,discovery]==1.0.0a3",
     "apcore-toolkit==0.15.1a2",
     "a2a-sdk[http-server]>=1.1.2",
     "starlette>=0.40.0",
