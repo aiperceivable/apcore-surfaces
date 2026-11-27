@@ -8,14 +8,19 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import AbstractContextManager
+from collections.abc import AsyncIterator
+from contextlib import AbstractContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
 from apcore import Identity
 from mcp import types as mcp_types
-from starlette.types import ASGIApp, Receive, Scope, Send
+from mcp.server.lowlevel import Server
+from mcp.server.lowlevel import server as mcp_lowlevel
+from mcp.shared import session as mcp_session
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from apcore_mcp.adapters.approval import (
     _approval_principal,
@@ -57,6 +62,72 @@ class _ApprovalResponseLogFilter(logging.Filter):
 
 
 _approval_response_log_filter = _ApprovalResponseLogFilter()
+_sdk_approval_logs = ContextVar("sdk_approval_logs", default=False)
+
+
+class _ApprovalRequestLogFilter(logging.Filter):
+    """Narrow MCP SDK diagnostics that can contain the original request."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not _sdk_approval_logs.get() or not isinstance(record.msg, str):
+            return True
+        if record.pathname == mcp_session.__file__:
+            if record.msg.startswith("Message that failed validation:"):
+                return False
+            if not record.msg.startswith(("Failed to validate request:", "Failed to validate notification:")):
+                return True
+        elif record.pathname == mcp_lowlevel.__file__:
+            if record.msg == "Received message: %s" and isinstance(record.args, tuple):
+                return not (len(record.args) == 1 and isinstance(record.args[0], Exception))
+            if not record.msg.startswith("Received exception from stream:"):
+                return True
+        else:
+            return True
+
+        record.msg = "MCP request validation failed"
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+_approval_request_log_filter = _ApprovalRequestLogFilter()
+
+
+def _protect_sdk_approval_logs(server: Server) -> None:
+    # MCP emits its session validation warnings through the root logger.
+    for name in (None, mcp_session.__name__, mcp_lowlevel.__name__):
+        logging.getLogger(name).addFilter(_approval_request_log_filter)
+    lifespan = server.lifespan
+
+    @asynccontextmanager
+    async def protected_lifespan(active_server: Server) -> AsyncIterator[Any]:
+        token = _sdk_approval_logs.set(True)
+        try:
+            async with lifespan(active_server) as value:
+                yield value
+        finally:
+            _sdk_approval_logs.reset(token)
+
+    server.lifespan = protected_lifespan
+
+
+def _safe_http_validation_error(body: bytes) -> bytes:
+    """Preserve the SDK's outer JSON-RPC error without its raw validation text."""
+    try:
+        response = json.loads(body)
+    except ValueError:
+        return body
+    if not isinstance(response, dict) or response.get("id") != "server-error":
+        return body
+    error = response.get("error")
+    if not isinstance(error, dict) or error.get("code") != mcp_types.INVALID_PARAMS:
+        return body
+    message = error.get("message")
+    if not isinstance(message, str) or not message.startswith("Validation error:"):
+        return body
+    error["message"] = "Invalid request parameters"
+    return json.dumps(response, separators=(",", ":")).encode()
 
 
 class _ApprovalLogMiddleware:
@@ -69,9 +140,30 @@ class _ApprovalLogMiddleware:
             await self._app(scope, receive, send)
             return
         response = _ApprovalResponseLog()
+        pending_start: Message | None = None
+
+        async def send_safe(message: Message) -> None:
+            nonlocal pending_start
+            if message["type"] == "http.response.start" and message["status"] == 400:
+                content_type = Headers(raw=message["headers"]).get("content-type", "")
+                if content_type.partition(";")[0] == "application/json":
+                    pending_start = message
+                    return
+            if pending_start is not None:
+                start = pending_start
+                pending_start = None
+                if message["type"] == "http.response.body" and not message.get("more_body"):
+                    body = message.get("body", b"")
+                    safe_body = _safe_http_validation_error(body)
+                    if safe_body is not body:
+                        MutableHeaders(scope=start)["content-length"] = str(len(safe_body))
+                        message = {**message, "body": safe_body}
+                await send(start)
+            await send(message)
+
         token = _response_log_context.set(response)
         try:
-            await self._app({**scope, _RESPONSE_LOG_SCOPE_KEY: response}, receive, send)
+            await self._app({**scope, _RESPONSE_LOG_SCOPE_KEY: response}, receive, send_safe)
         finally:
             _response_log_context.reset(token)
 

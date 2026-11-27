@@ -30,7 +30,7 @@ from referencing.jsonschema import DRAFT7, DRAFT201909, DRAFT202012
 import apcore_mcp.markdown as _markdown
 from apcore_mcp.adapters.annotations import AnnotationMapper
 from apcore_mcp.auth.middleware import _REQUEST_IDENTITY_KEY, auth_identity_var
-from apcore_mcp.server.approval_bridge import ApprovalBridge, _approval_response_log
+from apcore_mcp.server.approval_bridge import ApprovalBridge, _approval_response_log, _protect_sdk_approval_logs
 from apcore_mcp.server.async_task_bridge import RESERVED_PREFIX, AsyncTaskBridge
 from apcore_mcp.server.router import ExecutionRouter, _descriptor_version_hint, _matches_registered_version
 from apcore_mcp.server.transport import _protocol_source_var, transport_session_var
@@ -593,6 +593,7 @@ class MCPServerFactory:
             combined_tools.extend(async_bridge.build_meta_tools())
         if approval_bridge is not None:
             combined_tools.extend(approval_bridge.build_meta_tools())
+            _protect_sdk_approval_logs(server)
 
         regular_tool_ids = {id(tool) for tool in tools}
 
@@ -671,9 +672,7 @@ class MCPServerFactory:
                 and isinstance(router, ExecutionRouter)
             )
             credential_error = None
-            if "_approval_token" in (arguments or {}):
-                credential_error = "Send the approval credential in MCP request metadata."
-            elif approval_token is not _NO_APPROVAL_CREDENTIAL:
+            if approval_token is not _NO_APPROVAL_CREDENTIAL:
                 if not scoped_approval:
                     credential_error = "Scoped approval is unavailable for this call."
                 elif not isinstance(approval_token, str) or not 0 < len(approval_token) <= 256:
@@ -769,6 +768,28 @@ class MCPServerFactory:
                     text_contents.append(mcp_types.TextContent(type="text", text=item["text"]))
             output_schema = published.outputSchema if published is not None else None
             return _build_call_result(text_contents, is_error, output_schema, approval=pending_approval)
+
+        sdk_call_tool = server.request_handlers[mcp_types.CallToolRequest]
+
+        async def check_reserved_approval_input(request: mcp_types.CallToolRequest) -> mcp_types.ServerResult:
+            arguments = request.params.arguments or {}
+            nested_arguments = (
+                arguments.get("arguments")
+                if request.params.name in {"__apcore_task_submit", "__apcore_module_preview"}
+                else None
+            )
+            if "_approval_token" in arguments or (
+                isinstance(nested_arguments, dict) and "_approval_token" in nested_arguments
+            ):
+                message = mcp_types.TextContent(
+                    type="text", text="Send the approval credential in MCP request metadata."
+                )
+                return mcp_types.ServerResult(_build_call_result([message], True, None))
+            return await sdk_call_tool(request)
+
+        # The SDK validates the business schema before its decorated callback.
+        # Check reserved fields first so SDK validation cannot print them.
+        server.request_handlers[mcp_types.CallToolRequest] = check_reserved_approval_input
 
     def register_resource_handlers(
         self,

@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 import httpx
 import pytest
 from apcore import AlwaysDenyHandler, Executor, Identity, ModuleAnnotations, Registry
+from mcp.server.lowlevel import Server
+from mcp.shared import session as mcp_session
+from starlette.responses import JSONResponse
 
 from apcore_mcp import APCoreMCP
 from apcore_mcp.adapters.approval import _CORE_SCOPED_APPROVAL
 from apcore_mcp.approval_store import InMemoryApprovalStore
+from apcore_mcp.server.approval_bridge import _ApprovalLogMiddleware, _protect_sdk_approval_logs
 from tests.server.test_versioned_tool_wire import connected_client
 
 _TOOL = "fixture.approved_report"
@@ -231,3 +236,62 @@ def test_scoped_approval_is_explicitly_unavailable_on_legacy_sse() -> None:
     mcp = APCoreMCP(Registry(), approval_store=InMemoryApprovalStore())
     with pytest.raises(ValueError, match="legacy SSE transport"):
         mcp.serve(transport="sse")
+
+
+async def test_sdk_diagnostic_filter_protects_only_the_scoped_server(caplog) -> None:
+    server = Server("fixture")
+    _protect_sdk_approval_logs(server)
+    root = logging.getLogger()
+    with caplog.at_level("DEBUG"):
+        async with server.lifespan(server):
+            for level, diagnostic in (
+                (logging.WARNING, "Failed to validate request: synthetic-value"),
+                (logging.DEBUG, "Message that failed validation: synthetic-value"),
+                (logging.DEBUG, "Read stream closed by client"),
+            ):
+                root.handle(logging.LogRecord("root", level, mcp_session.__file__, 1, diagnostic, (), None))
+        root.handle(logging.LogRecord(
+            "root", logging.WARNING, mcp_session.__file__, 1, "Failed to validate request: host diagnostic", (), None,
+        ))
+
+    assert "synthetic-value" not in caplog.text
+    assert "MCP request validation failed" in caplog.text
+    assert "Read stream closed by client" in caplog.text
+    assert "host diagnostic" in caplog.text
+
+
+async def test_http_diagnostic_filter_keeps_validation_envelope_and_replaces_payload() -> None:
+    async def example_app(scope, receive, send):
+        response = JSONResponse({
+            "jsonrpc": "2.0", "id": "server-error", "error": {"code": -32602, "message": "Validation error: value"},
+        }, status_code=400, headers={"Mcp-Session-Id": "fixture-session"})
+        await response(scope, receive, send)
+
+    transport = httpx.ASGITransport(app=_ApprovalLogMiddleware(example_app))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+        response = await client.post("/mcp")
+
+    assert response.status_code == 400
+    assert response.headers["Mcp-Session-Id"] == "fixture-session"
+    assert int(response.headers["content-length"]) == len(response.content)
+    assert response.json() == {
+        "jsonrpc": "2.0", "id": "server-error", "error": {"code": -32602, "message": "Invalid request parameters"},
+    }
+
+
+async def test_reserved_approval_input_is_checked_before_tool_schema_validation() -> None:
+    registry = Registry()
+    report = Report()
+    registry.register(_TOOL, report, metadata={"async": True})
+    async with connected_client(registry, approval_store=InMemoryApprovalStore(), async_tasks=True) as session:
+        invalid = await session.call_tool(_TOOL, {"count": "invalid"})
+        direct = await session.call_tool(_TOOL, {"count": 1, "_approval_token": "synthetic-value"})
+        submitted = await session.call_tool("__apcore_task_submit", {
+            "module_id": _TOOL, "arguments": {"count": 1, "_approval_token": "synthetic-value"},
+        })
+
+    assert invalid.isError and "Input validation error" in invalid.content[0].text
+    for result in (direct, submitted):
+        assert result.isError
+        assert result.content[0].text == "Send the approval credential in MCP request metadata."
+    assert report.inputs == []
