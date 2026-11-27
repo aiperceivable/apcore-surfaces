@@ -3954,6 +3954,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_cancellation_releases_a_stream_blocked_on_progress() {
+        use apcore::{ChunkStream, Context, Module, ModuleError, Registry, StreamingModule};
+        use futures::StreamExt;
+        use serde_json::json;
+        use tokio::sync::{mpsc, Notify, Semaphore};
+
+        struct StreamingTool(Arc<()>);
+
+        #[async_trait::async_trait]
+        impl Module for StreamingTool {
+            fn input_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+
+            fn output_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+
+            fn description(&self) -> &str {
+                "Return one native stream chunk"
+            }
+
+            async fn execute(&self, _: Value, _: &Context<Value>) -> Result<Value, ModuleError> {
+                panic!("expected native streaming")
+            }
+
+            fn as_streaming(&self) -> Option<&dyn StreamingModule> {
+                Some(self)
+            }
+        }
+
+        impl StreamingModule for StreamingTool {
+            fn stream_typed(&self, _: Value, _: &Context<Value>) -> ChunkStream {
+                let lease = Arc::clone(&self.0);
+                Box::pin(
+                    futures::stream::iter([Ok(json!({"value": 1}))]).map(move |chunk| {
+                        let _lease = &lease;
+                        chunk
+                    }),
+                )
+            }
+        }
+
+        struct ObservedSseSink {
+            sink: SseSink,
+            sending: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl OutboundSink for ObservedSseSink {
+            async fn send(&self, message: Value) -> Result<(), SessionError> {
+                assert_eq!(message["method"], "notifications/progress");
+                self.sending.notify_one();
+                self.sink.send(message).await
+            }
+        }
+
+        let producer_lease = Arc::new(());
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_module(
+                "test.stream",
+                Box::new(StreamingTool(Arc::clone(&producer_lease))),
+            )
+            .unwrap();
+        let bridge = crate::APCoreMCP::builder()
+            .backend(registry)
+            .build()
+            .unwrap();
+        let (server, router, _, options, _, _) = bridge.build_server_components().unwrap();
+        let handler =
+            Arc::new(crate::server::server::ServerHandler::from_server(&server, options).unwrap());
+        let (events, pending_events) = mpsc::channel(1);
+        events
+            .try_send(Ok(axum::response::sse::Event::default()))
+            .unwrap();
+        let sending = Arc::new(Notify::new());
+        router.session_registry().insert(Arc::new(McpSession::new(
+            "test-session",
+            Arc::new(ObservedSseSink {
+                sink: SseSink { events },
+                sending: Arc::clone(&sending),
+            }),
+        )));
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "test.stream", "arguments": {}}
+        });
+        let mut blocked_request = request.clone();
+        blocked_request["params"]["_meta"] = json!({"progressToken": "test"});
+        stamp_session_id(&mut blocked_request, "test-session");
+        let requests = DirectRequests::default();
+        let slot = Arc::new(Semaphore::new(1));
+        let registration = requests.register(&blocked_request);
+        let blocked = tokio::spawn({
+            let requests = requests.clone();
+            let handler = Arc::clone(&handler);
+            let slot = Arc::clone(&slot);
+            async move {
+                requests
+                    .dispatch_registered(
+                        handler.as_ref(),
+                        blocked_request,
+                        registration,
+                        Some(slot),
+                    )
+                    .await
+            }
+        });
+        let deadline = std::time::Duration::from_secs(3);
+        tokio::time::timeout(deadline, sending.notified())
+            .await
+            .expect("stream reached the full progress sink");
+        assert_eq!(pending_events.len(), 1);
+        assert_eq!(slot.available_permits(), 0);
+        assert_eq!(Arc::strong_count(&producer_lease), 3);
+
+        assert!(requests
+            .dispatch(handler.as_ref(), cancel_request(1.into()))
+            .await
+            .is_none());
+        assert!(tokio::time::timeout(deadline, blocked)
+            .await
+            .expect("cancelled stream must release its slot without draining progress")
+            .unwrap()
+            .is_none());
+        assert_eq!(pending_events.len(), 1);
+        assert_eq!(Arc::strong_count(&producer_lease), 2);
+
+        let registration = requests.register(&request);
+        let response = tokio::time::timeout(
+            deadline,
+            requests.dispatch_registered(handler.as_ref(), request, registration, Some(slot)),
+        )
+        .await
+        .expect("a subsequent request can use the same slot")
+        .unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["isError"], false);
+    }
+
+    #[tokio::test]
     async fn stdio_carries_an_elicitation_round_trip() {
         let registry = Arc::new(SessionRegistry::new());
         let handler = eliciting_handler(Arc::clone(&registry));

@@ -9,11 +9,13 @@ from typing import Any
 import anyio
 import httpx
 from apcore import Context, Executor, Identity, Registry
+from apcore.async_task import AsyncTaskManager, TaskStatus
 from mcp import types
 from mcp.shared.message import SessionMessage
 from pydantic import BaseModel
 
 from apcore_mcp.auth.middleware import AuthMiddleware
+from apcore_mcp.server.async_task_bridge import AsyncTaskBridge
 from apcore_mcp.server.factory import MCPServerFactory
 from apcore_mcp.server.router import ExecutionRouter
 from apcore_mcp.server.transport import TransportManager, transport_session_var
@@ -197,6 +199,70 @@ async def test_http_sessions_isolate_same_request_id_and_cancel_tasks_on_close()
             assert removed.status_code == 200
             assert await bridge.closed.get() == module.sessions["target"]
             assert bridge.closed.empty()
+
+
+async def test_http_manager_shutdown_finishes_session_task_cancellation() -> None:
+    class SuspendingTaskManager(AsyncTaskManager):
+        async def cancel(self, task_id: str) -> bool:
+            await asyncio.sleep(0)
+            return await super().cancel(task_id)
+
+    module = _GatedModule()
+    registry = Registry()
+    registry.register("test.gated", module, metadata={"async": True})
+    executor = Executor(registry=registry)
+    task_manager = SuspendingTaskManager(executor)
+    bridge = AsyncTaskBridge(task_manager)
+    factory = MCPServerFactory()
+    server = factory.create_server()
+    factory.register_handlers(
+        server,
+        factory.build_tools(registry),
+        ExecutionRouter(executor),
+        async_bridge=bridge,
+        descriptor_lookup=registry.get_definition,
+    )
+    transport = TransportManager()
+    transport.set_async_task_bridge(bridge)
+    headers = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"}
+
+    try:
+        with anyio.fail_after(5):
+            async with (
+                transport.build_streamable_http_app(server, factory.build_init_options(server, "test", "1")) as app,
+                httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+            ):
+                initialized = await client.post(
+                    "/mcp/", headers=headers, json={
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18", "capabilities": {},
+                            "clientInfo": {"name": "test", "version": "1"},
+                        },
+                    },
+                )
+                initialized.raise_for_status()
+                headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+                notification = await client.post(
+                    "/mcp/", headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"}
+                )
+                assert notification.status_code == 202
+                response = await client.post("/mcp/", headers=headers, json={
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "test.gated", "arguments": {"name": "shutdown"}},
+                })
+                response.raise_for_status()
+                result = next(
+                    json.loads(line[5:])["result"] for line in response.iter_lines() if line.startswith("data:")
+                )
+                task_id = json.loads(result["content"][0]["text"])["task_id"]
+                assert await module.entered.get() == "shutdown"
+
+        # Exit the HTTP manager with an open session, without sending DELETE.
+        status = task_manager.get_status(task_id)
+        assert status is not None and status.status == TaskStatus.CANCELLED
+    finally:
+        await task_manager.shutdown()
 
 
 async def test_authenticated_http_session_rejects_other_principals_before_dispatch() -> None:

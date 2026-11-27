@@ -1864,8 +1864,15 @@ impl ExecutionRouter {
                 version_hint,
             )?;
             Some(
-                self.consume_stream(tool_name, chunks, Some(completion), progress, Some(context))
-                    .await,
+                self.consume_stream(
+                    tool_name,
+                    chunks,
+                    Some(completion),
+                    progress,
+                    Some(context),
+                    apcore_ctx.cancel_token.as_ref(),
+                )
+                .await,
             )
         })
         .await;
@@ -1939,6 +1946,7 @@ impl ExecutionRouter {
                     None,
                     Some((progress_token, send_notification)),
                     context,
+                    apcore_ctx.and_then(|ctx| ctx.cancel_token.as_ref()),
                 )
                 .await,
             )
@@ -1973,6 +1981,7 @@ impl ExecutionRouter {
         completion: Option<StreamCompletionHandle>,
         progress: Option<(&ProgressToken, &SendNotificationFn)>,
         context: Option<&Value>,
+        cancel_token: Option<&CancelToken>,
     ) -> StreamOutcome {
         use tokio_stream::StreamExt;
         let mut accumulated = Value::Object(serde_json::Map::new());
@@ -1998,7 +2007,22 @@ impl ExecutionRouter {
                                 "message": serde_json::to_string(&safe_chunk).unwrap_or_default(),
                             }
                         });
-                        if let Err(e) = send_notification(notification).await {
+                        let send = send_notification(notification);
+                        let sent = match cancel_token {
+                            Some(token) => tokio::select! {
+                                biased;
+                                // The sink can wait for queue capacity while the
+                                // Core stream is suspended between chunks.
+                                _ = token.cancelled() => {
+                                    return Self::stream_error(
+                                        "Streaming execution cancelled (EXECUTION_CANCELLED).".into(),
+                                    );
+                                }
+                                result = send => result,
+                            },
+                            None => send.await,
+                        };
+                        if let Err(e) = sent {
                             tracing::debug!("Failed to send progress notification: {e}");
                         }
                     }

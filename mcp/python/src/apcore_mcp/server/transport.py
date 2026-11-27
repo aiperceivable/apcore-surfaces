@@ -197,7 +197,9 @@ class TransportManager:
             bridge = self._async_task_bridge
             if bridge is not None:
                 try:
-                    await bridge.cancel_session_tasks(session_id)
+                    # The HTTP manager cancels the session's task group on shutdown.
+                    with anyio.CancelScope(shield=True):
+                        await bridge.cancel_session_tasks(session_id)
                 except Exception:  # noqa: BLE001 — disconnect must not propagate
                     logger.warning(
                         "cancel_session_tasks(%s) failed during transport teardown",
