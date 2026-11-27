@@ -1225,6 +1225,13 @@ export function buildModuleCommand(
     const flagBase = opt.name.replace(/_/g, "-");
     const option = new Option(opt.isBooleanFlag ? `--${flagBase}` : opt.flags, opt.description)
       .default(opt.defaultValue);
+    // Commander strips "no-" from the key by default. Keep it on declarations
+    // from the schema so only the generated boolean counterparts negate flags.
+    if (option.negate) {
+      const suffix = option.attributeName();
+      option.negate = false;
+      option.attributeName = () => `no${suffix.charAt(0).toUpperCase()}${suffix.slice(1)}`;
+    }
     if (opt.parseArg) option.argParser(opt.parseArg);
     cmd.addOption(option);
     schemaFlags.push([opt, option.attributeName()]);
@@ -1266,14 +1273,17 @@ export function buildModuleCommand(
       }
       // 1. Collect and merge input
       const schemaKwargs: Record<string, unknown> = {};
+      const structuredFlags: Record<string, unknown> = {};
       for (const [opt, key] of schemaFlags) {
         if (!Object.hasOwn(options, key)) continue;
         const value = options[key];
-        schemaKwargs[opt.name] = opt.parseStructuredArg && typeof value === "string" && cmd.getOptionValueSource(key) === "cli"
-          ? opt.parseStructuredArg(value)
-          : value;
+        if (opt.parseStructuredArg && typeof value === "string" && cmd.getOptionValueSource(key) === "cli") {
+          structuredFlags[opt.name] = opt.parseStructuredArg(value);
+        } else {
+          schemaKwargs[opt.name] = value;
+        }
       }
-      merged = await readModuleInput(stdinFlag, schemaKwargs, largeInput);
+      merged = { ...await readModuleInput(stdinFlag, schemaKwargs, largeInput), ...structuredFlags };
 
       // 2. Reconvert enum values
       const reconverted = reconvertEnumValues(merged, schemaOptions);

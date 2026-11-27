@@ -1035,26 +1035,18 @@ pub fn reconcile_bool_pairs(
     matches: &clap::ArgMatches,
     bool_pairs: &[crate::schema_parser::BoolFlagPair],
 ) -> HashMap<String, Value> {
+    let supplied = |id: &str| {
+        // exec has no generated option IDs. For generated options, check
+        // presence rather than the bool stored by SetTrue or SetFalse.
+        matches.try_contains_id(id).unwrap_or(false)
+            && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+    };
     let mut result = HashMap::new();
     for pair in bool_pairs {
-        // Use try_get_one to avoid panicking when the flag doesn't exist
-        // in ArgMatches (e.g. exec subcommand doesn't have schema-derived flags).
-        let pos_set = matches
-            .try_get_one::<bool>(&pair.prop_name)
-            .ok()
-            .flatten()
-            .copied()
-            .unwrap_or(false);
         let neg_id = format!("no-{}", pair.prop_name);
-        let neg_set = matches
-            .try_get_one::<bool>(&neg_id)
-            .ok()
-            .flatten()
-            .copied()
-            .unwrap_or(false);
-        let val = if pos_set {
+        let val = if supplied(&pair.prop_name) {
             true
-        } else if neg_set {
+        } else if supplied(&neg_id) {
             false
         } else {
             pair.default_val
@@ -1091,11 +1083,13 @@ fn extract_cli_kwargs(
 
     let mut inputs = CliInputs::default();
     for arg in &schema_args.args {
-        let id = arg.get_id().as_str();
-        // Skip the no- counterparts of boolean args.
-        if id.starts_with("no-") {
+        if matches!(
+            arg.get_action(),
+            clap::ArgAction::SetTrue | clap::ArgAction::SetFalse
+        ) {
             continue;
         }
+        let id = arg.get_id().as_str();
         // Use try_get_one to avoid panicking when the arg doesn't exist
         // in ArgMatches (e.g. exec subcommand doesn't have schema-derived flags).
         if let Ok(Some(value)) = matches.try_get_one::<String>(id) {

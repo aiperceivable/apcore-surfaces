@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,23 @@ def test_shared_structured_flag_contract(case: dict[str, Any]) -> None:
         assert module.calls == [expected["input"]]
     else:
         assert result.stderr
+
+
+@pytest.mark.skipif(version("apcore") == "0.33.0", reason="Core 0.33.0 loses root references inside unions")
+def test_nullable_flag_resolves_a_referenced_container_branch() -> None:
+    schema = deepcopy(_FIXTURE["schema"])
+    schema["$defs"] = {"labels": {"type": "array", "items": {"type": "string"}}}
+    schema["properties"]["maybe_labels"]["oneOf"][0] = {"$ref": "#/$defs/labels"}
+    command, module = _command(schema)
+
+    for value in ('["choice"]', "null"):
+        invoked = CliRunner().invoke(command, ["--filters", "{}", "--labels", "[]", "--maybe-labels", value])
+        assert invoked.exit_code == 0, invoked.output
+
+    assert module.calls == [
+        {"filters": {}, "labels": [], "maybe_labels": ["choice"]},
+        {"filters": {}, "labels": [], "maybe_labels": None},
+    ]
 
 
 @pytest.mark.parametrize("source", ["stdin", "file"])

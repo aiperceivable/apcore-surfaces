@@ -5,7 +5,11 @@
     "properties": {
       "filters": { "type": "object" },
       "labels": { "type": "array", "items": { "type": "string" } },
-      "note": { "type": "string" }
+      "note": { "type": "string" },
+      "maybe_filters": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
+      "maybe_labels": { "oneOf": [{ "type": "array", "items": { "type": "string" } }, { "type": "null" }] },
+      "nullable_labels": { "type": ["array", "null"], "items": { "type": "string" } },
+      "no_labels": { "type": "array", "items": { "type": "string" } }
     },
     "required": ["filters", "labels"]
   },
@@ -19,6 +23,21 @@
       "id": "empty_collections",
       "args": ["--filters", "{}", "--labels", "[]"],
       "expected": { "exit_code": 0, "calls": 1, "input": { "filters": {}, "labels": [] } }
+    },
+    {
+      "id": "nullable_structured_values",
+      "args": ["--filters", "{}", "--labels", "[]", "--maybe-filters", "{\"enabled\":true}", "--maybe-labels", "[\"choice\"]", "--nullable-labels", "[\"direct\"]"],
+      "expected": { "exit_code": 0, "calls": 1, "input": { "filters": {}, "labels": [], "maybe_filters": { "enabled": true }, "maybe_labels": ["choice"], "nullable_labels": ["direct"] } }
+    },
+    {
+      "id": "explicit_null_for_nullable_structured_flags",
+      "args": ["--filters", "{}", "--labels", "[]", "--maybe-filters", "null", "--maybe-labels", "null", "--nullable-labels", "null"],
+      "expected": { "exit_code": 0, "calls": 1, "input": { "filters": {}, "labels": [], "maybe_filters": null, "maybe_labels": null, "nullable_labels": null } }
+    },
+    {
+      "id": "no_prefix_is_part_of_the_property_name",
+      "args": ["--filters", "{}", "--labels", "[\"always\"]", "--no-labels", "[\"separate\"]"],
+      "expected": { "exit_code": 0, "calls": 1, "input": { "filters": {}, "labels": ["always"], "no_labels": ["separate"] } }
     },
     {
       "id": "malformed_object",

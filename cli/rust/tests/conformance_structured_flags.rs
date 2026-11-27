@@ -204,3 +204,111 @@ async fn composition_and_reference_siblings_keep_container_flags_typed() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn nullable_choices_decode_json_and_keep_original_schema_constraints() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "labels": {"anyOf": [{"$ref": "#/$defs/Labels"}, {"type": "null"}]},
+            "filters": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Filters"}]},
+            "note": {"anyOf": [{"type": "string"}, {"type": "array"}]},
+        },
+        "$defs": {
+            "Labels": {"type": "array", "items": {"type": "string"}},
+            "Filters": {"type": "object", "required": ["active"]},
+        },
+    });
+    for (id, args, exit_code, value) in [
+        (
+            "both containers and a string choice",
+            vec![
+                "--labels",
+                r#"["x"]"#,
+                "--filters",
+                r#"{"active":true}"#,
+                "--note",
+                "[]",
+            ],
+            0,
+            Some(json!({"labels": ["x"], "filters": {"active": true}, "note": "[]"})),
+        ),
+        (
+            "explicit null with another option omitted",
+            vec!["--labels", "null", "--filters", "null"],
+            0,
+            Some(json!({"labels": null, "filters": null})),
+        ),
+        (
+            "original array constraints",
+            vec!["--labels", "[17]"],
+            45,
+            None,
+        ),
+        (
+            "original object constraints",
+            vec!["--filters", "{}"],
+            45,
+            None,
+        ),
+        ("malformed JSON", vec!["--labels", "["], 45, None),
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        run_case(
+            &schema,
+            &args,
+            id,
+            &Expected {
+                exit_code,
+                calls: usize::from(exit_code == 0),
+                input: value,
+            },
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn literal_no_prefix_is_a_regular_structured_option() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"no-labels": {"type": "array"}},
+        "required": ["no-labels"],
+    });
+    run_case(
+        &schema,
+        &["--no-labels".into(), r#"["x"]"#.into()],
+        "literal no-labels option",
+        &Expected {
+            exit_code: 0,
+            calls: 1,
+            input: Some(json!({"no-labels": ["x"]})),
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn boolean_negation_uses_explicit_flag_presence() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"enabled": {"type": "boolean", "default": true}},
+    });
+    for (id, args, enabled) in [
+        ("default true", vec![], true),
+        ("explicit true", vec!["--enabled".into()], true),
+        ("explicit false", vec!["--no-enabled".into()], false),
+    ] {
+        run_case(
+            &schema,
+            &args,
+            id,
+            &Expected {
+                exit_code: 0,
+                calls: 1,
+                input: Some(json!({"enabled": enabled})),
+            },
+        )
+        .await;
+    }
+}

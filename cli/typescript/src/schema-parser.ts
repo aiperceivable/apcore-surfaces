@@ -8,6 +8,7 @@ import type { OptionConfig } from "./main.js";
 import { EXIT_CODES, SchemaValidationError } from "./errors.js";
 import { exitWith } from "./exit.js";
 import { warn as logWarn } from "./logger.js";
+import { structuredOptionTypes } from "./ref-resolver.js";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -77,17 +78,15 @@ export function extractHelp(propSchema: Record<string, unknown>, maxLength = 100
   return text;
 }
 
-function parseStructuredValue(value: string, flag: string, type: "object" | "array"): unknown {
+function parseStructuredValue(value: string, flag: string, types: readonly string[]): unknown {
   let decoded: unknown;
   try {
     decoded = JSON.parse(value);
   } catch {
     throw new SchemaValidationError(`${flag} must contain valid JSON.`);
   }
-  const matches = type === "array"
-    ? Array.isArray(decoded)
-    : typeof decoded === "object" && decoded !== null && !Array.isArray(decoded);
-  if (!matches) throw new SchemaValidationError(`${flag} must be a JSON ${type}.`);
+  const type = decoded === null ? "null" : Array.isArray(decoded) ? "array" : typeof decoded;
+  if (!types.includes(type)) throw new SchemaValidationError(`${flag} must be JSON of type ${types.join(" or ")}.`);
   return decoded;
 }
 
@@ -157,7 +156,8 @@ export function schemaToCliOptions(
     }
     flagNames[flagName] = propName;
 
-    const typeResult = mapType(propName, propSchema);
+    const structuredTypes = structuredOptionTypes(propSchema.type);
+    const typeResult = structuredTypes ? "string" : mapType(propName, propSchema);
     const isRequired = requiredList.includes(propName);
     const helpBase = extractHelp(propSchema, maxHelpLength);
     const helpText = isRequired
@@ -165,15 +165,14 @@ export function schemaToCliOptions(
       : helpBase ?? "";
     const defaultValue = propSchema.default as unknown;
 
-    const structuredType = propSchema.type;
-    if (structuredType === "object" || structuredType === "array") {
+    if (structuredTypes) {
       options.push({
         name: propName,
         flags: `${flagName} <json>`,
         description: helpText,
         defaultValue,
         required: isRequired,
-        parseStructuredArg: value => parseStructuredValue(value, flagName, structuredType),
+        parseStructuredArg: value => parseStructuredValue(value, flagName, structuredTypes),
       });
     } else if (typeResult === BOOLEAN_FLAG) {
       // Boolean flag pair: --flag/--no-flag
