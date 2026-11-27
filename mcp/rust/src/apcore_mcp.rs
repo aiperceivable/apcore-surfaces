@@ -2713,8 +2713,11 @@ mod tests {
 
     #[tokio::test]
     async fn wire_phase_b_keeps_approval_credentials_in_response_metadata() {
-        verify_wire_phase_b(false).await;
-        verify_wire_phase_b(true).await;
+        for native_stream in [false, true] {
+            for final_scope in [false, true] {
+                verify_wire_phase_b(native_stream, final_scope).await;
+            }
+        }
     }
 
     #[test]
@@ -2753,7 +2756,7 @@ mod tests {
             if message == "Phase B approval requires stdio or Streamable HTTP"));
     }
 
-    async fn verify_wire_phase_b(native_stream: bool) {
+    async fn verify_wire_phase_b(native_stream: bool, final_scope: bool) {
         use crate::approval_store::{ApprovalStore, InMemoryApprovalStore};
         use crate::auth::middleware::AUTH_IDENTITY;
         use crate::server::transport::McpHandler;
@@ -2822,8 +2825,30 @@ mod tests {
         let store = Arc::new(InMemoryApprovalStore::new());
         let notified = Arc::new(AtomicUsize::new(0));
         let notices = Arc::clone(&notified);
+
+        struct RequireFinalApproval;
+
+        #[async_trait::async_trait]
+        impl apcore::PolicyEvaluator for RequireFinalApproval {
+            async fn evaluate(
+                &self,
+                _: &apcore::PolicyEvaluationRequest,
+            ) -> Result<apcore::PolicyVerdict, apcore::ModuleError> {
+                Ok(apcore::PolicyVerdict {
+                    decision: apcore::PolicyEffect::RequireApproval,
+                    rule_id: None,
+                })
+            }
+        }
+
+        let mut executor = Executor::new(registry, Config::default());
+        if final_scope {
+            executor
+                .set_policy_evaluator(Some(Arc::new(RequireFinalApproval)))
+                .unwrap();
+        }
         let bridge = APCoreMCP::builder()
-            .backend(registry)
+            .backend(Arc::new(executor))
             .approval_store(store.clone())
             .approval_notify(move |_, _, _| {
                 notices.fetch_add(1, Ordering::SeqCst);

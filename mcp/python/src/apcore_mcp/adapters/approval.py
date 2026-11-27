@@ -162,11 +162,23 @@ def _argument_snapshot(arguments: dict[str, Any]) -> str:
 
 
 def _scope_for(request: ApprovalRequest, snapshot: str) -> ApprovalScope:
+    digest = getattr(request, "canonical_args_digest", None)
+    if digest is not None:
+        version = getattr(request, "module_version", None)
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("Invalid final approval argument digest")
+        if version is not None and not isinstance(version, str):
+            raise ValueError("Invalid final approval module version")
+        encoded = json.dumps([version, digest], separators=(",", ":")).encode("utf-8")
+        # The prefix separates final-scope records from existing argument-object digests.
+        material = b"apcore-final-scope-v1\0" + encoded
+    else:
+        material = snapshot.encode("utf-8")
     return ApprovalScope(
         _approval_principal(request.context.identity),
         request.caller_id,
         request.module_id,
-        sha256(snapshot.encode("utf-8")).hexdigest(),
+        sha256(material).hexdigest(),
     )
 
 
@@ -206,6 +218,10 @@ class StorageBackedApprovalHandler(ApprovalHandler):
     @property
     def scoped_approval_available(self) -> bool:
         return _CORE_SCOPED_APPROVAL and isinstance(self._store, ScopedApprovalStore)
+
+    @property
+    def supports_final_scope(self) -> bool:
+        return self.scoped_approval_available
 
     async def request_approval(self, request: ApprovalRequest) -> ApprovalResult:
         if not self.scoped_approval_available:
@@ -329,6 +345,10 @@ class _MCPScopedApprovalGate:
 
     def __init__(self, handler: _ScopedMCPApprovalHandler) -> None:
         self._handler = handler
+
+    @property
+    def supports_final_scope(self) -> bool:
+        return getattr(self._handler, "supports_final_scope", None) is True
 
     def _delivery_for(self, request: ApprovalRequest) -> _ApprovalDelivery | None:
         delivery = _approval_delivery.get()

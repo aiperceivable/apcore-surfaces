@@ -30,7 +30,7 @@
     "node": ">=20.0.0"
   },
   "peerDependencies": {
-    "apcore-js": "1.0.0-alpha.2",
+    "apcore-js": "1.0.0-alpha.3",
     "apcore-toolkit": "0.15.1-alpha.2"
   },
   "dependencies": {
@@ -47,7 +47,7 @@
     "@typescript-eslint/eslint-plugin": "^8.59.0",
     "@typescript-eslint/parser": "^8.59.0",
     "@vitest/coverage-v8": "^5.1.0",
-    "apcore-js": "1.0.0-alpha.2",
+    "apcore-js": "1.0.0-alpha.3",
     "apcore-toolkit": "0.15.1-alpha.2",
     "apdev-js": "^0.2.4",
     "eslint": "^10.2.1",

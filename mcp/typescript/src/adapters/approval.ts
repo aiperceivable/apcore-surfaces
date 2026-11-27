@@ -166,13 +166,25 @@ function businessArguments(request: ApprovalRequest): Record<string, unknown> {
   return args;
 }
 
+function argumentsScopeDigest(request: ApprovalRequest, args: Record<string, unknown>): string {
+  const digest: unknown = Reflect.get(request, "canonicalArgsDigest");
+  if (digest == null) return sha256(JSON.stringify(canonicalValue(args)));
+  const version: unknown = Reflect.get(request, "moduleVersion") ?? null;
+  if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)
+      || (version !== null && typeof version !== "string")) {
+    throw new Error("Invalid final approval scope");
+  }
+  // This prefix keeps final-scope records separate from legacy argument objects.
+  return sha256("apcore-final-scope-v1\0" + JSON.stringify([version, digest]));
+}
+
 function invocationScope(request: ApprovalRequest, args: Record<string, unknown>): ApprovalScope {
   const identity = request.context?.identity;
   return {
     principal: identity ? { type: identity.type, id: identity.id } : null,
     callerId: request.callerId ?? request.context?.callerId ?? null,
     moduleId: request.moduleId,
-    argumentsDigest: sha256(JSON.stringify(canonicalValue(args))),
+    argumentsDigest: argumentsScopeDigest(request, args),
   };
 }
 
@@ -203,13 +215,19 @@ export class StorageBackedApprovalHandler {
     if (!supportsScopedApprovalStore(this.store)) throw new Error("Phase B requires a scoped approval store");
   }
 
+  get supportsFinalScope(): boolean {
+    return supportsScopedCore() && supportsScopedApprovalStore(this.store);
+  }
+
   /** Bind the provider to the server's private foreground response path. */
   forMcpServer(): Pick<StorageBackedApprovalHandler,
-    "requestApproval" | "checkApproval" | "checkApprovalForPrincipal" | "checkApprovalForCall"> {
+    "requestApproval" | "checkApproval" | "checkApprovalForPrincipal" | "checkApprovalForCall" |
+    "supportsFinalScope"> {
     const isForeground = (request: ApprovalRequest) => canIssueApprovalReply(
       request.moduleId, request.callerId ?? request.context?.callerId ?? null, request.context?.data, true,
     );
     return {
+      supportsFinalScope: this.supportsFinalScope,
       requestApproval: async request => isForeground(request)
         ? this.requestApproval(request)
         : rejected("Scoped approval requires a direct tool call"),
