@@ -104,7 +104,7 @@ describe('createPrometheusServer', () => {
     let ready = false;
     const server = createPrometheusServer({
       metricsPath: '/private/scrape',
-      renderMetrics: () => 'apcore_requests_total{route="測試"} 1\n',
+      renderMetrics: () => 'apcore_requests_total{route="\u6e2c\u8a66"} 1\n',
       isReady: () => ready,
     });
     const port = await listen(server);
@@ -113,7 +113,7 @@ describe('createPrometheusServer', () => {
       expect(reply.status).toBe(200);
       expect(reply.headers['content-type']).toBe('text/plain; version=0.0.4; charset=utf-8');
       expect(reply.headers['content-length']).toBe(String(reply.body.length));
-      expect(reply.body.toString()).toBe('apcore_requests_total{route="測試"} 1\n');
+      expect(reply.body.toString()).toBe('apcore_requests_total{route="\u6e2c\u8a66"} 1\n');
       expect((await scrape(port, '/private/scrape/', 'GET')).status).toBe(404);
       expect((await scrape(port, '/metrics')).status).toBe(404);
       expect((await scrape(port, '/healthz?verbose=false')).body.toString()).toBe('OK');
