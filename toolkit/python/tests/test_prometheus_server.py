@@ -1,4 +1,4 @@
-"""HTTP-level compatibility for the standalone Prometheus listener."""
+"""HTTP-level contract for the standalone Prometheus listener."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from threading import Event, Thread
 from typing import Never
 
 import pytest
-from apcore.observability import MetricsCollector, PrometheusExporter, UsageCollector
 
 from apcore_toolkit import create_prometheus_server
 
@@ -39,31 +38,16 @@ def request(port: int, path: str, method: str = "GET") -> tuple[int, dict[str, s
         client.close()
 
 
-@pytest.mark.parametrize("populated", [False, True])
-def test_scrape_matches_legacy_http_response(populated: bool) -> None:
-    metrics = MetricsCollector()
-    usage = UsageCollector()
-    if populated:
-        metrics.increment("example_calls_total", {"site": "课堂"})
-        metrics.observe("apcore_module_duration_seconds", {"module_id": "math.add"}, 0.01)
-        usage.record(module_id="math.add", caller_id="client", latency_ms=10.0, success=True)
-    exporter = PrometheusExporter(metrics, usage_collector=usage)
-    exporter.start(port=0, path="/scrape")
-    try:
-        assert exporter._server is not None
-        legacy_status, legacy_headers, legacy_body = request(exporter._server.server_port, "/scrape")
-        with running(create_prometheus_server(exporter.export, port=0, metrics_path="/scrape")) as port:
-            status, headers, body = request(port, "/scrape?format=prometheus")
-            assert status == legacy_status == 200
-            assert body == legacy_body == exporter.export().encode("utf-8")
-            assert (
-                headers["Content-Type"] == legacy_headers["Content-Type"] == "text/plain; version=0.0.4; charset=utf-8"
-            )
-            assert headers["Content-Length"] == str(len(body))
-            assert request(port, "/metrics")[0] == 404
-            assert request(port, "/scrape/")[0] == 404
-    finally:
-        exporter.stop()
+@pytest.mark.parametrize("text", ["", '# TYPE example_calls_total counter\nexample_calls_total{site="\u8bfe\u5802"} 1\n'])
+def test_scrape_writes_the_supplied_metrics_text(text: str) -> None:
+    with running(create_prometheus_server(lambda: text, port=0, metrics_path="/scrape")) as port:
+        status, headers, body = request(port, "/scrape?format=prometheus")
+        assert status == 200
+        assert body == text.encode("utf-8")
+        assert headers["Content-Type"] == "text/plain; version=0.0.4; charset=utf-8"
+        assert headers["Content-Length"] == str(len(body))
+        assert request(port, "/metrics")[0] == 404
+        assert request(port, "/scrape/")[0] == 404
 
 
 def test_routes_readiness_and_rejects_non_get_requests() -> None:

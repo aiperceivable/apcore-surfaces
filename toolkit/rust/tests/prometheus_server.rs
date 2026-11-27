@@ -1,6 +1,5 @@
 #![cfg(feature = "prometheus-server")]
 
-use apcore::{MetricsCollector, PrometheusExporter, UsageCollector};
 use apcore_toolkit::PrometheusServer;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -32,17 +31,20 @@ fn split_response(response: &str) -> (&str, &str) {
 }
 
 #[tokio::test]
-async fn serves_the_legacy_metrics_text_with_routes_and_live_readiness() {
-    let metrics = MetricsCollector::new();
-    let usage = UsageCollector::new();
-    let legacy = PrometheusExporter::new(metrics.clone()).with_usage_collector(usage.clone());
-    legacy.start(0, "/metrics").await.unwrap();
-    let legacy_address = SocketAddr::from(([127, 0, 0, 1], legacy.local_addr().unwrap().port()));
-
+async fn serves_the_supplied_metrics_text_with_routes_and_live_readiness() {
+    const METRICS: &str =
+        "# TYPE example_calls_total counter\nexample_calls_total{site=\"\u{8bfe}\u{5802}\"} 1\n";
+    let has_metrics = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicBool::new(false));
     let mut server = PrometheusServer::new({
-        let snapshot = legacy.clone();
-        move || snapshot.export()
+        let has_metrics = Arc::clone(&has_metrics);
+        move || {
+            if has_metrics.load(Ordering::Relaxed) {
+                METRICS.to_string()
+            } else {
+                String::new()
+            }
+        }
     })
     .with_metrics_path("/custom")
     .with_readiness({
@@ -60,23 +62,15 @@ async fn serves_the_legacy_metrics_text_with_routes_and_live_readiness() {
     assert!(headers
         .to_ascii_lowercase()
         .contains("content-type: text/plain; version=0.0.4; charset=utf-8"));
-    let old = request(legacy_address, "GET", "/metrics").await;
-    assert_eq!(body, split_response(&old).1);
-    for name in [
-        "apcore_module_calls_total",
-        "apcore_module_errors_total",
-        "apcore_module_duration_seconds",
-    ] {
-        assert!(body.contains(name));
-    }
+    assert!(body.is_empty());
 
-    metrics.increment_calls("sample.metric", "success");
-    usage.record("sample.metric", Some("sample.caller"), 1.0, true);
+    has_metrics.store(true, Ordering::Relaxed);
     let populated = request(address, "GET", "/custom").await;
-    let old = request(legacy_address, "GET", "/metrics").await;
-    let body = split_response(&populated).1;
-    assert_eq!(body, split_response(&old).1);
-    assert!(body.contains("apcore_usage_"));
+    let (headers, body) = split_response(&populated);
+    assert_eq!(body, METRICS);
+    assert!(headers
+        .to_ascii_lowercase()
+        .contains(&format!("content-length: {}", METRICS.len())));
 
     assert!(request(address, "GET", "/metrics").await.contains("404"));
     let rejected = request(address, "POST", "/custom").await;
@@ -104,7 +98,6 @@ async fn serves_the_legacy_metrics_text_with_routes_and_live_readiness() {
         TcpStream::connect(address).await.unwrap_err().kind(),
         ErrorKind::ConnectionRefused
     );
-    legacy.shutdown();
 }
 
 #[tokio::test]

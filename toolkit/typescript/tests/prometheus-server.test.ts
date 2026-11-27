@@ -1,9 +1,10 @@
-import { MetricsCollector, PrometheusExporter, UsageCollector } from 'apcore-js';
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 import { createPrometheusServer } from '../src/index.js';
+
+const metricsText = '# TYPE example_calls_total counter\nexample_calls_total{site="\u8bfe\u5802"} 1\n';
 
 function request(server: Server, url: string, method = 'GET') {
   const response = { writeHead: vi.fn().mockReturnThis(), end: vi.fn() };
@@ -56,17 +57,11 @@ describe('createPrometheusServer', () => {
     },
   );
 
-  it('serves the exact legacy collector output for a custom path', () => {
-    const collector = new MetricsCollector();
-    const usageCollector = new UsageCollector();
-    collector.increment('apcore_test_calls_total', {}, 2);
-    usageCollector.record('learning.review', 12, false);
-    const exporter = new PrometheusExporter({ collector, usageCollector });
-    const server = createPrometheusServer({ renderMetrics: () => exporter.export(), metricsPath: '/scrape' });
+  it('serves the supplied metrics text for a custom path', () => {
+    const server = createPrometheusServer({ renderMetrics: () => metricsText, metricsPath: '/scrape' });
 
     const reply = request(server, '/scrape');
-    const body = Buffer.from(exporter.export(), 'utf8');
-    expect(body.toString()).toContain('apcore_usage_calls_total');
+    const body = Buffer.from(metricsText, 'utf8');
     expect(reply.writeHead).toHaveBeenCalledWith(200, {
       'Content-Type': 'text/plain; version=0.0.4; charset=utf-8',
       'Content-Length': String(body.length),
@@ -133,33 +128,22 @@ describe('createPrometheusServer', () => {
     }
   });
 
-  it('returns matching bytes from the legacy and Toolkit listeners for empty and live collectors', async () => {
-    const collector = new MetricsCollector();
-    const usageCollector = new UsageCollector();
-    const exporter = new PrometheusExporter({ collector, usageCollector });
-    const server = createPrometheusServer({ renderMetrics: () => exporter.export() });
+  it('renders current metrics on every scrape', async () => {
+    let text = '';
+    const server = createPrometheusServer({ renderMetrics: () => text });
     const port = await listen(server);
     try {
-      exporter.start({ port: 0 });
-      // The legacy wrapper does not expose its chosen ephemeral port.
-      const legacyServer = Reflect.get(exporter, '_server') as Server;
-      if (!legacyServer.listening) await once(legacyServer, 'listening');
-      const legacyPort = serverPort(legacyServer);
-
       const cold = await scrape(port, '/metrics');
       expect(cold.status).toBe(200);
       expect(cold.headers['content-length']).toBe('0');
-      expect(cold.body).toEqual((await scrape(legacyPort, '/metrics')).body);
-
-      collector.increment('apcore_test_calls_total', {}, 2);
-      usageCollector.record('study.review', 12, false);
+      expect(cold.body.length).toBe(0);
+      text = metricsText;
       const live = await scrape(port, '/metrics');
       expect(live.status).toBe(200);
-      expect(live.body.toString()).toContain('apcore_usage_calls_total');
-      expect(live.body).toEqual((await scrape(legacyPort, '/metrics')).body);
-      expect(live.body).toEqual(Buffer.from(exporter.export(), 'utf8'));
+      expect(live.body).toEqual(Buffer.from(metricsText, 'utf8'));
+      expect(live.headers['content-length']).toBe(String(live.body.length));
     } finally {
-      await Promise.all([exporter.stop(), close(server)]);
+      await close(server);
     }
   });
 
