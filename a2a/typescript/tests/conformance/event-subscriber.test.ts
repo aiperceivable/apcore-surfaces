@@ -1,7 +1,7 @@
-import {
-  APCore, A2ASubscriber, Config, VERSION, createSubscriberFromConfig, resetSubscriberRegistry,
-} from "apcore-js";
-import type { ApCoreEvent, EventEmitter } from "apcore-js";
+import { Config } from "apcore-js/config";
+import type { ApCoreEvent, EventEmitter } from "apcore-js/events";
+import { APCore } from "apcore-js/full";
+import { createSysModulesPlugin } from "apcore-js/sys-modules";
 import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -9,7 +9,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { A2AEventSubscriber, registerA2ASubscriber } from "../../src/index.js";
+import { A2AEventSubscriber, createA2AEventSubscriber } from "../../src/index.js";
 
 interface FixtureCase {
   id: string;
@@ -44,12 +44,12 @@ interface RecordedRequest {
 const fixture = JSON.parse(readFileSync(
   new URL("../../../conformance/fixtures/event_subscriber.json", import.meta.url), "utf8",
 )) as { event: FixtureEvent; test_cases: FixtureCase[] };
-// The published minimum suppresses failures from configured subscribers
-// inside CircuitBreakerWrapper. Candidate jobs can require all cases even
-// when checking their installation, so a stale minimum cannot pass them.
-const legacyCoreFloor = VERSION === "0.33.0" && process.env.APCORE_A2A_REQUIRE_RELIABLE_DELIVERY !== "1";
-
-function createEmitter(configFile: string, receiverUrl: string, test: FixtureCase): EventEmitter {
+function createEmitter(
+  configFile: string,
+  receiverUrl: string,
+  test: FixtureCase,
+  factory = createA2AEventSubscriber,
+): EventEmitter {
   const subscriber = test.subscriber.type === "filter"
     ? { ...test.subscriber, delegate_config: { platform_url: receiverUrl } }
     : { ...test.subscriber, platform_url: receiverUrl };
@@ -62,7 +62,11 @@ function createEmitter(configFile: string, receiverUrl: string, test: FixtureCas
     "    enabled: true",
     `    subscribers: ${JSON.stringify([subscriber])}`,
   ].join("\n"));
-  const app = new APCore({ config: Config.load(configFile), failOnError: true });
+  const app = new APCore({
+    config: Config.load(configFile),
+    failOnError: true,
+    plugins: [createSysModulesPlugin({ subscriberFactories: { a2a: factory } })],
+  });
   if (!app.events) throw new Error("Configured event bus is unavailable");
   return app.events;
 }
@@ -76,13 +80,12 @@ function expectRequest(recorded: RecordedRequest, expected: FixtureCase["expecte
   expect(recorded.body).toEqual({ skillId: expected.skill_id, event: fixture.event });
 }
 
-it("assigns distinct generated IDs to legacy and Surface A2A subscribers", () => {
-  const core = new A2ASubscriber("https://example.invalid/core");
+it("assigns distinct generated IDs to Surface A2A subscribers", () => {
   const surface = new A2AEventSubscriber("https://example.invalid/surface");
   const secondSurface = new A2AEventSubscriber("https://example.invalid/another");
-  expect(new Set([core.subscriberId, surface.subscriberId, secondSurface.subscriberId]).size).toBe(3);
+  expect(surface.subscriberId).not.toBe(secondSurface.subscriberId);
   expect(surface.subscriberId).toMatch(/^a2a-\d+$/);
-  expect(surface.subscriberType).toBe(core.subscriberType);
+  expect(surface.subscriberType).toBe("a2a");
   expect(new A2AEventSubscriber("https://example.invalid/explicit", undefined, { id: "receiver" }).subscriberId).toBe("receiver");
 });
 
@@ -110,7 +113,6 @@ describe("configured A2A event subscriber", () => {
       });
     });
     const scratch = mkdtempSync(join(tmpdir(), "apcore-a2a-event-"));
-    resetSubscriberRegistry();
     try {
       const listening = once(server, "listening");
       server.listen(0, "127.0.0.1");
@@ -127,10 +129,6 @@ describe("configured A2A event subscriber", () => {
         data: fixture.event.data,
       };
 
-      const config = { type: "a2a", platform_url: url };
-      expect(createSubscriberFromConfig(config)).toBeInstanceOf(A2ASubscriber);
-      registerA2ASubscriber();
-      expect(createSubscriberFromConfig(config)).toBeInstanceOf(A2AEventSubscriber);
       const emitter = createEmitter(configFile, url, test);
       try {
         for (const eventPattern of ["apcore.event.delivery_failed", "apcore.subscriber.circuit_opened"]) {
@@ -153,20 +151,29 @@ describe("configured A2A event subscriber", () => {
       }
 
       if (test.id === "bearer_success") {
-        resetSubscriberRegistry();
-        expect(createSubscriberFromConfig(config)).toBeInstanceOf(A2ASubscriber);
-        const legacy = createEmitter(configFile, url, test);
+        const secondSkill = "fixture.second";
+        const second = createEmitter(configFile, url, test, config =>
+          createA2AEventSubscriber({ ...config, skill_id: secondSkill }),
+        );
+        const first = createEmitter(configFile, url, test);
         try {
-          legacy.emit(event);
-          await legacy.flush();
+          second.emit(event);
+          first.emit(event);
+          await Promise.all([second.flush(), first.flush()]);
         } finally {
-          await legacy.shutdown();
+          await Promise.all([second.shutdown(), first.shutdown()]);
         }
-        expect(requests).toHaveLength(2);
-        expectRequest(requests[1], test.expected);
+        expect(requests).toHaveLength(3);
+        const expectedSkills = [test.expected.skill_id, secondSkill];
+        for (const expectedSkill of expectedSkills) {
+          const deliveries = requests.slice(1).filter(request =>
+            (request.body as { skillId: string }).skillId === expectedSkill,
+          );
+          expect(deliveries).toHaveLength(1);
+          expectRequest(deliveries[0], { ...test.expected, skill_id: expectedSkill });
+        }
       }
     } finally {
-      resetSubscriberRegistry();
       if (server.listening) {
         const closed = once(server, "close");
         server.close();
@@ -178,6 +185,6 @@ describe("configured A2A event subscriber", () => {
   };
 
   for (const test of fixture.test_cases) {
-    it.skipIf(legacyCoreFloor && test.expected.dead_letters > 0)(test.id, () => verifyDelivery(test));
+    it(test.id, () => verifyDelivery(test));
   }
 });

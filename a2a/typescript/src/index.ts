@@ -19,7 +19,7 @@ export {
 } from "./client/index.js";
 
 // Events
-export { A2AEventSubscriber, registerA2ASubscriber } from "./event-subscriber.js";
+export { A2AEventSubscriber, createA2AEventSubscriber } from "./event-subscriber.js";
 export type { A2AEventSubscriberOptions } from "./event-subscriber.js";
 
 // Auth
