@@ -164,7 +164,7 @@ dependencies = [
 name = "apcore-toolkit"
 version = "0.15.1-alpha.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2239fcaf5fc1f833ebba79cdc9d022c7a70cc4b523e4fc637538f4a6baaf5f9"
+checksum = "ab34436cafe0107095f188074f226983d1a1605741529b9397d27de490a3cad9"
 dependencies = [
  "apcore",
  "async-trait",
