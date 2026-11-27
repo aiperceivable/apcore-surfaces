@@ -19,15 +19,21 @@ def package_name(manifest: Path) -> str:
 
 
 def pin_core(manifest: Path, version: str) -> None:
+    original = manifest.read_text()
+    dependency = tomllib.loads(original)["dependencies"]["apcore"]
+    if isinstance(dependency, str):
+        pattern = r'^(apcore\s*=\s*")[^"]+(")$'
+    else:
+        pattern = r'^(apcore\s*=\s*\{[^\n}]*\bversion\s*=\s*")[^"]+("[^\n}]*\})$'
     text, count = re.subn(
-        r'^apcore = "[^"]+"$',
-        f'apcore = "={version}"',
-        manifest.read_text(),
+        pattern,
+        lambda match: f"{match[1]}={version}{match[2]}",
+        original,
         count=1,
         flags=re.MULTILINE,
     )
     if count != 1:
-        raise ValueError(f"Expected a version-only apcore dependency in {manifest}")
+        raise ValueError(f"Expected a versioned apcore dependency in {manifest}")
     manifest.write_text(text)
 
 

@@ -14,6 +14,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CORE_REF: 0384a3d4e7688c47eaa1feea6032fb4739813f20
+
 jobs:
   test:
     name: TypeScript (${{ matrix.component }})
@@ -27,41 +30,57 @@ jobs:
         working-directory: ${{ matrix.component }}/typescript
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - &checkout-core
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aiperceivable/apcore
+          ref: ${{ env.CORE_REF }}
+          path: .ci-apcore-core
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - uses: pnpm/action-setup@v4
         with:
           version: '10.30.1'
+      - &build-core-npm
+        name: Build the in-review Core npm distribution
+        run: |
+          core="$GITHUB_WORKSPACE/.ci-apcore-core/typescript"
+          pnpm --dir "$core" install --frozen-lockfile
+          pnpm --dir "$core" build
+          pnpm --dir "$core" pack --pack-destination "$RUNNER_TEMP"
       - &install-dependencies
-        name: Install dependencies with the checkout's Toolkit
+        name: Install dependencies with the Core archive and checkout Toolkit
         shell: bash
         run: |
           toolkit="$GITHUB_WORKSPACE/toolkit/typescript"
-          if [[ "$PWD" == "$toolkit" ]]; then
-            pnpm install --frozen-lockfile
-            exit
-          fi
-
-          pnpm --dir "$toolkit" install --frozen-lockfile
-          pnpm --dir "$toolkit" build
-
-          # Use the local Toolkit before pnpm attempts to fetch the registry
-          # artifact. Restore both inputs before running build or pack.
-          saved=$(mktemp -d)
-          cp package.json pnpm-lock.yaml "$saved/"
-          trap 'cp "$saved/package.json" "$saved/pnpm-lock.yaml" .; rm -rf "$saved"' EXIT
-          TOOLKIT="$toolkit" node --input-type=module <<'JS'
+          archive=( "$RUNNER_TEMP"/apcore-js-*.tgz )
+          installed=$(mktemp -d)
+          npm install --prefix "$installed" --ignore-scripts --no-save --no-package-lock "${archive[0]}"
+          core_root="$installed/node_modules/apcore-js"
+          install_deps() (
+            cd "$1"
+            saved=$(mktemp -d)
+            cp package.json pnpm-lock.yaml "$saved/"
+            trap 'cp "$saved/package.json" "$saved/pnpm-lock.yaml" .; rm -rf "$saved"' EXIT
+            CORE_ROOT="$core_root" TOOLKIT="$toolkit" node --input-type=module <<'JS'
           import { readFileSync, writeFileSync } from 'node:fs';
 
           const file = 'package.json';
           const manifest = JSON.parse(readFileSync(file, 'utf8'));
           manifest.pnpm ??= {};
-          manifest.pnpm.overrides ??= {};
-          manifest.pnpm.overrides['apcore-toolkit'] = 'link:' + process.env.TOOLKIT;
+          const overrides = manifest.pnpm.overrides ??= {};
+          overrides['apcore-js'] = 'link:' + process.env.CORE_ROOT;
+          if (process.cwd() !== process.env.TOOLKIT) overrides['apcore-toolkit'] = 'link:' + process.env.TOOLKIT;
           writeFileSync(file, JSON.stringify(manifest, null, 2) + '\n');
           JS
-          pnpm install --no-frozen-lockfile
+            pnpm install --no-frozen-lockfile
+          )
+          install_deps "$toolkit"
+          if [[ "$PWD" == "$toolkit" ]]; then exit; fi
+          pnpm --dir "$toolkit" build
+          install_deps "$PWD"
           TOOLKIT="$toolkit" node --input-type=module <<'JS'
           import assert from 'node:assert/strict';
           import { realpathSync } from 'node:fs';
@@ -100,12 +119,14 @@ jobs:
         working-directory: ${{ matrix.component }}/typescript
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - *checkout-core
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - uses: pnpm/action-setup@v4
         with:
           version: '10.30.1'
+      - *build-core-npm
       - *install-dependencies
       - run: pnpm build
       - name: Pack and install as an external consumer
@@ -119,7 +140,7 @@ jobs:
             toolkit="$GITHUB_WORKSPACE/toolkit/typescript"
             pnpm --dir "$toolkit" pack --pack-destination "$temporary"
           fi
-          archives=( "$temporary"/*.tgz )
+          archives=( "$temporary"/*.tgz "$RUNNER_TEMP"/apcore-js-*.tgz )
           toolkit_archive=( "$temporary"/apcore-toolkit-*.tgz )
           cd "$temporary"
           npm init -y

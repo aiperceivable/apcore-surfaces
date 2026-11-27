@@ -93,7 +93,7 @@ jobs:
             exit 1
           fi
           if [[ -n "$EXPECTED_CORE_SHA" && "$head_sha" != "$EXPECTED_CORE_SHA" ]]; then
-            echo "The Core run did not build the reviewed alpha.1 commit." >&2
+            echo "The Core run did not build the requested candidate commit." >&2
             exit 1
           fi
           example_sha="${EXPECTED_EXAMPLE_SHA:-$head_sha}"
@@ -115,6 +115,13 @@ jobs:
       matrix:
         component: [toolkit, mcp, a2a, cli]
         core: [minimum, candidate]
+        exclude: &candidate-only-hosts
+          - component: mcp
+            core: minimum
+          - component: a2a
+            core: minimum
+          - component: cli
+            core: minimum
     defaults:
       run:
         working-directory: ${{ matrix.component }}/python
@@ -194,7 +201,7 @@ jobs:
           assert core_path == installed.locate_file("apcore/__init__.py").resolve()
           assert toolkit_path == toolkit_expected.resolve()
           if os.environ["CORE_MODE"] == "candidate":
-              assert installed.version == "1.0.0a1"
+              assert installed.version == "1.0.0a2"
               origin = json.loads(installed.read_text("direct_url.json") or "{}")
               assert origin.get("url") == Path(os.environ["CORE_INSTALL"]).resolve().as_uri()
               assert callable(getattr(Executor, "stream_with_completion", None))
@@ -234,6 +241,7 @@ jobs:
       matrix:
         component: [toolkit, mcp, a2a, cli]
         core: [minimum, candidate]
+        exclude: *candidate-only-hosts
     defaults:
       run:
         working-directory: ${{ matrix.component }}/typescript
@@ -267,27 +275,6 @@ jobs:
         env:
           EXPECTED_SHA256: ${{ inputs.npm_sha256 }}
         run: |
-          toolkit="$GITHUB_WORKSPACE/toolkit/typescript"
-          roots=("$PWD")
-          if [[ "$COMPONENT" == toolkit ]]; then
-            pnpm install --frozen-lockfile
-          else
-            pnpm --dir "$toolkit" install --frozen-lockfile
-            # The release lock refers to the registry package. Test the candidate
-            # sources before that package is published by using a local override.
-            TOOLKIT="$toolkit" node --input-type=module <<'JS'
-          import { readFileSync, writeFileSync } from 'node:fs';
-
-          const file = 'package.json';
-          const manifest = JSON.parse(readFileSync(file, 'utf8'));
-          manifest.pnpm ??= {};
-          manifest.pnpm.overrides ??= {};
-          manifest.pnpm.overrides['apcore-toolkit'] = 'link:' + process.env.TOOLKIT;
-          writeFileSync(file, JSON.stringify(manifest, null, 2) + '\n');
-          JS
-            pnpm install --no-frozen-lockfile
-            roots+=("$toolkit")
-          fi
           core_package="apcore-js@0.33.0"
           if [[ "$CORE_MODE" == candidate ]]; then
             shopt -s nullglob
@@ -309,14 +296,29 @@ jobs:
           installed=$(mktemp -d)
           npm install --prefix "$installed" --ignore-scripts --no-save --no-package-lock --no-audit --no-fund "$core_package"
           core_root="$installed/node_modules/apcore-js"
-          for root in "${roots[@]}"; do
-            rm -f "$root/node_modules/apcore-js"
-            ln -s "$core_root" "$root/node_modules/apcore-js"
-          done
+          toolkit="$GITHUB_WORKSPACE/toolkit/typescript"
+          roots=("$toolkit")
           if [[ "$COMPONENT" != toolkit ]]; then
-            pnpm --dir "$toolkit" build
+            roots+=("$PWD")
           fi
-          pnpm build
+          for root in "${roots[@]}"; do
+            CORE_ROOT="$core_root" TOOLKIT_ROOT="$toolkit" ROOT="$root" node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const file = join(process.env.ROOT, 'package.json');
+          const manifest = JSON.parse(readFileSync(file, 'utf8'));
+          manifest.pnpm ??= {};
+          const overrides = manifest.pnpm.overrides ??= {};
+          overrides['apcore-js'] = 'link:' + process.env.CORE_ROOT;
+          if (process.env.ROOT !== process.env.TOOLKIT_ROOT) {
+            overrides['apcore-toolkit'] = 'link:' + process.env.TOOLKIT_ROOT;
+          }
+          writeFileSync(file, JSON.stringify(manifest, null, 2) + '\n');
+          JS
+            pnpm --dir "$root" install --no-frozen-lockfile
+            pnpm --dir "$root" build
+          done
           for root in "${roots[@]}"; do
             (
               cd "$root"
@@ -338,7 +340,7 @@ jobs:
           assert.ok(coreEntry.startsWith(core + sep));
           assert.equal(toolkitEntry, realpathSync(resolve(process.env.TOOLKIT_ROOT, 'dist/index.js')));
           if (process.env.CORE_MODE === 'candidate') {
-            assert.equal(coreVersion, '1.0.0-alpha.1');
+            assert.equal(coreVersion, '1.0.0-alpha.2');
             assert.equal(typeof Executor.prototype.streamWithCompletion, 'function');
             assert.equal(typeof APCore.prototype.streamWithCompletion, 'function');
           } else {
@@ -361,13 +363,7 @@ jobs:
       matrix:
         component: [toolkit, mcp, a2a, cli]
         core: [minimum, candidate]
-        # For C2-required packages, the first alpha is both the minimum and
-        # the current candidate. The candidate entry covers both.
-        exclude:
-          - component: mcp
-            core: minimum
-          - component: cli
-            core: minimum
+        exclude: *candidate-only-hosts
     env:
       CORE_MODE: ${{ matrix.core }}
       COMPONENT: ${{ matrix.component }}
@@ -410,8 +406,8 @@ jobs:
           crate="${crates[0]}"
           version="${crate##*/apcore-}"
           version="${version%.crate}"
-          if [[ "$version" != 1.0.0-alpha.1 ]]; then
-            echo "Expected the alpha.1 Core crate." >&2
+          if [[ "$version" != 1.0.0-alpha.2 ]]; then
+            echo "Expected the alpha.2 Core crate." >&2
             exit 1
           fi
           if [[ "$CORE_MODE" == candidate && -n "$EXPECTED_SHA256" ]]; then
