@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   ElicitationApprovalHandler,
   StorageBackedApprovalHandler,
+  supportsScopedCore,
 } from "../../src/adapters/approval.js";
 import { InMemoryApprovalStore } from "../../src/approval-store.js";
 import { MCP_ELICIT_KEY } from "../../src/helpers.js";
@@ -153,69 +154,36 @@ describe("ElicitationApprovalHandler", () => {
 });
 
 describe("StorageBackedApprovalHandler", () => {
-  const UUID_RE =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const request = { moduleId: "test.module", arguments: { x: 1 } };
 
-  it("[A-D-AP-1] returns the approval id in approvalId, not in reason", async () => {
-    const store = new InMemoryApprovalStore();
-    try {
-      const handler = new StorageBackedApprovalHandler(store);
-
-      const result = await handler.requestApproval({
-        moduleId: "test.module",
-        arguments: { x: 1 },
-      });
-
-      expect(result.status).toBe("pending");
-      // Python returns ApprovalResult(status="pending", approval_id=...) and Rust
-      // sets result.approval_id; `reason` is human-readable text in all three.
-      expect(result.approvalId).toMatch(UUID_RE);
-      expect(result.reason ?? undefined).toBeUndefined();
-
-      // The id must address the record the handler actually persisted.
-      const record = await store.getResult(result.approvalId!);
-      expect(record).not.toBeNull();
-      expect(record!.moduleId).toBe("test.module");
-    } finally {
-      store.stop();
-    }
+  it.skipIf(supportsScopedCore())("declines Phase B when Core only supports unscoped approval", async () => {
+    const handler = new StorageBackedApprovalHandler(new InMemoryApprovalStore());
+    expect(() => handler.assertScopedSupport()).toThrow("scoped approval support");
+    expect(await handler.requestApproval(request)).toMatchObject({ status: "rejected" });
   });
 
-  it("[A-D-AP-1] checkApproval echoes approvalId while still pending", async () => {
+  it.skipIf(!supportsScopedCore())("keeps Core credentials separate from public operator IDs", async () => {
     const store = new InMemoryApprovalStore();
+    const notify = vi.fn().mockResolvedValue(undefined);
+    const handler = new StorageBackedApprovalHandler(store, { notifyCallback: notify });
     try {
-      const handler = new StorageBackedApprovalHandler(store);
-      const pending = await handler.requestApproval({
-        moduleId: "test.module",
-        arguments: {},
+      const pending = await handler.requestApproval(request);
+      expect(pending).toMatchObject({ status: "pending", auditId: expect.any(String), approvalId: expect.any(String) });
+      expect(pending.approvalId).not.toBe(pending.auditId);
+      expect(notify).toHaveBeenCalledWith(pending.auditId, request.moduleId, request.arguments);
+      expect(await store.getResult(pending.auditId!)).toMatchObject({ moduleId: request.moduleId });
+      expect(await store.getResult(pending.approvalId!)).toBeNull();
+      expect(await handler.checkApproval(pending.approvalId!)).toMatchObject({ status: "rejected" });
+      expect(await handler.checkApprovalForPrincipal(pending.auditId!, null)).toEqual({
+        status: "pending", auditId: pending.auditId,
       });
+      expect(await handler.checkApprovalForCall(pending.approvalId!, request)).toEqual(pending);
 
-      const checked = await handler.checkApproval(pending.approvalId!);
-
-      expect(checked.status).toBe("pending");
-      expect(checked.approvalId).toBe(pending.approvalId);
-    } finally {
-      store.stop();
-    }
-  });
-
-  it("checkApproval carries the rejection reason, not an id", async () => {
-    const store = new InMemoryApprovalStore();
-    try {
-      const handler = new StorageBackedApprovalHandler(store);
-      const pending = await handler.requestApproval({
-        moduleId: "test.module",
-        arguments: {},
+      await store.resolve(pending.auditId!, { approved: true });
+      expect(await handler.checkApprovalForCall(pending.approvalId!, request)).toEqual({
+        status: "approved", auditId: pending.auditId,
       });
-      await store.resolve(pending.approvalId!, {
-        approved: false,
-        reason: "denied by operator",
-      });
-
-      const checked = await handler.checkApproval(pending.approvalId!);
-
-      expect(checked.status).toBe("rejected");
-      expect(checked.reason).toBe("denied by operator");
+      expect(await handler.checkApprovalForCall(pending.approvalId!, request)).toMatchObject({ status: "rejected" });
     } finally {
       store.stop();
     }

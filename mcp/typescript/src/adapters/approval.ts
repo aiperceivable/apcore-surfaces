@@ -5,31 +5,33 @@
  * approval requests to the human user via the MCP client.
  */
 
-import { randomUUID } from "crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createApprovalResult } from "apcore-js";
+import { canIssueApprovalReply, recordPendingApproval } from "../approval-reply.js";
+import { supportsScopedApprovalStore } from "../approval-store.js";
 import { MCP_ELICIT_KEY } from "../helpers.js";
-import type { ApprovalStore } from "../approval-store.js";
+import type { ApprovalPrincipal, ApprovalScope, ApprovalStore } from "../approval-store.js";
 
 export interface ApprovalRequest {
   moduleId: string;
   description?: string | null;
   arguments: Record<string, unknown>;
-  context?: { data?: Record<string, unknown> } | null;
+  callerId?: string | null;
+  context?: {
+    data?: Record<string, unknown>;
+    identity?: ApprovalPrincipal | null;
+    callerId?: string | null;
+  } | null;
 }
 
 export interface ApprovalResult {
   status: "approved" | "rejected" | "timeout" | "pending";
   /** Human-readable explanation. Never used to carry the approval id. */
   reason?: string | null;
-  /**
-   * Identifier of a pending approval, echoed back by the agent as
-   * `_meta.approvalId` and polled via `__apcore_approval_check`.
-   *
-   * [A-D-AP-1] Matches apcore-js `ApprovalResult.approvalId`, Python's
-   * `ApprovalResult(approval_id=...)` and Rust's `result.approval_id`. It was
-   * previously smuggled through `reason`, which left the field this repo's own
-   * ApprovalBridge reads (`{status; reason?; approvalId?}`) undefined.
-   */
+  /** Confidential credential for the Core gate when status is pending. */
   approvalId?: string;
+  /** Public record ID for telemetry and the operator. */
+  auditId?: string;
 }
 
 /**
@@ -120,16 +122,67 @@ export class ElicitationApprovalHandler {
   }
 }
 
+const PUBLIC_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export function isPublicApprovalId(value: unknown): value is string {
+  return typeof value === "string" && PUBLIC_ID.test(value);
+}
+
+function approvalRecordId(credential: string): string | null {
+  if (credential.length !== 101) return null;
+  const [id, secret, remainder] = credential.split(".");
+  return remainder === undefined && isPublicApprovalId(id) && /^[0-9a-f]{64}$/.test(secret ?? "") ? id : null;
+}
+
+export function isApprovalResumeToken(value: unknown): value is string {
+  return typeof value === "string" && approvalRecordId(value) !== null;
+}
+
+/** The scoped gate, credential isolation, and audit IDs shipped together. */
+export function supportsScopedCore(): boolean {
+  const auditId = "scoped-approval-capability";
+  const result = createApprovalResult({ status: "pending", ...{ auditId } });
+  return Reflect.get(result, "auditId") === auditId;
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (value === null || typeof value === "string" || typeof value === "boolean" ||
+      (typeof value === "number" && Number.isFinite(value))) return value;
+  if (Array.isArray(value)) return Array.from(value, canonicalValue);
+  if (typeof value === "object" &&
+      (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(record).sort().map(key => [key, canonicalValue(record[key])]));
+  }
+  throw new Error("Approval arguments must be JSON");
+}
+
+function businessArguments(request: ApprovalRequest): Record<string, unknown> {
+  const { _approval_token: _, ...args } = request.arguments;
+  return args;
+}
+
+function invocationScope(request: ApprovalRequest, args: Record<string, unknown>): ApprovalScope {
+  const identity = request.context?.identity;
+  return {
+    principal: identity ? { type: identity.type, id: identity.id } : null,
+    callerId: request.callerId ?? request.context?.callerId ?? null,
+    moduleId: request.moduleId,
+    argumentsDigest: sha256(JSON.stringify(canonicalValue(args))),
+  };
+}
+
+function rejected(reason: string): ApprovalResult {
+  return { status: "rejected", reason };
+}
+
 /**
- * Phase B approval handler backed by a pluggable ApprovalStore.
- *
- * requestApproval() saves a pending record and returns a pending ApprovalResult
- * causing apcore to raise ApprovalPendingError → APPROVAL_PENDING in MCP envelope.
- * checkApproval() reads the store; called by apcore when client retries with
- * _meta.approvalId set.
- *
- * notifyCallback lets callers fan out to Slack/email/webhooks.
- * Signature: (approvalId: string, moduleId: string, arguments: Record<string, unknown>) => Promise<void>
+ * Phase B handler with separate public record IDs and resume credentials.
+ * The operator callback receives only the public ID and business arguments.
  */
 export class StorageBackedApprovalHandler {
   private readonly store: ApprovalStore;
@@ -139,44 +192,106 @@ export class StorageBackedApprovalHandler {
     store: ApprovalStore,
     options: {
       notifyCallback?: (approvalId: string, moduleId: string, args: Record<string, unknown>) => Promise<void>;
-    } = {}
+    } = {},
   ) {
     this.store = store;
     this.notifyCallback = options.notifyCallback;
   }
 
-  async requestApproval(request: ApprovalRequest): Promise<ApprovalResult> {
-    const approvalId = randomUUID();
-    const moduleId = request.moduleId ?? "unknown";
-    const args = request.arguments ?? {};
+  assertScopedSupport(): void {
+    if (!supportsScopedCore()) throw new Error("Phase B requires Core with scoped approval support");
+    if (!supportsScopedApprovalStore(this.store)) throw new Error("Phase B requires a scoped approval store");
+  }
 
-    await this.store.savePending(approvalId, moduleId, args);
+  /** Bind the provider to the server's private foreground response path. */
+  forMcpServer(): Pick<StorageBackedApprovalHandler,
+    "requestApproval" | "checkApproval" | "checkApprovalForPrincipal" | "checkApprovalForCall"> {
+    const isForeground = (request: ApprovalRequest) => canIssueApprovalReply(
+      request.moduleId, request.callerId ?? request.context?.callerId ?? null, request.context?.data, true,
+    );
+    return {
+      requestApproval: async request => isForeground(request)
+        ? this.requestApproval(request)
+        : rejected("Scoped approval requires a direct tool call"),
+      checkApproval: this.checkApproval.bind(this),
+      checkApprovalForPrincipal: this.checkApprovalForPrincipal.bind(this),
+      checkApprovalForCall: async (credential, request) => isForeground(request)
+        ? this.checkApprovalForCall(credential, request)
+        : rejected("Scoped approval requires a direct tool call"),
+    };
+  }
+
+  async requestApproval(request: ApprovalRequest): Promise<ApprovalResult> {
+    if (!supportsScopedCore() || !supportsScopedApprovalStore(this.store)) {
+      return rejected("Scoped approval unavailable");
+    }
+    const args = businessArguments(request);
+    const contextData = request.context?.data;
+    let scope: ApprovalScope;
+    let auditId: string;
+    let credential: string;
+    try {
+      scope = invocationScope(request, args);
+      if (!canIssueApprovalReply(scope.moduleId, scope.callerId, contextData, false)) {
+        return rejected("Scoped approval requires a direct tool call");
+      }
+      auditId = randomUUID();
+      credential = `${auditId}.${randomBytes(32).toString("hex")}`;
+      await this.store.saveScopedPending(auditId, sha256(credential), scope);
+    } catch {
+      console.warn("[apcore-mcp] Approval could not be recorded");
+      return rejected("Approval could not be recorded");
+    }
 
     if (this.notifyCallback) {
       try {
-        await this.notifyCallback(approvalId, moduleId, args);
-      } catch (err) {
-        // log but don't fail the approval request
-        console.warn(`[apcore-mcp] notifyCallback raised for approval ${approvalId}:`, err);
+        await this.notifyCallback(auditId, scope.moduleId, args);
+      } catch {
+        console.warn("[apcore-mcp] Approval notification failed");
       }
     }
-
-    return { status: "pending", approvalId };
+    recordPendingApproval(scope.moduleId, scope.callerId, contextData, { approvalId: auditId, resumeToken: credential });
+    return { status: "pending", approvalId: credential, auditId };
   }
 
-  async checkApproval(approvalId: string): Promise<ApprovalResult> {
-    const record = await this.store.getResult(approvalId);
-    if (!record) {
-      return { status: "rejected", reason: "approval_id not found" };
+  async checkApproval(_approvalId: string): Promise<ApprovalResult> {
+    return rejected("Scoped approval verification is required");
+  }
+
+  async checkApprovalForPrincipal(
+    approvalId: string, principal: ApprovalPrincipal | null,
+  ): Promise<ApprovalResult> {
+    if (!isPublicApprovalId(approvalId) || !supportsScopedCore() || !supportsScopedApprovalStore(this.store)) {
+      return rejected("Approval record not found");
     }
-    if (record.status === "approved") {
-      return { status: "approved" };
+    try {
+      const record = await this.store.getScopedResult(approvalId, principal);
+      return record ? { status: record.status, auditId: approvalId } : rejected("Approval record not found");
+    } catch {
+      return rejected("Approval status unavailable");
     }
-    if (record.status === "rejected") {
-      return { status: "rejected", reason: record.reason ?? undefined };
+  }
+
+  async checkApprovalForCall(credential: string, request: ApprovalRequest): Promise<ApprovalResult> {
+    const auditId = approvalRecordId(credential);
+    if (!auditId || !supportsScopedCore() || !supportsScopedApprovalStore(this.store)) {
+      return rejected("Approval credential unavailable for this call");
     }
-    // [A-D-AP-1] Echo the id on the pending path, matching Python
-    // (approval.py: ApprovalResult(status="pending", approval_id=approval_id)).
-    return { status: "pending", approvalId };
+    try {
+      const scope = invocationScope(request, businessArguments(request));
+      const contextData = request.context?.data;
+      if (!canIssueApprovalReply(scope.moduleId, scope.callerId, contextData, false)) {
+        return rejected("Scoped approval requires a direct tool call");
+      }
+      const record = await this.store.consumeScoped(auditId, sha256(credential), scope);
+      if (!record) return rejected("Approval credential unavailable for this call");
+      if (record.status === "pending") {
+        recordPendingApproval(scope.moduleId, scope.callerId, contextData, { approvalId: auditId, resumeToken: credential });
+        return { status: "pending", approvalId: credential, auditId };
+      }
+      return { status: record.status, auditId };
+    } catch {
+      return rejected("Approval verification failed");
+    }
   }
 }

@@ -10,7 +10,9 @@
 
 import * as crypto from "node:crypto";
 import { registerStdioExecution } from "./stdio-output.js";
-import { CancelToken, isStreamingModule } from "apcore-js";
+import { CancelToken, InvalidInputError, isStreamingModule } from "apcore-js";
+import { isApprovalResumeToken, supportsScopedCore } from "../adapters/approval.js";
+import { confirmPendingApproval, runApprovalInvocation, type ApprovalReplyCapture } from "../approval-reply.js";
 import type { Module } from "apcore-js";
 import { ErrorMapper } from "../adapters/errors.js";
 import { ErrorCodes } from "../types.js";
@@ -122,6 +124,10 @@ export type CallResult = [TextContentDict[], boolean, string | undefined];
  * - `_meta.traceparent` — W3C trace_context header propagated from caller
  */
 export interface HandleCallExtra {
+  /** Validated MCP request metadata for Phase B resumption. */
+  approvalResumeToken?: string;
+  /** Per-request response handoff, created by the server factory. */
+  approvalReply?: ApprovalReplyCapture;
   /** MCP request cancellation, including transport disconnect. */
   signal?: AbortSignal;
   sendNotification?: (notification: Record<string, unknown>) => Promise<void>;
@@ -493,6 +499,13 @@ export class ExecutionRouter {
   ): Promise<CallResult> {
     try {
       // ── Build context with MCP callbacks ──────────────────────────────
+      const resumeToken = extra?.approvalResumeToken;
+      if (Object.hasOwn(args, "_approval_token")) {
+        throw new InvalidInputError("Use request metadata for approval resumption");
+      }
+      if (resumeToken !== undefined && (!isApprovalResumeToken(resumeToken) || !supportsScopedCore())) {
+        throw new InvalidInputError("Invalid or unsupported approval resume metadata");
+      }
       const progressToken = extra?._meta?.progressToken;
       const sendNotification = extra?.sendNotification;
       const sendRequest = extra?.sendRequest;
@@ -583,6 +596,7 @@ export class ExecutionRouter {
 
       // ── F-043: Async Task Bridge meta-tool dispatch ────────────────────
       if (this._asyncTaskBridge && this._asyncTaskBridge.isMetaTool(toolName)) {
+        if (resumeToken !== undefined) throw new InvalidInputError("Approval resumption requires a direct tool call");
         try {
           const metaResult = await this._asyncTaskBridge.handleMetaTool(
             toolName,
@@ -603,7 +617,7 @@ export class ExecutionRouter {
       }
 
       // ── F-043: Async-hinted module → AsyncTaskManager.submit() ─────────
-      if (this._asyncTaskBridge && this._asyncTaskBridge.enabled) {
+      if (this._asyncTaskBridge?.enabled) {
         let descriptor: import("../types.js").ModuleDescriptor | null = null;
         try {
           descriptor = this._executor.registry?.getDefinition?.(toolName) ?? null;
@@ -611,6 +625,7 @@ export class ExecutionRouter {
           // registry lookup is best-effort — leave descriptor null
         }
         if (this._asyncTaskBridge.isAsyncModule(descriptor)) {
+          if (resumeToken !== undefined) throw new InvalidInputError("Approval resumption requires a direct tool call");
           try {
             // [A-D-018] Forward progressToken AND sessionKey so the bridge
             // records both for terminal-state fan-out (progressToken) and
@@ -684,6 +699,9 @@ export class ExecutionRouter {
         }
       }
 
+      // Core separates the credential from business arguments before its pipeline.
+      const executionArgs = resumeToken === undefined ? args : { ...args, _approval_token: resumeToken };
+
       // ── Resolve versionHint from request metadata or descriptor ──────
       let versionHint: string | undefined = extra?.versionHint
         ?? extra?._meta?.apcore?.version;
@@ -713,16 +731,17 @@ export class ExecutionRouter {
       // return the ordinary call result, including after-middleware changes.
       const execution = typeof this._executor.streamWithCompletion === "function" &&
         (declaredStreaming || customStreamRequested)
-        ? this._executor.streamWithCompletion(toolName, args, context, versionHint)
+        ? this._executor.streamWithCompletion(toolName, executionArgs, context, versionHint)
         : null;
       // Retain the old structural extension point for custom executors. An
       // older Core instead uses one ordinary invocation with full validation.
       const chunks = execution?.chunks ?? (customStreamRequested
-        ? this._executor.stream?.(toolName, args, context, versionHint)
+        ? this._executor.stream?.(toolName, executionArgs, context, versionHint)
         : undefined);
       if (chunks) {
         const progress = wantsProgress ? { token: progressToken, send: sendNotification } : undefined;
-        const output = await this._collectStream(toolName, chunks, execution, progress);
+        const output = await runApprovalInvocation(extra?.approvalReply, context.data, () =>
+          this._collectStream(toolName, chunks, execution, progress));
         const redacted = await this._maybeRedact(toolName, output);
         return [[{ type: "text", text: await this._formatResult(redacted) }], false, effectiveTraceId];
       }
@@ -732,7 +751,9 @@ export class ExecutionRouter {
       let traceMeta: Record<string, unknown> | undefined;
 
       if (this._trace && typeof this._executor.callWithTrace === 'function') {
-        const [traceResult, pipelineTrace] = await this._executor.callWithTrace(toolName, args, context, versionHint);
+        const callWithTrace = this._executor.callWithTrace.bind(this._executor);
+        const [traceResult, pipelineTrace] = await runApprovalInvocation(extra?.approvalReply, context.data, () =>
+          callWithTrace(toolName, executionArgs, context, versionHint));
         result = traceResult;
         // Convert pipeline trace to a serialisable dict
         if (pipelineTrace && typeof pipelineTrace === 'object') {
@@ -760,7 +781,8 @@ export class ExecutionRouter {
         if (!callFn) {
           throw new Error('Executor must implement call() or callAsync()');
         }
-        result = await callFn(toolName, args, context, versionHint);
+        result = await runApprovalInvocation(extra?.approvalReply, context.data, () =>
+          callFn(toolName, executionArgs, context, versionHint));
       }
 
       const redacted = await this._maybeRedact(toolName, result);
@@ -779,6 +801,7 @@ export class ExecutionRouter {
       // Error messages, stacks, codes and attached fields may contain secrets.
       console.error("Tool execution failed");
       const errorInfo = this._errorMapper.toMcpError(error);
+      if (errorInfo.errorType === ErrorCodes.APPROVAL_PENDING) confirmPendingApproval(extra?.approvalReply);
 
       const content: TextContentDict[] = [
         {

@@ -12,6 +12,7 @@
  * Full spec: apcore-mcp/docs/features/async-task-bridge.md (F-043).
  */
 
+import { markBackgroundApprovalContext } from "../approval-reply.js";
 import type { ModuleDescriptor } from "../types.js";
 import { ErrorCodes } from "../types.js";
 
@@ -315,6 +316,12 @@ export class AsyncTaskBridge {
       }
     }
 
+    // Core preserves Context.data when it clones a context for the background job.
+    // The marker carries no approval state or credentials.
+    if (context && typeof context === "object" && "data" in context
+        && context.data && typeof context.data === "object") {
+      markBackgroundApprovalContext(context.data);
+    }
     const taskId = await this._manager.submit(moduleId, inputs, { context: context ?? null });
     if (options?.progressToken !== undefined) {
       this._progressTokens.set(taskId, options.progressToken);

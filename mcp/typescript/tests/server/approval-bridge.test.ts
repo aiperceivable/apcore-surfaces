@@ -1,142 +1,65 @@
 import { describe, it, expect, vi } from "vitest";
+import { supportsScopedCore } from "../../src/adapters/approval.js";
 import { ApprovalBridge, APPROVAL_META_TOOL_NAMES } from "../../src/server/approval-bridge.js";
 
-function buildHandler(overrides: Partial<{
-  checkApproval: (id: string) => Promise<{ status: string; reason?: string; approvalId?: string }>;
-}> = {}) {
-  return {
-    checkApproval: overrides.checkApproval ?? vi.fn().mockResolvedValue({ status: "pending", approvalId: "abc" }),
-  };
-}
+const check = "__apcore_approval_check";
+const id = "4f2c29a5-d981-4e46-9ca1-0b17535abd12";
 
 describe("ApprovalBridge", () => {
-  describe("isMetaTool", () => {
-    it("returns true for __apcore_approval_check", () => {
-      expect(ApprovalBridge.isMetaTool("__apcore_approval_check")).toBe(true);
-    });
-
-    it("returns false for async task meta-tools", () => {
-      expect(ApprovalBridge.isMetaTool("__apcore_task_submit")).toBe(false);
-      expect(ApprovalBridge.isMetaTool("__apcore_task_status")).toBe(false);
-    });
-
-    it("returns false for regular tool names", () => {
-      expect(ApprovalBridge.isMetaTool("my.module")).toBe(false);
-      expect(ApprovalBridge.isMetaTool("")).toBe(false);
-    });
+  it("recognizes the approval tool separately from ordinary and task tools", () => {
+    expect(APPROVAL_META_TOOL_NAMES).toContain(check);
+    expect(ApprovalBridge.isMetaTool(check)).toBe(true);
+    expect(ApprovalBridge.isMetaTool("__apcore_task_submit")).toBe(false);
+    expect(ApprovalBridge.isMetaTool("my.module")).toBe(false);
   });
 
-  describe("APPROVAL_META_TOOL_NAMES constant", () => {
-    it("contains __apcore_approval_check", () => {
-      expect(APPROVAL_META_TOOL_NAMES).toContain("__apcore_approval_check");
-    });
+  it("does not offer polling for an unscoped handler", async () => {
+    const legacy = vi.fn().mockResolvedValue({ status: "approved" });
+    const bridge = new ApprovalBridge({ checkApproval: legacy });
+    expect(bridge.buildMetaTools()).toEqual([]);
+    expect((await bridge.handleMetaTool(check, { approval_id: id }))[1]).toBe(true);
+    expect(legacy).not.toHaveBeenCalled();
   });
 
-  describe("buildMetaTools", () => {
-    it("returns one tool with correct name", () => {
-      const bridge = new ApprovalBridge(buildHandler());
-      const tools = bridge.buildMetaTools();
-      expect(tools).toHaveLength(1);
-      expect(tools[0].name).toBe("__apcore_approval_check");
-    });
-
-    it("tool has correct input schema requiring approval_id", () => {
-      const bridge = new ApprovalBridge(buildHandler());
-      const [tool] = bridge.buildMetaTools();
-      const schema = tool.inputSchema as Record<string, unknown>;
-      expect(schema.type).toBe("object");
-      expect(schema.required).toContain("approval_id");
-      expect(schema.additionalProperties).toBe(false);
-    });
-
-    it("tool description mentions approval_id and status values", () => {
-      const bridge = new ApprovalBridge(buildHandler());
-      const [tool] = bridge.buildMetaTools();
-      expect(tool.description).toContain("approval_id");
-      expect(tool.description).toContain("pending");
-      expect(tool.description).toContain("approved");
-      expect(tool.description).toContain("rejected");
-    });
+  it.skipIf(!supportsScopedCore())("lists only the public approval ID as input", () => {
+    const bridge = new ApprovalBridge({ checkApprovalForPrincipal: async () => ({ status: "pending" }) });
+    expect(bridge.buildMetaTools()).toMatchObject([{
+      name: check,
+      inputSchema: { type: "object", required: ["approval_id"], additionalProperties: false },
+    }]);
   });
 
-  describe("handleMetaTool - __apcore_approval_check", () => {
-    it("passes through pending status", async () => {
-      const handler = buildHandler({
-        checkApproval: vi.fn().mockResolvedValue({ status: "pending", approvalId: "abc" }),
-      });
-      const bridge = new ApprovalBridge(handler);
-      const [content, isError, traceId] = await bridge.handleMetaTool("__apcore_approval_check", {
-        approval_id: "abc",
-      });
+  it.skipIf(!supportsScopedCore()).each(["pending", "approved", "rejected"])(
+    "returns only the authorized public %s status", async status => {
+      const principal = { type: "service", id: "operator-client" };
+      const poll = vi.fn().mockResolvedValue({ status, reason: "private operator note" });
+      const bridge = new ApprovalBridge({ checkApprovalForPrincipal: poll });
+      const [content, isError, traceId] = await bridge.handleMetaTool(check, { approval_id: id }, principal);
       expect(isError).toBe(false);
       expect(traceId).toBeNull();
-      const payload = JSON.parse(content[0].text);
-      expect(payload.approval_id).toBe("abc");
-      expect(payload.status).toBe("pending");
-    });
+      expect(JSON.parse(content[0].text)).toEqual({ approval_id: id, status });
+      expect(poll).toHaveBeenCalledWith(id, principal);
+    },
+  );
 
-    it("passes through approved status without reason", async () => {
-      const handler = buildHandler({
-        checkApproval: vi.fn().mockResolvedValue({ status: "approved" }),
-      });
-      const bridge = new ApprovalBridge(handler);
-      const [content, isError] = await bridge.handleMetaTool("__apcore_approval_check", {
-        approval_id: "my-id",
-      });
-      expect(isError).toBe(false);
-      const payload = JSON.parse(content[0].text);
-      expect(payload.status).toBe("approved");
-      expect("reason" in payload).toBe(false);
-    });
-
-    it("passes through rejected status with reason", async () => {
-      const handler = buildHandler({
-        checkApproval: vi.fn().mockResolvedValue({ status: "rejected", reason: "no budget" }),
-      });
-      const bridge = new ApprovalBridge(handler);
-      const [content, isError] = await bridge.handleMetaTool("__apcore_approval_check", {
-        approval_id: "my-id",
-      });
-      expect(isError).toBe(false);
-      const payload = JSON.parse(content[0].text);
-      expect(payload.status).toBe("rejected");
-      expect(payload.reason).toBe("no budget");
-    });
-
-    it("missing approval_id returns is_error=true", async () => {
-      const bridge = new ApprovalBridge(buildHandler());
-      const [content, isError] = await bridge.handleMetaTool("__apcore_approval_check", {});
-      expect(isError).toBe(true);
-      expect(content[0].text).toContain("approval_id");
-    });
-
-    it("empty string approval_id returns is_error=true", async () => {
-      const bridge = new ApprovalBridge(buildHandler());
-      const [content, isError] = await bridge.handleMetaTool("__apcore_approval_check", {
-        approval_id: "",
-      });
-      expect(isError).toBe(true);
-    });
-
-    it("checkApproval throwing returns is_error=true", async () => {
-      const handler = buildHandler({
-        checkApproval: vi.fn().mockRejectedValue(new Error("store down")),
-      });
-      const bridge = new ApprovalBridge(handler);
-      const [content, isError] = await bridge.handleMetaTool("__apcore_approval_check", {
-        approval_id: "abc",
-      });
-      expect(isError).toBe(true);
-      expect(content[0].text).toContain("store down");
-    });
+  it("does not reflect an invalid identifier", async () => {
+    const bridge = new ApprovalBridge({ checkApprovalForPrincipal: vi.fn() });
+    const [content, isError] = await bridge.handleMetaTool(check, { approval_id: "invalid-id" });
+    expect(isError).toBe(true);
+    expect(content[0].text).toBe("A public approval_id is required");
   });
 
-  describe("handleMetaTool - unknown tool name", () => {
-    it("returns is_error=true for unknown meta-tool", async () => {
-      const bridge = new ApprovalBridge(buildHandler());
-      const [content, isError] = await bridge.handleMetaTool("__apcore_unknown_tool", {});
-      expect(isError).toBe(true);
-      expect(content[0].text).toContain("Unknown approval meta-tool");
-    });
+  it.skipIf(!supportsScopedCore())("returns a generic store error", async () => {
+    const poll = vi.fn().mockRejectedValue(new Error("private store detail"));
+    const bridge = new ApprovalBridge({ checkApprovalForPrincipal: poll });
+    const [content, isError] = await bridge.handleMetaTool(check, { approval_id: id });
+    expect(isError).toBe(true);
+    expect(content[0].text).toBe("Approval status unavailable");
+  });
+
+  it("declines an unknown meta-tool", async () => {
+    const bridge = new ApprovalBridge({});
+    const [, isError] = await bridge.handleMetaTool("__apcore_unknown_tool", {});
+    expect(isError).toBe(true);
   });
 });

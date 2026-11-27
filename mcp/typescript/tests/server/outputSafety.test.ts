@@ -23,7 +23,7 @@ describe("tool errors on the MCP wire", () => {
     const server = factory.createServer();
     const call = vi.fn(async () => { throw new apcore.ModuleError(code, "Controlled tool failure"); });
     const router = new ExecutionRouter({ ...executor({}), call });
-    const approval = new ApprovalBridge({ checkApproval: async () => ({ status: "pending" }) });
+    const approval = new ApprovalBridge({ checkApprovalForPrincipal: async () => ({ status: "pending" }) });
     factory.registerHandlers(server, [{ name: "demo", inputSchema: { type: "object" } }], router, { approvalBridge: approval });
     const client = new Client({ name: "output-safety", version: "1" });
     const [ct, st] = InMemoryTransport.createLinkedPair();
@@ -34,8 +34,12 @@ describe("tool errors on the MCP wire", () => {
       expect(call).toHaveBeenCalledOnce();
       await expect(client.callTool({ name: "missing.tool", arguments: {} })).rejects.toMatchObject({ code: -32602 });
       expect(call).toHaveBeenCalledOnce();
-      const denied = await client.callTool({ name: "__apcore_approval_check", arguments: {} });
-      expect(denied).toMatchObject({ isError: true, content: [{ text: "approval_id is required" }] });
+      const poll = () => client.callTool({ name: "__apcore_approval_check", arguments: {} });
+      if (approval.available) {
+        expect(await poll()).toMatchObject({ isError: true, content: [{ text: "A public approval_id is required" }] });
+      } else {
+        await expect(poll()).rejects.toMatchObject({ code: -32602 });
+      }
       await expect(client.request({ method: "unsupported" } as never, CallToolResultSchema)).rejects.toMatchObject({ code: -32601 });
     } finally {
       await client.close();

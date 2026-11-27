@@ -152,25 +152,13 @@ export class ErrorMapper {
         return result;
       }
 
-      // Approval pending -> narrow details to approvalId only.
-      // [D10-003] Cross-language parity: upstream apcore SDKs emit
-      // snake_case (`approval_id`) exclusively, so the previous dual-key
-      // branch for camelCase `approvalId` was dormant and diverged from
-      // Python/Rust contracts (which accept snake_case only). Drop the
-      // camelCase source key; the output stays camelCase per MCP convention.
       if (code === ErrorCodes.APPROVAL_PENDING) {
-        const narrowed =
-          details && "approval_id" in details
-            ? { approvalId: details["approval_id"] }
-            : null;
-        const result: McpErrorResponse = {
+        return {
           isError: true,
           errorType: code,
-          message: error.message,
-          details: narrowed,
+          message: "Approval is pending",
+          details: null,
         };
-        this._attachAiGuidance(error, result);
-        return result;
       }
 
       // Approval timeout -> mark as retryable

@@ -5,37 +5,44 @@
  * alongside asyncBridge.
  */
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { isPublicApprovalId, supportsScopedCore } from "../adapters/approval.js";
+import type { ApprovalPrincipal } from "../approval-store.js";
 
 export const APPROVAL_META_TOOL_NAMES = ["__apcore_approval_check"] as const;
 
 export type ApprovalMetaToolName = (typeof APPROVAL_META_TOOL_NAMES)[number];
 
 export class ApprovalBridge {
-  // handler is StorageBackedApprovalHandler but typed loosely for cross-SDK compat
   constructor(private readonly handler: {
-    checkApproval(approvalId: string): Promise<{ status: string; reason?: string; approvalId?: string }>;
+    checkApproval?(approvalId: string): Promise<{ status: string }>;
+    checkApprovalForPrincipal?(
+      approvalId: string, principal: ApprovalPrincipal | null,
+    ): Promise<{ status: string }>;
   }) {}
+
+  get available(): boolean {
+    return supportsScopedCore() && typeof this.handler.checkApprovalForPrincipal === "function";
+  }
 
   static isMetaTool(name: string): name is ApprovalMetaToolName {
     return (APPROVAL_META_TOOL_NAMES as readonly string[]).includes(name);
   }
 
   buildMetaTools(): Tool[] {
+    if (!this.available) return [];
     return [
       {
         name: "__apcore_approval_check",
         description:
           "Poll the status of a pending approval request. " +
-          "Returns {approval_id, status, reason}. " +
-          "status is 'pending', 'approved', or 'rejected'. " +
-          "When 'approved', retry the original tool call with " +
-          "_meta.approvalId set to this approval_id.",
+          "Use the public approvalId from the pending result metadata. " +
+          "When approved, retry the original tool with its resumeToken in request _meta.approvalId.",
         inputSchema: {
           type: "object" as const,
           properties: {
             approval_id: {
               type: "string",
-              description: "The approval_id from the APPROVAL_PENDING response",
+              description: "The public approvalId from _meta.apcore.approval",
             },
           },
           required: ["approval_id"],
@@ -47,10 +54,11 @@ export class ApprovalBridge {
 
   async handleMetaTool(
     name: string,
-    arguments_: Record<string, unknown>
+    arguments_: Record<string, unknown>,
+    principal: ApprovalPrincipal | null = null,
   ): Promise<[Array<{ type: string; text: string }>, boolean, string | null]> {
     if (name === "__apcore_approval_check") {
-      return this.handleCheck(arguments_);
+      return this.handleCheck(arguments_, principal);
     }
     return [
       [{ type: "text", text: `Unknown approval meta-tool: ${name}` }],
@@ -60,36 +68,22 @@ export class ApprovalBridge {
   }
 
   private async handleCheck(
-    args: Record<string, unknown>
-  ): Promise<[Array<{ type: string; text: string }>, boolean, string | null]> {
+    args: Record<string, unknown>,
+    principal: ApprovalPrincipal | null,
+  ): Promise<[Array<{ type: "text"; text: string }>, boolean, string | null]> {
     const approvalId = args["approval_id"];
-    if (typeof approvalId !== "string" || !approvalId) {
-      return [
-        [{ type: "text", text: "approval_id is required" }],
-        true,
-        null,
-      ];
+    if (!isPublicApprovalId(approvalId)) {
+      return [[{ type: "text", text: "A public approval_id is required" }], true, null];
+    }
+    if (!this.available || !this.handler.checkApprovalForPrincipal) {
+      return [[{ type: "text", text: "Scoped approval status unavailable" }], true, null];
     }
     try {
-      const result = await this.handler.checkApproval(approvalId);
-      const payload: Record<string, unknown> = {
-        approval_id: approvalId,
-        status: result.status,
-      };
-      if (result.reason !== undefined) {
-        payload["reason"] = result.reason;
-      }
-      return [
-        [{ type: "text", text: JSON.stringify(payload) }],
-        false,
-        null,
-      ];
-    } catch (err) {
-      return [
-        [{ type: "text", text: `Approval check failed: ${String(err)}` }],
-        true,
-        null,
-      ];
+      const result = await this.handler.checkApprovalForPrincipal(approvalId, principal);
+      const status = result.status === "approved" || result.status === "pending" ? result.status : "rejected";
+      return [[{ type: "text", text: JSON.stringify({ approval_id: approvalId, status }) }], false, null];
+    } catch {
+      return [[{ type: "text", text: "Approval status unavailable" }], true, null];
     }
   }
 }
