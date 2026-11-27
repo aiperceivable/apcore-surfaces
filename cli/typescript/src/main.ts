@@ -238,8 +238,7 @@ function validateInputSchema(
   const required = schema.required as string[] | undefined;
   if (required && Array.isArray(required)) {
     for (const field of required) {
-      const val = input[field];
-      if (val === null || val === undefined) {
+      if (!Object.hasOwn(input, field) || input[field] === undefined) {
         return `'${field}' is required`;
       }
     }
@@ -248,9 +247,16 @@ function validateInputSchema(
   if (properties) {
     for (const [field, propSchema] of Object.entries(properties)) {
       const val = input[field];
-      if (val === null || val === undefined) continue;
-      const expectedType = propSchema.type as string | undefined;
-      if (!expectedType) continue;
+      if (val === undefined) continue;
+      const expectedType = propSchema.type;
+      if (val === null) {
+        // A required field may be present with a nullable value. Leave
+        // schemas without an explicit type to Core's full validation.
+        const acceptsNull = Array.isArray(expectedType) ? expectedType.includes("null") : expectedType === "null";
+        if (expectedType !== undefined && !acceptsNull) return `'${field}' does not accept null`;
+        continue;
+      }
+      if (typeof expectedType !== "string") continue;
       const actualType = typeof val;
       if (expectedType === "string" && actualType !== "string") {
         return `'${field}' must be a string, got ${actualType}`;

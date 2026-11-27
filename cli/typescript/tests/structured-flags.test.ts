@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Executor, Registry } from "apcore-js";
 import { describe, expect, it, vi } from "vitest";
 import { buildModuleCommand } from "../src/main.js";
@@ -75,6 +77,44 @@ describe("structured generated flags", () => {
     expect(result.preflightInputs).toEqual([]);
     expect(result.inputs).toEqual([]);
     expect(result.diagnostics).toContain("--filters");
+  });
+
+  it("passes an explicit null for a required nullable field to preflight and execution", async () => {
+    const schema = {
+      ...fixture.schema,
+      required: ["maybe_filters"],
+    };
+    const args = ["--maybe-filters", "null"];
+
+    const preflight = await invoke(["--dry-run", ...args], schema);
+    expect(preflight.exitCode).toBe(0);
+    expect(preflight.preflightInputs).toEqual([{ maybe_filters: null }]);
+    expect(preflight.inputs).toEqual([]);
+
+    const dispatched = await invoke(args, schema);
+    expect(dispatched.exitCode).toBe(0);
+    expect(dispatched.inputs).toEqual([{ maybe_filters: null }]);
+  });
+
+  it("still requires the nullable field when its value is omitted", async () => {
+    const result = await invoke([], { ...fixture.schema, required: ["maybe_filters"] });
+    expect(result.exitCode).toBe(45);
+    expect(result.inputs).toEqual([]);
+    expect(result.diagnostics).toContain("'maybe_filters' is required");
+  });
+
+  it("rejects null for a required nonnullable field supplied in a JSON file", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "apcore-cli-nonnullable-"));
+    const file = join(directory, "input.json");
+    try {
+      writeFileSync(file, JSON.stringify({ filters: null, labels: [] }));
+      const result = await invoke(["--input", file]);
+      expect(result.exitCode).toBe(45);
+      expect(result.inputs).toEqual([]);
+      expect(result.diagnostics).toContain("'filters' does not accept null");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("uses schema defaults as typed values", async () => {
