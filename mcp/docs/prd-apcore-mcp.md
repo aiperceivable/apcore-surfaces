@@ -821,7 +821,7 @@ This feature bridges the gap between HTTP-level authentication and apcore's modu
 
 **Description:** Modules annotated with `requires_approval=True` trigger an approval gate before execution. The `ElicitationApprovalHandler` uses the MCP elicitation protocol to present approval requests to the human user via the MCP client. The user can accept or reject the request, and the result is mapped to an `ApprovalResult` that controls whether execution proceeds. Built-in handlers (`AutoApproveHandler`, `AlwaysDenyHandler`) are available for dev/testing scenarios via the upstream `apcore` library.
 
-Three new error codes (`APPROVAL_DENIED`, `APPROVAL_TIMEOUT`, `APPROVAL_PENDING`) enable structured error handling for approval-related failures, each with specific behavior: `APPROVAL_TIMEOUT` is marked auto-retryable, `APPROVAL_PENDING` narrows response details to `approvalId` only, and `APPROVAL_DENIED` extracts the denial reason.
+The approval error codes enable structured handling. `APPROVAL_TIMEOUT` is retryable, `APPROVAL_PENDING` uses a status-only diagnostic, and `APPROVAL_DENIED` extracts the denial reason. The [Phase B tool result](features/approval-phase-b.md#complete-flow) carries any resume token in metadata for the initiating caller.
 
 **User Story:** As an AI agent platform operator, I want modules that modify production data to require human approval before execution, so that I can enforce a human-in-the-loop safety net without changing module code.
 
@@ -832,7 +832,7 @@ Three new error codes (`APPROVAL_DENIED`, `APPROVAL_TIMEOUT`, `APPROVAL_PENDING`
 4. `checkApproval()` returns rejected with "Phase B not supported" since MCP elicitation is stateless.
 5. CLI provides `--approval` flag with choices: `elicit` (uses `ElicitationApprovalHandler`), `auto-approve` (uses `apcore.AutoApproveHandler`), `always-deny` (uses `apcore.AlwaysDenyHandler`), `off` (default, no approval).
 6. Error codes `APPROVAL_DENIED`, `APPROVAL_TIMEOUT`, `APPROVAL_PENDING` are added to the error constants.
-7. `ErrorMapper` handles approval errors with specific behavior: `APPROVAL_TIMEOUT` sets `retryable=true`, `APPROVAL_PENDING` narrows details to `approvalId`, `APPROVAL_DENIED` extracts `reason` from details.
+7. `ErrorMapper` marks `APPROVAL_TIMEOUT` as retryable, formats `APPROVAL_PENDING` as a safe status message, and extracts `reason` from `APPROVAL_DENIED`.
 8. `ElicitationApprovalHandler`, `ApprovalRequest`, and `ApprovalResult` are exported from the public API.
 9. Graceful degradation: when `apcore-js` (TypeScript) does not yet export approval handlers, `--approval auto-approve`/`--approval always-deny` fails with a descriptive error.
 10. The `--approval elicit` mode works independently of the upstream library's approval system (only requires the MCP elicit callback in context).

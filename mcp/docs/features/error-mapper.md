@@ -133,7 +133,7 @@ Only errors derived from `ModuleError` (which are designed to be user-facing) ar
 - CALL_DEPTH_EXCEEDED, CIRCULAR_CALL, CALL_FREQUENCY_EXCEEDED → sanitized "Internal error occurred" message
 - ACL_DENIED → sanitized "Access denied", details: null
 - SCHEMA_VALIDATION_ERROR → multi-line bulleted message with field-level errors; details preserved
-- APPROVAL_PENDING → details narrowed to `{"approvalId": ...}` (camelCase)
+- APPROVAL_PENDING → safe status text. The initiating holder receives any private resume token through the [Phase B result metadata](approval-phase-b.md#complete-flow).
 - APPROVAL_TIMEOUT → `retryable: true`
 - AI guidance fields (retryable, aiGuidance, userFixable, suggestion) attached from error attributes when present and not already set
 - On failure: returns safe fallback dict (never raises)

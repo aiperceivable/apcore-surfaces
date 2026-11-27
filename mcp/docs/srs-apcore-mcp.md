@@ -2789,7 +2789,7 @@ async Authenticator.authenticate(headers: dict[str, str]) -> Identity | None
 **Input/Trigger:** ModuleError with code matching an approval error code.
 
 **Expected Output:**
-- `APPROVAL_PENDING`: Details narrowed to `{"approvalId": ...}` only. If no `approval_id`/`approvalId` in details, details set to null.
+- `APPROVAL_PENDING` emits a safe status message with null details. Scoped resumption information travels in the [Phase B tool result metadata](features/approval-phase-b.md#complete-flow).
 - `APPROVAL_TIMEOUT`: `retryable: true` set on response. Details passed through.
 - `APPROVAL_DENIED`: `reason` extracted from details. If present, details set to `{"reason": ...}`. Otherwise details passed through.
 
