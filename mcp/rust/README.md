@@ -60,7 +60,7 @@ cargo add apcore-mcp
 cargo install apcore-mcp
 ```
 
-Requires Rust 1.86+, `apcore = 1.0.0-alpha.1` and `apcore-toolkit = 0.15.1-alpha.1`.
+Requires Rust 1.86 or later, `apcore = 1.0.0-alpha.2` with `config` and `sys-modules`, and `apcore-toolkit = 0.15.1-alpha.2`.
 Registry-based installation requires a compatible APCore release on crates.io.
 When testing a locally unpacked prerelease, resolve both this crate and Toolkit against
 the same unpacked APCore package and confirm with `cargo metadata`.
