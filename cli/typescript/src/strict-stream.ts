@@ -67,13 +67,18 @@ export async function executeStrictStream(
     throw new InvalidCliInputError("Strict streaming requires an Executor with stream completion support.");
   }
   let writeOrIterationFailed = false;
+  const stdout = process.stdout;
+  // A failed write also emits an error event. Keep it from interrupting
+  // receipt handling, cleanup, and auditing after the callback rejects.
+  const onOutputError = (): void => { writeOrIterationFailed = true; };
+  stdout.on("error", onOutputError);
   try {
     for await (const chunk of stream.chunks) {
       const line = JSON.stringify(chunk) + "\n";
       // The failure path can exit the process immediately. Flush each line
       // before advancing so already-emitted JSONL survives a piped exit.
       await new Promise<void>((resolve, reject) => {
-        process.stdout.write(line, error => error ? reject(error) : resolve());
+        stdout.write(line, error => error ? reject(error) : resolve());
       });
     }
   } catch {
@@ -81,6 +86,8 @@ export async function executeStrictStream(
     // The receipt keeps the canonical failure without exposing the iterator's
     // exception details. Close also stops the invocation if output failed.
     await stream.close();
+  } finally {
+    stdout.off("error", onOutputError);
   }
   const failure = completionError(await stream.completion);
   if (failure) throw failure;

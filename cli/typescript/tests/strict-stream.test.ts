@@ -1,8 +1,12 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Executor, Registry, STREAMING_MARKER, createAnnotations } from "apcore-js";
 import { describe, expect, it, vi } from "vitest";
+import { build } from "tsup";
 import { buildModuleCommand, createCli } from "../src/main.js";
 import { AuditLogger, getAuditLogger, setAuditLogger } from "../src/security/audit.js";
 
@@ -131,3 +135,65 @@ it("keeps the legacy stream completion and audit behavior", async () => {
     expect(app.counts()).toEqual({ calls: 0, streams: 1 });
   } finally { app.close(); }
 });
+
+it.skipIf(!hasCompletion)("closes a strict stream and records one failed audit when its pipe closes", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "apcore-cli-closed-pipe-"));
+  const audit = join(directory, "audit.jsonl");
+  const closed = join(directory, "producer-closed");
+  const cliBundle = pathToFileURL(join(directory, "cli.mjs")).href;
+  const packageRoot = fileURLToPath(new URL("../", import.meta.url));
+  try {
+    symlinkSync(join(packageRoot, "node_modules"), join(directory, "node_modules"), "junction");
+    await build({
+      entry: { cli: join(packageRoot, "src/index.ts") },
+      config: false,
+      outDir: directory,
+      outExtension: () => ({ js: ".mjs" }),
+      format: ["esm"],
+      dts: false,
+      silent: true,
+    });
+    const fixture = `
+      import { writeFileSync } from "node:fs";
+      import { Executor, Registry, STREAMING_MARKER, createAnnotations } from "apcore-js";
+      const [bundle, audit, closed] = process.argv.slice(1);
+      const { AuditLogger, buildModuleCommand, setAuditLogger } = await import(bundle);
+      const moduleId = "test.pipe";
+      const registry = new Registry();
+      await registry.register(moduleId, {
+        description: "Write a provisional result",
+        annotations: createAnnotations({ streaming: true }),
+        [STREAMING_MARKER]: true,
+        inputSchema: { type: "object" },
+        outputSchema: { type: "object" },
+        execute() { return {}; },
+        async *stream() {
+          try { yield { result: "provisional" }; }
+          finally { writeFileSync(closed, "closed"); }
+        },
+      });
+      setAuditLogger(new AuditLogger(audit));
+      const cmd = buildModuleCommand(registry.getDefinition(moduleId), Executor.fromRegistry(registry),
+        undefined, undefined, undefined, { exit: code => { process.exitCode = code; } });
+      await cmd.parseAsync(["--strict-stream"], { from: "user" });
+    `;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", fixture, cliBundle, audit, closed], {
+      cwd: packageRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5_000,
+    });
+    child.stdout.destroy();
+    let stderr = "";
+    child.stderr.setEncoding("utf8").on("data", chunk => { stderr += chunk; });
+    const [code, signal] = await once(child, "close");
+    expect(signal).toBeNull();
+    expect(code).toBe(1);
+    expect(stderr).not.toContain("Unhandled 'error' event");
+    expect(JSON.parse(stderr)).toMatchObject({ error: true, exit_code: 1 });
+    expect(readFileSync(closed, "utf8")).toBe("closed");
+    const entries = readFileSync(audit, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(entries).toMatchObject([{ module_id: "test.pipe", status: "error", exit_code: 1 }]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 10_000);
