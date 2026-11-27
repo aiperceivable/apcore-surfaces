@@ -76,6 +76,16 @@ function expectRequest(recorded: RecordedRequest, expected: FixtureCase["expecte
   expect(recorded.body).toEqual({ skillId: expected.skill_id, event: fixture.event });
 }
 
+it("assigns distinct generated IDs to legacy and Surface A2A subscribers", () => {
+  const core = new A2ASubscriber("https://example.invalid/core");
+  const surface = new A2AEventSubscriber("https://example.invalid/surface");
+  const secondSurface = new A2AEventSubscriber("https://example.invalid/another");
+  expect(new Set([core.subscriberId, surface.subscriberId, secondSurface.subscriberId]).size).toBe(3);
+  expect(surface.subscriberId).toMatch(/^a2a-\d+$/);
+  expect(surface.subscriberType).toBe(core.subscriberType);
+  expect(new A2AEventSubscriber("https://example.invalid/explicit", undefined, { id: "receiver" }).subscriberId).toBe("receiver");
+});
+
 describe("configured A2A event subscriber", () => {
   const verifyDelivery = async (test: FixtureCase): Promise<void> => {
     const requests: RecordedRequest[] = [];

@@ -1,7 +1,8 @@
 import { v4 as uuidv4 } from "uuid";
-import type { CancelToken } from "apcore-js";
+import { CancelToken, Context } from "apcore-js";
 import { Artifact, Part, Role, TaskState } from "@a2a-js/sdk";
 import type { Message, TaskStatus } from "@a2a-js/sdk";
+import { TaskNotCancelableError } from "@a2a-js/sdk/errors";
 import {
   AgentEvent,
   type AgentExecutor,
@@ -111,6 +112,25 @@ export interface ApCoreAgentExecutorOptions {
   discloseRefusalReason?: boolean;
 }
 
+const OUTCOME_STATES = {
+  completed: TaskState.TASK_STATE_COMPLETED,
+  failed: TaskState.TASK_STATE_FAILED,
+  canceled: TaskState.TASK_STATE_CANCELED,
+  "input-required": TaskState.TASK_STATE_INPUT_REQUIRED,
+  rejected: TaskState.TASK_STATE_REJECTED,
+} as const;
+
+type TaskOutcome = keyof typeof OUTCOME_STATES;
+type TerminalOutcome = Exclude<TaskOutcome, "input-required">;
+
+interface TaskExecution {
+  readonly taskId: string;
+  readonly contextId: string;
+  readonly token: CancelToken;
+  readonly clientCancellation: AbortController;
+  terminal?: TerminalOutcome;
+}
+
 export class ApCoreAgentExecutor implements AgentExecutor {
   private executor: ApCoreAgentExecutorOptions["executor"];
   private partConverter: PartConverter;
@@ -119,8 +139,8 @@ export class ApCoreAgentExecutor implements AgentExecutor {
   // here in milliseconds for setTimeout / global_deadline arithmetic.
   private executionTimeoutMs: number;
   private onStateChange?: (oldState: string, newState: string) => void;
-  // P0-B: CancelToken map keyed by taskId
-  private cancelTokens = new Map<string, CancelToken>();
+  // The SDK allocates one event bus per task and reuses it across interrupted turns.
+  private readonly executions = new WeakMap<ExecutionEventBus, TaskExecution>();
   private errorMapper: ErrorMapper;
 
   constructor(opts: ApCoreAgentExecutorOptions) {
@@ -145,11 +165,19 @@ export class ApCoreAgentExecutor implements AgentExecutor {
   }
 
   async execute(context: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
-    // 1. Initialize task in the event bus so ResultManager can track it
-    const contextId = context.contextId || context.taskId;
+    // Install the cancellation state before exposing the task.
+    const { taskId } = context;
+    const contextId = context.contextId || taskId;
+    const task: TaskExecution = {
+      taskId,
+      contextId,
+      token: new CancelToken(),
+      clientCancellation: new AbortController(),
+    };
+    this.executions.set(eventBus, task);
     eventBus.publish(
       AgentEvent.task({
-        id: context.taskId,
+        id: taskId,
         contextId,
         status: makeStatus(TaskState.TASK_STATE_SUBMITTED),
         artifacts: [],
@@ -158,12 +186,13 @@ export class ApCoreAgentExecutor implements AgentExecutor {
       }),
     );
 
+    if (task.terminal !== undefined) return;
+
     // 2. Get skillId from message metadata
     const metadata = context.userMessage?.metadata ?? {};
     const skillId = metadata.skillId as string | undefined;
     if (!skillId) {
-      this.notify("submitted", "failed");
-      this.publishFailed(context, eventBus, "Missing required parameter: metadata.skillId");
+      this.publishOutcome(task, eventBus, "submitted", "failed", "Missing required parameter: metadata.skillId");
       return;
     }
 
@@ -177,13 +206,11 @@ export class ApCoreAgentExecutor implements AgentExecutor {
       } catch {
         // Registry unavailable: cannot confirm the skill, so fail closed rather
         // than proceeding optimistically.
-        this.notify("submitted", "failed");
-        this.publishFailed(context, eventBus, `Skill not found: ${skillId}`);
+        this.publishOutcome(task, eventBus, "submitted", "failed", `Skill not found: ${skillId}`);
         return;
       }
       if (!known.includes(skillId)) {
-        this.notify("submitted", "failed");
-        this.publishFailed(context, eventBus, `Skill not found: ${skillId}`);
+        this.publishOutcome(task, eventBus, "submitted", "failed", `Skill not found: ${skillId}`);
         return;
       }
     }
@@ -203,126 +230,73 @@ export class ApCoreAgentExecutor implements AgentExecutor {
     try {
       inputs = this.partConverter.partsToInput(parts, descriptor);
     } catch (e) {
-      this.notify("submitted", "failed");
-      this.publishFailed(context, eventBus, String(e));
+      this.publishOutcome(task, eventBus, "submitted", "failed", String(e));
       return;
     }
 
-    // 5. Build apcore context with identity and CancelToken (P0-B)
-    const identity = getAuthIdentity();
-    let token: CancelToken | undefined;
-    let apcoreCtx: unknown = undefined;
-    try {
-      const { Context, CancelToken: CoreCancelToken } = await import("apcore-js");
-      // P0-B: create a CancelToken per task and store it
-      token = new CoreCancelToken();
-      this.cancelTokens.set(context.taskId, token);
-      // Map the A2A executionTimeout onto apcore's global_deadline so apcore
-      // can stop cooperatively between streaming chunks / pipeline steps.
-      // apcore-js >= 0.31.0 (spec D-99/D-100/D-101) makes the first-class
-      // `Context.globalDeadline` field (epoch SECONDS) the pipeline's only
-      // source for this: `BuiltinContextCreation` no longer reads
-      // data[CTX_GLOBAL_DEADLINE] at all, so seeding it via `data` — the
-      // workaround for apcore-js's own pre-0.31 bug, where the field was
-      // documented but never consulted — is now silently inert and the
-      // task's execution timeout would go unenforced by apcore's pipeline.
-      // Context.create(identity, traceParent, cancelToken, data, services, globalDeadline)
-      const globalDeadline = (Date.now() + this.executionTimeoutMs) / 1000;
-      apcoreCtx = identity
-        ? Context.create(identity, null, token, undefined, undefined, globalDeadline)
-        : Context.create(null, null, token, undefined, undefined, globalDeadline);
-    } catch {
-      // apcore-js Context/CancelToken not available in this environment
-    }
-
-    // 6. Check if executor supports streaming (P0-A)
+    // Check if executor supports streaming (P0-A)
     const streamFn = (this.executor as { stream?: unknown }).stream;
     const canStream =
       typeof streamFn === "function" &&
       (streamFn.constructor?.name === "AsyncGeneratorFunction" ||
         Object.prototype.toString.call(streamFn) === "[object AsyncGeneratorFunction]");
 
-    // 7. Execute with timeout
+    // Start both the host budget and Core's cooperative deadline for this turn.
     this.notify("submitted", "working");
+    if (task.terminal !== undefined) return;
     const inputObj = typeof inputs === "string" ? { text: inputs } : inputs;
+    const globalDeadline = (Date.now() + this.executionTimeoutMs) / 1000;
+    // Only a client cancellation can preempt the host wait. Core may
+    // signal its own token before reporting a typed timeout or cancellation.
+    const clientSignal = task.clientCancellation.signal;
 
     try {
+      const apcoreCtx = Context.create(getAuthIdentity() ?? null, null, task.token, undefined, undefined, globalDeadline);
       if (canStream) {
-        await this.executeStreaming(context, eventBus, skillId, inputObj, apcoreCtx, token?.signal);
+        await this.executeStreaming(eventBus, task, skillId, inputObj, apcoreCtx);
       } else {
-        // Non-streaming path (callAsync)
-        let output: Record<string, unknown>;
-        const coro = apcoreCtx
-          ? this.executor.callAsync(skillId, inputObj, apcoreCtx)
-          : this.executor.callAsync(skillId, inputObj);
-        output = await withTimeout(coro, this.executionTimeoutMs, token?.signal);
-        if (token?.signal.aborted) return;
-
-        // 8. Publish artifact + completed
-        const artifact = this.partConverter.outputToParts(output, context.taskId);
-
-        eventBus.publish(
-          AgentEvent.artifactUpdate({
-            taskId: context.taskId,
-            contextId,
-            artifact,
-            append: false,
-            lastChunk: true,
-            metadata: undefined,
-          }),
+        const output = await withTimeout(
+          this.executor.callAsync(skillId, inputObj, apcoreCtx), this.executionTimeoutMs, clientSignal,
         );
+        if (clientSignal.aborted) return;
+        if (task.token.signal.aborted) {
+          this.publishOutcome(task, eventBus, "working", "canceled", "Execution cancelled");
+          return;
+        }
 
-        this.publishCompleted(context, eventBus);
+        const artifact = this.partConverter.outputToParts(output, taskId);
+        eventBus.publish(AgentEvent.artifactUpdate({
+          taskId,
+          contextId,
+          artifact,
+          append: false,
+          lastChunk: true,
+          metadata: undefined,
+        }));
+        this.publishOutcome(task, eventBus, "working", "completed");
       }
     } catch (e: unknown) {
-      // cancelTask owns the CANCELED event after explicitly signaling the token.
-      if (token?.signal.aborted) return;
-      if (e instanceof TimeoutError) {
-        token?.cancel();
-        this.notify("working", "failed");
-        this.publishFailed(context, eventBus, "Execution timed out");
+      if (task.terminal !== undefined) return;
+      const code = (e as { code?: string } | null)?.code;
+      if (e instanceof TimeoutError || code === "MODULE_TIMEOUT") {
+        this.publishOutcome(task, eventBus, "working", "failed", "Execution timed out");
+        task.token.cancel();
         return;
       }
-      const code = (e as { code?: string }).code;
-      if (code === "MODULE_TIMEOUT") {
-        // apcore enforced global_deadline (streaming or cooperative step)
-        token?.cancel();
-        this.notify("working", "failed");
-        this.publishFailed(context, eventBus, "Execution timed out");
-        return;
-      }
-      if (code === "EXECUTION_CANCELLED") {
-        this.notify("working", "canceled");
-        this.publishCanceled(context, eventBus, "Execution cancelled");
+      if (code === "EXECUTION_CANCELLED" || task.token.signal.aborted) {
+        this.publishOutcome(task, eventBus, "working", "canceled", "Execution cancelled");
         return;
       }
       if (code === "APPROVAL_PENDING") {
-        // A resumable pause, not a refusal: the message carries the approvalId
-        // the caller resumes with (srs FR-EXE-002). Must not be swept in with
-        // the governance codes below — `rejected` is terminal, so re-coding it
-        // would end the conversation.
-        this.notify("working", "input-required");
-        this.publishInputRequired(context, eventBus, String(e));
+        this.publishOutcome(task, eventBus, "working", "input-required", String(e));
         return;
       }
       if (isGovernanceRefusal(code)) {
-        // A2A 1.0 defines `rejected` as terminal, and a policy refusal is what
-        // it describes (srs FR-ERR-012). `failed` said only "something broke",
-        // which for a refusal is both wrong and an invitation to retry. This is
-        // the surface that matters on message/send, where the response is a
-        // JSON-RPC `result` and the error code never reaches the caller at all.
-        this.notify("working", "rejected");
-        this.publishRejected(context, eventBus, failureText(e, this.errorMapper));
+        this.publishOutcome(task, eventBus, "working", "rejected", failureText(e, this.errorMapper));
         return;
       }
-      console.error(`Execution failed for task ${context.taskId} skill ${skillId}:`, e);
-      this.notify("working", "failed");
-      this.publishFailed(context, eventBus, failureText(e, this.errorMapper));
-      return;
-    } finally {
-      // Clean up the cancel token on every exit path (matches Python's
-      // finally / Rust's Drop guard).
-      this.cancelTokens.delete(context.taskId);
+      console.error(`Execution failed for task ${taskId} skill ${skillId}:`, e);
+      this.publishOutcome(task, eventBus, "working", "failed", failureText(e, this.errorMapper));
     }
   }
 
@@ -331,177 +305,108 @@ export class ApCoreAgentExecutor implements AgentExecutor {
    * TaskArtifactUpdateEvent for each chunk, then publishes completed.
    */
   private async executeStreaming(
-    context: RequestContext,
     eventBus: ExecutionEventBus,
+    task: TaskExecution,
     moduleId: string,
     inputs: Record<string, unknown>,
-    apcoreCtx: unknown,
-    signal?: AbortSignal,
+    apcoreCtx: Context<unknown>,
   ): Promise<void> {
-    const contextId = context.contextId || context.taskId;
-    const artifactId = `art-${context.taskId}`;
+    const { taskId, contextId } = task;
+    const clientSignal = task.clientCancellation.signal;
+    const artifactId = `art-${taskId}`;
     let chunkIndex = 0;
 
     const streamFn = (
       this.executor as unknown as {
-        stream: (moduleId: string, inputs: Record<string, unknown>, ctx?: unknown) => AsyncGenerator<Record<string, unknown>>;
+        stream: (moduleId: string, inputs: Record<string, unknown>, ctx: Context<unknown>) => AsyncGenerator<Record<string, unknown>>;
       }
     ).stream;
-    const gen = apcoreCtx
-      ? streamFn.call(this.executor, moduleId, inputs, apcoreCtx)
-      : streamFn.call(this.executor, moduleId, inputs);
+    const iterator = streamFn.call(this.executor, moduleId, inputs, apcoreCtx)[Symbol.asyncIterator]();
 
     // The host uses a monotonic total budget even if the producer ignores
     // apcore's cooperative deadline.
     const deadline = performance.now() + this.executionTimeoutMs;
-    const iterator = gen[Symbol.asyncIterator]();
     let exhausted = false;
     try {
       for (;;) {
-        if (signal?.aborted) return;
+        if (clientSignal.aborted) return;
         const remaining = deadline - performance.now();
         if (remaining <= 0) throw new TimeoutError();
-        const next = await withTimeout(iterator.next(), remaining, signal);
-        if (signal?.aborted) return;
+        const next = await withTimeout(iterator.next(), remaining, clientSignal);
+        if (clientSignal.aborted) return;
+        if (task.token.signal.aborted) {
+          this.publishOutcome(task, eventBus, "working", "canceled", "Execution cancelled");
+          return;
+        }
         if (next.done) {
           exhausted = true;
           break;
         }
-        const artifact = this.partConverter.outputToParts(next.value, context.taskId);
-        eventBus.publish(
-          AgentEvent.artifactUpdate({
-            taskId: context.taskId,
-            contextId,
-            artifact: { ...artifact, artifactId },
-            append: chunkIndex > 0,
-            lastChunk: false,
-            metadata: undefined,
-          }),
-        );
+        const artifact = this.partConverter.outputToParts(next.value, taskId);
+        eventBus.publish(AgentEvent.artifactUpdate({
+          taskId,
+          contextId,
+          artifact: { ...artifact, artifactId },
+          append: chunkIndex > 0,
+          lastChunk: false,
+          metadata: undefined,
+        }));
         chunkIndex++;
       }
     } finally {
       if (!exhausted) {
-        // AsyncGenerator.return() queues behind any pending next(). A late
-        // value or cleanup failure must never change the task's terminal state.
+        // AsyncGenerator.return() waits behind any pending next().
         void Promise.resolve().then(() => iterator.return?.(undefined)).catch((error: unknown) => {
-          console.warn(`[apcore-a2a] Stream cleanup failed for task ${context.taskId}`, error);
+          console.warn(`[apcore-a2a] Stream cleanup failed for task ${taskId}`, error);
         });
       }
     }
 
-    // Signal end of stream with lastChunk: true
-    eventBus.publish(
-      AgentEvent.artifactUpdate({
-        taskId: context.taskId,
-        contextId,
-        artifact: Artifact.fromJSON({ artifactId, parts: [] }),
-        append: chunkIndex > 0,
-        lastChunk: true,
-        metadata: undefined,
-      }),
-    );
-
-    if (!signal?.aborted) this.publishCompleted(context, eventBus);
+    eventBus.publish(AgentEvent.artifactUpdate({
+      taskId,
+      contextId,
+      artifact: Artifact.fromJSON({ artifactId, parts: [] }),
+      append: chunkIndex > 0,
+      lastChunk: true,
+      metadata: undefined,
+    }));
+    this.publishOutcome(task, eventBus, "working", "completed");
   }
 
   async cancelTask(taskId: string, eventBus: ExecutionEventBus): Promise<void> {
-    // P0-B: Cancel the running execution via CancelToken
-    const token = this.cancelTokens.get(taskId);
-    if (token) {
-      token.cancel();
-      this.cancelTokens.delete(taskId);
+    const task = this.executions.get(eventBus);
+    if (task?.taskId === taskId) {
+      if (task.terminal === "canceled") {
+        // The SDK's new cancellation listener joined after the terminal event.
+        queueMicrotask(() => eventBus.finished());
+        return;
+      }
+      if (task.terminal !== undefined) throw new TaskNotCancelableError(`Task not cancelable: ${taskId}`);
+      this.publishOutcome(task, eventBus, "working", "canceled", "Canceled by client");
+      task.clientCancellation.abort();
+      task.token.cancel();
+      return;
     }
 
-    eventBus.publish(
-      AgentEvent.statusUpdate({
-        taskId,
-        contextId: taskId,
-        status: makeStatus(TaskState.TASK_STATE_CANCELED, textMessage("Canceled by client")),
-        metadata: undefined,
-      }),
-    );
-
-    this.notify("working", "canceled");
+    this.publishOutcome({ taskId, contextId: taskId }, eventBus, "working", "canceled", "Canceled by client");
   }
 
-  private publishCompleted(context: RequestContext, eventBus: ExecutionEventBus): void {
-    const contextId = context.contextId || context.taskId;
-    eventBus.publish(
-      AgentEvent.statusUpdate({
-        taskId: context.taskId,
-        contextId,
-        status: makeStatus(TaskState.TASK_STATE_COMPLETED),
-        metadata: undefined,
-      }),
-    );
-
-    this.notify("working", "completed");
-  }
-
-  private publishFailed(
-    context: RequestContext,
+  private publishOutcome(
+    task: Pick<TaskExecution, "taskId" | "contextId" | "terminal">,
     eventBus: ExecutionEventBus,
-    message: string,
+    previous: "submitted" | "working",
+    outcome: TaskOutcome,
+    message?: string,
   ): void {
-    const contextId = context.contextId || context.taskId;
-    eventBus.publish(
-      AgentEvent.statusUpdate({
-        taskId: context.taskId,
-        contextId,
-        status: makeStatus(TaskState.TASK_STATE_FAILED, textMessage(message)),
-        metadata: undefined,
-      }),
-    );
-  }
-
-  /** Emit REJECTED status for a governance refusal (srs FR-ERR-012). */
-  private publishRejected(
-    context: RequestContext,
-    eventBus: ExecutionEventBus,
-    message: string,
-  ): void {
-    const contextId = context.contextId || context.taskId;
-    eventBus.publish(
-      AgentEvent.statusUpdate({
-        taskId: context.taskId,
-        contextId,
-        status: makeStatus(TaskState.TASK_STATE_REJECTED, textMessage(message)),
-        metadata: undefined,
-      }),
-    );
-  }
-
-  private publishInputRequired(
-    context: RequestContext,
-    eventBus: ExecutionEventBus,
-    message: string,
-  ): void {
-    const contextId = context.contextId || context.taskId;
-    eventBus.publish(
-      AgentEvent.statusUpdate({
-        taskId: context.taskId,
-        contextId,
-        status: makeStatus(TaskState.TASK_STATE_INPUT_REQUIRED, textMessage(message)),
-        metadata: undefined,
-      }),
-    );
-  }
-
-  private publishCanceled(
-    context: RequestContext,
-    eventBus: ExecutionEventBus,
-    message: string,
-  ): void {
-    const contextId = context.contextId || context.taskId;
-    eventBus.publish(
-      AgentEvent.statusUpdate({
-        taskId: context.taskId,
-        contextId,
-        status: makeStatus(TaskState.TASK_STATE_CANCELED, textMessage(message)),
-        metadata: undefined,
-      }),
-    );
+    if (task.terminal !== undefined) return;
+    if (outcome !== "input-required") task.terminal = outcome;
+    eventBus.publish(AgentEvent.statusUpdate({
+      taskId: task.taskId,
+      contextId: task.contextId,
+      status: makeStatus(OUTCOME_STATES[outcome], message === undefined ? undefined : textMessage(message)),
+      metadata: undefined,
+    }));
+    this.notify(previous, outcome);
   }
 }
 

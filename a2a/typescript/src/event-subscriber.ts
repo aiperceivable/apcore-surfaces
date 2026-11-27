@@ -26,7 +26,9 @@ export class A2AEventSubscriber implements EventSubscriber {
     auth?: AuthHeaders,
     options: A2AEventSubscriberOptions = {},
   ) {
-    this.subscriberId = options.id ?? `a2a-${nextSubscriberId++}`;
+    // Core's legacy allocator uses unpadded decimal IDs. Reserve the
+    // zero-prefixed range for the new transport while both can coexist.
+    this.subscriberId = options.id ?? `a2a-0${nextSubscriberId++}`;
     this.retry = options.retry;
     this.timeoutMs = options.timeoutMs ?? 5000;
     this.skillId = options.skillId ?? "apevo.event_receiver";

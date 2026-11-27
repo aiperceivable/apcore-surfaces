@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Context, ErrorCodes, ModuleError } from "apcore-js";
-import { Part, TaskState } from "@a2a-js/sdk";
+import { AgentCard, Message, Part, Role, TaskState } from "@a2a-js/sdk";
+import { TaskNotCancelableError } from "@a2a-js/sdk/errors";
+import { DefaultRequestHandler, InMemoryTaskStore, ServerCallContext } from "@a2a-js/sdk/server";
 import type { ExecutionEventBus, AgentExecutionEvent, RequestContext } from "@a2a-js/sdk/server";
 import { ApCoreAgentExecutor } from "../../src/server/executor.js";
 import { PartConverter } from "../../src/adapters/parts.js";
@@ -65,6 +67,75 @@ function deferred() {
   const promise = new Promise<void>((done) => { resolve = done; });
   return { promise, resolve };
 }
+
+describe("task terminal ownership through the A2A SDK", () => {
+  const card = AgentCard.fromJSON({ capabilities: {} });
+  const context = new ServerCallContext();
+
+  function message(contextId?: string): Message {
+    return Message.fromJSON({
+      messageId: "terminal-test",
+      contextId,
+      role: Role.ROLE_USER,
+      metadata: { skillId: "test" },
+      parts: [{ text: "Run the task" }],
+    });
+  }
+
+  it.each(["unary", "stream"] as const)("persists an executor-originated %s cancellation", async (mode) => {
+    const cancel = (coreContext: unknown): never => {
+      (coreContext as Context).cancelToken?.cancel();
+      throw new ModuleError(ErrorCodes.EXECUTION_CANCELLED, "Executor stopped");
+    };
+    const agent = new ApCoreAgentExecutor({
+      executor: mode === "stream" ? {
+        callAsync: vi.fn(),
+        async *stream(_moduleId: string, _inputs: unknown, coreContext: unknown) {
+          yield cancel(coreContext);
+        },
+      } : {
+        async callAsync(_moduleId, _inputs, coreContext) { return cancel(coreContext); },
+      },
+      partConverter: new PartConverter(),
+    });
+    const handler = new DefaultRequestHandler(card, new InMemoryTaskStore(), agent);
+    const states = [];
+    let taskId = "";
+    for await (const { payload } of handler.sendMessageStream({ message: message() }, context)) {
+      if (payload?.$case === "task") taskId = payload.value.id;
+      if (payload?.$case === "statusUpdate") states.push(payload.value.status?.state);
+    }
+    expect(states).toEqual([TaskState.TASK_STATE_CANCELED]);
+    expect((await handler.getTask({ id: taskId }, context)).status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+  });
+
+  it("preserves the timeout terminal state when cancellation races its publication", async () => {
+    const result = deferred();
+    let taskId = "";
+    let cancellation: Promise<unknown> | undefined;
+    const agent = new ApCoreAgentExecutor({
+      executor: { async callAsync() { await result.promise; return {}; } },
+      partConverter: new PartConverter(),
+      executionTimeout: 0.03,
+      onStateChange(_from, to) {
+        if (to === "failed") cancellation = handler.cancelTask({ id: taskId }, context).catch(error => error);
+      },
+    });
+    const handler = new DefaultRequestHandler(card, new InMemoryTaskStore(), agent);
+    const states = [];
+    try {
+      for await (const { payload } of handler.sendMessageStream({ message: message() }, context)) {
+        if (payload?.$case === "task") taskId = payload.value.id;
+        if (payload?.$case === "statusUpdate") states.push(payload.value.status?.state);
+      }
+      expect(states).toEqual([TaskState.TASK_STATE_FAILED]);
+      expect(await cancellation).toBeInstanceOf(TaskNotCancelableError);
+      expect((await handler.getTask({ id: taskId }, context)).status?.state).toBe(TaskState.TASK_STATE_FAILED);
+    } finally {
+      result.resolve();
+    }
+  });
+});
 
 describe("ApCoreAgentExecutor", () => {
   let partConverter: PartConverter;
@@ -244,6 +315,7 @@ describe("ApCoreAgentExecutor", () => {
       }
       const updates = (bus.events as AgentExecutionEvent[]).filter((event) => event.kind === "statusUpdate");
       expect(updates.map((event) => event.data.status.state)).toEqual([TaskState.TASK_STATE_CANCELED]);
+      expect(updates[0].data.contextId).toBe("ctx-1");
       expect(bus.events).toHaveLength(2);
     }, 2_000);
 
