@@ -64,7 +64,7 @@ pub struct AppState {
     /// Filtered per caller like the extended card: the Explorer sits behind the
     /// auth middleware whenever one is configured.
     pub(crate) explorer_card: Arc<FilteredCard>,
-    pub(crate) running_tasks: Arc<Mutex<HashMap<String, Arc<TaskExecution>>>>,
+    pub(crate) running_tasks: RunningTasks,
     /// Per-task push-notification webhook configs
     /// (`tasks/pushNotificationConfig/*`), scoped to their owner by the store.
     pub(crate) push_config_store: Arc<dyn PushConfigStore>,
@@ -826,13 +826,8 @@ async fn handle_send(
 
     let mut task = submitted_task(&task_id, &context_id);
 
-    let execution = register_execution(state, &task_id);
-    // Unregister the cancel token on every exit path (success, error, panic);
-    // a Drop guard mirrors handle_stream and avoids leaking the token.
-    let _cancel_guard = CancelGuard {
-        state: state.clone(),
-        task_id: task_id.clone(),
-    };
+    let running = state.running_tasks.register(&task_id, ctx);
+    let execution = &running.execution;
 
     save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await?;
 
@@ -900,7 +895,7 @@ async fn handle_stream(
         }) => return failed_task_stream(state, task_id, context_id, ctx, id, message).await,
     };
 
-    let execution = register_execution(state, &task_id);
+    let running = state.running_tasks.register(&task_id, ctx);
 
     // Reserve capacity for the terminal status and successful end marker.
     // Artifact backpressure must not block either after the decision is made.
@@ -915,11 +910,7 @@ async fn handle_stream(
     let started = tokio::time::Instant::now();
 
     tokio::spawn(async move {
-        // Unregister the cancel token on every exit path (success, error, panic).
-        let _cancel_guard = CancelGuard {
-            state: state2.clone(),
-            task_id: task_id.clone(),
-        };
+        let execution = &running.execution;
         let mut task = submitted_task(&task_id, &context_id);
         if skill_known {
             task.status = TaskStatus::new(TaskState::Working);
@@ -1188,7 +1179,7 @@ async fn handle_cancel(
         "Missing required parameter: id".to_string(),
     ))?;
 
-    let execution = state.running_tasks.lock().unwrap().get(task_id).cloned();
+    let execution = state.running_tasks.get(task_id, ctx);
     let terminal = match &execution {
         Some(execution) => Some(execution.terminal.lock().await),
         None => None,
@@ -1446,7 +1437,7 @@ fn canceled_by_client() -> TaskStatus {
     )
 }
 
-pub(crate) struct TaskExecution {
+struct TaskExecution {
     token: CancelToken,
     client_canceled: watch::Sender<Option<TaskStatus>>,
     terminal: tokio::sync::Mutex<()>,
@@ -1458,35 +1449,54 @@ impl TaskExecution {
     }
 }
 
-fn register_execution(state: &AppState, task_id: &str) -> Arc<TaskExecution> {
-    let (client_canceled, _) = watch::channel(None);
-    let execution = Arc::new(TaskExecution {
-        token: CancelToken::new(),
-        client_canceled,
-        terminal: tokio::sync::Mutex::new(()),
-    });
-    state
-        .running_tasks
-        .lock()
-        .unwrap()
-        .insert(task_id.to_string(), execution.clone());
-    execution
-}
+type RunningTaskKey = (OwnerId, String);
 
-/// Drop guard that unregisters a task's cancel token on all exit paths
-/// (normal return, early return, or panic), preventing token leaks.
-struct CancelGuard {
-    state: AppState,
-    task_id: String,
-}
+/// Active executions use the same owner scope as the task store.
+#[derive(Clone, Default)]
+pub(crate) struct RunningTasks(Arc<Mutex<HashMap<RunningTaskKey, Arc<TaskExecution>>>>);
 
-impl Drop for CancelGuard {
-    fn drop(&mut self) {
-        self.state
-            .running_tasks
+impl RunningTasks {
+    fn register(&self, task_id: &str, ctx: &CallContext) -> RunningTask {
+        let (client_canceled, _) = watch::channel(None);
+        let execution = Arc::new(TaskExecution {
+            token: CancelToken::new(),
+            client_canceled,
+            terminal: tokio::sync::Mutex::new(()),
+        });
+        let key = (ctx.owner().clone(), task_id.to_string());
+        self.0
             .lock()
             .unwrap()
-            .remove(&self.task_id);
+            .insert(key.clone(), execution.clone());
+        RunningTask {
+            tasks: self.clone(),
+            key,
+            execution,
+        }
+    }
+
+    fn get(&self, task_id: &str, ctx: &CallContext) -> Option<Arc<TaskExecution>> {
+        let key = (ctx.owner().clone(), task_id.to_string());
+        self.0.lock().unwrap().get(&key).cloned()
+    }
+}
+
+/// Removes the execution from the active registry when its worker exits.
+struct RunningTask {
+    tasks: RunningTasks,
+    key: RunningTaskKey,
+    execution: Arc<TaskExecution>,
+}
+
+impl Drop for RunningTask {
+    fn drop(&mut self) {
+        let mut tasks = self.tasks.0.lock().unwrap();
+        if tasks
+            .get(&self.key)
+            .is_some_and(|execution| Arc::ptr_eq(execution, &self.execution))
+        {
+            tasks.remove(&self.key);
+        }
     }
 }
 
@@ -1494,6 +1504,47 @@ impl Drop for CancelGuard {
 mod tests {
     use super::*;
     use crate::types::Part;
+
+    #[test]
+    fn active_tasks_are_scoped_to_their_store_owner() {
+        let tasks = RunningTasks::default();
+        let alice = CallContext::from_identity(Some(&Identity::new(
+            "alice".into(),
+            "user".into(),
+            vec![],
+            HashMap::new(),
+        )));
+        let anonymous = CallContext::anonymous();
+        let named_run = tasks.register("task", &alice);
+        let anonymous_run = tasks.register("task", &anonymous);
+
+        let found = tasks.get("task", &alice).unwrap();
+        assert!(Arc::ptr_eq(&found, &named_run.execution));
+        let found = tasks.get("task", &anonymous).unwrap();
+        assert!(Arc::ptr_eq(&found, &anonymous_run.execution));
+
+        drop(named_run);
+        assert!(tasks.get("task", &alice).is_none());
+        assert!(tasks.get("task", &anonymous).is_some());
+        drop(anonymous_run);
+        assert!(tasks.get("task", &anonymous).is_none());
+    }
+
+    #[test]
+    fn active_task_cleanup_only_removes_its_registration() {
+        let tasks = RunningTasks::default();
+        let ctx = CallContext::anonymous();
+        let first = tasks.register("task", &ctx);
+        let replacement = tasks.register("task", &ctx);
+
+        drop(first);
+        let found = tasks
+            .get("task", &ctx)
+            .expect("replacement is still active");
+        assert!(Arc::ptr_eq(&found, &replacement.execution));
+        drop(replacement);
+        assert!(tasks.get("task", &ctx).is_none());
+    }
 
     /// Extract the status message's text (if any).
     fn status_text(status: &TaskStatus) -> Option<String> {
