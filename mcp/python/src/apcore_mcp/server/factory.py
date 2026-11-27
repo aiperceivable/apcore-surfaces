@@ -13,7 +13,8 @@ from urllib.parse import parse_qs, unquote
 
 import anyio
 import jsonschema  # type: ignore[import-untyped]  # MCP supplies jsonschema without its optional typing stubs.
-from apcore import CancelToken, Identity
+from apcore import CancelToken, Identity, ModuleError
+from apcore import Registry as CoreRegistry
 from apcore.schema.exporter import SchemaExporter
 from apcore.schema.types import SchemaDefinition
 from mcp import types as mcp_types
@@ -30,6 +31,7 @@ from apcore_mcp.adapters.annotations import AnnotationMapper
 from apcore_mcp.auth.middleware import _REQUEST_IDENTITY_KEY, auth_identity_var
 from apcore_mcp.server.approval_bridge import ApprovalBridge
 from apcore_mcp.server.async_task_bridge import RESERVED_PREFIX, AsyncTaskBridge
+from apcore_mcp.server.router import ExecutionRouter, _descriptor_version_hint, _matches_registered_version
 from apcore_mcp.server.transport import _protocol_source_var, transport_session_var
 
 logger = logging.getLogger(__name__)
@@ -481,6 +483,15 @@ class MCPServerFactory:
                 logger.warning("Skipped module %s: no definition found", module_id)
                 continue
             try:
+                # Advertise the same registration used when an unhinted
+                # request takes the module's configured version default.
+                version_hint = _descriptor_version_hint(descriptor)
+                if isinstance(registry, CoreRegistry) and version_hint is not None:
+                    selected = registry.get_definition(module_id, version_hint)
+                    if selected is not None and _matches_registered_version(
+                        registry, module_id, version_hint, selected.version,
+                    ):
+                        descriptor = selected
                 # Keep compatibility arguments while preserving the runtime schema.
                 tools.append(self.build_tool(descriptor, registry=registry, strict=strict))
             except ValueError as e:
@@ -495,6 +506,45 @@ class MCPServerFactory:
                 logger.warning("Failed to build tool for %s: %s", module_id, e)
                 continue
         return tools
+
+    def _bind_requested_version(
+        self,
+        router: ExecutionRouter,
+        published: mcp_types.Tool,
+        extra: dict[str, Any],
+        *,
+        async_enabled: bool,
+    ) -> str | None:
+        try:
+            selection = router._select_wire_version(published.name, extra)
+        except ModuleError as error:
+            return self._error_mapper.to_mcp_error(error)["message"]
+        if selection is None:
+            return None
+        selected, default, can_pin = selection
+        mismatch = f"Requested version {selected.version} does not match the advertised tool contract."
+        try:
+            selected_tool = self.build_tool(selected)
+        except ValueError:
+            return mismatch
+        fields = {"inputSchema", "annotations", "meta"}
+        if _supports_structured_output():
+            fields.add("outputSchema")
+        published_contract = json.dumps(published.model_dump(mode="json", include=fields), sort_keys=True)
+        selected_contract = json.dumps(selected_tool.model_dump(mode="json", include=fields), sort_keys=True)
+        if selected_tool.name != published.name or published_contract != selected_contract:
+            return mismatch
+        if not can_pin:
+            return "This Core version cannot confirm the requested tool registration."
+        if async_enabled:
+            default_async = AsyncTaskBridge.is_async_module(default)
+            if default_async != AsyncTaskBridge.is_async_module(selected):
+                return mismatch
+            if default_async:
+                return "Version hints are unavailable for background tool execution."
+        extra["version_hint"] = selected.version
+        extra["_mcp_wire_version"] = True
+        return None
 
     def register_handlers(
         self,
@@ -537,6 +587,8 @@ class MCPServerFactory:
         if approval_bridge is not None:
             combined_tools.extend(approval_bridge.build_meta_tools())
 
+        regular_tool_ids = {id(tool) for tool in tools}
+
         @server.list_tools()
         async def handle_list_tools() -> list[mcp_types.Tool]:
             if _supports_structured_output():
@@ -575,6 +627,21 @@ class MCPServerFactory:
 
                 extra["send_notification"] = send_notification
                 extra["progress_token"] = progress_token
+
+            published = next((tool for tool in reversed(combined_tools) if tool.name == name), None)
+            if (
+                published is not None
+                and id(published) in regular_tool_ids
+                and isinstance(router, ExecutionRouter)
+            ):
+                error = self._bind_requested_version(
+                    router,
+                    published,
+                    extra,
+                    async_enabled=async_bridge is not None and descriptor_lookup is not None,
+                )
+                if error is not None:
+                    return _build_call_result([mcp_types.TextContent(type="text", text=error)], True, None)
 
             # Meta-tool route: handled entirely by the async bridge.
             if async_bridge is not None and async_bridge.is_meta_tool(name):
@@ -655,7 +722,7 @@ class MCPServerFactory:
                     text_contents.append(mcp_types.TextContent(type="text", text=item["text"], _meta=item_meta))
                 else:
                     text_contents.append(mcp_types.TextContent(type="text", text=item["text"]))
-            output_schema = next((tool.outputSchema for tool in reversed(combined_tools) if tool.name == name), None)
+            output_schema = published.outputSchema if published is not None else None
             return _build_call_result(text_contents, is_error, output_schema)
 
     def register_resource_handlers(

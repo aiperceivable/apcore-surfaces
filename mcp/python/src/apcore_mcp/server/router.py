@@ -13,6 +13,8 @@ from contextlib import aclosing
 from typing import Any
 
 from apcore import APCore, CancelToken, Context, Executor, ModuleError, StreamingModule
+from apcore.registry.types import ModuleDescriptor
+from apcore.registry.version import matches_version_hint
 from apcore.trace_context import TraceContext, TraceParent
 
 from apcore_mcp.adapters.errors import ErrorMapper
@@ -27,6 +29,31 @@ _DEEP_MERGE_MAX_DEPTH = 32
 # without an eviction cap a long-running server would leak memory.
 _CANCEL_TOKENS_MAX = 4096
 _POLICY_SKIPS = {"not_configured", "no_match", "strategy_skipped"}
+
+
+def _request_version_hint(extra: dict[str, Any] | None) -> str | None:
+    if extra is None:
+        return None
+    if extra.get("version_hint") is not None:
+        return extra["version_hint"]
+    meta = extra.get("_meta")
+    apcore_meta = meta.get("apcore") if isinstance(meta, dict) else None
+    version = apcore_meta.get("version") if isinstance(apcore_meta, dict) else None
+    return version if isinstance(version, str) else None
+
+
+def _descriptor_version_hint(descriptor: Any) -> str | None:
+    metadata = getattr(descriptor, "metadata", None)
+    hint = metadata.get("version_hint") if isinstance(metadata, dict) else None
+    return hint if isinstance(hint, str) else None
+
+
+def _matches_registered_version(registry: Any, module_id: str, requested: str, reported: str) -> bool:
+    # Older Core releases resolved the instance but could report another
+    # registration's version and annotations in the descriptor.
+    return matches_version_hint(reported, requested) and (
+        registry.get(module_id, reported) is registry.get(module_id, requested)
+    )
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any], depth: int = 0) -> dict[str, Any]:
@@ -90,6 +117,11 @@ class ExecutionRouter:
         self._trace_executor = executor.executor if isinstance(executor, APCore) else executor
         self._error_mapper = ErrorMapper()
         self._validate_inputs = validate_inputs
+        self._versioned_preflight = (
+            self._core_backend
+            and validate_inputs
+            and "version_hint" in inspect.signature(executor.validate).parameters
+        )
         self._output_formatter = output_formatter
         self._output_format = output_format
         self._redact_output = redact_output
@@ -190,16 +222,38 @@ class ExecutionRouter:
             logger.warning("redact_sensitive failed for %s, returning unredacted output", tool_name, exc_info=True)
             return result
 
+    def _select_wire_version(
+        self, tool_name: str, extra: dict[str, Any]
+    ) -> tuple[ModuleDescriptor, ModuleDescriptor | None, bool] | None:
+        """Resolve a hinted Core registration before comparing it with the advertised tool."""
+        if not self._core_backend:
+            return None
+        registry = self._executor.registry
+        default = registry.get_definition(tool_name)
+        version_hint = _request_version_hint(extra)
+        if version_hint is None:
+            version_hint = _descriptor_version_hint(default)
+        if version_hint is None:
+            return None
+        selected = registry.get_definition(tool_name, version_hint)
+        if selected is None:
+            raise ModuleError("MODULE_NOT_FOUND", f"Module '{tool_name}' not found for the requested version")
+        return selected, default, _matches_registered_version(registry, tool_name, version_hint, selected.version)
+
     def _output_projection(
         self, tool_name: str, version_hint: str | None
     ) -> tuple[str | None, dict[str, Any] | None]:
         if not self._redact_output or not self._core_backend or version_hint is None:
             return version_hint, None
-        definition = self._executor.registry.get_definition(tool_name, version_hint)
+        registry = self._executor.registry
+        definition = registry.get_definition(tool_name, version_hint)
         if definition is None:
             raise ModuleError("MODULE_NOT_FOUND", f"Module '{tool_name}' not found")
-        # Resolve a range once, so execution and projection use the same registration.
-        return definition.version, definition.output_schema
+        # Pin only when Core can report the actual selected version. Direct
+        # router callers can still pass the original range to older Core.
+        if _matches_registered_version(registry, tool_name, version_hint, definition.version):
+            version_hint = definition.version
+        return version_hint, definition.output_schema
 
     def _format_result(self, result: Any) -> str:
         """Format an execution result into text for LLM consumption.
@@ -524,24 +578,8 @@ class ExecutionRouter:
             cancel_token=cancel_token,
         )
 
-        # version_hint resolution per spec's 3-source cascade: [A-D-006]
-        #   1. extras.version_hint (SDK caller-supplied, highest priority)
-        #   2. extras._meta.apcore.version (MCP client-supplied)
-        #   3. descriptor.metadata.version_hint (descriptor default, lowest)
-        # Pre-fix Python only consulted #1 and #2; #3 was never read.
-        version_hint: str | None = None
-        if extra is not None:
-            version_hint = extra.get("version_hint")
-            if version_hint is None:
-                meta = extra.get("_meta")
-                if isinstance(meta, dict):
-                    apcore_meta = meta.get("apcore")
-                    if isinstance(apcore_meta, dict):
-                        raw = apcore_meta.get("version")
-                        if isinstance(raw, str):
-                            version_hint = raw
-        # Source #3: descriptor default fallback. Read the same descriptor
-        # to route annotated streaming modules without progress metadata.
+        # Explicit SDK hint, then MCP metadata, then descriptor default.
+        version_hint = _request_version_hint(extra)
         descriptor = None
         if version_hint is None or callable(self._open_completed_stream):
             registry = getattr(self._executor, "registry", None)
@@ -551,16 +589,28 @@ class ExecutionRouter:
                     descriptor = get_def(tool_name)
                 except Exception:  # noqa: BLE001  # defensive — registry may raise
                     descriptor = None
-                if descriptor is not None and version_hint is None:
-                    meta_attr = getattr(descriptor, "metadata", None) or {}
-                    raw = meta_attr.get("version_hint") if isinstance(meta_attr, dict) else None
-                    if isinstance(raw, str):
-                        version_hint = raw
+                if version_hint is None:
+                    version_hint = _descriptor_version_hint(descriptor)
 
         # Pre-execution validation
         if self._validate_inputs:
             try:
-                validation = self._executor.validate(tool_name, arguments, context)
+                preflight_options: dict[str, str | None] = {}
+                if extra is not None and extra.get("_mcp_wire_version") is True:
+                    if self._versioned_preflight:
+                        preflight_options["version_hint"] = version_hint
+                    else:
+                        registry = self._executor.registry
+                        if registry.get(tool_name, version_hint) is not registry.get(tool_name):
+                            return (
+                                [{
+                                    "type": "text",
+                                    "text": "This Core version cannot preflight a non-default module version",
+                                }],
+                                True,
+                                None,
+                            )
+                validation = self._executor.validate(tool_name, arguments, context, **preflight_options)
                 if not validation.valid:
                     parts: list[str] = []
                     for e in validation.errors:
