@@ -1129,14 +1129,16 @@ impl ExecutionRouter {
         arguments: &Value,
         extra: Option<&Value>,
     ) -> (StreamOutcome, WireOutputSchema) {
-        self.with_call_output(tool_name, self.dispatch_call(tool_name, arguments, extra))
-            .await
+        let dispatch = Box::pin(self.dispatch_call(tool_name, arguments, extra));
+        self.with_call_output(tool_name, dispatch).await
     }
 
+    // Keep the dispatch state on the heap before task-local wrappers capture it.
+    // Inline propagation exhausts the default Windows main stack in debug builds.
     async fn with_call_output(
         &self,
         tool_name: &str,
-        dispatch: impl Future<Output = StreamOutcome>,
+        dispatch: Pin<Box<impl Future<Output = StreamOutcome>>>,
     ) -> (StreamOutcome, WireOutputSchema) {
         let output = self.live_call_output(tool_name).map(Arc::new);
         let result = LIVE_CALL_OUTPUT
@@ -1587,8 +1589,7 @@ impl ExecutionRouter {
             }
         }
 
-        self.with_call_output(
-            tool_name,
+        let dispatch = Box::pin(
             self.dispatch_stream_or_call(
                 tool_name,
                 arguments,
@@ -1600,9 +1601,8 @@ impl ExecutionRouter {
                     .as_ref()
                     .zip(extra.send_notification.as_ref()),
             ),
-        )
-        .await
-        .0
+        );
+        self.with_call_output(tool_name, dispatch).await.0
     }
 
     // -----------------------------------------------------------------------
