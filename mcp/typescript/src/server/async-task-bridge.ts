@@ -93,17 +93,20 @@ export interface TaskInfoProjection {
 /**
  * Minimal duck-typed `AsyncTaskManager` contract the bridge depends on.
  *
- * This mirrors **apcore-js 0.32.3**, whose `submit` takes an options object and
+ * This mirrors apcore-js, whose `submit` takes an options object and
  * whose `getStatus` / `listTasks` are async. It is intentionally TS-local:
  * apcore-python and apcore-rust still expose positional `context` and sync
  * reads, so their bridges keep their own manager shape. The cross-language
  * contract is the MCP `__apcore_task_*` envelope, not this interface.
  */
 export interface AsyncTaskManagerLike {
+  readonly supportsTaskAllocationCallback?: boolean;
+  readonly ownsPrivateTaskStore?: boolean;
+  readonly store?: object;
   submit(
     moduleId: string,
     inputs: Record<string, unknown>,
-    opts?: { context?: unknown | null },
+    opts?: { context?: unknown | null; onTaskAllocated?: (taskId: string) => void },
   ): Promise<string>;
   getStatus(taskId: string): Promise<{
     taskId: string;
@@ -200,6 +203,13 @@ export interface AsyncTaskBridgeOptions {
   executor?: ExecutorLike;
 }
 
+interface ScopedTaskBinding {
+  owner: string;
+  state: "pending" | "published" | "failed";
+}
+
+const scopedTaskOwners = new WeakMap<object, Map<string, ScopedTaskBinding>>();
+
 /**
  * Routes MCP tool calls either to the synchronous Execution Router (default)
  * or to `AsyncTaskManager.submit()` for async-hinted modules.
@@ -212,7 +222,7 @@ export class AsyncTaskBridge {
   private readonly _descriptorLookup?: AsyncTaskBridgeOptions["descriptorLookup"];
   private readonly _executor?: ExecutorLike;
   private readonly _scopedTasks: boolean;
-  private readonly _scopedTaskOwners = new Map<string, string>();
+  private readonly _scopedTaskOwners: Map<string, ScopedTaskBinding>;
   /**
    * Maps task_id → progressToken recorded at submit time so terminal-
    * state notifications can be fanned out via the original token.
@@ -234,6 +244,12 @@ export class AsyncTaskBridge {
     this._descriptorLookup = options?.descriptorLookup;
     this._executor = options?.executor;
     this._scopedTasks = options?.scopedTasks === true;
+    // Share ownership with any bridge using the same in-memory store, including a host
+    // explicitly passing that instance to a second manager.
+    const store = manager.store;
+    const ownerKey = store && typeof store === "object" ? store : manager;
+    this._scopedTaskOwners = scopedTaskOwners.get(ownerKey) ?? new Map();
+    scopedTaskOwners.set(ownerKey, this._scopedTaskOwners);
   }
 
   /** Whether async routing and meta-tools are enabled. */
@@ -298,11 +314,14 @@ export class AsyncTaskBridge {
     },
   ): Promise<{ task_id: string; status: "pending" }> {
     const owner = this._scopedOwner(context);
-    if (owner !== null && (!this._scopedTasks || !this._canDisclose(moduleId, context))) {
+    if (owner !== null && (!this._scopedTasks || this._manager.supportsTaskAllocationCallback !== true ||
+        this._manager.ownsPrivateTaskStore !== true ||
+        !this._canDisclose(moduleId, context))) {
       throw new Error("Async module is unavailable to this authority");
     }
-    if (this._scopedTaskOwners.size > 0) {
-      const tracked = [...this._scopedTaskOwners.keys()];
+    const tracked = Array.from(this._scopedTaskOwners.entries())
+      .filter(([, binding]) => binding.state !== "pending").map(([taskId]) => taskId);
+    if (tracked.length > 0) {
       const live = new Set((await this._manager.listTasks()).map(info => info.taskId));
       for (const taskId of tracked) {
         if (!live.has(taskId)) this._scopedTaskOwners.delete(taskId);
@@ -340,8 +359,7 @@ export class AsyncTaskBridge {
         && context.data && typeof context.data === "object") {
       markBackgroundApprovalContext(context.data);
     }
-    const taskId = await this._manager.submit(moduleId, inputs, { context: context ?? null });
-    if (owner !== null) this._scopedTaskOwners.set(taskId, owner);
+    const taskId = await this._submitOwnedTask(moduleId, inputs, context ?? null, owner);
     if (options?.progressToken !== undefined) {
       this._progressTokens.set(taskId, options.progressToken);
     }
@@ -351,6 +369,24 @@ export class AsyncTaskBridge {
       this._sessionTasks.set(options.sessionKey, list);
     }
     return { task_id: taskId, status: "pending" };
+  }
+
+  private async _submitOwnedTask(
+    moduleId: string, inputs: Record<string, unknown>, context: unknown, owner: string | null,
+  ): Promise<string> {
+    if (owner === null) return this._manager.submit(moduleId, inputs, { context });
+    const binding: ScopedTaskBinding = { owner, state: "pending" };
+    try {
+      const taskId = await this._manager.submit(moduleId, inputs, {
+        context,
+        onTaskAllocated: id => { this._scopedTaskOwners.set(id, binding); },
+      });
+      binding.state = "published";
+      return taskId;
+    } finally {
+      // A store may have persisted the record before reporting a failure.
+      if (binding.state === "pending") binding.state = "failed";
+    }
   }
 
   /**
@@ -392,6 +428,13 @@ export class AsyncTaskBridge {
       this._progressTokens.delete(taskId);
     }
     return cancelled;
+  }
+
+  /** Remove transport-specific state when an idle HTTP session is reclaimed. */
+  detachSessionTasks(sessionKey: string): void {
+    const taskIds = this._sessionTasks.get(sessionKey) ?? [];
+    this._sessionTasks.delete(sessionKey);
+    for (const taskId of taskIds) this._progressTokens.delete(taskId);
   }
 
   /**
@@ -770,8 +813,10 @@ export class AsyncTaskBridge {
   }
 
   private _canReadTask(info: { taskId: string; moduleId: string }, context: unknown): boolean {
-    const owner = this._scopedTaskOwners.get(info.taskId) ?? null;
-    return owner === this._scopedOwner(context) && (owner === null || this._canDisclose(info.moduleId, context));
+    const binding = this._scopedTaskOwners.get(info.taskId);
+    const owner = this._scopedOwner(context);
+    if (!binding) return owner === null;
+    return binding.state === "published" && binding.owner === owner && this._canDisclose(info.moduleId, context);
   }
 
   private _projectTaskInfo(info: {

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
+import json
 import logging
+import re
+import secrets
 import time
 import warnings
 from collections.abc import AsyncGenerator, Awaitable
@@ -30,6 +34,7 @@ from a2a.types import (
     TaskState,
     TaskStatusUpdateEvent,
 )
+from a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
 from a2a.utils.errors import InvalidParamsError, TaskNotCancelableError, TaskNotFoundError
 from apcore.error_formatter import ErrorFormatterRegistry
 from starlette.applications import Starlette
@@ -74,6 +79,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _SaveResult = TypeVar("_SaveResult")
+_SCOPED_PAGE_TOKEN = re.compile(r"v1\.([1-9][0-9]{0,14})\.([0-9a-f]{64})")
+_SCOPED_SCAN_PAGE_SIZE = 100
 
 
 class _ObservedTaskStore:
@@ -82,6 +89,7 @@ class _ObservedTaskStore:
     def __init__(self, store: Any, executor: ApCoreAgentExecutor) -> None:
         self._store = store
         self._executor = executor
+        self._page_token_key = secrets.token_bytes(32)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
@@ -99,7 +107,7 @@ class _ObservedTaskStore:
 
     def _visible_page(self, page: ListTasksResponse, context: ServerCallContext) -> ListTasksResponse:
         visible = [task for task in page.tasks if self._can_read(task, context)]
-        if scoped_owner(_identity_of(context)) is None and len(visible) == len(page.tasks):
+        if len(visible) == len(page.tasks):
             return page
         response = ListTasksResponse()
         response.CopyFrom(page)
@@ -115,7 +123,58 @@ class _ObservedTaskStore:
         return task if task is not None and self._can_read(task, context) else None
 
     async def list(self, params: ListTasksRequest, context: ServerCallContext) -> ListTasksResponse:
-        return self._visible_page(await self._store.list(params, context), context)
+        identity = _identity_of(context)
+        if scoped_owner(identity) is None:
+            return self._visible_page(await self._store.list(params, context), context)
+        return await self._list_scoped(params, context, identity.authority_key())
+
+    async def _list_scoped(
+        self, params: ListTasksRequest, context: ServerCallContext, authority: str
+    ) -> ListTasksResponse:
+        page_size = params.page_size or DEFAULT_LIST_TASKS_PAGE_SIZE
+        if page_size < 1:
+            raise InvalidParamsError(message="pageSize must be a positive integer")
+
+        query = ListTasksRequest()
+        query.CopyFrom(params)
+        query.ClearField("page_token")
+        query.ClearField("page_size")
+        principal = json.dumps([context.tenant, authority]).encode()
+        binding = principal + b"\0" + query.SerializeToString(deterministic=True)
+        offset = 0
+        if params.page_token:
+            cursor = _SCOPED_PAGE_TOKEN.fullmatch(params.page_token)
+            if cursor is None or not hmac.compare_digest(cursor[2], self._sign_offset(binding, cursor[1])):
+                raise InvalidParamsError(message="Invalid page token")
+            offset = int(cursor[1])
+
+        # Page and count the visible results, never expose storage cursors or counts.
+        query.page_size = _SCOPED_SCAN_PAGE_SIZE
+        tasks = []
+        visible_total = 0
+        seen_tokens: set[str] = set()
+        while True:
+            page = await self._store.list(query, context)
+            for task in page.tasks:
+                if self._can_read(task, context):
+                    if offset <= visible_total < offset + page_size:
+                        tasks.append(task)
+                    visible_total += 1
+            if not page.next_page_token:
+                break
+            if page.next_page_token in seen_tokens:
+                raise RuntimeError("TaskStore repeated a pagination token")
+            seen_tokens.add(page.next_page_token)
+            query.page_token = page.next_page_token
+
+        next_offset = offset + len(tasks)
+        next_token = (
+            f"v1.{next_offset}.{self._sign_offset(binding, str(next_offset))}" if next_offset < visible_total else ""
+        )
+        return ListTasksResponse(tasks=tasks, page_size=page_size, total_size=visible_total, next_page_token=next_token)
+
+    def _sign_offset(self, binding: bytes, offset: str) -> str:
+        return hmac.digest(self._page_token_key, offset.encode("ascii") + b"\0" + binding, "sha256").hex()
 
     async def save(self, task: Task, context: ServerCallContext) -> None:
         await self._save(task, context, self._store.save(task, context))

@@ -14,6 +14,7 @@ import { describe, it, expect, vi, afterAll } from "vitest";
 import request from "supertest";
 import type { Express } from "express";
 import type { Server } from "node:http";
+import { InMemoryTaskStore } from "@a2a-js/sdk/server";
 import { ACL, Executor, Registry as CoreRegistry, createIdentity } from "apcore-js";
 import jwt from "jsonwebtoken";
 import { A2AServerFactory } from "../../src/server/factory.js";
@@ -128,13 +129,13 @@ async function rpc(
 }
 
 /** Run one task as `who` and return its id. */
-async function submit(app: Express, who: string, messageId: string): Promise<string> {
+async function submit(app: Express, who: string, messageId: string, skillId = "echo"): Promise<string> {
   const body = await rpc(app, who, "SendMessage", {
     message: {
       messageId,
       role: "ROLE_USER",
       parts: [{ text: "{}" }],
-      metadata: { skillId: "echo" },
+      metadata: { skillId },
     },
   });
   expect(body.error, JSON.stringify(body)).toBeUndefined();
@@ -214,6 +215,57 @@ describe("verified delegated A2A task authority", () => {
       .set("Authorization", `Bearer ${signed({}, "different-key")}`).set("A2A-Version", "1.0")
       .send({ jsonrpc: "2.0", id: "bad-token", method: "GetTask", params: { id: task } });
     expect(invalid.status).toBe(401);
+  });
+
+  it("pages through hidden tasks without exposing storage cursors or counts", async () => {
+    class SingleRowStore extends InMemoryTaskStore {
+      override list(...[params, context]: Parameters<InMemoryTaskStore["list"]>) {
+        return super.list({ ...params, pageSize: 1 }, context);
+      }
+    }
+    const registry = new CoreRegistry();
+    const readSkill = "secure.read";
+    for (const id of [skillId, readSkill]) {
+      await registry.register(id, {
+        description: "Return a scoped result",
+        inputSchema: { type: "object" }, outputSchema: { type: "object" },
+        execute: () => ({ value: "private" }),
+      });
+    }
+    const executor = new Executor({ registry, acl: new ACL([
+      { callers: ["@external"], targets: [skillId], effect: "allow", conditions: { scopes: ["write"] } },
+      { callers: ["@external"], targets: [readSkill], effect: "allow", conditions: { scopes: ["read"] } },
+    ]) });
+    const { app } = new A2AServerFactory().create(registry as never, executor, {
+      name: "Scoped Agent", description: "d", version: "1", url: "http://localhost",
+      auth, taskStore: new SingleRowStore(),
+    });
+    const broad = signed();
+    const oldest = await submit(app, broad, "m-old-visible", readSkill);
+    const recent = await submit(app, broad, "m-new-visible", readSkill);
+    const hidden = await submit(app, broad, "m-hidden", skillId);
+    const narrow = signed({ scp: ["read"] });
+    const query = { status: "TASK_STATE_COMPLETED", pageSize: 1 };
+    const page = await rpc(app, narrow, "ListTasks", query);
+    const first = page.result as { tasks: { id: string }[]; totalSize: number; nextPageToken: string };
+    expect(page.error, JSON.stringify(page)).toBeUndefined();
+    expect(first.tasks.map(task => task.id)).toEqual([recent]);
+    expect(first.totalSize).toBe(2);
+    const cursor = first.nextPageToken;
+    expect(cursor).toBeTruthy();
+    expect(cursor).not.toContain(hidden);
+    for (const credential of [signed({ scp: ["write"] }), signed({ sub: "other", scp: ["read"] })]) {
+      const replay = await rpc(app, credential, "ListTasks", { ...query, pageToken: cursor });
+      expect(replay.error?.message).toBe("Invalid page token");
+    }
+    const replay = await rpc(app, narrow, "ListTasks", { ...query, contextId: hidden, pageToken: cursor });
+    expect(replay.error?.message).toBe("Invalid page token");
+    const next = await rpc(app, narrow, "ListTasks", { ...query, pageToken: cursor });
+    const second = next.result as typeof first;
+    expect(next.error, JSON.stringify(next)).toBeUndefined();
+    expect(second.tasks.map(task => task.id)).toEqual([oldest]);
+    expect(second.totalSize).toBe(2);
+    expect(second.nextPageToken ?? "").toBe("");
   });
 });
 

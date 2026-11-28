@@ -45,6 +45,14 @@ export interface UsageExporter {
 /** Default maximum request body size in bytes (4MB). */
 const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 
+/** Default retained scoped Streamable HTTP sessions per manager. */
+const DEFAULT_MAX_SCOPED_HTTP_SESSIONS = 1000;
+
+function scopedHttpSessionLimit(): number {
+  const configured = Number(process.env.APCORE_MAX_SCOPED_HTTP_SESSIONS);
+  return Number.isSafeInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_SCOPED_HTTP_SESSIONS;
+}
+
 /** Prometheus exposition format content-type. */
 const PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -132,6 +140,9 @@ export class TransportManager {
 
   private readonly _httpSessionOwners = new WeakMap<StreamableHTTPServerTransport, string | null>();
   private readonly _scopedHttpSessions = new Map<string, StreamableHTTPServerTransport>();
+  private readonly _scopedHttpActivity = new Map<StreamableHTTPServerTransport, number>();
+  private readonly _capacityEvictions = new WeakSet<StreamableHTTPServerTransport>();
+  private readonly _maxScopedHttpSessions = scopedHttpSessionLimit();
   private readonly _scopedSseTransports = new Set<SSEServerTransport>();
   private _scopedServerFactory?: () => Server;
 
@@ -147,6 +158,7 @@ export class TransportManager {
    */
   private _asyncTaskBridge?: {
     cancelSessionTasks(sessionKey: string): Promise<number>;
+    detachSessionTasks?(sessionKey: string): void;
   };
 
   /**
@@ -230,6 +242,7 @@ export class TransportManager {
    */
   setAsyncTaskBridge(bridge: {
     cancelSessionTasks(sessionKey: string): Promise<number>;
+    detachSessionTasks?(sessionKey: string): void;
   }): void {
     // [D10-006] Reject null/undefined bridge (matching Python `TypeError`).
     // Silently storing null would surface later as a TypeError on first
@@ -470,13 +483,24 @@ export class TransportManager {
 
       const handleMcp = async () => {
         let opening: StreamableHTTPServerTransport | undefined;
+        // A standalone GET is a listener. POST and replay requests can carry active work.
+        const tracksActivity = req.method !== "GET" || req.headers["last-event-id"] !== undefined;
+        const active = tracksActivity ? this._scopedHttpActivity.get(transport) : undefined;
+        if (active !== undefined) this._scopedHttpActivity.set(transport, active + 1);
         try {
           if (req.method === "POST" || req.method === "DELETE") {
             const body = await readBody(req);
             const parsed = body ? JSON.parse(body) : undefined;
             if (req.method === "POST" && requestedSession === undefined && identity?.scopes !== undefined &&
                 this._scopedServerFactory && isInitializeRequest(parsed)) {
-              opening = this._newStreamableTransport(true);
+              opening = await this._openScopedHttpTransport();
+              if (!opening) {
+                res.writeHead(503, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                  jsonrpc: "2.0", error: { code: -32000, message: "Scoped session capacity reached" }, id: null,
+                }));
+                return;
+              }
               await this._scopedServerFactory().connect(opening);
             }
             await (opening ?? transport).handleRequest(req, res, parsed);
@@ -496,12 +520,39 @@ export class TransportManager {
           }
         } finally {
           if (opening && opening.sessionId === undefined) await opening.close();
+          if (opening || active !== undefined) this._finishScopedHttpRequest(opening ?? transport);
         }
       };
 
       // Wrap in identityStorage so getCurrentIdentity() works in the call chain
       await identityStorage.run(identity, handleMcp);
     };
+  }
+
+  private async _openScopedHttpTransport(): Promise<StreamableHTTPServerTransport | undefined> {
+    if (this._scopedHttpActivity.size >= this._maxScopedHttpSessions) {
+      // Map order records last completion. An opening or active request is never evicted.
+      for (const [candidate, active] of this._scopedHttpActivity) {
+        if (active !== 0 || !candidate.sessionId) continue;
+        this._scopedHttpSessions.delete(candidate.sessionId);
+        this._scopedHttpActivity.set(candidate, 1);
+        this._capacityEvictions.add(candidate);
+        await candidate.close();
+        break;
+      }
+    }
+    // Account for another opening that acquired a slot while close() awaited.
+    if (this._scopedHttpActivity.size >= this._maxScopedHttpSessions) return undefined;
+    const transport = this._newStreamableTransport(true);
+    this._scopedHttpActivity.set(transport, 1);
+    return transport;
+  }
+
+  private _finishScopedHttpRequest(transport: StreamableHTTPServerTransport): void {
+    const active = this._scopedHttpActivity.get(transport);
+    if (active === undefined) return;
+    this._scopedHttpActivity.delete(transport);
+    this._scopedHttpActivity.set(transport, active - 1);
   }
 
   private _newStreamableTransport(scoped = false): StreamableHTTPServerTransport {
@@ -514,9 +565,14 @@ export class TransportManager {
     });
     transport.onclose = () => {
       this._httpSessionOwners.delete(transport);
+      this._scopedHttpActivity.delete(transport);
       const sessionId = transport.sessionId;
       if (!sessionId) return;
       this._scopedHttpSessions.delete(sessionId);
+      if (this._capacityEvictions.delete(transport)) {
+        this._asyncTaskBridge?.detachSessionTasks?.(sessionId);
+        return;
+      }
       this._asyncTaskBridge?.cancelSessionTasks(sessionId).catch((error: unknown) => {
         console.warn(`cancelSessionTasks failed for streamable-http session ${sessionId}:`, error);
       });
@@ -820,7 +876,7 @@ export class TransportManager {
   }
 
   private async _closeScopedTransports(): Promise<void> {
-    const transports = [...this._scopedHttpSessions.values(), ...this._scopedSseTransports];
+    const transports = [...this._scopedHttpActivity.keys(), ...this._scopedSseTransports];
     await Promise.all(transports.map(transport => transport.close()));
   }
 

@@ -84,6 +84,10 @@ The top-level `sub` identifies the root subject. The outermost `act` identifies 
 
 A live scoped session binds to the authority that opened it. A refreshed token with equivalent authority can reuse the session. Open a new session when the effective scopes or roles change. Scoped tasks retain owner identity across a refresh and are checked against current authority. Approvals issued for one effective scope cannot be polled or resumed from another scope.
 
+TypeScript Streamable HTTP retains up to 1,000 scoped sessions per transport manager by default. `APCORE_MAX_SCOPED_HTTP_SESSIONS` sets the cap. At capacity the manager closes the least recently used idle session. It returns HTTP 503 when all slots are busy. Capacity eviction leaves submitted background work running.
+
+Scoped background work uses the Core task manager with its private in-memory store. Configure that manager to use scoped task submission.
+
 ### Permissive Mode
 If `require_auth=False` is configured, the middleware will attempt to authenticate but will allow the request to proceed even if no token is provided. In this case, the tool will execute with an `Anonymous` identity, and the Executor's ACL will decide if the call is permitted.
 

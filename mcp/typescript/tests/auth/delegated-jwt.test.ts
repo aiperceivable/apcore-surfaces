@@ -4,10 +4,11 @@ import type { AddressInfo } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ACL, Context, Executor, Registry, createAnnotations } from "apcore-js";
+import { AsyncTaskManager, TaskStatus } from "apcore-js/full";
 import jwt from "jsonwebtoken";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
-  asyncServe, createAsyncTaskBridge, InMemoryApprovalStore, JWTAuthenticator, META_TOOL_NAMES,
+  AsyncTaskBridge, asyncServe, createAsyncTaskBridge, InMemoryApprovalStore, JWTAuthenticator, META_TOOL_NAMES,
 } from "../../src/index.js";
 
 const key = "signed-test-secret";
@@ -126,6 +127,95 @@ describe("delegated MCP JWT", () => {
     }
   });
 
+  it("reclaims idle scoped HTTP sessions without cancelling their background work", async () => {
+    const moduleId = "sample.slow";
+    const backgroundId = "sample.detached";
+    let notifyStarted!: () => void;
+    let finishCall!: () => void;
+    let finishBackground!: () => void;
+    const started = new Promise<void>(resolve => { notifyStarted = resolve; });
+    const finish = new Promise<void>(resolve => { finishCall = resolve; });
+    const background = new Promise<void>(resolve => { finishBackground = resolve; });
+    const registry = new Registry();
+    await registry.register(moduleId, {
+      description: "Wait for a test signal",
+      inputSchema: { type: "object" }, outputSchema: { type: "object" },
+      execute: async () => { notifyStarted(); await finish; return { ok: true }; },
+    });
+    await registry.register(backgroundId, {
+      description: "Continue after the transport closes",
+      inputSchema: { type: "object" }, outputSchema: { type: "object" },
+      annotations: createAnnotations({ extra: { mcp_async: "true" } }),
+      execute: async () => { await background; return { continued: true }; },
+    });
+    vi.stubEnv("APCORE_MAX_SCOPED_HTTP_SESSIONS", "1");
+    const app = await asyncServe(registry as never, {
+      async: true, authenticator: auth,
+      acl: new ACL([{
+        callers: ["@external"], targets: [moduleId, backgroundId], effect: "allow", conditions: { scopes: ["read"] },
+      }]),
+    });
+    const http = createServer(app.handler);
+    const first = new Client({ name: "first", version: "1" });
+    const next = new Client({ name: "next", version: "1" });
+    const returning = new Client({ name: "returning", version: "1" });
+    try {
+      http.listen(0, "127.0.0.1");
+      await once(http, "listening");
+      const url = new URL(`http://127.0.0.1:${(http.address() as AddressInfo).port}/mcp`);
+      const connect = (client: Client, subject: string) => client.connect(new StreamableHTTPClientTransport(url, {
+        requestInit: { headers: { Authorization: `Bearer ${token({ sub: subject })}` } },
+      }));
+      await connect(first, "first-account");
+      const active = first.callTool({ name: moduleId, arguments: {} });
+      try {
+        await Promise.race([started, active.then(() => { throw new Error("Tool completed unexpectedly"); })]);
+        const rejected = await fetch(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token({ sub: "next-account" })}`,
+            Accept: "application/json, text/event-stream", "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0", id: 1, method: "initialize",
+            params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "next", version: "1" } },
+          }),
+        });
+        expect(rejected.status).toBe(503);
+        await rejected.text();
+      } finally {
+        finishCall();
+        await active;
+      }
+      const submission = await first.callTool({ name: backgroundId, arguments: {} });
+      const text = (result: { content?: unknown }) => JSON.parse((result.content as { text: string }[])[0].text);
+      const task = text(submission);
+      expect(task).toMatchObject({ task_id: expect.any(String), status: "pending" });
+      const status = (client: Client) => client.callTool({
+        name: META_TOOL_NAMES.STATUS, arguments: { task_id: task.task_id },
+      });
+      await connect(next, "next-account");
+      expect((await next.listTools()).tools.map(tool => tool.name)).toContain(moduleId);
+      await expect(first.listTools()).rejects.toThrow("Session not found");
+      expect(text(await status(next))).toMatchObject({ error: "ASYNC_TASK_NOT_FOUND" });
+      await connect(returning, "first-account");
+      expect(text(await status(returning))).toMatchObject({ status: "running" });
+      finishBackground();
+      await expect.poll(async () => text(await status(returning))).toMatchObject({
+        status: "completed", result: { continued: true },
+      });
+    } finally {
+      finishBackground();
+      vi.unstubAllEnvs();
+      await first.close();
+      await next.close();
+      await returning.close();
+      await app.close();
+      http.closeAllConnections();
+      await new Promise<void>(resolve => http.close(() => resolve()));
+    }
+  });
+
   it("rechecks current scoped permission on tasks across sessions", async () => {
     const moduleId = "sample.background";
     const registry = new Registry();
@@ -153,6 +243,85 @@ describe("delegated MCP JWT", () => {
       }
     } finally {
       await bridge.manager.shutdown?.();
+    }
+  });
+
+  it.each([false, true])("keeps scoped ownership private until publication succeeds (store failure %s)", async (fail) => {
+    const scopedId = "sample.scoped";
+    const legacyId = "sample.legacy";
+    const registry = new Registry();
+    for (const moduleId of [scopedId, legacyId]) {
+      await registry.register(moduleId, {
+        description: "Produce a task result",
+        inputSchema: { type: "object" }, outputSchema: { type: "object" }, execute: () => ({}),
+      });
+    }
+    const executor = new Executor({ registry, acl: new ACL([
+      { callers: ["@external"], targets: [scopedId], effect: "allow", conditions: { scopes: ["write"] } },
+      { callers: ["@external"], targets: [legacyId], effect: "allow" },
+    ]) });
+    let notifyAllocating!: () => void;
+    let allowWriteStart!: () => void;
+    let notifyStored!: () => void;
+    let allowWriteReturn!: () => void;
+    const allocating = new Promise<void>(resolve => { notifyAllocating = resolve; });
+    const allowStore = new Promise<void>(resolve => { allowWriteStart = resolve; });
+    const stored = new Promise<void>(resolve => { notifyStored = resolve; });
+    const release = new Promise<void>(resolve => { allowWriteReturn = resolve; });
+    const manager = new AsyncTaskManager({ executor });
+    const save = manager.store.save.bind(manager.store);
+    vi.spyOn(manager.store, "save").mockImplementation(async task => {
+      const scopedPending = task.moduleId === scopedId && task.status === TaskStatus.PENDING;
+      if (scopedPending) {
+        notifyAllocating();
+        await allowStore;
+      }
+      await save(task);
+      if (scopedPending) {
+        notifyStored();
+        await release;
+        if (fail) throw new Error("write acknowledged unsuccessfully");
+      }
+    });
+    const bridge = new AsyncTaskBridge(manager, { executor, scopedTasks: true });
+    const observer = new AsyncTaskBridge(manager, { executor, scopedTasks: true });
+    const aliased = new AsyncTaskBridge(new AsyncTaskManager({ executor, store: manager.store }), {
+      executor, scopedTasks: true,
+    });
+    const owner = Context.create(await auth.authenticate({ authorization: `Bearer ${token()}` }));
+    const legacy = Context.create();
+    const { task_id: legacyTask } = await bridge.submit(legacyId, {}, legacy);
+    const scoped = bridge.submit(scopedId, {}, owner);
+    let secondLegacy: ReturnType<typeof bridge.submit> | undefined;
+    try {
+      await expect(aliased.submit(scopedId, {}, owner)).rejects.toThrow("unavailable to this authority");
+      await Promise.race([allocating, scoped.then(() => { throw new Error("Task unexpectedly published"); })]);
+      secondLegacy = bridge.submit(legacyId, {}, legacy);
+      // Let the other submission collect any stale owners before the store write.
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      allowWriteStart();
+      await Promise.race([stored, scoped.then(() => { throw new Error("Task unexpectedly published"); })]);
+      const list = (context: Context, via = observer) => via.handleMetaTool(META_TOOL_NAMES.LIST, {}, context);
+      expect(await list(legacy)).toEqual({ tasks: [expect.objectContaining({ task_id: legacyTask })] });
+      expect(await list(owner)).toEqual({ tasks: [] });
+      allowWriteReturn();
+      if (fail) {
+        await expect(scoped).rejects.toThrow("write acknowledged unsuccessfully");
+        expect(await list(owner)).toEqual({ tasks: [] });
+      } else {
+        const task = await scoped;
+        expect(await list(owner)).toEqual({ tasks: [expect.objectContaining({ task_id: task.task_id })] });
+      }
+      const second = await secondLegacy;
+      expect(await list(legacy)).toEqual({ tasks: [
+        expect.objectContaining({ task_id: legacyTask }), expect.objectContaining({ task_id: second.task_id }),
+      ] });
+      expect(await list(legacy, aliased)).toEqual(await list(legacy));
+    } finally {
+      allowWriteStart();
+      allowWriteReturn();
+      await Promise.allSettled([scoped, secondLegacy]);
+      await manager.shutdown();
     }
   });
 });

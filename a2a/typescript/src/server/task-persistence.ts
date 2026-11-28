@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { TaskState } from "@a2a-js/sdk";
 import type {
   AgentCard, CancelTaskRequest, Message, SendMessageRequest, StreamResponse, Task, TaskStatus,
@@ -17,6 +18,10 @@ const TERMINAL_STATES = new Set<TaskState>([
   TaskState.TASK_STATE_CANCELED,
   TaskState.TASK_STATE_REJECTED,
 ]);
+
+const DEFAULT_PAGE_SIZE = 50;
+const SCOPED_SCAN_PAGE_SIZE = 100;
+const SCOPED_PAGE_TOKEN = /^v1\.([1-9][0-9]{0,14})\.([0-9a-f]{64})$/;
 
 function isTerminal(state: TaskState | undefined): boolean {
   return state !== undefined && TERMINAL_STATES.has(state);
@@ -40,6 +45,7 @@ class TaskPersistence implements TaskStore {
   private readonly claimKeys = new WeakMap<ServerCallContext, Set<string>>();
   private readonly abandoned = new WeakSet<ServerCallContext>();
   private readonly watches = new WeakMap<ExecutionEventBus, () => void>();
+  private readonly pageTokenKey = randomBytes(32);
 
   constructor(
     private readonly store: TaskStore,
@@ -140,10 +146,14 @@ class TaskPersistence implements TaskStore {
   }
 
   async list(...args: Parameters<TaskStore["list"]>): ReturnType<TaskStore["list"]> {
-    const [, context] = args;
+    const [params, context] = args;
+    const identity = identityOf(context);
+    const authority = identity?.authorityKey?.();
+    if (authority != null) return this.listScoped(params, context, authority);
+
     const page = await this.store.list(...args);
     const tasks = page.tasks.filter(task => this.canRead(task, context));
-    if (scopedOwner(identityOf(context)) === null && tasks.length === page.tasks.length) return page;
+    if (tasks.length === page.tasks.length) return page;
     // The underlying cursor may contain the last task's id. Only expose a
     // continuation if that task is visible to the current authority.
     const lastTask = page.tasks.at(-1);
@@ -151,6 +161,54 @@ class TaskPersistence implements TaskStore {
       ...page, tasks, totalSize: tasks.length,
       nextPageToken: lastTask && this.canRead(lastTask, context) ? page.nextPageToken : "",
     };
+  }
+
+  private async listScoped(
+    params: Parameters<TaskStore["list"]>[0], context: ServerCallContext, authority: string,
+  ): ReturnType<TaskStore["list"]> {
+    const pageSize = params.pageSize ?? DEFAULT_PAGE_SIZE;
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1) {
+      throw new RequestMalformedError("pageSize must be a positive integer");
+    }
+    const binding = JSON.stringify([
+      context.tenant ?? null, authority, params.contextId, params.status, params.statusTimestampAfter,
+      params.historyLength, params.includeArtifacts,
+    ]);
+    let offset = 0;
+    if (params.pageToken) {
+      const cursor = SCOPED_PAGE_TOKEN.exec(params.pageToken);
+      if (!cursor || !timingSafeEqual(this.signOffset(binding, cursor[1]), Buffer.from(cursor[2], "hex"))) {
+        throw new RequestMalformedError("Invalid page token");
+      }
+      offset = Number(cursor[1]);
+    }
+
+    // Page and count the visible results, never expose storage cursors or counts.
+    const tasks: Task[] = [];
+    const seenTokens = new Set<string>();
+    let storageToken = "";
+    let totalSize = 0;
+    do {
+      const page = await this.store.list({ ...params, pageSize: SCOPED_SCAN_PAGE_SIZE, pageToken: storageToken }, context);
+      for (const task of page.tasks) {
+        if (this.canRead(task, context)) {
+          if (offset <= totalSize && totalSize < offset + pageSize) tasks.push(task);
+          totalSize++;
+        }
+      }
+      storageToken = page.nextPageToken;
+      if (storageToken && seenTokens.has(storageToken)) throw new Error("TaskStore repeated a pagination token");
+      seenTokens.add(storageToken);
+    } while (storageToken);
+
+    const nextOffset = offset + tasks.length;
+    const nextPageToken = nextOffset < totalSize
+      ? `v1.${nextOffset}.${this.signOffset(binding, String(nextOffset)).toString("hex")}` : "";
+    return { tasks, pageSize, totalSize, nextPageToken };
+  }
+
+  private signOffset(binding: string, offset: string): Buffer {
+    return createHmac("sha256", this.pageTokenKey).update(offset + "\0" + binding).digest();
   }
 
   abandon(context: ServerCallContext): void {
