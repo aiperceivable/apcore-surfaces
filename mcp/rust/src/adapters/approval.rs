@@ -333,8 +333,14 @@ pub(crate) async fn scoped_approval_status(
     if !is_public_approval_id(audit_id) {
         return rejected("Approval record not found");
     }
-    let principal = identity.map(ApprovalPrincipal::from);
-    match store.get_scoped_result(audit_id, principal.as_ref()).await {
+    let record = match identity.and_then(apcore::Identity::authority_key) {
+        Some(authority_key) => store.get_authority_result(audit_id, &authority_key).await,
+        None => {
+            let principal = identity.map(ApprovalPrincipal::from);
+            store.get_scoped_result(audit_id, principal.as_ref()).await
+        }
+    };
+    match record {
         Ok(Some(record)) => stored_result(&record, Some(audit_id)),
         Ok(None) => rejected("Approval record not found"),
         Err(_) => store_error(),
@@ -397,6 +403,10 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
         self.store.supports_scoped_approval()
     }
 
+    fn supports_authority_scope(&self) -> bool {
+        self.store.supports_authority_scope()
+    }
+
     async fn request_approval(
         &self,
         request: &ApprovalRequest,
@@ -411,12 +421,19 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
         let credential = format!("{audit_id}.{}", Uuid::new_v4().simple());
         let verifier = credential_verifier(&credential);
         let scope = ApprovalScope::from(request);
-        if self
-            .store
-            .save_scoped_pending(&audit_id, &verifier, &scope)
-            .await
-            .is_err()
-        {
+        let saved = match request.authority_key() {
+            Some(authority_key) => {
+                self.store
+                    .save_authority_pending(&audit_id, &verifier, &scope, &authority_key)
+                    .await
+            }
+            None => {
+                self.store
+                    .save_scoped_pending(&audit_id, &verifier, &scope)
+                    .await
+            }
+        };
+        if saved.is_err() {
             return Ok(store_error());
         }
 
@@ -440,7 +457,7 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
         if resume_audit_id(audit_id).is_some() {
             return Ok(rejected("Approval record not found"));
         }
-        Ok(match self.store.get_result(audit_id).await {
+        Ok(match self.store.get_legacy_result(audit_id).await {
             Ok(Some(record)) => {
                 let public_id = Uuid::parse_str(audit_id).is_ok().then_some(audit_id);
                 let mut result = stored_result(&record, public_id);
@@ -470,23 +487,29 @@ impl ApprovalHandler for StorageBackedApprovalHandler {
         };
         let verifier = credential_verifier(credential);
         let scope = ApprovalScope::from(request);
-        Ok(
-            match self.store.consume_scoped(audit_id, &verifier, &scope).await {
-                Ok(Some(record)) => {
-                    let pending = record.status == ApprovalStatus::Pending;
-                    let mut result = stored_result(&record, Some(audit_id));
-                    if pending {
-                        crate::server::approval_bridge::record_pending_approval(
-                            request, audit_id, credential,
-                        );
-                        result.approval_id = Some(credential.to_owned());
-                    }
-                    result
+        let record = match request.authority_key() {
+            Some(authority_key) => {
+                self.store
+                    .consume_authority_scoped(audit_id, &verifier, &scope, &authority_key)
+                    .await
+            }
+            None => self.store.consume_scoped(audit_id, &verifier, &scope).await,
+        };
+        Ok(match record {
+            Ok(Some(record)) => {
+                let pending = record.status == ApprovalStatus::Pending;
+                let mut result = stored_result(&record, Some(audit_id));
+                if pending {
+                    crate::server::approval_bridge::record_pending_approval(
+                        request, audit_id, credential,
+                    );
+                    result.approval_id = Some(credential.to_owned());
                 }
-                Ok(None) => rejected("Approval credential unavailable for this call"),
-                Err(_) => store_error(),
-            },
-        )
+                result
+            }
+            Ok(None) => rejected("Approval credential unavailable for this call"),
+            Err(_) => store_error(),
+        })
     }
 }
 
@@ -543,6 +566,89 @@ mod tests {
         let anonymous = handler.check_scoped_approval(audit_id, None).await;
         assert_eq!(anonymous.status, "rejected");
         assert!(anonymous.audit_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn delegated_authority_binds_polling_and_one_time_consumption() {
+        fn request(subject: &str, scopes: &[&str]) -> ApprovalRequest {
+            let scope_set: Vec<_> = scopes.iter().map(|scope| (*scope).to_owned()).collect();
+            let root =
+                apcore::Identity::new(subject.into(), "user".into(), vec![], Default::default())
+                    .with_authority(
+                        Some(vec!["read".into(), "write".into()]),
+                        Some("issuer".into()),
+                    )
+                    .unwrap();
+            let actor =
+                apcore::Identity::new("editor".into(), "user".into(), vec![], Default::default());
+            let mut request = scoped_request();
+            request.context = Some(apcore::Context::new(
+                root.delegate(actor, scope_set).unwrap(),
+            ));
+            request
+        }
+        let store = Arc::new(crate::approval_store::InMemoryApprovalStore::new());
+        let handler = StorageBackedApprovalHandler::new(store.clone());
+        let original = request("alice", &["read", "write"]);
+        let result = handler.request_approval(&original).await.unwrap();
+        let audit_id = result.audit_id.as_deref().unwrap();
+        let credential = result.approval_id.as_deref().unwrap();
+        assert!(store.resolve(audit_id, true, None).await.unwrap());
+
+        for wrong in [
+            scoped_request(),
+            request("bob", &["read", "write"]),
+            request("alice", &["read"]),
+        ] {
+            assert_eq!(
+                handler
+                    .check_scoped_approval(
+                        audit_id,
+                        wrong.context.as_ref().unwrap().identity.as_ref()
+                    )
+                    .await
+                    .status,
+                "rejected"
+            );
+            assert_eq!(
+                handler
+                    .check_approval_for_call(credential, &wrong)
+                    .await
+                    .unwrap()
+                    .status,
+                "rejected"
+            );
+        }
+        assert_eq!(
+            handler.check_scoped_approval(audit_id, None).await.status,
+            "rejected"
+        );
+        assert_eq!(
+            handler
+                .check_scoped_approval(
+                    audit_id,
+                    original.context.as_ref().unwrap().identity.as_ref()
+                )
+                .await
+                .status,
+            "approved"
+        );
+        assert_eq!(
+            handler
+                .check_approval_for_call(credential, &original)
+                .await
+                .unwrap()
+                .status,
+            "approved"
+        );
+        assert_eq!(
+            handler
+                .check_approval_for_call(credential, &original)
+                .await
+                .unwrap()
+                .status,
+            "rejected"
+        );
     }
 
     #[tokio::test]

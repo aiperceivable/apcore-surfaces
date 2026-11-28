@@ -954,7 +954,17 @@ struct HttpSession {
     requests: DirectRequests,
 }
 
-type SessionOwner = (String, String);
+#[derive(Clone, PartialEq, Eq)]
+enum SessionOwner {
+    Legacy {
+        identity_type: String,
+        id: String,
+    },
+    Scoped {
+        owner_key: String,
+        authority_key: String,
+    },
+}
 
 fn request_identity() -> Option<apcore::Identity> {
     AUTH_IDENTITY.try_with(Clone::clone).ok().flatten()
@@ -962,10 +972,17 @@ fn request_identity() -> Option<apcore::Identity> {
 
 fn session_owner(identity: Option<&apcore::Identity>) -> Option<SessionOwner> {
     identity.map(|identity| {
-        (
-            identity.identity_type().to_owned(),
-            identity.id().to_owned(),
-        )
+        identity
+            .owner_key()
+            .zip(identity.authority_key())
+            .map(|(owner_key, authority_key)| SessionOwner::Scoped {
+                owner_key,
+                authority_key,
+            })
+            .unwrap_or_else(|| SessionOwner::Legacy {
+                identity_type: identity.identity_type().to_owned(),
+                id: identity.id().to_owned(),
+            })
     })
 }
 
@@ -1576,6 +1593,7 @@ async fn sse_messages_handler(
     let owner = session_owner(identity.as_ref());
     let sender = lock_sessions(&state.sessions)
         .get(&session_id)
+        // The long-lived stream receives tool results and carries elicitation replies.
         .filter(|session| session.owner == owner)
         .map(|session| session.sender.clone());
     let Some(sender) = sender else {
@@ -2554,6 +2572,104 @@ mod tests {
             responses,
             vec![serde_json::json!({"id":2,"roles":["current"]})]
         );
+    }
+
+    fn scoped_test_identity(subject: &str, scopes: &[&str]) -> apcore::Identity {
+        let root = apcore::Identity::new(
+            subject.into(),
+            "user".into(),
+            Vec::new(),
+            Default::default(),
+        )
+        .with_authority(
+            Some(vec!["read".into(), "write".into()]),
+            Some("issuer".into()),
+        )
+        .unwrap();
+        let actor = apcore::Identity::new(
+            "worker".into(),
+            "agent".into(),
+            Vec::new(),
+            Default::default(),
+        );
+        root.delegate(
+            actor,
+            scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delegated_sse_binds_the_open_response_stream_to_its_authority() {
+        let app = sse_test_app();
+        let original = scoped_test_identity("alice", &["read", "write"]);
+        let (_stream, id) = AUTH_IDENTITY
+            .scope(Some(original), open_sse_session(&app))
+            .await;
+        for requester in [
+            scoped_test_identity("bob", &["read", "write"]),
+            scoped_test_identity("alice", &["read"]),
+        ] {
+            let status = AUTH_IDENTITY
+                .scope(Some(requester), post_sse_message(&app, &id, 1))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let equivalent = scoped_test_identity("alice", &["write", "read"]);
+        let status = AUTH_IDENTITY
+            .scope(Some(equivalent), post_sse_message(&app, &id, 2))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn delegated_streamable_http_reuses_only_equivalent_authority() {
+        let app = Arc::new(TransportManager::new(None))
+            .build_streamable_http_app(Arc::new(EchoHandler), None);
+        let original = scoped_test_identity("alice", &["read", "write"]);
+        let initialize = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize"});
+        let initial = AUTH_IDENTITY
+            .scope(
+                Some(original),
+                post_http_rpc(&app, None, initialize.clone()),
+            )
+            .await;
+        let id = initial.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let narrowed = scoped_test_identity("alice", &["read"]);
+        let ping = serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"ping"});
+        let other = scoped_test_identity("bob", &["read", "write"]);
+        for different in [other, narrowed.clone()] {
+            let denied = AUTH_IDENTITY
+                .scope(
+                    Some(different),
+                    post_http_rpc(&app, Some(&id), ping.clone()),
+                )
+                .await;
+            assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        }
+        let refreshed = scoped_test_identity("alice", &["write", "read"]);
+        let accepted = AUTH_IDENTITY
+            .scope(
+                Some(refreshed),
+                post_http_rpc(&app, Some(&id), ping.clone()),
+            )
+            .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let second_session = AUTH_IDENTITY
+            .scope(
+                Some(narrowed.clone()),
+                post_http_rpc(&app, None, initialize),
+            )
+            .await;
+        let new_id = second_session.headers()["mcp-session-id"].to_str().unwrap();
+        assert_ne!(id, new_id);
+        let accepted = AUTH_IDENTITY
+            .scope(Some(narrowed), post_http_rpc(&app, Some(new_id), ping))
+            .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
     }
 
     #[tokio::test]

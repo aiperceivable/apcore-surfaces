@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+pub use super::delegation::DelegatedClaims;
+use super::delegation::{project, DELEGATED_CLOCK_SKEW};
 use super::protocol::Authenticator;
 
 #[derive(Debug, Clone)]
@@ -49,6 +51,7 @@ pub struct JWTAuthenticator {
     audience: Option<String>,
     /// Expected `iss` claim; verified when set (Python/TS parity).
     issuer: Option<String>,
+    delegated_claims: Option<DelegatedClaims>,
 }
 
 impl JWTAuthenticator {
@@ -61,6 +64,7 @@ impl JWTAuthenticator {
             algorithms: vec![Algorithm::HS256],
             audience: None,
             issuer: None,
+            delegated_claims: None,
         }
     }
 
@@ -95,6 +99,14 @@ impl JWTAuthenticator {
     /// Verify the `iss` claim against the given issuer.
     pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
         self.issuer = Some(issuer.into());
+        self
+    }
+
+    /// Enable projection of a verified JWT's scopes and outer actor into Core authority.
+    /// A configured issuer and audience are required in this mode.
+    #[must_use]
+    pub fn with_delegated_claims(mut self, claims: DelegatedClaims) -> Self {
+        self.delegated_claims = Some(claims);
         self
     }
 
@@ -164,6 +176,14 @@ impl Authenticator for JWTAuthenticator {
         if let Some(iss) = &self.issuer {
             validation.set_issuer(&[iss]);
         }
+        if self.delegated_claims.is_some() {
+            if self.issuer.as_deref()?.is_empty() || self.audience.as_deref()?.is_empty() {
+                return None;
+            }
+            validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+            validation.validate_nbf = true;
+            validation.leeway = DELEGATED_CLOCK_SKEW;
+        }
 
         let data = decode::<Claims>(token, &key, &validation).ok()?;
         let claims = data.claims.extra;
@@ -180,7 +200,11 @@ impl Authenticator for JWTAuthenticator {
         // (Python returns None, TS returns null). Numeric/bool id values are
         // coerced to their string form to match Python str() / TS String();
         // null/array/object are not valid ids and reject.
-        let id = claims.get(&mapping.id_claim).and_then(claim_to_string)?;
+        let id = if self.delegated_claims.is_some() {
+            claims.get("sub")?.as_str()?.to_owned()
+        } else {
+            claims.get(&mapping.id_claim).and_then(claim_to_string)?
+        };
 
         // Coerce every array element via claim_to_string to match Python
         // `tuple(str(r) for r in raw_roles)` / TS `rawRoles.map(String)`; only
@@ -206,7 +230,15 @@ impl Authenticator for JWTAuthenticator {
             }
         }
 
-        Some(Identity::new(id, identity_type, roles, attrs))
+        let identity = Identity::new(id, identity_type, roles, attrs);
+        match &self.delegated_claims {
+            Some(mapping) => project(&claims, &identity, mapping),
+            None => Some(identity),
+        }
+    }
+
+    fn rejects_invalid_credentials(&self) -> bool {
+        self.delegated_claims.is_some()
     }
 
     fn security_schemes(&self) -> Option<Value> {
@@ -430,5 +462,140 @@ mod tests {
         assert!(auth.authenticate(&bearer(&t)).await.is_none());
         let t2 = token(&json!({ "sub": "bob", "tenant": "t1" }));
         assert!(auth.authenticate(&bearer(&t2)).await.is_some());
+    }
+
+    fn delegated_auth() -> JWTAuthenticator {
+        JWTAuthenticator::new(SECRET)
+            .with_audience("a2a")
+            .with_issuer("issuer")
+            .with_claim_mapping(ClaimMapping {
+                attrs_claims: vec!["act".into(), "scope".into(), "scp".into(), "tenant".into()],
+                ..ClaimMapping::default()
+            })
+            .with_delegated_claims(DelegatedClaims {
+                scp_claim: Some("scp".into()),
+                actor_roles_claim: Some("trustedRoles".into()),
+            })
+    }
+
+    fn valid_delegated_claims() -> Value {
+        json!({
+            "sub": "subject", "iss": "issuer", "aud": ["another", "a2a"],
+            "exp": jsonwebtoken::get_current_timestamp() + 300,
+            "scope": "write read read", "scp": ["read", "write"],
+            "roles": ["subject-role"], "tenant": "tenant1",
+            "act": {
+                "sub": "actor", "trustedRoles": ["actor-role"], "roles": ["unmapped"],
+                "act": { "sub": "historical", "trustedRoles": ["ignored-admin"] }
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn scoped_jwt_uses_only_the_current_actor_and_root_subject() {
+        let claims = valid_delegated_claims();
+        let auth = delegated_auth();
+        let current = auth.authenticate(&bearer(&token(&claims))).await.unwrap();
+        assert_eq!(current.id(), "actor");
+        assert_eq!(current.identity_type(), "agent");
+        assert_eq!(current.roles(), &["actor-role"]);
+        assert_eq!(current.issuer(), Some("issuer"));
+        assert_eq!(current.scopes().unwrap(), &["read", "write"]);
+        let root = current.root_subject();
+        assert_eq!(root.id(), "subject");
+        assert_eq!(root.roles(), &["subject-role"]);
+        assert_eq!(root.attrs().len(), 1);
+        assert_eq!(root.get_attr("tenant"), Some(&json!("tenant1")));
+        assert_eq!(current.delegation_depth(), 1);
+
+        let mut refreshed = claims;
+        refreshed["act"]["act"] = json!({"sub": "another-history", "iss": "a-different-issuer"});
+        let updated = auth
+            .authenticate(&bearer(&token(&refreshed)))
+            .await
+            .unwrap();
+        assert_eq!(current.authority_key(), updated.authority_key());
+        assert_eq!(current.owner_key(), updated.owner_key());
+
+        let mut direct = valid_delegated_claims();
+        let direct_claims = direct.as_object_mut().unwrap();
+        direct_claims.remove("act");
+        direct_claims.remove("scope");
+        direct_claims.insert("scp".into(), json!([]));
+        let identity = auth.authenticate(&bearer(&token(&direct))).await.unwrap();
+        assert_eq!(identity.id(), "subject");
+        assert_eq!(identity.delegation_depth(), 0);
+        assert!(identity.scopes().is_some_and(<[_]>::is_empty));
+    }
+
+    #[tokio::test]
+    async fn scoped_jwt_requires_verified_claims_and_bounded_history() {
+        let auth = delegated_auth();
+        let claims = valid_delegated_claims();
+        let now = jsonwebtoken::get_current_timestamp();
+        for (claim, invalid_value) in [
+            ("iss", json!("wrong-issuer")),
+            ("aud", json!("wrong-audience")),
+            ("sub", json!(45)),
+            ("exp", json!(now - 300)),
+            ("exp", json!("invalid")),
+            ("nbf", json!(now + 300)),
+            ("nbf", json!(true)),
+            ("iat", json!(now + 300)),
+            ("iat", Value::Null),
+            ("scope", json!("read  write")),
+            ("scope", json!(["read", "write"])),
+            ("scp", json!(["different"])),
+            ("act", json!({"sub": "actor", "act": {"roles": ["admin"]}})),
+            ("act", json!({"sub": "actor", "trustedRoles": [false]})),
+        ] {
+            let mut invalid = claims.clone();
+            invalid[claim] = invalid_value;
+            assert!(
+                auth.authenticate(&bearer(&token(&invalid))).await.is_none(),
+                "{claim}: {invalid}"
+            );
+        }
+        for required in ["iss", "aud", "sub", "exp"] {
+            let mut missing = claims.clone();
+            missing.as_object_mut().unwrap().remove(required);
+            assert!(
+                auth.authenticate(&bearer(&token(&missing))).await.is_none(),
+                "{required}"
+            );
+        }
+        let mut missing_scope = claims.clone();
+        let map = missing_scope.as_object_mut().unwrap();
+        map.remove("scope");
+        map.remove("scp");
+        assert!(auth
+            .authenticate(&bearer(&token(&missing_scope)))
+            .await
+            .is_none());
+
+        let mut actor = json!({"sub": "old"});
+        for _ in 0..8 {
+            actor = json!({"sub": "actor", "act": actor});
+        }
+        let mut too_deep = claims.clone();
+        too_deep["act"] = actor;
+        assert!(auth
+            .authenticate(&bearer(&token(&too_deep)))
+            .await
+            .is_none());
+
+        let wrong_signature = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"another-key"),
+        )
+        .unwrap();
+        assert!(auth.authenticate(&bearer(&wrong_signature)).await.is_none());
+        let unconfigured =
+            JWTAuthenticator::new(SECRET).with_delegated_claims(DelegatedClaims::default());
+        assert!(unconfigured
+            .authenticate(&bearer(&token(&claims)))
+            .await
+            .is_none());
     }
 }

@@ -75,7 +75,7 @@ export type { BridgeContext } from "./server/context.js";
 
 // ─── Auth Exports ────────────────────────────────────────────────────────────
 export { JWTAuthenticator } from "./auth/jwt.js";
-export type { ClaimMapping, JWTAuthenticatorOptions } from "./auth/jwt.js";
+export type { ClaimMapping, DelegatedClaims, JWTAuthenticatorOptions } from "./auth/jwt.js";
 export type { Authenticator, Identity } from "./auth/types.js";
 export { identityStorage, getCurrentIdentity } from "./auth/storage.js";
 export { buildExplorerAuthHook } from "./auth/hooks.js";
@@ -958,7 +958,6 @@ async function serveInternal(
     // aiperceivable/apcore-mcp#16 phase A: advertise `com.aiperceivable/management`
     // in `initialize` capabilities only for surfaces actually registered.
     const managementSurfaces = computeManagementSurfaces(registry);
-    const server = factory.createServer(name, version, managementSurfaces);
     let tools = factory.buildTools(registry, { tags, prefix });
     tools = factory.attachAsyncMetaTools(tools, asyncBridge ?? undefined);
     const router = new ExecutionRouter(executor, {
@@ -970,8 +969,13 @@ async function serveInternal(
       trace,
       asyncTaskBridge: asyncBridge ?? undefined,
     });
-    factory.registerHandlers(server, tools, router, scopedApproval ? { approvalBridge: scopedApproval.bridge } : undefined);
-    factory.registerResourceHandlers(server, registry, router);
+    const createSessionServer = () => {
+      const server = factory.createServer(name, version, managementSurfaces);
+      factory.registerHandlers(server, tools, router, scopedApproval ? { approvalBridge: scopedApproval.bridge } : undefined);
+      factory.registerResourceHandlers(server, registry, router);
+      return server;
+    };
+    const server = createSessionServer();
 
     // Start dynamic tool registration listener if enabled
     if (options.dynamic) {
@@ -1004,6 +1008,7 @@ async function serveInternal(
     }
     if (authenticator) {
       transportManager.setAuthenticator(authenticator);
+      transportManager.setScopedServerFactory?.(createSessionServer);
     }
     if (requireAuth !== undefined) {
       transportManager.setRequireAuth(requireAuth);
@@ -1302,7 +1307,6 @@ export async function asyncServe(
   // aiperceivable/apcore-mcp#16 phase A: advertise `com.aiperceivable/management`
   // in `initialize` capabilities only for surfaces actually registered.
   const managementSurfaces = computeManagementSurfaces(registry);
-  const server = factory.createServer(name, version, managementSurfaces);
   let tools = factory.buildTools(registry, { tags, prefix });
   tools = factory.attachAsyncMetaTools(tools, asyncBridge ?? undefined);
   const router = new ExecutionRouter(executor, {
@@ -1314,8 +1318,13 @@ export async function asyncServe(
     trace,
     asyncTaskBridge: asyncBridge ?? undefined,
   });
-  factory.registerHandlers(server, tools, router, scopedApproval ? { approvalBridge: scopedApproval.bridge } : undefined);
-  factory.registerResourceHandlers(server, registry, router);
+  const createSessionServer = () => {
+    const server = factory.createServer(name, version, managementSurfaces);
+    factory.registerHandlers(server, tools, router, scopedApproval ? { approvalBridge: scopedApproval.bridge } : undefined);
+    factory.registerResourceHandlers(server, registry, router);
+    return server;
+  };
+  const server = createSessionServer();
 
   // Start dynamic tool registration listener if enabled. The embedded handler
   // has no explicit stop hook, so the listener's teardown is wired into the
@@ -1347,6 +1356,7 @@ export async function asyncServe(
   }
   if (authenticator) {
     transportManager.setAuthenticator(authenticator);
+    transportManager.setScopedServerFactory?.(createSessionServer);
   }
   if (requireAuth !== undefined) {
     transportManager.setRequireAuth(requireAuth);

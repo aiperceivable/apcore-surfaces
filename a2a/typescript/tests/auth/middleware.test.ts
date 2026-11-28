@@ -92,6 +92,16 @@ describe("createAuthMiddleware", () => {
   });
 
   describe("authentication", () => {
+    it("rejects provided bad scoped credentials in permissive mode", () => {
+      const authenticator = { ...makeAuthenticator(null), rejectInvalidCredentials: true };
+      const middleware = createAuthMiddleware({ authenticator, requireAuth: false });
+      const malformed = makeRes();
+      middleware(makeReq("/", "Bearer invalid"), malformed, next);
+      expect(malformed.statusCode).toBe(401);
+      expect(next).not.toHaveBeenCalled();
+      middleware(makeReq("/"), makeRes(), next);
+      expect(next).toHaveBeenCalledOnce();
+    });
     it("returns 401 when auth fails and requireAuth is true", () => {
       const middleware = createAuthMiddleware({
         authenticator: makeAuthenticator(null),

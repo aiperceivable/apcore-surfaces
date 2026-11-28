@@ -17,12 +17,15 @@ export interface ApprovalRequest {
   description?: string | null;
   arguments: Record<string, unknown>;
   callerId?: string | null;
+  authorityKey?: string;
   context?: {
     data?: Record<string, unknown>;
-    identity?: ApprovalPrincipal | null;
+    identity?: ApprovalIdentity | null;
     callerId?: string | null;
   } | null;
 }
+
+type ApprovalIdentity = Pick<ApprovalPrincipal, "type" | "id"> & { authorityKey?(): string | null };
 
 export interface ApprovalResult {
   status: "approved" | "rejected" | "timeout" | "pending";
@@ -149,6 +152,16 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+export function approvalPrincipal(identity: ApprovalIdentity | null | undefined): ApprovalPrincipal | null {
+  if (!identity) return null;
+  const authority = identity.authorityKey?.() ?? null;
+  return {
+    type: identity.type,
+    id: identity.id,
+    ...(authority === null ? {} : { authorityKey: sha256("apcore-approval-authority-v1\0" + authority) }),
+  };
+}
+
 function canonicalValue(value: unknown): unknown {
   if (value === null || typeof value === "string" || typeof value === "boolean" ||
       (typeof value === "number" && Number.isFinite(value))) return value;
@@ -180,8 +193,11 @@ function argumentsScopeDigest(request: ApprovalRequest, args: Record<string, unk
 
 function invocationScope(request: ApprovalRequest, args: Record<string, unknown>): ApprovalScope {
   const identity = request.context?.identity;
+  if ((identity?.authorityKey?.() ?? undefined) !== request.authorityKey) {
+    throw new Error("Invalid approval authority binding");
+  }
   return {
-    principal: identity ? { type: identity.type, id: identity.id } : null,
+    principal: approvalPrincipal(identity),
     callerId: request.callerId ?? request.context?.callerId ?? null,
     moduleId: request.moduleId,
     argumentsDigest: argumentsScopeDigest(request, args),
@@ -219,15 +235,20 @@ export class StorageBackedApprovalHandler {
     return supportsScopedCore() && supportsScopedApprovalStore(this.store);
   }
 
+  get supportsAuthorityScope(): boolean {
+    return this.supportsFinalScope && this.store.supportsAuthorityScope === true;
+  }
+
   /** Bind the provider to the server's private foreground response path. */
   forMcpServer(): Pick<StorageBackedApprovalHandler,
     "requestApproval" | "checkApproval" | "checkApprovalForPrincipal" | "checkApprovalForCall" |
-    "supportsFinalScope"> {
+    "supportsFinalScope" | "supportsAuthorityScope"> {
     const isForeground = (request: ApprovalRequest) => canIssueApprovalReply(
       request.moduleId, request.callerId ?? request.context?.callerId ?? null, request.context?.data, true,
     );
     return {
       supportsFinalScope: this.supportsFinalScope,
+      supportsAuthorityScope: this.supportsAuthorityScope,
       requestApproval: async request => isForeground(request)
         ? this.requestApproval(request)
         : rejected("Scoped approval requires a direct tool call"),
@@ -242,6 +263,9 @@ export class StorageBackedApprovalHandler {
   async requestApproval(request: ApprovalRequest): Promise<ApprovalResult> {
     if (!supportsScopedCore() || !supportsScopedApprovalStore(this.store)) {
       return rejected("Scoped approval unavailable");
+    }
+    if (request.authorityKey !== undefined && !this.supportsAuthorityScope) {
+      return rejected("Approval authority binding unavailable");
     }
     const args = businessArguments(request);
     const contextData = request.context?.data;
@@ -282,6 +306,7 @@ export class StorageBackedApprovalHandler {
     if (!isPublicApprovalId(approvalId) || !supportsScopedCore() || !supportsScopedApprovalStore(this.store)) {
       return rejected("Approval record not found");
     }
+    if (principal?.authorityKey !== undefined && !this.supportsAuthorityScope) return rejected("Approval record not found");
     try {
       const record = await this.store.getScopedResult(approvalId, principal);
       return record ? { status: record.status, auditId: approvalId } : rejected("Approval record not found");
@@ -293,6 +318,9 @@ export class StorageBackedApprovalHandler {
   async checkApprovalForCall(credential: string, request: ApprovalRequest): Promise<ApprovalResult> {
     const auditId = approvalRecordId(credential);
     if (!auditId || !supportsScopedCore() || !supportsScopedApprovalStore(this.store)) {
+      return rejected("Approval credential unavailable for this call");
+    }
+    if (request.authorityKey !== undefined && !this.supportsAuthorityScope) {
       return rejected("Approval credential unavailable for this call");
     }
     try {

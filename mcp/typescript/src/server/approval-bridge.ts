@@ -14,6 +14,7 @@ export type ApprovalMetaToolName = (typeof APPROVAL_META_TOOL_NAMES)[number];
 
 export class ApprovalBridge {
   constructor(private readonly handler: {
+    readonly supportsAuthorityScope?: boolean;
     checkApproval?(approvalId: string): Promise<{ status: string }>;
     checkApprovalForPrincipal?(
       approvalId: string, principal: ApprovalPrincipal | null,
@@ -77,6 +78,9 @@ export class ApprovalBridge {
     }
     if (!this.available || !this.handler.checkApprovalForPrincipal) {
       return [[{ type: "text", text: "Scoped approval status unavailable" }], true, null];
+    }
+    if (principal?.authorityKey !== undefined && this.handler.supportsAuthorityScope !== true) {
+      return [[{ type: "text", text: JSON.stringify({ approval_id: approvalId, status: "rejected" }) }], false, null];
     }
     try {
       const result = await this.handler.checkApprovalForPrincipal(approvalId, principal);

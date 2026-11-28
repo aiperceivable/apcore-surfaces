@@ -79,6 +79,14 @@ impl ApCoreAgentExecutor {
         self.executor.acl.clone()
     }
 
+    /// Check current scoped access using the Core pipeline's silent discovery gate.
+    pub(crate) fn scoped_skill_visible(&self, skill_id: &str, identity: &Identity) -> bool {
+        let ctx = self.acl_context(Some(identity.clone()));
+        self.executor
+            .get_callable_definition(skill_id, None, Some(&ctx))
+            .is_some()
+    }
+
     /// Build an apcore `Context` carrying the authenticated identity, the
     /// cancel token and a global deadline (`now + execution_timeout`, fractional
     /// seconds since UNIX epoch per the apcore Rust contract).

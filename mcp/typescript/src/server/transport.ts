@@ -14,9 +14,15 @@ import { bindStdioWork, withStdioOutput } from "./stdio-output.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { hasApprovalReplies } from "../approval-reply.js";
-import type { Authenticator } from "../auth/types.js";
-import { identityStorage } from "../auth/storage.js";
+import type { Authenticator, Identity } from "../auth/types.js";
+import { getCurrentIdentity, identityStorage } from "../auth/storage.js";
+
+function sessionPrincipal(identity: Identity | null): string | null {
+  // Legacy sessions keep their established per-request identity behavior.
+  return identity?.authorityKey?.() ?? null;
+}
 
 /** Options for HTTP-based transports. */
 export interface HttpTransportOptions {
@@ -38,6 +44,14 @@ export interface UsageExporter {
 
 /** Default maximum request body size in bytes (4MB). */
 const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+/** Default retained scoped Streamable HTTP sessions per manager. */
+const DEFAULT_MAX_SCOPED_HTTP_SESSIONS = 1000;
+
+function scopedHttpSessionLimit(): number {
+  const configured = Number(process.env.APCORE_MAX_SCOPED_HTTP_SESSIONS);
+  return Number.isSafeInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_SCOPED_HTTP_SESSIONS;
+}
 
 /** Prometheus exposition format content-type. */
 const PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
@@ -124,6 +138,19 @@ export class TransportManager {
   /** Explicit requireAuth override (when set, takes precedence over authenticator's own value). */
   private _requireAuth?: boolean;
 
+  private readonly _httpSessionOwners = new WeakMap<StreamableHTTPServerTransport, string | null>();
+  private readonly _scopedHttpSessions = new Map<string, StreamableHTTPServerTransport>();
+  private readonly _scopedHttpActivity = new Map<StreamableHTTPServerTransport, number>();
+  private readonly _capacityEvictions = new WeakSet<StreamableHTTPServerTransport>();
+  private readonly _maxScopedHttpSessions = scopedHttpSessionLimit();
+  private readonly _scopedSseTransports = new Set<SSEServerTransport>();
+  private _scopedServerFactory?: () => Server;
+
+  /** Allocate a separate protocol server for each scoped session. */
+  setScopedServerFactory(factory: () => Server): void {
+    this._scopedServerFactory = factory;
+  }
+
   /**
    * Optional AsyncTaskBridge — used to cancel session-bound async tasks
    * on transport disconnect via `cancelSessionTasks(sessionId)`.
@@ -131,6 +158,7 @@ export class TransportManager {
    */
   private _asyncTaskBridge?: {
     cancelSessionTasks(sessionKey: string): Promise<number>;
+    detachSessionTasks?(sessionKey: string): void;
   };
 
   /**
@@ -214,6 +242,7 @@ export class TransportManager {
    */
   setAsyncTaskBridge(bridge: {
     cancelSessionTasks(sessionKey: string): Promise<number>;
+    detachSessionTasks?(sessionKey: string): void;
   }): void {
     // [D10-006] Reject null/undefined bridge (matching Python `TypeError`).
     // Silently storing null would surface later as a TypeError on first
@@ -364,7 +393,8 @@ export class TransportManager {
     const identity = await this._authenticator.authenticate(headersMap);
     if (!identity) {
       const requireAuth = this._requireAuth ?? this._authenticator.requireAuth ?? true;
-      if (!requireAuth) {
+      const badCredential = this._authenticator.rejectInvalidCredentials === true && Object.hasOwn(req.headers, "authorization");
+      if (!requireAuth && !badCredential) {
         return { identity: null, blocked: false };
       }
       // [JWT-2] Unify 401 body shape with Python+Rust:
@@ -408,7 +438,7 @@ export class TransportManager {
    * `buildStreamableHttpApp` (embeddable handler).
    */
   private _createStreamableHandler(
-    transport: StreamableHTTPServerTransport,
+    defaultTransport: StreamableHTTPServerTransport,
     endpoint: string,
     urlBase: string,
   ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
@@ -440,12 +470,40 @@ export class TransportManager {
         return;
       }
 
+      const requestedSession = req.headers["mcp-session-id"];
+      const transport = typeof requestedSession === "string"
+        ? this._scopedHttpSessions.get(requestedSession) ?? defaultTransport : defaultTransport;
+      if (requestedSession !== undefined &&
+          (requestedSession !== transport.sessionId ||
+            this._httpSessionOwners.get(transport) !== sessionPrincipal(identity))) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message: "Session not found" }, id: null }));
+        return;
+      }
+
       const handleMcp = async () => {
+        let opening: StreamableHTTPServerTransport | undefined;
+        // A standalone GET is a listener. POST and replay requests can carry active work.
+        const tracksActivity = req.method !== "GET" || req.headers["last-event-id"] !== undefined;
+        const active = tracksActivity ? this._scopedHttpActivity.get(transport) : undefined;
+        if (active !== undefined) this._scopedHttpActivity.set(transport, active + 1);
         try {
           if (req.method === "POST" || req.method === "DELETE") {
             const body = await readBody(req);
             const parsed = body ? JSON.parse(body) : undefined;
-            await transport.handleRequest(req, res, parsed);
+            if (req.method === "POST" && requestedSession === undefined && identity?.scopes !== undefined &&
+                this._scopedServerFactory && isInitializeRequest(parsed)) {
+              opening = await this._openScopedHttpTransport();
+              if (!opening) {
+                res.writeHead(503, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                  jsonrpc: "2.0", error: { code: -32000, message: "Scoped session capacity reached" }, id: null,
+                }));
+                return;
+              }
+              await this._scopedServerFactory().connect(opening);
+            }
+            await (opening ?? transport).handleRequest(req, res, parsed);
           } else {
             await transport.handleRequest(req, res);
           }
@@ -460,16 +518,66 @@ export class TransportManager {
               res.writeHead(500).end("Internal Server Error");
             }
           }
+        } finally {
+          if (opening && opening.sessionId === undefined) await opening.close();
+          if (opening || active !== undefined) this._finishScopedHttpRequest(opening ?? transport);
         }
       };
 
       // Wrap in identityStorage so getCurrentIdentity() works in the call chain
-      if (identity) {
-        await identityStorage.run(identity, handleMcp);
-      } else {
-        await handleMcp();
-      }
+      await identityStorage.run(identity, handleMcp);
     };
+  }
+
+  private async _openScopedHttpTransport(): Promise<StreamableHTTPServerTransport | undefined> {
+    if (this._scopedHttpActivity.size >= this._maxScopedHttpSessions) {
+      // Map order records last completion. An opening or active request is never evicted.
+      for (const [candidate, active] of this._scopedHttpActivity) {
+        if (active !== 0 || !candidate.sessionId) continue;
+        this._scopedHttpSessions.delete(candidate.sessionId);
+        this._scopedHttpActivity.set(candidate, 1);
+        this._capacityEvictions.add(candidate);
+        await candidate.close();
+        break;
+      }
+    }
+    // Account for another opening that acquired a slot while close() awaited.
+    if (this._scopedHttpActivity.size >= this._maxScopedHttpSessions) return undefined;
+    const transport = this._newStreamableTransport(true);
+    this._scopedHttpActivity.set(transport, 1);
+    return transport;
+  }
+
+  private _finishScopedHttpRequest(transport: StreamableHTTPServerTransport): void {
+    const active = this._scopedHttpActivity.get(transport);
+    if (active === undefined) return;
+    this._scopedHttpActivity.delete(transport);
+    this._scopedHttpActivity.set(transport, active - 1);
+  }
+
+  private _newStreamableTransport(scoped = false): StreamableHTTPServerTransport {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => crypto.randomUUID(),
+      onsessioninitialized: (id) => {
+        this._httpSessionOwners.set(transport, sessionPrincipal(getCurrentIdentity()));
+        if (scoped) this._scopedHttpSessions.set(id, transport);
+      },
+    });
+    transport.onclose = () => {
+      this._httpSessionOwners.delete(transport);
+      this._scopedHttpActivity.delete(transport);
+      const sessionId = transport.sessionId;
+      if (!sessionId) return;
+      this._scopedHttpSessions.delete(sessionId);
+      if (this._capacityEvictions.delete(transport)) {
+        this._asyncTaskBridge?.detachSessionTasks?.(sessionId);
+        return;
+      }
+      this._asyncTaskBridge?.cancelSessionTasks(sessionId).catch((error: unknown) => {
+        console.warn(`cancelSessionTasks failed for streamable-http session ${sessionId}:`, error);
+      });
+    };
+    return transport;
   }
 
   /**
@@ -563,34 +671,7 @@ export class TransportManager {
 
     const endpoint = options.endpoint ?? "/mcp";
 
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => crypto.randomUUID(),
-    });
-
-    // [A-D-018] StreamableHTTP wiring: when the transport closes (server
-    // shutdown or SDK-internal session expiry), cancel any session-bound
-    // async tasks via the bridge. Mirrors the SSE-side onclose handler.
-    // Note: the SDK exposes a single onclose for the whole transport,
-    // not per-session — this fires once when the transport tears down,
-    // not on individual client disconnects. For per-client cancellation
-    // we'd need per-session-aware hooks the SDK does not currently
-    // provide. The transport-shutdown path is still a real cleanup
-    // point worth wiring.
-    if (this._asyncTaskBridge) {
-      const existing = transport.onclose;
-      transport.onclose = () => {
-        const sid = transport.sessionId;
-        if (sid && this._asyncTaskBridge) {
-          this._asyncTaskBridge.cancelSessionTasks(sid).catch((err: unknown) => {
-            console.warn(
-              `cancelSessionTasks failed for streamable-http session ${sid}:`,
-              err,
-            );
-          });
-        }
-        if (existing) existing();
-      };
-    }
+    const transport = this._newStreamableTransport();
 
     await server.connect(transport);
 
@@ -634,7 +715,7 @@ export class TransportManager {
 
     const endpoint = options.endpoint ?? "/sse";
     const messagesEndpoint = "/messages";
-    const transports = new Map<string, SSEServerTransport>();
+    const transports = new Map<string, { transport: SSEServerTransport; principal: string | null }>();
 
     const explorerNodeHandler = this._explorerNodeHandler;
     const explorerPrefix = this._explorerPrefix;
@@ -664,10 +745,13 @@ export class TransportManager {
           // Establish SSE connection
           const transport = new SSEServerTransport(messagesEndpoint, res);
           const sessionId = transport.sessionId;
-          transports.set(sessionId, transport);
+          transports.set(sessionId, { transport, principal: sessionPrincipal(identity) });
+          const scopedServer = identity?.scopes !== undefined ? this._scopedServerFactory?.() : undefined;
+          if (scopedServer) this._scopedSseTransports.add(transport);
 
           transport.onclose = () => {
             transports.delete(sessionId);
+            this._scopedSseTransports.delete(transport);
             // [A-D-018] Cooperatively cancel any async tasks bound to
             // this session when the client disconnects.
             if (this._asyncTaskBridge) {
@@ -683,7 +767,7 @@ export class TransportManager {
           };
 
           // Server.connect starts the SDK transport after installing callbacks.
-          await server.connect(transport);
+          await (scopedServer ?? server).connect(transport);
         } else if (url.pathname === messagesEndpoint && req.method === "POST") {
           // Route message to the correct session transport
           const sessionId = url.searchParams.get("sessionId");
@@ -692,8 +776,8 @@ export class TransportManager {
             return;
           }
 
-          const transport = transports.get(sessionId);
-          if (!transport) {
+          const session = transports.get(sessionId);
+          if (!session || session.principal !== sessionPrincipal(identity)) {
             res.writeHead(400).end("Unknown session");
             return;
           }
@@ -701,7 +785,7 @@ export class TransportManager {
           try {
             const body = await readBody(req);
             const parsed = body ? JSON.parse(body) : undefined;
-            await transport.handlePostMessage(req, res, parsed);
+            await session.transport.handlePostMessage(req, res, parsed);
           } catch (err) {
             if (!res.headersSent) {
               const message = err instanceof Error ? err.message : "";
@@ -764,40 +848,14 @@ export class TransportManager {
   }> {
     const endpoint = options?.endpoint ?? "/mcp";
 
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => crypto.randomUUID(),
-    });
-
-    // [A-D-018] StreamableHTTP wiring: when the transport closes (server
-    // shutdown or SDK-internal session expiry), cancel any session-bound
-    // async tasks via the bridge. Mirrors the SSE-side onclose handler.
-    // Note: the SDK exposes a single onclose for the whole transport,
-    // not per-session — this fires once when the transport tears down,
-    // not on individual client disconnects. For per-client cancellation
-    // we'd need per-session-aware hooks the SDK does not currently
-    // provide. The transport-shutdown path is still a real cleanup
-    // point worth wiring.
-    if (this._asyncTaskBridge) {
-      const existing = transport.onclose;
-      transport.onclose = () => {
-        const sid = transport.sessionId;
-        if (sid && this._asyncTaskBridge) {
-          this._asyncTaskBridge.cancelSessionTasks(sid).catch((err: unknown) => {
-            console.warn(
-              `cancelSessionTasks failed for streamable-http session ${sid}:`,
-              err,
-            );
-          });
-        }
-        if (existing) existing();
-      };
-    }
+    const transport = this._newStreamableTransport();
 
     await server.connect(transport);
 
     const handler = this._createStreamableHandler(transport, endpoint, "http://localhost");
 
     const close = async () => {
+      await this._closeScopedTransports();
       await transport.close();
     };
 
@@ -809,11 +867,17 @@ export class TransportManager {
    */
   async close(): Promise<void> {
     await this._closeStdio?.();
+    await this._closeScopedTransports();
     if (!this.httpServer) return;
 
     return new Promise((resolve) => {
       this.httpServer!.close(() => resolve());
     });
+  }
+
+  private async _closeScopedTransports(): Promise<void> {
+    const transports = [...this._scopedHttpActivity.keys(), ...this._scopedSseTransports];
+    await Promise.all(transports.map(transport => transport.close()));
   }
 
   /**

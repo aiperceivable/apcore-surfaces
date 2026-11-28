@@ -8,6 +8,9 @@ from typing import Any
 
 import jwt as pyjwt
 from apcore import Identity
+from apcore.errors import InvalidInputError
+
+from apcore_a2a.auth._delegation import DelegatedClaims, project_delegated_identity
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,7 @@ class JWTAuthenticator:
         issuer: Expected ``iss`` claim (optional).
         claim_mapping: Maps JWT claims to Identity fields.
         require_claims: Claims that must be present in the token.
+        delegated_claims: Enable verified JWT scope and actor projection.
     """
 
     def __init__(
@@ -69,7 +73,13 @@ class JWTAuthenticator:
         issuer: str | None = None,
         claim_mapping: ClaimMapping | None = None,
         require_claims: list[str] | None = None,
+        delegated_claims: DelegatedClaims | None = None,
     ) -> None:
+        if delegated_claims is not None and (
+            not isinstance(issuer, str) or not issuer or not isinstance(audience, str) or not audience
+        ):
+            raise ValueError("JWT delegation requires an expected issuer and audience")
+        self._delegated_claims = delegated_claims
         self._key = key
         self._algorithms = algorithms or ["HS256"]
         self._audience = audience
@@ -77,9 +87,16 @@ class JWTAuthenticator:
         self._claim_mapping = claim_mapping or ClaimMapping()
         self._require_claims: list[str] = require_claims if require_claims is not None else ["sub"]
 
+    @property
+    def rejects_invalid_credentials(self) -> bool:
+        """Reject a supplied invalid credential even in permissive middleware."""
+        return self._delegated_claims is not None
+
     def authenticate(self, headers: dict[str, str]) -> Identity | None:
         """Extract Bearer token from headers, decode, and return Identity."""
-        auth_header = headers.get("authorization", "")
+        auth_header = headers.get("authorization") or (
+            headers.get("Authorization", "") if self._delegated_claims is not None else ""
+        )
         if not auth_header.lower().startswith("bearer "):
             return None
 
@@ -91,7 +108,15 @@ class JWTAuthenticator:
         if payload is None:
             return None
 
-        return self._payload_to_identity(payload)
+        identity = self._payload_to_identity(payload)
+        mapping = self._delegated_claims
+        if identity is None or mapping is None:
+            return identity
+        try:
+            return project_delegated_identity(payload, identity, mapping)
+        except (InvalidInputError, KeyError, OverflowError, TypeError, ValueError):
+            logger.debug("JWT delegation claim validation failed")
+            return None
 
     def security_schemes(self) -> dict:
         """Return security scheme descriptors for this authenticator.
@@ -104,14 +129,17 @@ class JWTAuthenticator:
         """Decode and validate a JWT token. Returns None on any error."""
         try:
             options: dict[str, Any] = {}
-            if self._require_claims:
-                options["require"] = self._require_claims
+            required = self._require_claims
+            if self._delegated_claims is not None:
+                required = list(dict.fromkeys([*required, "sub", "iss", "aud", "exp"]))
+            if required:
+                options["require"] = required
             # Disable PyJWT's RFC sub-type enforcement (PyJWT >= 2.10 rejects a
             # non-string `sub`). The canonical cross-language rule coerces a scalar
             # numeric/boolean `sub` to a string in ``_claim_to_string`` and rejects
             # only null/array/object; deferring the check there keeps Python aligned
             # with the Rust/TS SDKs.
-            options["verify_sub"] = False
+            options["verify_sub"] = self._delegated_claims is not None
 
             kwargs: dict[str, Any] = {
                 "jwt": token,
@@ -123,9 +151,11 @@ class JWTAuthenticator:
                 kwargs["audience"] = self._audience
             if self._issuer is not None:
                 kwargs["issuer"] = self._issuer
+            if self._delegated_claims is not None:
+                kwargs["leeway"] = 30
 
             return pyjwt.decode(**kwargs)
-        except pyjwt.InvalidTokenError:
+        except (pyjwt.InvalidTokenError, TypeError, ValueError, OverflowError):
             logger.debug("JWT validation failed", exc_info=True)
             return None
         except Exception:
@@ -141,7 +171,7 @@ class JWTAuthenticator:
         and non-scalar role elements are dropped.
         """
         mapping = self._claim_mapping
-        identity_id = _claim_to_string(payload.get(mapping.id_claim))
+        identity_id = _claim_to_string(payload.get("sub" if self._delegated_claims is not None else mapping.id_claim))
         if identity_id is None:
             return None
 

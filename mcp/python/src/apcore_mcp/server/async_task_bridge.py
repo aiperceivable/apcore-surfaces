@@ -15,11 +15,13 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
+from weakref import WeakKeyDictionary
 
-from apcore import Context
-from apcore.async_task import AsyncTaskManager, TaskInfo, TaskStatus
-from apcore.errors import TaskLimitExceededError
+from apcore import Context, Identity
+from apcore.async_task import AsyncTaskManager, InMemoryTaskStore, TaskInfo, TaskStatus
+from apcore.errors import ACLDeniedError, TaskLimitExceededError
 from apcore.trace_context import TraceContext, TraceParent
 from mcp import types as mcp_types
 
@@ -92,6 +94,15 @@ def _preflight_to_dict(result: Any) -> dict[str, Any]:
     }
 
 
+@dataclass
+class _ScopedTaskBinding:
+    owner: str
+    state: Literal["pending", "published", "failed"] = "pending"
+
+
+_SCOPED_TASK_OWNERS: WeakKeyDictionary[InMemoryTaskStore, dict[str, _ScopedTaskBinding]] = WeakKeyDictionary()
+
+
 class AsyncTaskBridge:
     """Thin routing layer in front of :class:`AsyncTaskManager`.
 
@@ -127,6 +138,10 @@ class AsyncTaskBridge:
         # mass-cancel tasks bound to a transport on disconnect.
         # Mirrors Rust's `session_tasks` map.
         self._session_tasks: dict[str, list[str]] = {}
+        # Ownership and task records must share the lifetime of the local store.
+        # This also covers a host explicitly reusing the same store in another manager.
+        store = getattr(manager, "_store", None)
+        self._scoped_task_owners = _SCOPED_TASK_OWNERS.setdefault(store, {}) if type(store) is InMemoryTaskStore else {}
 
     @classmethod
     def with_limits(
@@ -190,8 +205,29 @@ class AsyncTaskBridge:
         mass-cancel tasks bound to that session on transport disconnect.
         [A-D-019]
         """
+        identity = context.identity if context is not None else None
+        owner = self._scoped_owner(identity)
+        if owner is not None and (
+            not self._can_disclose(module_id, identity)
+            or getattr(self._manager, "supports_task_allocation_callback", False) is not True
+            or getattr(self._manager, "owns_private_task_store", False) is not True
+        ):
+            raise ACLDeniedError(None, module_id)
+        tracked_owners = [
+            task_id for task_id, binding in self._scoped_task_owners.items() if binding.state != "pending"
+        ]
+        if tracked_owners:
+            live = {info.task_id for info in await self._manager.list_tasks_async()}
+            for task_id in tracked_owners:
+                if task_id not in live:
+                    self._scoped_task_owners.pop(task_id, None)
         task_id = await self._submit_with_progress(
-            module_id, arguments, context, progress_token=progress_token, send_notification=send_notification
+            module_id,
+            arguments,
+            context,
+            owner=owner,
+            progress_token=progress_token,
+            send_notification=send_notification,
         )
         if session_key is not None:
             self._session_tasks.setdefault(session_key, []).append(task_id)
@@ -227,6 +263,7 @@ class AsyncTaskBridge:
         arguments: dict[str, Any],
         context: Context | None,
         *,
+        owner: str | None = None,
         progress_token: Any | None = None,
         send_notification: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> str:
@@ -235,7 +272,21 @@ class AsyncTaskBridge:
         # route through MCP notifications/progress.
         if context is not None and progress_token is not None and send_notification is not None:
             self._install_progress_sink(context, progress_token, send_notification)
-        task_id = await self._manager.submit(module_id, arguments, context)
+        if owner is None:
+            task_id = await self._manager.submit(module_id, arguments, context)
+        else:
+            binding = _ScopedTaskBinding(owner)
+
+            def reserve(task_id: str) -> None:
+                self._scoped_task_owners[task_id] = binding
+
+            try:
+                task_id = await self._manager.submit(module_id, arguments, context, on_task_allocated=reserve)
+                binding.state = "published"
+            finally:
+                # A store may have persisted the record before reporting a failure.
+                if binding.state == "pending":
+                    binding.state = "failed"
         if progress_token is not None and send_notification is not None:
             self._progress_bindings[task_id] = (progress_token, send_notification)
         return task_id
@@ -361,15 +412,16 @@ class AsyncTaskBridge:
     ) -> tuple[list[dict[str, Any]], bool, str | None]:
         """Dispatch a meta-tool call. Returns ``(content, is_error, trace_id)``."""
         args = arguments or {}
+        identity = (router_extra or {}).get("identity")
         try:
             if name == "__apcore_task_submit":
                 return await self._handle_submit_tool(args, resolve_descriptor, router_extra or {})
             if name == "__apcore_task_status":
-                return self._handle_status_tool(args)
+                return await self._handle_status_tool(args, identity)
             if name == "__apcore_task_cancel":
-                return await self._handle_cancel_tool(args)
+                return await self._handle_cancel_tool(args, identity)
             if name == "__apcore_task_list":
-                return self._handle_list_tool(args)
+                return await self._handle_list_tool(args, identity)
             if name == "__apcore_module_preview":
                 return await self._handle_preview_tool(args, router_extra or {})
         except TaskLimitExceededError as exc:
@@ -430,12 +482,14 @@ class AsyncTaskBridge:
         )
         return self._text_response(envelope)
 
-    def _handle_status_tool(self, args: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, str | None]:
+    async def _handle_status_tool(
+        self, args: dict[str, Any], identity: Identity | None
+    ) -> tuple[list[dict[str, Any]], bool, str | None]:
         task_id = args.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             return self._error_response(ValueError("task_id is required"))
-        info = self._manager.get_status(task_id)
-        if info is None:
+        info = await self._manager.get_status_async(task_id)
+        if info is None or not self._can_access_task(info, identity):
             return self._text_response(
                 {"error": "ASYNC_TASK_NOT_FOUND", "task_id": task_id},
                 is_error=True,
@@ -453,11 +507,14 @@ class AsyncTaskBridge:
             payload["error"] = info.error
         return self._text_response(payload)
 
-    async def _handle_cancel_tool(self, args: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, str | None]:
+    async def _handle_cancel_tool(
+        self, args: dict[str, Any], identity: Identity | None
+    ) -> tuple[list[dict[str, Any]], bool, str | None]:
         task_id = args.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             return self._error_response(ValueError("task_id is required"))
-        if self._manager.get_status(task_id) is None:
+        info = await self._manager.get_status_async(task_id)
+        if info is None or not self._can_access_task(info, identity):
             return self._text_response(
                 {"error": "ASYNC_TASK_NOT_FOUND", "task_id": task_id},
                 is_error=True,
@@ -467,7 +524,9 @@ class AsyncTaskBridge:
         self._progress_bindings.pop(task_id, None)
         return self._text_response({"task_id": task_id, "cancelled": cancelled})
 
-    def _handle_list_tool(self, args: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, str | None]:
+    async def _handle_list_tool(
+        self, args: dict[str, Any], identity: Identity | None
+    ) -> tuple[list[dict[str, Any]], bool, str | None]:
         status_filter: TaskStatus | None = None
         raw_status = args.get("status")
         if isinstance(raw_status, str):
@@ -475,8 +534,30 @@ class AsyncTaskBridge:
                 status_filter = TaskStatus(raw_status)
             except ValueError:
                 return self._error_response(ValueError(f"Invalid status filter: {raw_status!r}"))
-        tasks = self._manager.list_tasks(status_filter)
-        return self._text_response({"tasks": [_task_info_to_dict(t) for t in tasks]})
+        tasks = await self._manager.list_tasks_async(status_filter)
+        visible = [_task_info_to_dict(task) for task in tasks if self._can_access_task(task, identity)]
+        return self._text_response({"tasks": visible})
+
+    @staticmethod
+    def _scoped_owner(identity: Identity | None) -> str | None:
+        return getattr(identity, "owner_key", lambda: None)()
+
+    def _can_disclose(self, module_id: str, identity: Identity | None) -> bool:
+        get_descriptor = getattr(self._executor, "get_callable_descriptor", None)
+        if not callable(get_descriptor):
+            return False
+        try:
+            return get_descriptor(module_id, Context.create(identity=identity)) is not None
+        except Exception:
+            logger.debug("Scoped task access could not be verified", exc_info=True)
+            return False
+
+    def _can_access_task(self, task: TaskInfo, identity: Identity | None) -> bool:
+        binding = self._scoped_task_owners.get(task.task_id)
+        owner = self._scoped_owner(identity)
+        if binding is None:
+            return owner is None
+        return binding.state == "published" and binding.owner == owner and self._can_disclose(task.module_id, identity)
 
     async def _handle_preview_tool(
         self,

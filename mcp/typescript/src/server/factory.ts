@@ -34,7 +34,7 @@ import type { HandleCallExtra } from "./router.js";
 import { buildTraceparent } from "./trace-context.js";
 import { APCORE_META_TOOL_PREFIX, AsyncTaskBridge } from "./async-task-bridge.js";
 import { ApprovalBridge } from "./approval-bridge.js";
-import { isApprovalResumeToken } from "../adapters/approval.js";
+import { approvalPrincipal, isApprovalResumeToken } from "../adapters/approval.js";
 import { enableApprovalReplies, type ApprovalReplyCapture, type PendingApprovalReply } from "../approval-reply.js";
 import {
   isMarkdownAvailable,
@@ -771,7 +771,8 @@ export class MCPServerFactory {
       // Dispatch to approval bridge meta-tool if applicable (AFTER async bridge,
       // BEFORE the async-hint route in router.handleCall).
       if (approvalBridge && ApprovalBridge.isMetaTool(name)) {
-        const [apContent, apIsError] = await approvalBridge.handleMetaTool(name, toolArgs, handleCallExtra.identity ?? null);
+        const principal = approvalPrincipal(handleCallExtra.identity);
+        const [apContent, apIsError] = await approvalBridge.handleMetaTool(name, toolArgs, principal);
         const apTextContents = apContent.map(c => ({ type: "text" as const, text: c.text }));
         return { content: apTextContents, ...(apIsError ? { isError: true } : {}) };
       }

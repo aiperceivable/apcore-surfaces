@@ -27,7 +27,7 @@ default = []
 openapi = ["apcore-toolkit/http-proxy"]
 
 [dependencies]
-apcore = { version = "=1.0.0-alpha.4", default-features = false, features = ["discovery", "sys-modules"] }
+apcore = { version = "=1.0.0-alpha.5", default-features = false, features = ["discovery", "sys-modules"] }
 # `default-features = false` so `http-proxy` — a *default* feature of the
 # toolkit — is reached through this crate's `openapi` feature instead of being
 # enabled unconditionally. The unconditional import (`deep_resolve_refs`) is

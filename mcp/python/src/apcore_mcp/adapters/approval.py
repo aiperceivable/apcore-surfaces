@@ -144,7 +144,10 @@ _NO_PHASE_B = "Scoped approval is unavailable for this call"
 
 
 def _approval_principal(identity: Identity | None) -> ApprovalPrincipal:
-    return (identity.type, identity.id) if isinstance(identity, Identity) else None
+    if not isinstance(identity, Identity):
+        return None
+    authority = getattr(identity, "authority_key", lambda: None)()
+    return authority if authority is not None else (identity.type, identity.id)
 
 
 def _is_public_approval_id(value: object) -> TypeGuard[str]:
@@ -174,8 +177,14 @@ def _scope_for(request: ApprovalRequest, snapshot: str) -> ApprovalScope:
         material = b"apcore-final-scope-v1\0" + encoded
     else:
         material = snapshot.encode("utf-8")
+    principal = _approval_principal(request.context.identity)
+    authority = getattr(request, "authority_key", None)
+    if isinstance(principal, str) or authority is not None:
+        if not isinstance(principal, str) or authority != principal:
+            raise ValueError("Invalid approval authority binding")
+        material = b"apcore-delegated-approval-v1\0" + authority.encode("ascii") + b"\0" + material
     return ApprovalScope(
-        _approval_principal(request.context.identity),
+        principal,
         request.caller_id,
         request.module_id,
         sha256(material).hexdigest(),
@@ -221,6 +230,10 @@ class StorageBackedApprovalHandler(ApprovalHandler):
 
     @property
     def supports_final_scope(self) -> bool:
+        return self.scoped_approval_available
+
+    @property
+    def supports_authority_scope(self) -> bool:
         return self.scoped_approval_available
 
     async def request_approval(self, request: ApprovalRequest) -> ApprovalResult:
@@ -349,6 +362,10 @@ class _MCPScopedApprovalGate:
     @property
     def supports_final_scope(self) -> bool:
         return getattr(self._handler, "supports_final_scope", None) is True
+
+    @property
+    def supports_authority_scope(self) -> bool:
+        return getattr(self._handler, "supports_authority_scope", None) is True
 
     def _delivery_for(self, request: ApprovalRequest) -> _ApprovalDelivery | None:
         delivery = _approval_delivery.get()

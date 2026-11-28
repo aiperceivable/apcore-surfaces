@@ -1,12 +1,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { TaskState } from "@a2a-js/sdk";
 import type {
-  AgentCard, CancelTaskRequest, SendMessageRequest, StreamResponse, Task, TaskStatus,
+  AgentCard, CancelTaskRequest, Message, SendMessageRequest, StreamResponse, Task, TaskStatus,
 } from "@a2a-js/sdk";
+import { RequestMalformedError, TaskNotFoundError } from "@a2a-js/sdk/errors";
 import { DefaultRequestHandler, resolveUserScope } from "@a2a-js/sdk/server";
 import type {
   AgentExecutionEvent, AgentExecutor, ExecutionEventBus, ExtendedAgentCardProvider, RequestContext, ServerCallContext, TaskStore,
 } from "@a2a-js/sdk/server";
+import type { Identity } from "apcore-js";
+import { identityOf, scopedOwner, TASK_OWNER_KEY, TASK_SKILL_KEY } from "./context.js";
 
 const TERMINAL_STATES = new Set<TaskState>([
   TaskState.TASK_STATE_COMPLETED,
@@ -14,6 +18,10 @@ const TERMINAL_STATES = new Set<TaskState>([
   TaskState.TASK_STATE_CANCELED,
   TaskState.TASK_STATE_REJECTED,
 ]);
+
+const DEFAULT_PAGE_SIZE = 50;
+const SCOPED_SCAN_PAGE_SIZE = 100;
+const SCOPED_PAGE_TOKEN = /^v1\.([1-9][0-9]{0,14})\.([0-9a-f]{64})$/;
 
 function isTerminal(state: TaskState | undefined): boolean {
   return state !== undefined && TERMINAL_STATES.has(state);
@@ -37,8 +45,21 @@ class TaskPersistence implements TaskStore {
   private readonly claimKeys = new WeakMap<ServerCallContext, Set<string>>();
   private readonly abandoned = new WeakSet<ServerCallContext>();
   private readonly watches = new WeakMap<ExecutionEventBus, () => void>();
+  private readonly pageTokenKey = randomBytes(32);
 
-  constructor(private readonly store: TaskStore) {}
+  constructor(
+    private readonly store: TaskStore,
+    private readonly canUseScopedSkill?: (skillId: string, identity: Identity) => boolean,
+  ) {}
+
+  private canRead(task: Task, context: ServerCallContext): boolean {
+    const identity = identityOf(context);
+    const owner = scopedOwner(identity);
+    if ((task.metadata?.[TASK_OWNER_KEY] ?? null) !== owner) return false;
+    if (owner === null) return true;
+    const skill = task.metadata?.[TASK_SKILL_KEY];
+    return identity !== null && typeof skill === "string" && this.canUseScopedSkill?.(skill, identity) === true;
+  }
 
   cancel<T>(taskId: string, run: () => Promise<T>): Promise<T> {
     return this.cancelRequests.run(taskId, run);
@@ -78,6 +99,7 @@ class TaskPersistence implements TaskStore {
       this.abandon(context);
       throw error;
     }
+    if (task && !this.canRead(task, context)) return undefined;
     if (!task || this.cancelRequests.getStore() !== taskId || isTerminal(task.status?.state)) {
       return task;
     }
@@ -99,7 +121,7 @@ class TaskPersistence implements TaskStore {
       if (this.cancelRequests.getStore() === task.id && state === TaskState.TASK_STATE_CANCELED) {
         // The SDK can reach its direct-write fallback with a stale Store snapshot.
         const current = await this.store.load(task.id, context);
-        if (!current || isTerminal(current.status?.state)) return;
+        if (!current || !this.canRead(current, context) || isTerminal(current.status?.state)) return;
         const claim = this.terminalClaims.get(key);
         if (claim?.contextId === task.contextId && claim.status.state !== state) return;
       }
@@ -123,8 +145,70 @@ class TaskPersistence implements TaskStore {
     }
   }
 
-  list(...args: Parameters<TaskStore["list"]>): ReturnType<TaskStore["list"]> {
-    return this.store.list(...args);
+  async list(...args: Parameters<TaskStore["list"]>): ReturnType<TaskStore["list"]> {
+    const [params, context] = args;
+    const identity = identityOf(context);
+    const authority = identity?.authorityKey?.();
+    if (authority != null) return this.listScoped(params, context, authority);
+
+    const page = await this.store.list(...args);
+    const tasks = page.tasks.filter(task => this.canRead(task, context));
+    if (tasks.length === page.tasks.length) return page;
+    // The underlying cursor may contain the last task's id. Only expose a
+    // continuation if that task is visible to the current authority.
+    const lastTask = page.tasks.at(-1);
+    return {
+      ...page, tasks, totalSize: tasks.length,
+      nextPageToken: lastTask && this.canRead(lastTask, context) ? page.nextPageToken : "",
+    };
+  }
+
+  private async listScoped(
+    params: Parameters<TaskStore["list"]>[0], context: ServerCallContext, authority: string,
+  ): ReturnType<TaskStore["list"]> {
+    const pageSize = params.pageSize ?? DEFAULT_PAGE_SIZE;
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1) {
+      throw new RequestMalformedError("pageSize must be a positive integer");
+    }
+    const binding = JSON.stringify([
+      context.tenant ?? null, authority, params.contextId, params.status, params.statusTimestampAfter,
+      params.historyLength, params.includeArtifacts,
+    ]);
+    let offset = 0;
+    if (params.pageToken) {
+      const cursor = SCOPED_PAGE_TOKEN.exec(params.pageToken);
+      if (!cursor || !timingSafeEqual(this.signOffset(binding, cursor[1]), Buffer.from(cursor[2], "hex"))) {
+        throw new RequestMalformedError("Invalid page token");
+      }
+      offset = Number(cursor[1]);
+    }
+
+    // Page and count the visible results, never expose storage cursors or counts.
+    const tasks: Task[] = [];
+    const seenTokens = new Set<string>();
+    let storageToken = "";
+    let totalSize = 0;
+    do {
+      const page = await this.store.list({ ...params, pageSize: SCOPED_SCAN_PAGE_SIZE, pageToken: storageToken }, context);
+      for (const task of page.tasks) {
+        if (this.canRead(task, context)) {
+          if (offset <= totalSize && totalSize < offset + pageSize) tasks.push(task);
+          totalSize++;
+        }
+      }
+      storageToken = page.nextPageToken;
+      if (storageToken && seenTokens.has(storageToken)) throw new Error("TaskStore repeated a pagination token");
+      seenTokens.add(storageToken);
+    } while (storageToken);
+
+    const nextOffset = offset + tasks.length;
+    const nextPageToken = nextOffset < totalSize
+      ? `v1.${nextOffset}.${this.signOffset(binding, String(nextOffset)).toString("hex")}` : "";
+    return { tasks, pageSize, totalSize, nextPageToken };
+  }
+
+  private signOffset(binding: string, offset: string): Buffer {
+    return createHmac("sha256", this.pageTokenKey).update(offset + "\0" + binding).digest();
   }
 
   abandon(context: ServerCallContext): void {
@@ -146,8 +230,9 @@ export class A2ATaskRequestHandler extends DefaultRequestHandler {
     store: TaskStore,
     agent: AgentExecutor,
     extendedAgentCardProvider?: ExtendedAgentCardProvider,
+    canUseScopedSkill?: (skillId: string, identity: Identity) => boolean,
   ) {
-    const persistence = new TaskPersistence(store);
+    const persistence = new TaskPersistence(store, canUseScopedSkill);
     super(card, persistence, {
       execute(context, bus) {
         persistence.observe(context, bus);
@@ -160,6 +245,21 @@ export class A2ATaskRequestHandler extends DefaultRequestHandler {
     this.persistence = persistence;
   }
 
+  private async checkScopedContinuation(params: SendMessageRequest, context: ServerCallContext): Promise<void> {
+    const taskId = params.message?.taskId;
+    if (!taskId || scopedOwner(identityOf(context)) === null) return;
+    const task = await this.persistence.load(taskId, context);
+    if (!task) throw new TaskNotFoundError("Task not found");
+    if (task.metadata?.[TASK_SKILL_KEY] !== params.message?.metadata?.skillId) {
+      throw new RequestMalformedError("A scoped task continuation must use the original skill");
+    }
+  }
+
+  override async sendMessage(params: SendMessageRequest, context: ServerCallContext): Promise<Message | Task> {
+    await this.checkScopedContinuation(params, context);
+    return super.sendMessage(params, context);
+  }
+
   override cancelTask(params: CancelTaskRequest, context: ServerCallContext): Promise<Task> {
     return this.persistence.cancel(params.id, () => super.cancelTask(params, context));
   }
@@ -168,6 +268,7 @@ export class A2ATaskRequestHandler extends DefaultRequestHandler {
     params: SendMessageRequest, context: ServerCallContext,
   ): AsyncGenerator<StreamResponse, void, undefined> {
     try {
+      await this.checkScopedContinuation(params, context);
       yield* super.sendMessageStream(params, context);
     } finally {
       this.persistence.abandon(context);

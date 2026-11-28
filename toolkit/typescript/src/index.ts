@@ -262,3 +262,5 @@ export function inferAnnotationsFromMethod(method: string): ModuleAnnotations {
 
 export { createPrometheusServer } from './prometheus-server.js';
 export type { PrometheusServerOptions } from './prometheus-server.js';
+export { readDelegatedJwtAuthority, validateDelegatedClaims } from './auth/delegated-jwt.js';
+export type { DelegatedClaims, DelegatedJwtAuthority } from './auth/delegated-jwt.js';

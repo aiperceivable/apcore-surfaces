@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from apcore.async_task import AsyncTaskManager, TaskStatus
-from apcore.errors import TaskLimitExceededError
+from apcore import Context, Identity
+from apcore.async_task import AsyncTaskManager, TaskInfo, TaskStatus
+from apcore.errors import ACLDeniedError, TaskLimitExceededError
 
 from apcore_mcp.server.async_task_bridge import META_TOOL_NAMES, AsyncTaskBridge
 from apcore_mcp.server.factory import MCPServerFactory
@@ -294,7 +295,7 @@ def test_preview_meta_tool_is_registered() -> None:
 @pytest.mark.asyncio
 async def test_preview_meta_tool_returns_predicted_changes() -> None:
     """Preview drives executor.validate() and surfaces predicted_changes."""
-    from apcore import Change, Context, PreviewResult, Registry
+    from apcore import Change, PreviewResult, Registry
     from apcore.executor import Executor
     from apcore.module import Module
 
@@ -459,3 +460,116 @@ async def test_submit_tool_accepts_null_and_empty_arguments(value: object) -> No
     )
 
     assert is_error is False
+
+
+@pytest.mark.asyncio
+async def test_scoped_background_task_rechecks_owner_and_current_access() -> None:
+    from apcore import Context, Executor, Identity, Registry
+    from apcore.acl import ACL, ACLRule
+
+    class Module:
+        description = "Return the operation result"
+        input_schema = {"type": "object"}
+        output_schema = {"type": "object"}
+
+        async def execute(self, inputs, context):
+            return {"result": "ok"}
+
+    registry = Registry()
+    registry.register("task.run", Module())
+    acl = ACL([ACLRule(["@external"], ["task.run"], "allow", conditions={"scopes": ["run"]})])
+    actor = Identity("actor", issuer="issuer")
+    subject = Identity("subject", scopes=["read", "run"], issuer="issuer")
+    original = subject.delegate(actor, ["run"])
+    narrowed = subject.delegate(actor, ["read"])
+    different = Identity("other", scopes=["run"], issuer="issuer").delegate(actor, ["run"])
+    with Executor(registry, acl=acl) as executor:
+        bridge = AsyncTaskBridge.with_limits(executor)
+        task_id = (await bridge.submit("task.run", {}, Context.create(original)))["task_id"]
+        try:
+            for identity in (None, narrowed, different):
+                _, denied, _ = await bridge.handle_meta_tool(
+                    "__apcore_task_status", {"task_id": task_id}, router_extra={"identity": identity}
+                )
+                assert denied
+            content, denied, _ = await bridge.handle_meta_tool(
+                "__apcore_task_status", {"task_id": task_id}, router_extra={"identity": original}
+            )
+            assert not denied and json.loads(content[0]["text"])["task_id"] == task_id
+        finally:
+            await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_after_write", [False, True])
+async def test_scoped_task_publication_waits_for_storage(
+    monkeypatch: pytest.MonkeyPatch, fail_after_write: bool
+) -> None:
+    class Executor(_SlowExecutor):
+        def get_callable_descriptor(self, module_id: str, context: Context) -> object:
+            return object()
+
+    allocating = asyncio.Event()
+    allow_store = asyncio.Event()
+    stored = asyncio.Event()
+    release = asyncio.Event()
+
+    executor = Executor()
+    manager = AsyncTaskManager(executor)
+    save = manager._store.save
+
+    async def delayed_save(info: TaskInfo) -> None:
+        scoped_pending = info.module_id == "task.scoped" and info.status == TaskStatus.PENDING
+        if scoped_pending:
+            allocating.set()
+            await allow_store.wait()
+        await save(info)
+        if scoped_pending:
+            stored.set()
+            await release.wait()
+            if fail_after_write:
+                raise RuntimeError("write acknowledged unsuccessfully")
+
+    monkeypatch.setattr(manager._store, "save", delayed_save)
+    bridge = AsyncTaskBridge(manager)
+    observer = AsyncTaskBridge(manager)
+    aliased = AsyncTaskBridge(AsyncTaskManager(executor, store=manager._store))
+    identity = Identity("account", scopes=["run"])
+
+    async def listed(current: Identity | None = None, via: AsyncTaskBridge = observer) -> list[str]:
+        content, failed, _ = await via.handle_meta_tool("__apcore_task_list", {}, router_extra={"identity": current})
+        assert not failed
+        return [task["task_id"] for task in json.loads(content[0]["text"])["tasks"]]
+
+    legacy_task = (await bridge.submit("task.legacy", {}, None))["task_id"]
+    scoped = asyncio.create_task(bridge.submit("task.scoped", {}, Context.create(identity)))
+    second_legacy: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        with pytest.raises(ACLDeniedError):
+            await aliased.submit("task.scoped", {}, Context.create(identity))
+        await asyncio.wait_for(allocating.wait(), timeout=2)
+        second_legacy = asyncio.create_task(bridge.submit("task.legacy", {}, None))
+        # Let the other submission collect any stale owners before the store write.
+        await asyncio.sleep(0)
+        allow_store.set()
+        await asyncio.wait_for(stored.wait(), timeout=2)
+        assert await listed() == [legacy_task]
+        assert await listed(identity) == []
+        release.set()
+        if fail_after_write:
+            with pytest.raises(RuntimeError, match="write acknowledged unsuccessfully"):
+                await scoped
+            assert await listed(identity) == []
+        else:
+            task = await scoped
+            assert await listed(identity) == [task["task_id"]]
+        second_task = await second_legacy
+        assert await listed() == [legacy_task, second_task["task_id"]]
+        assert await listed(via=aliased) == [legacy_task, second_task["task_id"]]
+    finally:
+        allow_store.set()
+        release.set()
+        await asyncio.gather(scoped, return_exceptions=True)
+        if second_legacy is not None:
+            await asyncio.gather(second_legacy, return_exceptions=True)
+        await bridge.shutdown()

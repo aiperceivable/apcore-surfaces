@@ -107,6 +107,11 @@ pub trait ApprovalStore: Send + Sync + 'static {
         false
     }
 
+    /// Opt in when the store binds delegated reads and atomic consumption to the authority key.
+    fn supports_authority_scope(&self) -> bool {
+        false
+    }
+
     /// Persist a new pending approval record.
     async fn save_pending(
         &self,
@@ -117,6 +122,14 @@ pub trait ApprovalStore: Send + Sync + 'static {
 
     /// Return the current record, or None if approval_id is unknown.
     async fn get_result(&self, approval_id: &str) -> StoreResult<Option<ApprovalRecord>>;
+
+    /// Legacy status lookup. Authority-aware stores must exclude delegated records.
+    async fn get_legacy_result(&self, approval_id: &str) -> StoreResult<Option<ApprovalRecord>> {
+        if self.supports_authority_scope() {
+            return Ok(None);
+        }
+        self.get_result(approval_id).await
+    }
 
     /// Mark approval_id as approved or rejected.
     /// Returns false if the id is unknown or already resolved.
@@ -164,6 +177,41 @@ pub trait ApprovalStore: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Persist a scoped record bound to the supplied current Core authority.
+    async fn save_authority_pending(
+        &self,
+        _audit_id: &str,
+        _verifier: &ApprovalVerifier,
+        _scope: &ApprovalScope,
+        _authority_key: &str,
+    ) -> StoreResult<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "authority-scoped approval storage unavailable",
+        )
+        .into())
+    }
+
+    /// Read status only for the current Core authority that requested the approval.
+    async fn get_authority_result(
+        &self,
+        _audit_id: &str,
+        _authority_key: &str,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        Ok(None)
+    }
+
+    /// Match the verifier, invocation and authority and atomically consume an approved record.
+    async fn consume_authority_scoped(
+        &self,
+        _audit_id: &str,
+        _verifier: &ApprovalVerifier,
+        _scope: &ApprovalScope,
+        _authority_key: &str,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        Ok(None)
+    }
+
     /// Start a background TTL sweep for this store, returning the spawned
     /// task handle (or `None` if the store needs no sweeping).
     ///
@@ -192,6 +240,7 @@ struct InternalRecord {
 struct ScopedApproval {
     verifier: Option<ApprovalVerifier>,
     scope: ApprovalScope,
+    authority_key: Option<String>,
 }
 
 impl InternalRecord {
@@ -315,6 +364,50 @@ impl InMemoryApprovalStore {
         );
         Ok(())
     }
+
+    async fn insert_scoped(
+        &self,
+        audit_id: &str,
+        verifier: &ApprovalVerifier,
+        scope: &ApprovalScope,
+        authority_key: Option<&str>,
+    ) -> StoreResult<()> {
+        self.insert_pending(
+            audit_id,
+            &scope.module_id,
+            Some(ScopedApproval {
+                verifier: Some(*verifier),
+                scope: scope.clone(),
+                authority_key: authority_key.map(str::to_owned),
+            }),
+        )
+        .await
+    }
+
+    async fn consume_matching_scope(
+        &self,
+        audit_id: &str,
+        verifier: &ApprovalVerifier,
+        scope: &ApprovalScope,
+        authority_key: Option<&str>,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        let mut records = self.records.lock().await;
+        let result = self.live_record(&mut records, audit_id).and_then(|record| {
+            let scoped = record.scoped.as_mut()?;
+            let matches_verifier = bool::from(scoped.verifier.as_ref()?.ct_eq(verifier));
+            if !matches_verifier
+                || scoped.scope != *scope
+                || scoped.authority_key.as_deref() != authority_key
+            {
+                return None;
+            }
+            if record.status == ApprovalStatus::Approved {
+                scoped.verifier = None;
+            }
+            Some(record.snapshot())
+        });
+        Ok(result)
+    }
 }
 
 impl Default for InMemoryApprovalStore {
@@ -326,6 +419,10 @@ impl Default for InMemoryApprovalStore {
 #[async_trait]
 impl ApprovalStore for InMemoryApprovalStore {
     fn supports_scoped_approval(&self) -> bool {
+        true
+    }
+
+    fn supports_authority_scope(&self) -> bool {
         true
     }
 
@@ -342,6 +439,20 @@ impl ApprovalStore for InMemoryApprovalStore {
         let mut records = self.records.lock().await;
         Ok(self
             .live_record(&mut records, approval_id)
+            .map(|record| record.snapshot()))
+    }
+
+    async fn get_legacy_result(&self, approval_id: &str) -> StoreResult<Option<ApprovalRecord>> {
+        let mut records = self.records.lock().await;
+        Ok(self
+            .live_record(&mut records, approval_id)
+            .filter(|record| {
+                record
+                    .scoped
+                    .as_ref()
+                    .and_then(|scoped| scoped.authority_key.as_ref())
+                    .is_none()
+            })
             .map(|record| record.snapshot()))
     }
 
@@ -376,15 +487,7 @@ impl ApprovalStore for InMemoryApprovalStore {
         verifier: &ApprovalVerifier,
         scope: &ApprovalScope,
     ) -> StoreResult<()> {
-        self.insert_pending(
-            audit_id,
-            &scope.module_id,
-            Some(ScopedApproval {
-                verifier: Some(*verifier),
-                scope: scope.clone(),
-            }),
-        )
-        .await
+        self.insert_scoped(audit_id, verifier, scope, None).await
     }
 
     async fn get_scoped_result(
@@ -394,8 +497,9 @@ impl ApprovalStore for InMemoryApprovalStore {
     ) -> StoreResult<Option<ApprovalRecord>> {
         let mut records = self.records.lock().await;
         let result = self.live_record(&mut records, audit_id).and_then(|record| {
-            let scope = &record.scoped.as_ref()?.scope;
-            (scope.principal.as_ref() == principal).then(|| record.snapshot())
+            let scoped = record.scoped.as_ref()?;
+            (scoped.authority_key.is_none() && scoped.scope.principal.as_ref() == principal)
+                .then(|| record.snapshot())
         });
         Ok(result)
     }
@@ -406,19 +510,42 @@ impl ApprovalStore for InMemoryApprovalStore {
         verifier: &ApprovalVerifier,
         scope: &ApprovalScope,
     ) -> StoreResult<Option<ApprovalRecord>> {
+        self.consume_matching_scope(audit_id, verifier, scope, None)
+            .await
+    }
+
+    async fn save_authority_pending(
+        &self,
+        audit_id: &str,
+        verifier: &ApprovalVerifier,
+        scope: &ApprovalScope,
+        authority_key: &str,
+    ) -> StoreResult<()> {
+        self.insert_scoped(audit_id, verifier, scope, Some(authority_key))
+            .await
+    }
+
+    async fn get_authority_result(
+        &self,
+        audit_id: &str,
+        authority_key: &str,
+    ) -> StoreResult<Option<ApprovalRecord>> {
         let mut records = self.records.lock().await;
-        let result = self.live_record(&mut records, audit_id).and_then(|record| {
-            let scoped = record.scoped.as_mut()?;
-            let matches_verifier = bool::from(scoped.verifier.as_ref()?.ct_eq(verifier));
-            if !matches_verifier || scoped.scope != *scope {
-                return None;
-            }
-            if record.status == ApprovalStatus::Approved {
-                scoped.verifier = None;
-            }
-            Some(record.snapshot())
-        });
-        Ok(result)
+        Ok(self.live_record(&mut records, audit_id).and_then(|record| {
+            let scoped = record.scoped.as_ref()?;
+            (scoped.authority_key.as_deref() == Some(authority_key)).then(|| record.snapshot())
+        }))
+    }
+
+    async fn consume_authority_scoped(
+        &self,
+        audit_id: &str,
+        verifier: &ApprovalVerifier,
+        scope: &ApprovalScope,
+        authority_key: &str,
+    ) -> StoreResult<Option<ApprovalRecord>> {
+        self.consume_matching_scope(audit_id, verifier, scope, Some(authority_key))
+            .await
     }
 
     fn start_sweep(&self) -> Option<tokio::task::JoinHandle<()>> {

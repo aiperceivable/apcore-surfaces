@@ -6,6 +6,7 @@
 
 import jwt from "jsonwebtoken";
 import { createIdentity, type Identity } from "apcore-js";
+import { readDelegatedJwtAuthority, validateDelegatedClaims, type DelegatedClaims } from "apcore-toolkit";
 import type { Authenticator } from "./types.js";
 
 /** Mapping from JWT claims to Identity fields. */
@@ -40,7 +41,11 @@ export interface JWTAuthenticatorOptions {
   requireClaims?: string[];
   /** If true (default), unauthenticated requests are rejected. If false, they proceed without identity. */
   requireAuth?: boolean;
+  /** Opt in to scope and actor projection from a verified token. */
+  delegatedClaims?: DelegatedClaims;
 }
+
+export type { DelegatedClaims };
 
 /**
  * Authenticator that verifies JWT Bearer tokens from the Authorization header.
@@ -58,6 +63,7 @@ export class JWTAuthenticator implements Authenticator {
   private readonly _claimMapping: Required<Omit<ClaimMapping, "attrs">> & { attrs?: string[] };
   private readonly _requireClaims: string[];
   private readonly _requireAuth: boolean;
+  private readonly _delegatedClaims?: DelegatedClaims;
 
   constructor(options: JWTAuthenticatorOptions) {
     const keyValue = options.key ?? options.secret;
@@ -66,7 +72,7 @@ export class JWTAuthenticator implements Authenticator {
     // gracefully (return null) when authenticate() is called without a valid key.
     // requireAuth belongs on AuthMiddleware, not on the authenticator itself.
     this._secret = keyValue ?? "";
-    this._algorithms = options.algorithms ?? ["HS256"];
+    this._algorithms = [...(options.algorithms ?? ["HS256"])];
     this._audience = options.audience;
     this._issuer = options.issuer;
     this._claimMapping = {
@@ -77,11 +83,21 @@ export class JWTAuthenticator implements Authenticator {
     };
     this._requireClaims = options.requireClaims ?? ["sub"];
     this._requireAuth = options.requireAuth ?? true;
+    if (options.delegatedClaims !== undefined) {
+      if (!this._secret || this._algorithms.includes("none")) {
+        throw new TypeError("Delegated JWT claims require signed algorithms and a verification key");
+      }
+      this._delegatedClaims = validateDelegatedClaims(options.delegatedClaims, this._issuer, this._audience);
+    }
   }
 
   /** Whether unauthenticated requests should be rejected. */
   get requireAuth(): boolean {
     return this._requireAuth;
+  }
+
+  get rejectInvalidCredentials(): boolean {
+    return this._delegatedClaims !== undefined;
   }
 
   async authenticate(headers: Record<string, string>): Promise<Identity | null> {
@@ -125,7 +141,9 @@ export class JWTAuthenticator implements Authenticator {
         if (value === undefined || value === null) return null;
       }
 
-      const rawId = claims[this._claimMapping.id];
+      const mapping = this._delegatedClaims;
+      const authority = mapping && readDelegatedJwtAuthority(claims, mapping, Math.floor(Date.now() / 1000));
+      const rawId = authority?.subjectId ?? claims[this._claimMapping.id];
       if (rawId === undefined || rawId === null) return null;
       const id = String(rawId);
       // [D11-107] Match Python's `claims.get(...) or "user"` semantics —
@@ -138,16 +156,14 @@ export class JWTAuthenticator implements Authenticator {
       const roles = Array.isArray(rawRoles) ? rawRoles.map(String) : [];
 
       // Extract attrs from payload
-      const attrs: Record<string, unknown> = {};
-      if (this._claimMapping.attrs) {
-        for (const key of this._claimMapping.attrs) {
-          if (key in claims) {
-            attrs[key] = claims[key];
-          }
-        }
-      }
+      const attrs = Object.fromEntries((this._claimMapping.attrs ?? [])
+        .filter(key => Object.hasOwn(claims, key) && (!mapping || !["act", "scope", mapping.scpClaim].includes(key)))
+        .map(key => [key, claims[key]]));
 
-      return createIdentity(id, type, roles, attrs);
+      if (!authority) return createIdentity(id, type, roles, attrs);
+      const { issuer, scopes, actor } = authority;
+      const subject = createIdentity(id, type, roles, attrs, { issuer, scopes });
+      return actor ? subject.delegate(createIdentity(actor.id, actor.type, actor.roles, {}, { issuer }), scopes) : subject;
     } catch {
       // Verification failed (expired, invalid signature, etc.)
       return null;

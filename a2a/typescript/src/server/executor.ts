@@ -18,6 +18,7 @@ import {
 } from "../adapters/errors.js";
 import type { PartConverter } from "../adapters/parts.js";
 import type { Registry } from "../adapters/agent-card.js";
+import { identityOf, scopedOwner, TASK_OWNER_KEY, TASK_SKILL_KEY } from "./context.js";
 
 /**
  * This package's default error-redaction policy, used when no deployment has
@@ -175,6 +176,8 @@ export class ApCoreAgentExecutor implements AgentExecutor {
       clientCancellation: new AbortController(),
     };
     this.executions.set(eventBus, task);
+    const requestedSkill = context.userMessage?.metadata?.skillId;
+    const owner = scopedOwner(identityOf(context.context) ?? getAuthIdentity());
     eventBus.publish(
       AgentEvent.task({
         id: taskId,
@@ -182,16 +185,16 @@ export class ApCoreAgentExecutor implements AgentExecutor {
         status: makeStatus(TaskState.TASK_STATE_SUBMITTED),
         artifacts: [],
         history: [],
-        metadata: undefined,
+        metadata: owner === null || typeof requestedSkill !== "string"
+          ? undefined : { [TASK_OWNER_KEY]: owner, [TASK_SKILL_KEY]: requestedSkill },
       }),
     );
 
     if (task.terminal !== undefined) return;
 
     // 2. Get skillId from message metadata
-    const metadata = context.userMessage?.metadata ?? {};
-    const skillId = metadata.skillId as string | undefined;
-    if (!skillId) {
+    const skillId = requestedSkill;
+    if (typeof skillId !== "string" || !skillId) {
       this.publishOutcome(task, eventBus, "submitted", "failed", "Missing required parameter: metadata.skillId");
       return;
     }

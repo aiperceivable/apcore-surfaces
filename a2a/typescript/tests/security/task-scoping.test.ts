@@ -14,8 +14,11 @@ import { describe, it, expect, vi, afterAll } from "vitest";
 import request from "supertest";
 import type { Express } from "express";
 import type { Server } from "node:http";
-import { createIdentity } from "apcore-js";
+import { InMemoryTaskStore } from "@a2a-js/sdk/server";
+import { ACL, Executor, Registry as CoreRegistry, createIdentity } from "apcore-js";
+import jwt from "jsonwebtoken";
 import { A2AServerFactory } from "../../src/server/factory.js";
+import { JWTAuthenticator } from "../../src/auth/jwt.js";
 import type { Registry } from "../../src/adapters/agent-card.js";
 import type { Authenticator } from "../../src/auth/types.js";
 
@@ -126,13 +129,13 @@ async function rpc(
 }
 
 /** Run one task as `who` and return its id. */
-async function submit(app: Express, who: string, messageId: string): Promise<string> {
+async function submit(app: Express, who: string, messageId: string, skillId = "echo"): Promise<string> {
   const body = await rpc(app, who, "SendMessage", {
     message: {
       messageId,
       role: "ROLE_USER",
       parts: [{ text: "{}" }],
-      metadata: { skillId: "echo" },
+      metadata: { skillId },
     },
   });
   expect(body.error, JSON.stringify(body)).toBeUndefined();
@@ -149,6 +152,122 @@ async function listTaskIds(app: Express, who: string): Promise<string[]> {
   const tasks = (body.result as { tasks?: { id: string }[] }).tasks ?? [];
   return tasks.map((t) => t.id).sort();
 }
+
+describe("verified delegated A2A task authority", () => {
+  const key = "a2a-signed-test-secret";
+  const issuer = "https://issuer.example";
+  const audience = "a2a-test";
+  const skillId = "secure.echo";
+  const auth = new JWTAuthenticator(key, {
+    issuer, audience, delegatedClaims: { scpClaim: "scp", actorRolesClaim: "currentRoles" },
+  });
+
+  function signed(claims: Record<string, unknown> = {}, secret = key): string {
+    return jwt.sign({
+      iss: issuer, aud: audience, sub: "subject", exp: Math.floor(Date.now() / 1000) + 300,
+      scp: ["read", "write"], roles: ["subject-role"],
+      act: { sub: "same-actor", currentRoles: ["runner"], act: { sub: "prior", currentRoles: ["admin"] } },
+      ...claims,
+    }, secret);
+  }
+
+  it("validates the signed issuer, audience and time window before selecting a current actor", () => {
+    const current = auth.authenticate({ authorization: `Bearer ${signed()}` });
+    expect(current?.roles).toEqual(["runner"]);
+    expect(current?.rootSubject.roles).toEqual(["subject-role"]);
+    expect(current?.delegationDepth).toBe(1);
+    expect(current?.scopes).toEqual(["read", "write"]);
+    for (const token of [signed({}, "different-key"), signed({ iss: "wrong" }), signed({ aud: "wrong" }),
+      signed({ iat: Math.floor(Date.now() / 1000) + 150 }), signed({ scope: "yes", scp: ["no"] })]) {
+      expect(auth.authenticate({ authorization: `Bearer ${token}` })).toBeNull();
+    }
+  });
+
+  it("hides old task results, lists, and push subscriptions after scope or subject changes", async () => {
+    const registry = new CoreRegistry();
+    await registry.register(skillId, {
+      description: "Echo a scoped result",
+      inputSchema: { type: "object" }, outputSchema: { type: "object" },
+      execute: () => ({ value: "private" }),
+    });
+    const executor = new Executor({ registry, acl: new ACL([{
+      callers: ["@external"], targets: [skillId], effect: "allow",
+      conditions: { scopes: ["write"], roles: ["runner"], subject_roles: ["subject-role"] },
+    }]) });
+    const { app } = new A2AServerFactory().create(registry as never, executor, {
+      name: "Scoped Agent", description: "d", version: "1", url: "http://localhost",
+      auth, pushNotifications: true,
+    });
+    const broad = signed();
+    const result = await rpc(app, broad, "SendMessage", {
+      message: { messageId: "m-scoped", role: "ROLE_USER", parts: [{ text: "{}" }], metadata: { skillId } },
+    });
+    expect(result.error, JSON.stringify(result)).toBeUndefined();
+    const task = (result.result as { task: { id: string } }).task.id;
+    expect((await rpc(app, signed(), "GetTask", { id: task })).result?.id).toBe(task);
+    expect(await listTaskIds(app, signed())).toEqual([task]);
+    for (const current of [signed({ scp: ["read"] }), signed({ sub: "other-subject" })]) {
+      expect((await rpc(app, current, "GetTask", { id: task })).error?.code).toBe(TASK_NOT_FOUND_CODE);
+      expect((await rpc(app, current, "ListTaskPushNotificationConfigs", { taskId: task })).error?.code).toBe(TASK_NOT_FOUND_CODE);
+      expect(await listTaskIds(app, current)).toEqual([]);
+    }
+    const invalid = await request(await serverFor(app)).post("/")
+      .set("Authorization", `Bearer ${signed({}, "different-key")}`).set("A2A-Version", "1.0")
+      .send({ jsonrpc: "2.0", id: "bad-token", method: "GetTask", params: { id: task } });
+    expect(invalid.status).toBe(401);
+  });
+
+  it("pages through hidden tasks without exposing storage cursors or counts", async () => {
+    class SingleRowStore extends InMemoryTaskStore {
+      override list(...[params, context]: Parameters<InMemoryTaskStore["list"]>) {
+        return super.list({ ...params, pageSize: 1 }, context);
+      }
+    }
+    const registry = new CoreRegistry();
+    const readSkill = "secure.read";
+    for (const id of [skillId, readSkill]) {
+      await registry.register(id, {
+        description: "Return a scoped result",
+        inputSchema: { type: "object" }, outputSchema: { type: "object" },
+        execute: () => ({ value: "private" }),
+      });
+    }
+    const executor = new Executor({ registry, acl: new ACL([
+      { callers: ["@external"], targets: [skillId], effect: "allow", conditions: { scopes: ["write"] } },
+      { callers: ["@external"], targets: [readSkill], effect: "allow", conditions: { scopes: ["read"] } },
+    ]) });
+    const { app } = new A2AServerFactory().create(registry as never, executor, {
+      name: "Scoped Agent", description: "d", version: "1", url: "http://localhost",
+      auth, taskStore: new SingleRowStore(),
+    });
+    const broad = signed();
+    const oldest = await submit(app, broad, "m-old-visible", readSkill);
+    const recent = await submit(app, broad, "m-new-visible", readSkill);
+    const hidden = await submit(app, broad, "m-hidden", skillId);
+    const narrow = signed({ scp: ["read"] });
+    const query = { status: "TASK_STATE_COMPLETED", pageSize: 1 };
+    const page = await rpc(app, narrow, "ListTasks", query);
+    const first = page.result as { tasks: { id: string }[]; totalSize: number; nextPageToken: string };
+    expect(page.error, JSON.stringify(page)).toBeUndefined();
+    expect(first.tasks.map(task => task.id)).toEqual([recent]);
+    expect(first.totalSize).toBe(2);
+    const cursor = first.nextPageToken;
+    expect(cursor).toBeTruthy();
+    expect(cursor).not.toContain(hidden);
+    for (const credential of [signed({ scp: ["write"] }), signed({ sub: "other", scp: ["read"] })]) {
+      const replay = await rpc(app, credential, "ListTasks", { ...query, pageToken: cursor });
+      expect(replay.error?.message).toBe("Invalid page token");
+    }
+    const replay = await rpc(app, narrow, "ListTasks", { ...query, contextId: hidden, pageToken: cursor });
+    expect(replay.error?.message).toBe("Invalid page token");
+    const next = await rpc(app, narrow, "ListTasks", { ...query, pageToken: cursor });
+    const second = next.result as typeof first;
+    expect(next.error, JSON.stringify(next)).toBeUndefined();
+    expect(second.tasks.map(task => task.id)).toEqual([oldest]);
+    expect(second.totalSize).toBe(2);
+    expect(second.nextPageToken ?? "").toBe("");
+  });
+});
 
 describe("task scoping", () => {
   describe("reads", () => {

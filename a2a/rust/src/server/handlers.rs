@@ -177,6 +177,18 @@ fn acl_filtered_card(
     identity: Option<&Identity>,
     hide_approval_gated: bool,
 ) -> Value {
+    if let Some(identity) = identity.filter(|identity| identity.scopes().is_some()) {
+        let mut filtered = card.clone();
+        if let Some(skills) = filtered.get_mut("skills").and_then(Value::as_array_mut) {
+            skills.retain(|skill| {
+                skill
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| executor.scoped_skill_visible(id, identity))
+            });
+        }
+        return filtered;
+    }
     let Some(acl) = executor.acl() else {
         return card.clone();
     };
@@ -324,6 +336,9 @@ impl FilteredCard {
         executor: &ApCoreAgentExecutor,
         identity: Option<&Identity>,
     ) -> Arc<Value> {
+        if identity.is_some_and(|identity| identity.scopes().is_some()) {
+            return Arc::new(acl_filtered_card(&self.card, executor, identity, false));
+        }
         let key = OwnerId::from_identity(identity).as_str().to_string();
         if let Some(cached) = self.cache.lock().unwrap().get(&key) {
             return cached.clone();
@@ -725,7 +740,7 @@ async fn fail_task(
         history: vec![],
     };
     let task_json = serde_json::to_value(&task).unwrap();
-    save_task(state, task_id, task_json.clone(), ctx).await?;
+    save_task(state, task_id, task_json.clone(), ctx, None).await?;
     notify_push(
         state,
         task_id,
@@ -759,8 +774,14 @@ async fn failed_task_stream(
         artifacts: vec![],
         history: vec![],
     };
-    if let Err((code, message)) =
-        save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await
+    if let Err((code, message)) = save_task(
+        state,
+        &task_id,
+        serde_json::to_value(&task).unwrap(),
+        ctx,
+        None,
+    )
+    .await
     {
         return Json(rpc_error(&id, code, &message)).into_response();
     }
@@ -811,6 +832,7 @@ async fn handle_send(
             message,
         }) => return fail_task(state, &task_id, &context_id, ctx, message).await,
     };
+    check_scoped_continuation(state, ctx, params).await?;
 
     // Reject unknown skills with a FAILED task (Python/TS parity).
     if !state.skill_ids.contains(&skill_id) {
@@ -829,7 +851,14 @@ async fn handle_send(
     let running = state.running_tasks.register(&task_id, ctx);
     let execution = &running.execution;
 
-    save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await?;
+    save_task(
+        state,
+        &task_id,
+        serde_json::to_value(&task).unwrap(),
+        ctx,
+        Some(&skill_id),
+    )
+    .await?;
 
     let result = state
         .executor
@@ -857,7 +886,7 @@ async fn handle_send(
         }
     }
     let task_json = serde_json::to_value(&task).unwrap();
-    save_task(state, &task_id, task_json.clone(), ctx).await?;
+    save_task(state, &task_id, task_json.clone(), ctx, Some(&skill_id)).await?;
     drop(terminal);
 
     // Deliver the terminal status to any registered webhook.
@@ -894,6 +923,9 @@ async fn handle_stream(
             message,
         }) => return failed_task_stream(state, task_id, context_id, ctx, id, message).await,
     };
+    if let Err((code, message)) = check_scoped_continuation(state, ctx, params).await {
+        return Json(rpc_error(&id, code, &message)).into_response();
+    }
 
     let running = state.running_tasks.register(&task_id, ctx);
 
@@ -919,6 +951,7 @@ async fn handle_stream(
                 &task_id,
                 serde_json::to_value(&task).unwrap(),
                 &ctx2,
+                Some(&skill_id),
             )
             .await
             {
@@ -957,6 +990,7 @@ async fn handle_stream(
                 &task_id,
                 serde_json::to_value(&task).unwrap(),
                 &ctx2,
+                Some(&skill_id),
             )
             .await
             {
@@ -999,10 +1033,12 @@ async fn handle_stream(
                     "Execution timed out",
                 )));
             }
-            let chunks =
-                state2
-                    .executor
-                    .stream_channel(skill_id, inputs, identity, execution.token.clone());
+            let chunks = state2.executor.stream_channel(
+                skill_id.clone(),
+                inputs,
+                identity,
+                execution.token.clone(),
+            );
             forward_artifacts(&state2, &task, chunks, &tx, &id).await
         };
         let mut canceled = execution.client_canceled.subscribe();
@@ -1036,6 +1072,7 @@ async fn handle_stream(
                     &task_id,
                     serde_json::to_value(&task).unwrap(),
                     &ctx2,
+                    Some(&skill_id),
                 )
                 .await
                 {
@@ -1153,11 +1190,15 @@ async fn handle_get(
 /// (`a2a-python`'s `OwnerResolver`, `a2a-js`'s per-context bucket); the spec
 /// repo is silent on it, so this follows upstream.
 async fn handle_list(state: &AppState, ctx: &CallContext) -> Result<Vec<Value>, (i32, String)> {
-    state
+    let tasks = state
         .task_store
         .list(&ListParams::new(), ctx)
         .await
-        .map_err(|e| store_failure("task store list", e))
+        .map_err(|e| store_failure("task store list", e))?;
+    Ok(tasks
+        .into_iter()
+        .filter_map(|task| visible_task(state, ctx, task).map(|record| record.task))
+        .collect())
 }
 
 /// `tasks/cancel` — signal cooperative cancellation and mark the task canceled.
@@ -1187,12 +1228,12 @@ async fn handle_cancel(
 
     // Another principal's task reads back as absent, so it is reported as
     // missing rather than as forbidden.
-    let stored = read_task(state, task_id, ctx)
+    let stored = read_task_record(state, task_id, ctx)
         .await?
         .ok_or((CODE_TASK_NOT_FOUND, "Task not found".to_string()))?;
 
     // A task whose stored JSON cannot be read back is unusable, not cancelable.
-    let mut task: Task = serde_json::from_value(stored)
+    let mut task: Task = serde_json::from_value(stored.task)
         .map_err(|_| (CODE_TASK_NOT_FOUND, "Task not found".to_string()))?;
 
     if task.status.state.is_terminal() {
@@ -1213,7 +1254,14 @@ async fn handle_cancel(
     let task_json = serde_json::to_value(&task).unwrap();
     // Persist the accepted cancellation before waking the worker. The store
     // write is serialized with local execution's competing terminal write.
-    save_task(state, task_id, task_json.clone(), ctx).await?;
+    save_task(
+        state,
+        task_id,
+        task_json.clone(),
+        ctx,
+        stored.skill.as_deref(),
+    )
+    .await?;
     if let Some(execution) = &execution {
         execution
             .client_canceled
@@ -1256,11 +1304,10 @@ async fn owned_task_id<'a>(
         CODE_INVALID_PARAMS,
         "Missing required parameter: id".to_string(),
     ))?;
-    match state.task_store.get(task_id, ctx).await {
-        Ok(Some(_)) => Ok(task_id),
-        Ok(None) => Err((CODE_TASK_NOT_FOUND, "Task not found".to_string())),
-        Err(e) => Err(store_failure(&format!("task store read for {task_id}"), e)),
-    }
+    read_task(state, task_id, ctx)
+        .await?
+        .map(|_| task_id)
+        .ok_or((CODE_TASK_NOT_FOUND, "Task not found".to_string()))
 }
 
 /// `tasks/pushNotificationConfig/set` — register a webhook for a task.
@@ -1340,6 +1387,11 @@ async fn notify_push(state: &AppState, task_id: &str, ctx: &CallContext, event: 
         Ok(None) => return,
         Err(_) => return,
     };
+    if ctx.scoped_identity().is_some()
+        && !matches!(read_task(state, task_id, ctx).await, Ok(Some(_)))
+    {
+        return;
+    }
     let url = match cfg.get("url").and_then(Value::as_str) {
         Some(u) => u.to_string(),
         None => return,
@@ -1406,9 +1458,13 @@ async fn store_operation<T>(
 async fn save_task(
     state: &AppState,
     task_id: &str,
-    task: Value,
+    mut task: Value,
     ctx: &CallContext,
+    skill: Option<&str>,
 ) -> Result<(), (i32, String)> {
+    if ctx.scoped_identity().is_some() {
+        task[TASK_AUTHORITY] = json!({"owner": ctx.owner().as_str(), "skill": skill});
+    }
     store_operation(
         state,
         &format!("task store write for {task_id}"),
@@ -1422,12 +1478,68 @@ async fn read_task(
     task_id: &str,
     ctx: &CallContext,
 ) -> Result<Option<Value>, (i32, String)> {
-    store_operation(
+    Ok(read_task_record(state, task_id, ctx)
+        .await?
+        .map(|record| record.task))
+}
+
+const TASK_AUTHORITY: &str = "_apcoreTaskAuthority";
+
+struct VisibleTask {
+    task: Value,
+    skill: Option<String>,
+}
+
+/// Check the durable binding before exposing a task and strip private metadata from the wire.
+fn visible_task(state: &AppState, ctx: &CallContext, mut task: Value) -> Option<VisibleTask> {
+    let binding = task
+        .as_object_mut()
+        .and_then(|object| object.remove(TASK_AUTHORITY));
+    let Some(identity) = ctx.scoped_identity() else {
+        return binding
+            .is_none()
+            .then_some(VisibleTask { task, skill: None });
+    };
+    let binding = binding?;
+    let owner = binding.get("owner").and_then(Value::as_str)?;
+    let skill = binding.get("skill").and_then(Value::as_str)?;
+    if owner != ctx.owner().as_str() || !state.executor.scoped_skill_visible(skill, identity) {
+        return None;
+    }
+    Some(VisibleTask {
+        task,
+        skill: Some(skill.to_owned()),
+    })
+}
+
+async fn read_task_record(
+    state: &AppState,
+    task_id: &str,
+    ctx: &CallContext,
+) -> Result<Option<VisibleTask>, (i32, String)> {
+    let task = store_operation(
         state,
         &format!("task store read for {task_id}"),
         state.task_store.get(task_id, ctx),
     )
-    .await
+    .await?;
+    Ok(task.and_then(|task| visible_task(state, ctx, task)))
+}
+
+async fn check_scoped_continuation(
+    state: &AppState,
+    ctx: &CallContext,
+    params: &Value,
+) -> Result<(), (i32, String)> {
+    if let (Some(_), Some(task_id)) = (
+        ctx.scoped_identity(),
+        params.pointer("/message/taskId").and_then(Value::as_str),
+    ) {
+        if read_task(state, task_id, ctx).await?.is_none() {
+            return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string()));
+        }
+    }
+    Ok(())
 }
 
 fn canceled_by_client() -> TaskStatus {

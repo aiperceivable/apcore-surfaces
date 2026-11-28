@@ -32,6 +32,8 @@ use apcore::context::Identity;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OwnerId(String);
 
+const OWNER_PREFIX: &str = "apcore:";
+
 impl OwnerId {
     /// The shared bucket for requests carrying no authenticated identity.
     pub fn anonymous() -> Self {
@@ -40,7 +42,17 @@ impl OwnerId {
 
     /// The owner for a request's authenticated principal.
     pub fn from_identity(identity: Option<&Identity>) -> Self {
-        Self(identity.map(|i| i.id().to_string()).unwrap_or_default())
+        let Some(identity) = identity else {
+            return Self::anonymous();
+        };
+        if let Some(owner) = identity.owner_key() {
+            return Self(format!("{OWNER_PREFIX}scoped:{owner}"));
+        }
+        let id = identity.id();
+        if id.starts_with(OWNER_PREFIX) {
+            return Self(format!("{OWNER_PREFIX}legacy:{id}"));
+        }
+        Self(id.to_owned())
     }
 
     /// The owner as a string; empty for the anonymous bucket.
@@ -67,15 +79,27 @@ impl std::fmt::Display for OwnerId {
 /// arbitrary state bag later is then a non-breaking change. Upstream's
 /// equivalent (`a2a-python`'s `ServerCallContext`) grew exactly those fields
 /// over time.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct CallContext {
     owner: OwnerId,
+    scoped_identity: Option<Identity>,
+}
+
+impl std::fmt::Debug for CallContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallContext")
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CallContext {
     /// A context for an explicit owner.
     pub fn new(owner: OwnerId) -> Self {
-        Self { owner }
+        Self {
+            owner,
+            scoped_identity: None,
+        }
     }
 
     /// A context for the shared anonymous bucket.
@@ -85,12 +109,21 @@ impl CallContext {
 
     /// A context for a request's authenticated principal.
     pub fn from_identity(identity: Option<&Identity>) -> Self {
-        Self::new(OwnerId::from_identity(identity))
+        Self {
+            owner: OwnerId::from_identity(identity),
+            scoped_identity: identity
+                .filter(|identity| identity.scopes().is_some())
+                .cloned(),
+        }
     }
 
     /// The principal this call is scoped to.
     pub fn owner(&self) -> &OwnerId {
         &self.owner
+    }
+
+    pub(crate) fn scoped_identity(&self) -> Option<&Identity> {
+        self.scoped_identity.as_ref()
     }
 }
 
@@ -158,6 +191,8 @@ impl StoreError {
 /// - [`list`](TaskStore::list) **must** return only `ctx.owner()`'s tasks.
 /// - [`save`](TaskStore::save) **must** store under `ctx.owner()`. Two owners
 ///   may hold the same task id without seeing each other's copy.
+/// - Store the complete JSON value. Scoped tasks carry private adapter metadata
+///   for an authorization check when read, including after a restart.
 ///
 /// The simplest way to satisfy all four at once is to bucket by owner — key the
 /// backing map (or the database's primary key) on `(owner, task_id)` rather
@@ -351,6 +386,17 @@ mod tests {
 
     fn task(id: &str) -> Value {
         json!({ "id": id, "status": { "state": "completed" } })
+    }
+
+    #[test]
+    fn scoped_owner_namespace_is_disjoint_from_legacy_ids() {
+        let identity = Identity::new("alice".into(), "user".into(), vec![], HashMap::new())
+            .with_authority(Some(vec!["read".into()]), Some("issuer".into()))
+            .unwrap();
+        let owner = OwnerId::from_identity(Some(&identity));
+        let legacy = Identity::new(owner.as_str().into(), "user".into(), vec![], HashMap::new());
+        assert_ne!(owner, OwnerId::from_identity(Some(&legacy)));
+        assert_ne!(owner, OwnerId::anonymous());
     }
 
     #[tokio::test]

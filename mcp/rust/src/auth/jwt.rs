@@ -9,6 +9,8 @@ use tracing::debug;
 
 use crate::auth::protocol::{Authenticator, Identity};
 
+pub use super::delegation::DelegatedClaims;
+
 /// Mapping from JWT claim names to Identity fields.
 ///
 /// Mirrors the Python `ClaimMapping` dataclass, controlling which JWT claims
@@ -52,6 +54,7 @@ pub struct JWTAuthenticator {
     issuer: Option<String>,
     claim_mapping: ClaimMapping,
     require_claims: Vec<String>,
+    delegated_claims: Option<DelegatedClaims>,
     /// Whether unauthenticated requests should be rejected at this authenticator.
     ///
     /// NOTE [D1-004]: Python delegates this policy to `AuthMiddleware` rather than
@@ -90,6 +93,7 @@ impl JWTAuthenticator {
             issuer,
             claim_mapping: claim_mapping.unwrap_or_default(),
             require_claims: require_claims.unwrap_or_else(|| vec!["sub".to_string()]),
+            delegated_claims: None,
             require_auth: require_auth.unwrap_or(true),
         }
     }
@@ -142,11 +146,17 @@ impl JWTAuthenticator {
         self.require_auth
     }
 
+    /// Require verified issuer, audience and scope claims and project delegated authority.
+    pub fn with_delegated_claims(mut self, claims: DelegatedClaims) -> Self {
+        self.delegated_claims = Some(claims);
+        self
+    }
+
     /// Decode and validate a JWT token. Returns `None` on any error.
     fn decode_token(&self, token: &str) -> Option<HashMap<String, serde_json::Value>> {
         // No usable key (unparseable PEM) — reject rather than fail open.
         let key = self.key.as_ref()?;
-        let mut validation = Validation::new(self.algorithms[0]);
+        let mut validation = Validation::new(*self.algorithms.first()?);
         if self.algorithms.len() > 1 {
             validation.algorithms = self.algorithms.clone();
         }
@@ -169,13 +179,16 @@ impl JWTAuthenticator {
         }
 
         // Configure required claims
-        validation.set_required_spec_claims(
-            &self
-                .require_claims
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>(),
-        );
+        let mut required_claims: Vec<_> = self.require_claims.iter().map(String::as_str).collect();
+        if self.delegated_claims.is_some() {
+            self.issuer.as_deref().filter(|issuer| !issuer.is_empty())?;
+            self.audience
+                .as_deref()
+                .filter(|audience| !audience.is_empty())?;
+            required_claims.extend(["sub", "iss", "aud", "exp"]);
+            validation.validate_nbf = true;
+        }
+        validation.set_required_spec_claims(&required_claims);
 
         match jsonwebtoken::decode::<HashMap<String, serde_json::Value>>(token, key, &validation) {
             Ok(token_data) => {
@@ -267,6 +280,10 @@ impl JWTAuthenticator {
 
 #[async_trait]
 impl Authenticator for JWTAuthenticator {
+    fn rejects_invalid_credentials(&self) -> bool {
+        self.delegated_claims.is_some()
+    }
+
     async fn authenticate(&self, headers: &HashMap<String, String>) -> Option<Identity> {
         // Case-insensitive lookup for "authorization" header
         let auth_header = headers
@@ -275,7 +292,7 @@ impl Authenticator for JWTAuthenticator {
             .map(|(_, v)| v.as_str())?;
 
         // Check for "Bearer " prefix (case-insensitive)
-        if auth_header.len() < 7 || !auth_header[..7].eq_ignore_ascii_case("bearer ") {
+        if !auth_header.get(..7)?.eq_ignore_ascii_case("bearer ") {
             return None;
         }
 
@@ -285,7 +302,11 @@ impl Authenticator for JWTAuthenticator {
         }
 
         let payload = self.decode_token(token)?;
-        self.payload_to_identity(&payload)
+        let identity = self.payload_to_identity(&payload)?;
+        match &self.delegated_claims {
+            Some(claims) => super::delegation::project(&payload, &identity, claims),
+            None => Some(identity),
+        }
     }
 }
 

@@ -23,7 +23,7 @@ export { A2AEventSubscriber, createA2AEventSubscriber } from "./event-subscriber
 export type { A2AEventSubscriberOptions } from "./event-subscriber.js";
 
 // Auth
-export type { Authenticator, ClaimMapping } from "./auth/index.js";
+export type { Authenticator, ClaimMapping, DelegatedClaims, JWTAuthenticatorOptions } from "./auth/index.js";
 export { JWTAuthenticator } from "./auth/index.js";
 export { createAuthMiddleware } from "./auth/index.js";
 export { authIdentityStore, getAuthIdentity } from "./auth/index.js";

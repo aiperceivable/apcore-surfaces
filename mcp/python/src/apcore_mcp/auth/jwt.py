@@ -8,7 +8,9 @@ from typing import Any
 
 import jwt as pyjwt
 from apcore import Identity
+from apcore.errors import InvalidInputError
 
+from apcore_mcp.auth._delegation import DelegatedClaims, project_delegated_identity
 from apcore_mcp.auth.protocol import Authenticator
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,7 @@ class JWTAuthenticator:
         issuer: Expected ``iss`` claim (optional).
         claim_mapping: Maps JWT claims to Identity fields.
         require_claims: Claims that must be present in the token.
+        delegated_claims: Enable verified JWT scope and actor projection.
     """
 
     def __init__(
@@ -56,13 +59,24 @@ class JWTAuthenticator:
         issuer: str | None = None,
         claim_mapping: ClaimMapping | None = None,
         require_claims: list[str] | None = None,
+        delegated_claims: DelegatedClaims | None = None,
     ) -> None:
+        if delegated_claims is not None and (
+            not isinstance(issuer, str) or not issuer or not isinstance(audience, str) or not audience
+        ):
+            raise ValueError("JWT delegation requires an expected issuer and audience")
+        self._delegated_claims = delegated_claims
         self._key = key
         self._algorithms = algorithms or ["HS256"]
         self._audience = audience
         self._issuer = issuer
         self._claim_mapping = claim_mapping or ClaimMapping()
         self._require_claims: list[str] = require_claims if require_claims is not None else ["sub"]
+
+    @property
+    def rejects_invalid_credentials(self) -> bool:
+        """Reject a supplied invalid credential even in permissive middleware."""
+        return self._delegated_claims is not None
 
     async def authenticate(self, headers: dict[str, str]) -> Identity | None:
         """Extract Bearer token from headers, decode, and return Identity.
@@ -90,14 +104,25 @@ class JWTAuthenticator:
         if payload is None:
             return None
 
-        return self._payload_to_identity(payload)
+        identity = self._payload_to_identity(payload)
+        mapping = self._delegated_claims
+        if identity is None or mapping is None:
+            return identity
+        try:
+            return project_delegated_identity(payload, identity, mapping)
+        except (InvalidInputError, KeyError, OverflowError, TypeError, ValueError):
+            logger.debug("JWT delegation claim validation failed")
+            return None
 
     def _decode_token(self, token: str) -> dict[str, Any] | None:
         """Decode and validate a JWT token. Returns None on any error."""
         try:
             options: dict[str, Any] = {}
-            if self._require_claims:
-                options["require"] = self._require_claims
+            required = self._require_claims
+            if self._delegated_claims is not None:
+                required = list(dict.fromkeys([*required, "sub", "iss", "aud", "exp"]))
+            if required:
+                options["require"] = required
 
             kwargs: dict[str, Any] = {
                 "jwt": token,
@@ -116,14 +141,14 @@ class JWTAuthenticator:
                 kwargs["issuer"] = self._issuer
 
             return pyjwt.decode(**kwargs)
-        except pyjwt.InvalidTokenError:
+        except (pyjwt.InvalidTokenError, TypeError, ValueError, OverflowError):
             logger.debug("JWT validation failed", exc_info=True)
             return None
 
     def _payload_to_identity(self, payload: dict[str, Any]) -> Identity | None:
         """Convert a decoded JWT payload to an Identity."""
         mapping = self._claim_mapping
-        identity_id = payload.get(mapping.id_claim)
+        identity_id = payload.get("sub" if self._delegated_claims is not None else mapping.id_claim)
         if identity_id is None:
             return None
 

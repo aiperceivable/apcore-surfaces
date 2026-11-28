@@ -87,7 +87,7 @@ def _rpc(client: TestClient, who: str, method: str, params: dict, *, v1: bool = 
     return client.post("/", content=body, headers=headers).json()
 
 
-def _submit(client: TestClient, who: str, message_id: str) -> str:
+def _submit(client: TestClient, who: str, message_id: str, skill_id: str = "echo") -> str:
     """Run one task as ``who`` and return its id."""
     response = _rpc(
         client,
@@ -98,7 +98,7 @@ def _submit(client: TestClient, who: str, message_id: str) -> str:
                 "role": "user",
                 "messageId": message_id,
                 "parts": [{"kind": "text", "text": "{}"}],
-                "metadata": {"skillId": "echo"},
+                "metadata": {"skillId": skill_id},
             }
         },
     )
@@ -249,3 +249,74 @@ def test_without_an_authenticator_every_caller_shares_one_owner_bucket():
     # A second, differently-credentialed caller sees it, because with no
     # authenticator configured there is only one principal.
     assert _rpc(client, "someone-else", "tasks/get", {"id": task_id})["result"]["id"] == task_id
+
+
+def test_delegated_task_ownership_uses_subject_and_current_scope():
+    from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+    from a2a.types import ListTasksRequest
+    from apcore import Executor, Registry
+    from apcore.acl import ACL, ACLRule
+
+    class Module:
+        description = "Return the operation result"
+        input_schema = {"type": "object"}
+        output_schema = {"type": "object"}
+
+        def execute(self, inputs, context):
+            return {"result": "ok"}
+
+    class Auth(_BearerIsPrincipal):
+        def authenticate(self, headers):
+            principal = super().authenticate(headers)
+            if principal is None:
+                return None
+            subject, scope = principal.id.split("/")
+            scopes = scope.split(",")
+            root = Identity(subject, scopes=scopes, issuer="issuer")
+            return root.delegate(Identity("same-actor", issuer="issuer"), scopes)
+
+    class SingleRowStore(InMemoryTaskStore):
+        async def list(self, params, context):
+            query = ListTasksRequest()
+            query.CopyFrom(params)
+            query.page_size = 1
+            return await super().list(query, context)
+
+    registry = Registry()
+    registry.register("echo", Module())
+    registry.register("restricted", Module())
+    acl = ACL([
+        ACLRule(["@external"], ["echo"], "allow", conditions={"scopes": ["run"]}),
+        ACLRule(["@external"], ["restricted"], "allow", conditions={"scopes": ["admin"]}),
+    ])
+    with Executor(registry, acl=acl) as executor:
+        app, _ = A2AServerFactory().create(
+            registry, executor, name="Task scoping", description="d", version="1", url="http://localhost",
+            auth=Auth(), task_store=SingleRowStore(),
+        )
+        with TestClient(app) as client:
+            task_id = _submit(client, "alice/run", "m-delegated")
+            assert _rpc(client, "alice/run", "GetTask", {"id": task_id}, v1=True)["result"]["id"] == task_id
+            for principal in ("bob/run", "alice/read"):
+                failure = _rpc(client, principal, "GetTask", {"id": task_id}, v1=True)["error"]
+                assert failure["message"] == "Task not found"
+                listing = _rpc(client, principal, "ListTasks", {}, v1=True)["result"]
+                assert not listing.get("tasks")
+
+            recent = _submit(client, "alice/run,admin", "m-visible")
+            hidden = _submit(client, "alice/run,admin", "m-hidden", "restricted")
+            query = {"pageSize": 1}
+            page = _rpc(client, "alice/run", "ListTasks", query, v1=True)["result"]
+            assert [task["id"] for task in page["tasks"]] == [recent]
+            assert page["totalSize"] == 2
+            token = page["nextPageToken"]
+            assert hidden not in token
+            for principal in ("alice/admin", "bob/run"):
+                replay = _rpc(client, principal, "ListTasks", {**query, "pageToken": token}, v1=True)
+                assert replay["error"]["message"] == "Invalid page token"
+            replay = _rpc(client, "alice/run", "ListTasks", {**query, "contextId": hidden, "pageToken": token}, v1=True)
+            assert replay["error"]["message"] == "Invalid page token"
+            page = _rpc(client, "alice/run", "ListTasks", {**query, "pageToken": token}, v1=True)["result"]
+            assert [task["id"] for task in page["tasks"]] == [task_id]
+            assert page["totalSize"] == 2
+            assert not page.get("nextPageToken")

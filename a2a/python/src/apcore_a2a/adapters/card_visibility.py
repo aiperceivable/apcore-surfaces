@@ -127,6 +127,18 @@ def _decide(acl: Any, caller_id: str | None, skill_id: str, ctx: Any | None) -> 
     return decision.access == "allow", bool(decision.approval_required)
 
 
+def scoped_skill_callable(executor: Any, skill_id: str, identity: Any) -> bool:
+    descriptor = getattr(executor, "get_callable_descriptor", None)
+    if not callable(descriptor):
+        return False
+    try:
+        context = _acl_context(identity)
+        return context is not None and descriptor(skill_id, context) is not None
+    except Exception:
+        logger.debug("Scoped skill access could not be verified", exc_info=True)
+        return False
+
+
 def skill_access(executor: Any, skill_ids: list[str], identity: Any | None) -> dict[str, bool]:
     """The skills the ACL permits ``identity`` to invoke, each mapped to whether
     invoking it needs a human first.
@@ -152,6 +164,8 @@ def skill_access(executor: Any, skill_ids: list[str], identity: Any | None) -> d
     traffic it was written for. The authenticated principal travels in the
     context instead, where the ``identity_types`` / ``roles`` conditions see it.
     """
+    if getattr(identity, "scopes", None) is not None:
+        return {skill_id: False for skill_id in skill_ids if scoped_skill_callable(executor, skill_id, identity)}
     acl = executor_acl(executor)
     if acl is None:
         return {skill_id: False for skill_id in skill_ids}

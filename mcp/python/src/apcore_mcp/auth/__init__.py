@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from apcore_mcp.auth.jwt import ClaimMapping, JWTAuthenticator
+from apcore_mcp.auth.jwt import ClaimMapping, DelegatedClaims, JWTAuthenticator
 from apcore_mcp.auth.middleware import AuthMiddleware, auth_identity_var, extract_headers
 from apcore_mcp.auth.protocol import Authenticator, Identity
 
@@ -23,6 +23,7 @@ __all__ = [
     "Authenticator",
     "JWTAuthenticator",
     "ClaimMapping",
+    "DelegatedClaims",
     "AuthMiddleware",
     "auth_identity_var",
     "extract_headers",

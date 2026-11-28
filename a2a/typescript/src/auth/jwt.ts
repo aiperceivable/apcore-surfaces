@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import { createIdentity, type Identity } from "apcore-js";
+import { readDelegatedJwtAuthority, validateDelegatedClaims, type DelegatedClaims } from "apcore-toolkit";
 import type { Authenticator } from "./types.js";
 
 export interface ClaimMapping {
@@ -15,7 +16,11 @@ export interface JWTAuthenticatorOptions {
   issuer?: string;
   claimMapping?: ClaimMapping;
   requireClaims?: string[];
+  /** Opt in to scope and actor projection from a verified token. */
+  delegatedClaims?: DelegatedClaims;
 }
+
+export type { DelegatedClaims };
 
 /**
  * Coerce a JWT claim value to a string using the canonical cross-language rule.
@@ -38,10 +43,11 @@ export class JWTAuthenticator implements Authenticator {
   private issuer?: string;
   private claimMapping: Required<ClaimMapping>;
   private requireClaims: string[];
+  private readonly delegatedClaims?: DelegatedClaims;
 
   constructor(key: string, opts?: JWTAuthenticatorOptions) {
     this.key = key;
-    this.algorithms = opts?.algorithms ?? ["HS256"];
+    this.algorithms = [...(opts?.algorithms ?? ["HS256"])];
     this.audience = opts?.audience;
     this.issuer = opts?.issuer;
     this.claimMapping = {
@@ -51,10 +57,20 @@ export class JWTAuthenticator implements Authenticator {
       attrsClaims: opts?.claimMapping?.attrsClaims ?? [],
     };
     this.requireClaims = opts?.requireClaims ?? ["sub"];
+    if (opts?.delegatedClaims !== undefined) {
+      if (!this.key || this.algorithms.includes("none")) {
+        throw new TypeError("Delegated JWT claims require signed algorithms and a verification key");
+      }
+      this.delegatedClaims = validateDelegatedClaims(opts.delegatedClaims, this.issuer, this.audience);
+    }
+  }
+
+  get rejectInvalidCredentials(): boolean {
+    return this.delegatedClaims !== undefined;
   }
 
   authenticate(headers: Record<string, string>): Identity | null {
-    const authHeader = headers.authorization ?? "";
+    const authHeader = headers.authorization ?? (this.delegatedClaims ? headers.Authorization ?? "" : "");
     if (!authHeader.toLowerCase().startsWith("bearer ")) return null;
 
     const token = authHeader.slice(7).trim();
@@ -63,7 +79,11 @@ export class JWTAuthenticator implements Authenticator {
     const payload = this.decodeToken(token);
     if (!payload) return null;
 
-    return this.payloadToIdentity(payload);
+    try {
+      return this.payloadToIdentity(payload);
+    } catch {
+      return null;
+    }
   }
 
   securitySchemes(): Record<string, unknown> {
@@ -77,15 +97,17 @@ export class JWTAuthenticator implements Authenticator {
       };
       if (this.audience) opts.audience = this.audience;
       if (this.issuer) opts.issuer = this.issuer;
+      if (this.delegatedClaims) opts.clockTolerance = 30;
 
       const payload = jwt.verify(token, this.key, opts);
       if (typeof payload === "string") return null;
+      const claims = payload as Record<string, unknown>;
 
       for (const claim of this.requireClaims) {
-        if (!(claim in payload)) return null;
+        if (!Object.hasOwn(claims, claim) || (this.delegatedClaims && claims[claim] == null)) return null;
       }
 
-      return payload as Record<string, unknown>;
+      return claims;
     } catch {
       return null;
     }
@@ -93,9 +115,11 @@ export class JWTAuthenticator implements Authenticator {
 
   private payloadToIdentity(payload: Record<string, unknown>): Identity | null {
     const mapping = this.claimMapping;
+    const delegation = this.delegatedClaims;
+    const authority = delegation && readDelegatedJwtAuthority(payload, delegation, Math.floor(Date.now() / 1000));
     // The id claim must coerce to a scalar string, or the token is rejected
     // (canonical rule: a non-scalar `sub` is not a valid identity id).
-    const id = claimToString(payload[mapping.idClaim]);
+    const id = authority?.subjectId ?? claimToString(payload[mapping.idClaim]);
     if (id === null) return null;
 
     // Only an absent/null/non-scalar type falls back to "user"; an explicit
@@ -106,11 +130,13 @@ export class JWTAuthenticator implements Authenticator {
       ? rawRoles.map(claimToString).filter((r): r is string => r !== null)
       : [];
 
-    const attrs: Record<string, unknown> = {};
-    for (const claim of mapping.attrsClaims) {
-      if (claim in payload) attrs[claim] = payload[claim];
-    }
+    const attrs = Object.fromEntries(mapping.attrsClaims
+      .filter(key => Object.hasOwn(payload, key) && (!delegation || !["act", "scope", delegation.scpClaim].includes(key)))
+      .map(key => [key, payload[key]]));
 
-    return createIdentity(id, identityType, roles, attrs);
+    if (!authority) return createIdentity(id, identityType, roles, attrs);
+    const { issuer, scopes, actor } = authority;
+    const subject = createIdentity(id, identityType, roles, attrs, { issuer, scopes });
+    return actor ? subject.delegate(createIdentity(actor.id, actor.type, actor.roles, {}, { issuer }), scopes) : subject;
   }
 }
