@@ -8,7 +8,8 @@ import { AsyncTaskManager, TaskStatus } from "apcore-js/full";
 import jwt from "jsonwebtoken";
 import { describe, expect, it, vi } from "vitest";
 import {
-  AsyncTaskBridge, asyncServe, createAsyncTaskBridge, InMemoryApprovalStore, JWTAuthenticator, META_TOOL_NAMES,
+  AsyncTaskBridge, asyncServe, createAsyncTaskBridge, elicit, InMemoryApprovalStore, JWTAuthenticator,
+  META_TOOL_NAMES, reportProgress,
 } from "../../src/index.js";
 
 const key = "signed-test-secret";
@@ -146,7 +147,13 @@ describe("delegated MCP JWT", () => {
       description: "Continue after the transport closes",
       inputSchema: { type: "object" }, outputSchema: { type: "object" },
       annotations: createAnnotations({ extra: { mcp_async: "true" } }),
-      execute: async () => { await background; return { continued: true }; },
+      execute: async (_inputs, context) => {
+        await background;
+        if (!context) throw new Error("Missing task context");
+        await reportProgress(context, 1, 1, "Done");
+        expect(await elicit(context, "Continue?", { type: "object", properties: {} })).toBeNull();
+        return { continued: true };
+      },
     });
     vi.stubEnv("APCORE_MAX_SCOPED_HTTP_SESSIONS", "1");
     const app = await asyncServe(registry as never, {
@@ -187,7 +194,7 @@ describe("delegated MCP JWT", () => {
         finishCall();
         await active;
       }
-      const submission = await first.callTool({ name: backgroundId, arguments: {} });
+      const submission = await first.callTool({ name: backgroundId, arguments: {} }, undefined, { onprogress: vi.fn() });
       const text = (result: { content?: unknown }) => JSON.parse((result.content as { text: string }[])[0].text);
       const task = text(submission);
       expect(task).toMatchObject({ task_id: expect.any(String), status: "pending" });

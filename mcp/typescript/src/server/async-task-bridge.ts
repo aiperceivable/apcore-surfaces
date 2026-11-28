@@ -14,6 +14,7 @@
 
 import { InvalidInputError } from "apcore-js";
 import { markBackgroundApprovalContext } from "../approval-reply.js";
+import { MCP_ELICIT_KEY, MCP_PROGRESS_KEY } from "../helpers.js";
 import type { ModuleDescriptor } from "../types.js";
 import { ErrorCodes } from "../types.js";
 
@@ -210,6 +211,23 @@ interface ScopedTaskBinding {
 
 const scopedTaskOwners = new WeakMap<object, Map<string, ScopedTaskBinding>>();
 
+function makeDetachableCallback(
+  data: Record<string, unknown>, key: string, fallback: null | undefined,
+): (() => void) | undefined {
+  let send = data[key];
+  if (typeof send !== "function") return undefined;
+  data[key] = async (...args: unknown[]): Promise<unknown> => {
+    if (typeof send !== "function") return fallback;
+    try {
+      return await send(...args);
+    } catch (error) {
+      if (typeof send === "function") throw error;
+      return fallback;
+    }
+  };
+  return () => { send = undefined; };
+}
+
 /**
  * Routes MCP tool calls either to the synchronous Execution Router (default)
  * or to `AsyncTaskManager.submit()` for async-hinted modules.
@@ -224,11 +242,10 @@ export class AsyncTaskBridge {
   private readonly _scopedTasks: boolean;
   private readonly _scopedTaskOwners: Map<string, ScopedTaskBinding>;
   /**
-   * Maps task_id → progressToken recorded at submit time so terminal-
-   * state notifications can be fanned out via the original token.
+   * Tracks notification tokens and callbacks bound to each task's transport.
    * [A-D-018]
    */
-  private readonly _progressTokens = new Map<string, string | number>();
+  private readonly _taskNotifications = new Map<string, { progressToken?: string | number; detach?: () => void }>();
   /**
    * Maps session/connection key → list of task ids launched from that
    * session so {@link cancelSessionTasks} can cancel them on transport
@@ -341,7 +358,7 @@ export class AsyncTaskBridge {
       const sendNotification = options.sendNotification;
       const contextData = (context as Record<string, unknown>).data;
       if (contextData && typeof contextData === "object") {
-        (contextData as Record<string, unknown>)["_mcp_progress"] = async (
+        (contextData as Record<string, unknown>)[MCP_PROGRESS_KEY] = async (
           progress: number,
           total: number,
         ) => {
@@ -355,13 +372,20 @@ export class AsyncTaskBridge {
 
     // Core preserves Context.data when it clones a context for the background job.
     // The marker carries no approval state or credentials.
+    let detach: (() => void) | undefined;
     if (context && typeof context === "object" && "data" in context
         && context.data && typeof context.data === "object") {
       markBackgroundApprovalContext(context.data);
+      if (options?.sessionKey !== undefined) {
+        const data = context.data as Record<string, unknown>;
+        const detachProgress = makeDetachableCallback(data, MCP_PROGRESS_KEY, undefined);
+        const detachElicit = makeDetachableCallback(data, MCP_ELICIT_KEY, null);
+        if (detachProgress || detachElicit) detach = () => { detachProgress?.(); detachElicit?.(); };
+      }
     }
     const taskId = await this._submitOwnedTask(moduleId, inputs, context ?? null, owner);
-    if (options?.progressToken !== undefined) {
-      this._progressTokens.set(taskId, options.progressToken);
+    if (options?.progressToken !== undefined || detach) {
+      this._taskNotifications.set(taskId, { progressToken: options?.progressToken, detach });
     }
     if (options?.sessionKey !== undefined) {
       const list = this._sessionTasks.get(options.sessionKey) ?? [];
@@ -397,7 +421,7 @@ export class AsyncTaskBridge {
    * when no token was registered. [A-D-018]
    */
   getProgressToken(taskId: string): string | number | undefined {
-    return this._progressTokens.get(taskId);
+    return this._taskNotifications.get(taskId)?.progressToken;
   }
 
   /**
@@ -425,7 +449,7 @@ export class AsyncTaskBridge {
       } catch {
         // Cancel may fail if the task has already completed; swallow.
       }
-      this._progressTokens.delete(taskId);
+      this._taskNotifications.delete(taskId);
     }
     return cancelled;
   }
@@ -434,7 +458,10 @@ export class AsyncTaskBridge {
   detachSessionTasks(sessionKey: string): void {
     const taskIds = this._sessionTasks.get(sessionKey) ?? [];
     this._sessionTasks.delete(sessionKey);
-    for (const taskId of taskIds) this._progressTokens.delete(taskId);
+    for (const taskId of taskIds) {
+      this._taskNotifications.get(taskId)?.detach?.();
+      this._taskNotifications.delete(taskId);
+    }
   }
 
   /**
@@ -666,7 +693,7 @@ export class AsyncTaskBridge {
         // "task never existed".
         const info = await this._manager.getStatus(taskId);
         if (!info) {
-          this._progressTokens.delete(taskId);
+          this._taskNotifications.delete(taskId);
         }
         if (!info || !this._canReadTask(info, context)) {
           return {
@@ -681,7 +708,7 @@ export class AsyncTaskBridge {
         // token whose caller has already been told the task is gone. Mirrors
         // Python's `_progress_bindings.pop(task_id, None)` and Rust's
         // `progress_tokens.remove(task_id)`.
-        this._progressTokens.delete(taskId);
+        this._taskNotifications.delete(taskId);
         return { task_id: taskId, cancelled };
       }
       case META_TOOL_NAMES.PREVIEW: {

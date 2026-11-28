@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { elicit, MCP_ELICIT_KEY, MCP_PROGRESS_KEY, reportProgress } from "../../src/helpers.js";
 import {
   AsyncTaskBridge,
   META_TOOL_NAMES,
@@ -541,6 +542,27 @@ describe("D11-015: Progress sink installation in submit()", () => {
     });
 
     expect(context.data["_mcp_progress"]).toBeUndefined();
+  });
+
+  it("tolerates transport failure only after session detachment", async () => {
+    const bridge = new AsyncTaskBridge(buildManager());
+    let rejectSend!: (error: Error) => void;
+    const sending = new Promise<void>((_resolve, reject) => { rejectSend = reject; });
+    const progress = vi.fn().mockRejectedValueOnce(new Error("active transport failure")).mockReturnValueOnce(sending);
+    const question = vi.fn();
+    const context = { data: { [MCP_PROGRESS_KEY]: progress, [MCP_ELICIT_KEY]: question } };
+
+    await bridge.submit("my.module", {}, context, { sessionKey: "session", progressToken: "token" });
+    await expect(reportProgress(context, 1)).rejects.toThrow("active transport failure");
+    const inFlight = reportProgress(context, 2);
+    bridge.detachSessionTasks("session");
+    rejectSend(new Error("connection closed"));
+
+    await expect(inFlight).resolves.toBeUndefined();
+    await expect(reportProgress(context, 3)).resolves.toBeUndefined();
+    await expect(elicit(context, "Continue?")).resolves.toBeNull();
+    expect(progress).toHaveBeenCalledTimes(2);
+    expect(question).not.toHaveBeenCalled();
   });
 });
 
