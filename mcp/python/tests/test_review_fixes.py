@@ -334,6 +334,7 @@ class TestOutputSchemaMapParity:
             mock_executor = MagicMock()
 
             mcp = APCoreMCP.__new__(APCoreMCP)
+            mcp._artifact_store = None
             mcp._registry = mock_registry
             mcp._executor = mock_executor
             mcp._name = "test"

@@ -289,3 +289,9 @@ pytest
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+
+
+### Hosted artifact links
+
+Python hosts can add authorized downloads to unary A2A results.
+See [Hosted artifact links pilot](../docs/features/adapters.md#hosted-artifact-links-pilot).

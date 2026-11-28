@@ -3,22 +3,84 @@
 //! Responsible for building tools from registry descriptors, registering
 //! handlers, and producing a ready-to-run MCPServer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
 
 use apcore::module::ModuleAnnotations;
 use apcore::registry::{ModuleDescriptor, Registry};
 
 use crate::adapters::annotations::{AnnotationMapper, McpAnnotations};
+use crate::artifacts::{MCPArtifactStore, ARTIFACT_URI_PREFIX};
+use crate::auth::middleware::AUTH_IDENTITY;
 use crate::server::async_task_bridge::AsyncTaskBridge;
 use crate::server::router::ExecutionRouter;
 use crate::server::server::{FactoryError, MCPServer, MCPServerConfig};
 use crate::server::types::{
-    CallToolResult, InitializationOptions, ReadResourceContents, Resource, ResourceTemplate,
-    ResourcesCapability, ServerCapabilities, TextContent, Tool, ToolAnnotations, ToolsCapability,
+    CallToolResult, InitializationOptions, ReadResourceContents, Resource, ResourceLink,
+    ResourceTemplate, ResourcesCapability, ServerCapabilities, TextContent, Tool, ToolAnnotations,
+    ToolsCapability,
 };
+
+fn attach_artifact_links(
+    store: &MCPArtifactStore,
+    result: &mut CallToolResult,
+    schema: Option<&Value>,
+) {
+    if result.is_error {
+        return;
+    }
+    let (Some(values), Some(properties)) = (
+        result.structured_content.as_ref(),
+        schema
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object),
+    ) else {
+        return;
+    };
+    let _ = AUTH_IDENTITY.try_with(|identity| {
+        let mut emitted = HashSet::new();
+        for (name, definition) in properties {
+            if definition["x-mcp-artifact"] != true || definition["x-sensitive"] == true {
+                continue;
+            }
+            let Some(key) = values[name].as_str().filter(|key| key.len() == 32) else {
+                continue;
+            };
+            if emitted.contains(key) {
+                continue;
+            }
+            let uri = format!("{ARTIFACT_URI_PREFIX}{key}");
+            if let Some(artifact) = store.read_uri(&uri, identity.as_ref()) {
+                emitted.insert(key);
+                result.resource_links.push(ResourceLink {
+                    uri,
+                    name: artifact.name.clone(),
+                    mime_type: artifact.mime_type.clone(),
+                    size: artifact.bytes.len(),
+                });
+            }
+        }
+    });
+}
+
+fn read_artifact_resource(
+    store: &MCPArtifactStore,
+    uri: String,
+) -> Result<Vec<ReadResourceContents>, FactoryError> {
+    let artifact = AUTH_IDENTITY
+        .try_with(|identity| store.read_uri(&uri, identity.as_ref()))
+        .ok()
+        .flatten()
+        .ok_or_else(|| FactoryError::ResourceNotFound("artifact".to_owned()))?;
+    Ok(vec![ReadResourceContents {
+        content: STANDARD.encode(&artifact.bytes),
+        mime_type: artifact.mime_type.clone(),
+        artifact_uri: Some(uri),
+    }])
+}
 
 /// Summarize a full apcore `PipelineTrace` JSON into the MCP `_meta.trace`
 /// shape: `{ step_count, steps: [{ name, duration_ms, skip_reason? }] }`.
@@ -348,6 +410,7 @@ async fn call_router_as_resource(
     Ok(vec![ReadResourceContents {
         content: text,
         mime_type: "application/json".to_string(),
+        artifact_uri: None,
     }])
 }
 
@@ -421,6 +484,7 @@ pub struct MCPServerFactory {
     /// token. apcore-toolkit 0.6+. Display-overlay
     /// `mcp.description` overrides are still honoured first.
     rich_description: bool,
+    artifact_store: Option<Arc<MCPArtifactStore>>,
 }
 
 impl Default for MCPServerFactory {
@@ -435,6 +499,7 @@ impl MCPServerFactory {
         Self {
             annotation_mapper: AnnotationMapper,
             rich_description: false,
+            artifact_store: None,
         }
     }
 
@@ -445,7 +510,13 @@ impl MCPServerFactory {
         Self {
             annotation_mapper: AnnotationMapper,
             rich_description,
+            artifact_store: None,
         }
+    }
+
+    pub(crate) fn with_artifact_store(mut self, store: Option<Arc<MCPArtifactStore>>) -> Self {
+        self.artifact_store = store;
+        self
     }
 
     /// Whether this factory renders `Tool.description` as Markdown.
@@ -865,9 +936,11 @@ impl MCPServerFactory {
             .collect();
         let output_schemas = Arc::new(output_schemas);
         let router_clone = Arc::clone(&router);
+        let artifact_store = self.artifact_store.clone();
         server.call_tool_handler = Some(Arc::new(move |name, arguments, extra| {
             let router = Arc::clone(&router_clone);
             let output_schemas = Arc::clone(&output_schemas);
+            let artifact_store = artifact_store.clone();
             Box::pin(async move {
                 let structured = extra
                     .as_ref()
@@ -936,11 +1009,17 @@ impl MCPServerFactory {
                 let result = CallToolResult {
                     structured_content: None,
                     content: text_items,
+                    resource_links: Vec::new(),
                     is_error,
                     meta,
                 };
                 if structured {
-                    result.with_structured_content(schema.select(output_schemas.get(&name)))
+                    let schema = schema.select(output_schemas.get(&name));
+                    let mut result = result.with_structured_content(schema);
+                    if let Some(store) = artifact_store.as_deref() {
+                        attach_artifact_links(store, &mut result, schema);
+                    }
+                    result
                 } else {
                     result
                 }
@@ -1079,11 +1158,18 @@ impl MCPServerFactory {
 
         // read_resource handler
         let docs_for_read = Arc::clone(&docs);
+        let artifact_store = self.artifact_store.clone();
         server.read_resource_handler = Some(Arc::new(move |uri: String| {
             let docs = Arc::clone(&docs_for_read);
             let router = Arc::clone(&router);
             let available = Arc::clone(&available);
+            let artifact_store = artifact_store.clone();
             Box::pin(async move {
+                if uri.starts_with(ARTIFACT_URI_PREFIX) {
+                    if let Some(store) = artifact_store.as_deref() {
+                        return read_artifact_resource(store, uri);
+                    }
+                }
                 if let Some(module_id) = uri.strip_prefix("docs://") {
                     if !docs.contains_key(module_id) {
                         return Err(FactoryError::ResourceNotFound(uri));
@@ -1096,6 +1182,7 @@ impl MCPServerFactory {
                         Some(content) => Ok(vec![ReadResourceContents {
                             content,
                             mime_type: "text/plain".to_string(),
+                            artifact_uri: None,
                         }]),
                         None => Err(FactoryError::ResourceNotFound(uri.clone())),
                     };

@@ -9,6 +9,7 @@
  */
 
 import * as crypto from "node:crypto";
+import { ElicitResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { registerStdioExecution } from "./stdio-output.js";
 import { CancelToken, InvalidInputError, isStreamingModule } from "apcore-js";
 import { isApprovalResumeToken, supportsScopedCore } from "../adapters/approval.js";
@@ -18,7 +19,7 @@ import { ErrorMapper } from "../adapters/errors.js";
 import { ErrorCodes } from "../types.js";
 import type { Executor, ModuleDescriptor, TextContentDict, McpErrorResponse, StreamCompletion, StreamExecution, StreamStepOutcome } from "../types.js";
 import { createBridgeContext } from "./context.js";
-import { MCP_PROGRESS_KEY, MCP_ELICIT_KEY } from "../helpers.js";
+import { MCP_PROGRESS_KEY, MCP_ELICIT_KEY, withCoreInteractions } from "../helpers.js";
 import type { ElicitResult } from "../helpers.js";
 import { getCurrentIdentity } from "../auth/storage.js";
 import type { Identity } from "../auth/types.js";
@@ -567,10 +568,10 @@ export class ExecutionRouter {
               method: "elicitation/create",
               params: {
                 message,
-                ...(requestedSchema ? { requestedSchema } : {}),
+                requestedSchema: requestedSchema ?? { type: "object", properties: {} },
               },
             },
-            {},
+            ElicitResultSchema,
           );
           return (result as ElicitResult) ?? null;
         };
@@ -591,12 +592,12 @@ export class ExecutionRouter {
       // is silently broken — the router-level cancel API works but the cancel
       // signal never reaches the running module. Mirrors Python's first-class
       // `Context.create(..., cancel_token=...)` (apcore 0.22.0 D-24).
-      const context = createBridgeContext(
+      const context = withCoreInteractions(createBridgeContext(
         contextData,
         identity,
         inboundTraceId,
         cancelToken,
-      );
+      ));
 
       // Preserve the pre-fix traceId return contract: return the context's
       // trace_id only when the call carried "meaningful" trace context

@@ -26,7 +26,7 @@ from apcore.trace_context import TraceContext, TraceParent
 from mcp import types as mcp_types
 
 from apcore_mcp.adapters.errors import ErrorMapper
-from apcore_mcp.helpers import MCP_PROGRESS_KEY
+from apcore_mcp.helpers import MCP_PROGRESS_KEY, _bind_core_progress
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +272,7 @@ class AsyncTaskBridge:
         # route through MCP notifications/progress.
         if context is not None and progress_token is not None and send_notification is not None:
             self._install_progress_sink(context, progress_token, send_notification)
+            context = _bind_core_progress(context)
         if owner is None:
             task_id = await self._manager.submit(module_id, arguments, context)
         else:

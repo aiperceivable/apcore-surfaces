@@ -890,8 +890,9 @@ impl crate::server::transport::McpHandler for ServerHandler {
                 let mut call_result = (self.call_tool)(name, arguments, extra).await;
                 if !self.supports_structured_results(&message) {
                     call_result.structured_content = None;
+                    call_result.resource_links.clear();
                 }
-                RpcResult::Success(serde_json::to_value(call_result).unwrap_or_default())
+                RpcResult::Success(call_result.to_wire())
             }
             "resources/list" => {
                 if let Some(ref handler) = self.list_resources {
@@ -936,15 +937,8 @@ impl crate::server::transport::McpHandler for ServerHandler {
                 if let Some(ref handler) = self.read_resource {
                     match handler(uri).await {
                         Ok(contents) => {
-                            let contents_json: Vec<Value> = contents
-                                .iter()
-                                .map(|c| {
-                                    serde_json::json!({
-                                        "content": c.content,
-                                        "mimeType": c.mime_type
-                                    })
-                                })
-                                .collect();
+                            let contents_json: Vec<Value> =
+                                contents.iter().map(ReadResourceContents::to_wire).collect();
                             RpcResult::Success(serde_json::json!({ "contents": contents_json }))
                         }
                         Err(e) => ServerHandler::rpc_error(-32602, e.to_string()),

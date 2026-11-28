@@ -35,6 +35,7 @@ from apcore_mcp.adapters.approval import (
     _implements_mcp_scoped_approval,
     _MCPScopedApprovalGate,
 )
+from apcore_mcp.artifacts import MCPArtifactStore
 from apcore_mcp.auth.protocol import Authenticator
 from apcore_mcp.server.transport import MetricsExporter
 
@@ -407,6 +408,7 @@ class APCoreMCP:
         approval_handler: object | None = None,
         approval_store: object | None = None,
         approval_notify: object | None = None,
+        artifact_store: MCPArtifactStore | None = None,
         output_formatter: Callable[[dict], str] | None = None,
         output_format: str | None = None,
         strategy: str | None = None,
@@ -450,6 +452,7 @@ class APCoreMCP:
             require_auth: If True, unauthenticated requests receive 401.
             exempt_paths: Exact paths that bypass authentication.
             approval_handler: Optional approval handler for runtime approval support.
+            artifact_store: Optional bounded store for MCP media resource links.
             output_formatter: Optional callable that formats dict results into
                 text for LLM consumption. Defaults to ``None`` (raw JSON).
             output_format: Optional built-in output format name ("json", "csv",
@@ -653,6 +656,7 @@ class APCoreMCP:
         self._async_bridge: Any = None
         self._approval_handler = approval_handler
         self._approval_store = approval_store
+        self._artifact_store = artifact_store
         self._output_formatter = output_formatter
         self._output_format = output_format
 
@@ -715,7 +719,7 @@ class APCoreMCP:
 
         version = self._resolve_version()
 
-        factory = MCPServerFactory()
+        factory = MCPServerFactory(artifact_store=self._artifact_store) if self._artifact_store else MCPServerFactory()
         server = factory.create_server(name=self._name, version=version)
         discovery_sources: dict[int, str] = {}
         tools = factory.build_tools(

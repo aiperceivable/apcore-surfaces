@@ -27,6 +27,8 @@ import type {
   ReadResourceResult,
 } from "@modelcontextprotocol/sdk/types.js";
 
+import { ARTIFACT_URI_PREFIX, type MCPArtifactStore } from "../artifacts.js";
+import { getCurrentIdentity } from "../auth/storage.js";
 import { AnnotationMapper } from "../adapters/annotations.js";
 import type { Registry, ModuleDescriptor, JsonSchema } from "../types.js";
 import type { ExecutionRouter } from "./router.js";
@@ -103,6 +105,7 @@ export interface MCPServerFactoryOptions {
    * one-time warning.
    */
   richDescription?: boolean;
+  artifactStore?: MCPArtifactStore;
 }
 
 function outputSchemaForTool(descriptor: ModuleDescriptor): Tool["outputSchema"] {
@@ -114,6 +117,7 @@ function outputSchemaForTool(descriptor: ModuleDescriptor): Tool["outputSchema"]
 export class MCPServerFactory {
   private readonly _annotationMapper: AnnotationMapper;
   private readonly _richDescription: boolean;
+  private readonly _artifactStore: MCPArtifactStore | undefined;
   private readonly _toolSources = new WeakMap<Tool, { moduleId: string; versionHint?: string }>();
   private _warnedToolkitMissing = false;
 
@@ -121,6 +125,7 @@ export class MCPServerFactory {
     this._annotationMapper = new AnnotationMapper();
     
     this._richDescription = options.richDescription ?? false;
+    this._artifactStore = options.artifactStore;
   }
 
   /**
@@ -523,6 +528,12 @@ export class MCPServerFactory {
     // Handle resources/read requests
     server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
       const uri = request.params.uri;
+      if (this._artifactStore && uri.startsWith(ARTIFACT_URI_PREFIX)) {
+        const artifact = this._artifactStore.read(uri, getCurrentIdentity());
+        if (artifact === null) throw new McpError(ErrorCode.InvalidParams, "Artifact not found");
+        return { contents: [{ uri, ...artifact }] };
+      }
+
 
       // apcore://system.* management resources — dispatch through the
       // ExecutionRouter so ACL, approval, audit events, and redaction all
@@ -817,9 +828,32 @@ export class MCPServerFactory {
         };
       }
 
-      return supportsStructuredOutput(server, extra)
-        ? addStructuredOutput(result, responseTool)
-        : result;
+      if (!supportsStructuredOutput(server, extra)) return result;
+      const projected = addStructuredOutput(result, responseTool);
+      this.attachArtifactLinks(projected, responseTool);
+      return projected;
     });
+  }
+
+  private attachArtifactLinks(result: CallToolResult, tool: Tool): void {
+    const store = this._artifactStore;
+    const properties = tool.outputSchema?.properties;
+    if (!store || result.isError || !result.structuredContent || !properties) return;
+
+    const identity = getCurrentIdentity();
+    const emitted = new Set<string>();
+    for (const [name, schema] of Object.entries(properties)) {
+      if (typeof schema !== "object" || schema === null) continue;
+      const definition = schema as Record<string, unknown>;
+      if (definition["x-mcp-artifact"] !== true || definition["x-sensitive"] === true) continue;
+      const key = result.structuredContent[name];
+      if (typeof key !== "string" || key.length !== 32 || emitted.has(key)) continue;
+      const uri = ARTIFACT_URI_PREFIX + key;
+      const artifact = store.describe(uri, identity);
+      if (artifact !== null) {
+        emitted.add(key);
+        result.content.push({ type: "resource_link", uri, ...artifact });
+      }
+    }
   }
 }

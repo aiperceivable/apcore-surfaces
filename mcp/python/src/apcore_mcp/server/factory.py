@@ -27,6 +27,7 @@ from referencing.jsonschema import DRAFT7, DRAFT201909, DRAFT202012
 
 import apcore_mcp.markdown as _markdown
 from apcore_mcp.adapters.annotations import AnnotationMapper
+from apcore_mcp.artifacts import ARTIFACT_URI_PREFIX, MCPArtifactStore
 from apcore_mcp.auth.middleware import _REQUEST_IDENTITY_KEY, auth_identity_var
 from apcore_mcp.server.approval_bridge import ApprovalBridge, _approval_response_log, _protect_sdk_approval_logs
 from apcore_mcp.server.async_task_bridge import RESERVED_PREFIX, AsyncTaskBridge
@@ -263,7 +264,14 @@ def _build_call_result(
 class MCPServerFactory:
     """Creates and configures MCP Server instances from apcore Registry."""
 
-    def __init__(self, *, strict: bool = True, rich_description: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        strict: bool = True,
+        rich_description: bool = False,
+        artifact_store: MCPArtifactStore | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
         # When ``rich_description`` is True, MCP Tool descriptions are
         # rendered as apcore-toolkit Markdown (title, description,
         # behavior table, schemas, examples) instead of the plain
@@ -790,7 +798,10 @@ class MCPServerFactory:
             if output_schema is not None and "_mcp_live_output_schema" in extra:
                 schema = extra["_mcp_live_output_schema"]
                 output_schema = schema if isinstance(schema, dict) and schema.get("type") == "object" else None
-            return _build_call_result(text_contents, is_error, output_schema, approval=pending_approval)
+            result = _build_call_result(text_contents, is_error, output_schema, approval=pending_approval)
+            if regular_tool and not background_tool:
+                self._attach_artifact_links(result, output_schema, identity)
+            return result
 
         sdk_call_tool = server.request_handlers[mcp_types.CallToolRequest]
 
@@ -924,6 +935,11 @@ class MCPServerFactory:
         @server.read_resource()
         async def handle_read_resource(uri: Any) -> list[ReadResourceContents]:
             uri_str = str(uri)
+            if self._artifact_store is not None and uri_str.startswith(ARTIFACT_URI_PREFIX):
+                artifact = self._artifact_store.read_uri(uri_str, _request_identity())
+                if artifact is None:
+                    raise ValueError("Artifact not found")
+                return [ReadResourceContents(content=artifact.content, mime_type=artifact.mime_type)]
             docs_prefix = "docs://"
             system_prefix = f"{_SYSTEM_RESOURCE_SCHEME}://system."
             if uri_str.startswith(system_prefix):
@@ -935,6 +951,39 @@ class MCPServerFactory:
             if not documentation:
                 raise ValueError(f"Resource not found: {uri_str}")
             return [ReadResourceContents(content=documentation, mime_type="text/plain")]
+
+    def _attach_artifact_links(
+        self,
+        result: mcp_types.CallToolResult,
+        schema: dict[str, Any] | None,
+        identity: Identity | None,
+    ) -> None:
+        store = self._artifact_store
+        if store is None or result.isError or result.structuredContent is None or schema is None:
+            return
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+        emitted: set[str] = set()
+        for name, definition in properties.items():
+            if not isinstance(definition, dict) or definition.get("x-mcp-artifact") is not True:
+                continue
+            if definition.get("x-sensitive") is True:
+                continue
+            key = result.structuredContent.get(name)
+            if not isinstance(key, str) or len(key) != 32 or key in emitted:
+                continue
+            uri = ARTIFACT_URI_PREFIX + key
+            artifact = store.read_uri(uri, identity)
+            if artifact is not None:
+                emitted.add(key)
+                result.content.append(mcp_types.ResourceLink(
+                    type="resource_link",
+                    uri=AnyUrl(uri),
+                    name=artifact.name,
+                    mimeType=artifact.mime_type,
+                    size=len(artifact.content),
+                ))
 
     async def _read_system_resource(
         self,

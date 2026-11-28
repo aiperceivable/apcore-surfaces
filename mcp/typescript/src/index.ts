@@ -8,6 +8,7 @@
  */
 
 import { createNodeHandler, type Tool as UITool } from "mcp-embedded-ui";
+import type { MCPArtifactStore } from "./artifacts.js";
 import { OpenAIConverter } from "./converters/openai.js";
 import type { ConvertRegistryOptions } from "./converters/openai.js";
 import { MCPServerFactory } from "./server/factory.js";
@@ -35,6 +36,8 @@ import type { ApprovalStore } from "./approval-store.js";
 import { StorageBackedApprovalHandler } from "./adapters/approval.js";
 import { ApprovalBridge } from "./server/approval-bridge.js";
 import pkg from "../package.json" with { type: "json" };
+
+export { MCPArtifactStore } from "./artifacts.js";
 
 export const VERSION: string = pkg.version;
 
@@ -662,6 +665,7 @@ export interface BaseServeOptions {
    * stopped on shutdown), preventing unbounded record growth.
    */
   approvalStore?: ApprovalStore;
+  artifactStore?: MCPArtifactStore;
   /**
    * Optional callback invoked when a new approval is requested. Used together
    * with `approvalStore` to fan out to Slack/email/webhooks.
@@ -954,7 +958,7 @@ async function serveInternal(
       : null;
 
     // Build MCP server components
-    const factory = new MCPServerFactory();
+    const factory = new MCPServerFactory({ artifactStore: options.artifactStore });
     // aiperceivable/apcore-mcp#16 phase A: advertise `com.aiperceivable/management`
     // in `initialize` capabilities only for surfaces actually registered.
     const managementSurfaces = computeManagementSurfaces(registry);
@@ -1303,7 +1307,7 @@ export async function asyncServe(
     : null;
 
   // Build MCP server components
-  const factory = new MCPServerFactory();
+  const factory = new MCPServerFactory({ artifactStore: options.artifactStore });
   // aiperceivable/apcore-mcp#16 phase A: advertise `com.aiperceivable/management`
   // in `initialize` capabilities only for surfaces actually registered.
   const managementSurfaces = computeManagementSurfaces(registry);

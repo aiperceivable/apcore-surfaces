@@ -11,6 +11,7 @@ from google.protobuf import struct_pb2
 from google.protobuf.json_format import MessageToDict, ParseDict
 
 from apcore_a2a.adapters.schema import SchemaConverter
+from apcore_a2a.artifacts import ArtifactLinkPolicy, _ArtifactDeclaration
 
 
 class PartConverter:
@@ -58,6 +59,19 @@ class PartConverter:
             raise ValueError("FilePart is not supported")
 
         raise ValueError("Empty or unknown part content")
+
+    async def add_artifact_links(
+        self,
+        artifact: Artifact,
+        output: Any,
+        declaration: _ArtifactDeclaration,
+        policy: ArtifactLinkPolicy,
+    ) -> None:
+        """Add authorized URL parts to an existing finalized data artifact."""
+        if isinstance(output, dict) and declaration.is_current():
+            parts = await policy._resolve_parts(output, declaration.fields, declaration.identity)
+            if declaration.is_current():
+                artifact.parts.extend(parts)
 
     def output_to_parts(self, output: Any, task_id: str = "") -> Artifact:
         """Convert apcore module output to a2a.types.Artifact.

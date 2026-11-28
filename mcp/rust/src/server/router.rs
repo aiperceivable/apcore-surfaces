@@ -230,15 +230,43 @@ pub trait Executor: Send + Sync {
 
 /// Everything [`ExecutionRouter::build_context`] produces for one call.
 ///
-/// `.3` is the elicit guard and MUST be bound for the life of the dispatch;
+/// `.3` owns the interaction scope for the life of the dispatch;
 /// see [`ExecutionRouter::build_context`] for why a bare `_` reintroduces the
 /// bug it exists to prevent.
 type BuiltContext = (
     Value,
     HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
     apcore::Context<Value>,
-    Option<ElicitGuard>,
+    InteractionGuard,
 );
+
+struct InteractionGuard {
+    native_lifetime: Option<CancelToken>,
+    _legacy_elicitation: Option<ElicitGuard>,
+}
+
+impl Drop for InteractionGuard {
+    fn drop(&mut self) {
+        if let Some(lifetime) = &self.native_lifetime {
+            lifetime.cancel();
+        }
+    }
+}
+
+// Use the Core callback contract's ModuleError directly.
+#[allow(clippy::result_large_err)]
+async fn during_interaction<T>(
+    lifetime: &CancelToken,
+    operation: impl Future<Output = Result<T, apcore::ModuleError>>,
+) -> Result<T, apcore::ModuleError> {
+    tokio::select! {
+        biased;
+        () = lifetime.cancelled() => Err(apcore::ExecutionCancelledError::without_module(
+            "The MCP tool call has completed",
+        ).into()),
+        result = operation => result,
+    }
+}
 
 /// Build the per-call [`ElicitCallback`] that forwards to the MCP session.
 ///
@@ -257,6 +285,44 @@ fn make_elicit_callback(session: Arc<dyn SessionHandle>) -> crate::helpers::Elic
                     tracing::warn!("Elicitation request failed: {e}");
                     None
                 }
+            }
+        })
+    })
+}
+
+fn native_elicitation_handler(
+    session: Arc<dyn SessionHandle>,
+    lifetime: CancelToken,
+) -> apcore::ElicitationHandler {
+    use crate::helpers::ElicitAction;
+    use apcore::{ElicitationResult, ErrorCode, ModuleError};
+
+    Arc::new(move |request| {
+        let session = Arc::clone(&session);
+        let lifetime = lifetime.clone();
+        Box::pin(async move {
+            let schema = request.requested_schema.unwrap_or_else(|| json!({}));
+            let reply = during_interaction(&lifetime, async {
+                session
+                    .elicit_form(&request.message, &schema)
+                    .await
+                    .map_err(|_| {
+                        ModuleError::new(ErrorCode::GeneralInternalError, "MCP elicitation failed")
+                    })
+            })
+            .await?;
+            match reply.action {
+                ElicitAction::Accept => match reply.content {
+                    Some(Value::Object(content)) => Ok(ElicitationResult::Accept { content }),
+                    _ => Err(ModuleError::invalid_input(
+                        "MCP elicitation accepted without object content",
+                    )),
+                },
+                ElicitAction::Decline => Ok(ElicitationResult::Decline),
+                ElicitAction::Cancel => Ok(ElicitationResult::Cancel),
+                ElicitAction::Unknown(_) => Err(ModuleError::invalid_input(
+                    "MCP elicitation returned an unknown action",
+                )),
             }
         })
     })
@@ -373,6 +439,11 @@ pub type SendNotificationFn = Arc<
 /// Handle to the MCP session for elicitation requests.
 #[async_trait]
 pub trait SessionHandle: Send + Sync {
+    /// Whether this session can present an elicitation form.
+    fn supports_elicitation(&self) -> bool {
+        true
+    }
+
     /// Send an elicitation form to the client and return the result.
     async fn elicit_form(
         &self,
@@ -1264,10 +1335,10 @@ impl ExecutionRouter {
             identity,
             typed_identity: None,
         };
-        // `_elicit_guard` keeps the registered elicit callback alive for the
+        // `_interaction_guard` keeps callbacks available for the
         // whole dispatch below. Binding it to a bare `_` would drop it here and
         // deregister the callback before the approval gate ever runs.
-        let (context_value, _context_data, apcore_ctx, _elicit_guard) =
+        let (context_value, _context_data, apcore_ctx, _interaction_guard) =
             Self::build_context_with_trace(&call_extra, trace_parent.clone(), Some(cancel_token));
 
         // Short-circuit the `__apcore_approval_check` meta-tool via the
@@ -1554,7 +1625,8 @@ impl ExecutionRouter {
         });
 
         // Build per-call context
-        let (context_value, _context_data, apcore_ctx, _elicit_guard) = Self::build_context(&extra);
+        let (context_value, _context_data, apcore_ctx, _interaction_guard) =
+            Self::build_context(&extra);
 
         // Pre-execution validation. catch_unwind guards against panics from
         // third-party executor implementations (symmetric with validate_tool's
@@ -1684,18 +1756,18 @@ impl ExecutionRouter {
     /// callback objects) and in `apcore_ctx.data` (as marker values so
     /// modules can detect availability).
     ///
-    /// Returns `(context_value, context_data, apcore_context, elicit_guard)`
+    /// Returns `(context_value, context_data, apcore_context, interaction_guard)`
     /// where `context_data` holds the callback objects that cannot be
     /// serialized into JSON, and `apcore_context` is the proper apcore
     /// `Context`.
     ///
     /// # The elicit guard MUST outlive the call
     ///
-    /// `elicit_guard` owns the registry entry that
+    /// `interaction_guard` owns the registry entry that
     /// [`MCP_ELICIT_CALL_ID_KEY`] in `apcore_context.data` points at. Dropping
     /// it deregisters the callback, so an approval handler running after that
     /// point resolves the id to nothing and rejects. Bind it for the whole
-    /// dispatch (`let (.., _elicit_guard) = ...`) — never to a bare `_`, which
+    /// dispatch (`let (.., _interaction_guard) = ...`) — never to a bare `_`, which
     /// drops immediately and reinstates exactly the bug this returns it to
     /// prevent.
     fn build_context(extra: &CallExtra) -> BuiltContext {
@@ -1767,15 +1839,25 @@ impl ExecutionRouter {
 
         let has_progress = extra.progress_token.is_some() && extra.send_notification.is_some();
         let has_elicit = extra.session.is_some();
+        let native_session = extra
+            .session
+            .as_ref()
+            .filter(|session| session.supports_elicitation());
+        let lifetime = (has_progress || native_session.is_some()).then(CancelToken::new);
 
         // Inject progress callback
-        if let (Some(ref token), Some(ref send_notification)) =
-            (&extra.progress_token, &extra.send_notification)
-        {
+        if let (Some(token), Some(send_notification), Some(lifetime)) = (
+            &extra.progress_token,
+            &extra.send_notification,
+            lifetime.as_ref(),
+        ) {
             let token = token.clone();
             let sn = Arc::clone(send_notification);
-            let progress_cb: crate::helpers::ProgressCallback =
-                Box::new(move |progress, total, message| {
+            let progress_cb = Arc::new(
+                move |progress: f64,
+                      total: Option<f64>,
+                      message: Option<String>|
+                      -> Pin<Box<dyn Future<Output = ()> + Send>> {
                     let token_val = progress_token_to_value(&token);
                     let sn = Arc::clone(&sn);
                     Box::pin(async move {
@@ -1799,14 +1881,30 @@ impl ExecutionRouter {
                             tracing::debug!("Failed to send progress notification: {e}");
                         }
                     })
-                });
-            data.insert(MCP_PROGRESS_KEY.to_string(), Box::new(progress_cb));
+                },
+            );
+            let legacy = Arc::clone(&progress_cb);
+            let legacy_callback: crate::helpers::ProgressCallback =
+                Box::new(move |progress, total, message| legacy(progress, total, message));
+            data.insert(MCP_PROGRESS_KEY.to_string(), Box::new(legacy_callback));
+            let lifetime = lifetime.clone();
+            apcore_ctx = apcore_ctx.with_progress_reporter(Some(Arc::new(move |update| {
+                let callback = Arc::clone(&progress_cb);
+                let lifetime = lifetime.clone();
+                Box::pin(async move {
+                    during_interaction(&lifetime, async move {
+                        callback(update.progress, update.total, update.message).await;
+                        Ok(())
+                    })
+                    .await
+                })
+            })));
         }
 
         // Inject elicit callback.
         //
-        // Two copies, because they serve two different consumers. The
-        // side-channel `data` map is the historical home and is typed
+        // The legacy callbacks serve two consumers. The side-channel
+        // `data` map is the historical home and is typed
         // `Box<dyn Any>`, which no apcore surface can read. The registry copy
         // is the one an `ApprovalHandler` can actually reach: it is addressed
         // by the id written into `apcore_ctx.data` below, and the returned
@@ -1821,11 +1919,15 @@ impl ExecutionRouter {
                 make_elicit_callback(Arc::clone(session)),
             ));
         }
+        if let (Some(session), Some(lifetime)) = (native_session, lifetime.as_ref()) {
+            apcore_ctx = apcore_ctx.with_elicitation_handler(Some(native_elicitation_handler(
+                Arc::clone(session),
+                lifetime.clone(),
+            )));
+        }
 
-        // Write marker values into apcore Context.data so modules can
-        // detect callback availability. Actual callbacks live in the
-        // side-channel `data` map since serde_json::Value cannot hold
-        // function pointers.
+        // Retain the legacy availability markers and approval handle.
+        // Native callbacks live in the Context's local attachments.
         {
             let mut shared = apcore_ctx.data.write();
             if has_progress {
@@ -1863,7 +1965,15 @@ impl ExecutionRouter {
             Value::String(apcore_ctx.trace_id.clone()),
         );
 
-        (Value::Object(context_obj), data, apcore_ctx, elicit_guard)
+        (
+            Value::Object(context_obj),
+            data,
+            apcore_ctx,
+            InteractionGuard {
+                native_lifetime: lifetime,
+                _legacy_elicitation: elicit_guard,
+            },
+        )
     }
 
     // -----------------------------------------------------------------------

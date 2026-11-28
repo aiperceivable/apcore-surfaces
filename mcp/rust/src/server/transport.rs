@@ -2420,6 +2420,14 @@ mod tests {
 
     /// Collect the next `count` JSON-RPC responses carried by `message` events.
     async fn collect_sse_responses(body: &mut axum::body::Body, count: usize) -> Vec<Value> {
+        collect_sse_messages(body, count, |message| message.get("id").is_some()).await
+    }
+
+    async fn collect_sse_messages(
+        body: &mut axum::body::Body,
+        count: usize,
+        accept: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
         let mut responses = Vec::new();
         while responses.len() < count {
             let chunk = read_sse_chunk(body).await;
@@ -2430,7 +2438,7 @@ mod tests {
                 let Ok(value) = serde_json::from_str::<Value>(payload.trim()) else {
                     continue;
                 };
-                if value.get("id").is_some() {
+                if accept(&value) {
                     responses.push(value);
                 }
             }
@@ -4359,6 +4367,262 @@ mod tests {
             .await
             .expect("join")
             .expect("the stdio loop must exit cleanly on EOF");
+    }
+
+    type RetainedContext = Arc<std::sync::Mutex<Option<apcore::Context<Value>>>>;
+
+    struct NativeInteraction(RetainedContext);
+
+    #[async_trait::async_trait]
+    impl apcore::Module for NativeInteraction {
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        fn output_schema(&self) -> Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        fn description(&self) -> &'static str {
+            "Use the Core Context interaction methods"
+        }
+
+        async fn execute(
+            &self,
+            _inputs: Value,
+            context: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::ModuleError> {
+            context
+                .report_progress(2.0, Some(3.0), Some("native progress"))
+                .await?;
+            let reply = context
+                .elicit("Native prompt?", serde_json::json!({"type":"object"}))
+                .await?;
+            *self.0.lock().unwrap() = Some(context.clone());
+            Ok(serde_json::json!({"reply":reply}))
+        }
+    }
+
+    fn native_interaction_handler() -> (
+        Arc<crate::server::server::ServerHandler>,
+        String,
+        RetainedContext,
+    ) {
+        let retained = RetainedContext::default();
+        let registry = Arc::new(apcore::Registry::new());
+        registry
+            .register_module(
+                "demo.native",
+                Box::new(NativeInteraction(Arc::clone(&retained))),
+            )
+            .unwrap();
+        let bridge = crate::APCoreMCP::builder()
+            .backend(registry)
+            .build()
+            .unwrap();
+        let (server, _, tools, options, _, _) = bridge.build_server_components().unwrap();
+        let handler = crate::server::server::ServerHandler::from_server(&server, options).unwrap();
+        (Arc::new(handler), tools[0].name.clone(), retained)
+    }
+
+    fn native_init(capabilities: Value) -> Value {
+        serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":capabilities}
+        })
+    }
+
+    fn native_call(tool_name: &str, id: u64) -> Value {
+        serde_json::json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":tool_name,"arguments":{},"_meta":{"progressToken":"native"}}
+        })
+    }
+
+    fn native_prompt(progress: &Value, prompt: &Value) {
+        assert_eq!(progress["method"], "notifications/progress");
+        assert_eq!(progress["params"]["progressToken"], "native");
+        assert_eq!(progress["params"]["progress"], 2.0);
+        assert_eq!(progress["params"]["message"], "native progress");
+        assert_eq!(prompt["method"], "elicitation/create");
+        assert_eq!(prompt["params"]["message"], "Native prompt?");
+        assert_eq!(
+            prompt["params"]["requestedSchema"],
+            serde_json::json!({"type":"object"})
+        );
+    }
+
+    fn native_result(response: &Value) -> Value {
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["result"]["isError"], false);
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stdio_delivers_native_context_progress_and_elicitation() {
+        let (handler, name, retained) = native_interaction_handler();
+        let tm = TransportManager::new(None);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_lines = BufReader::new(client_read).lines();
+        let serve = tokio::spawn(async move {
+            let (server_read, server_write) = tokio::io::split(server);
+            tm.run_stdio_with_io(server_read, server_write, handler.as_ref())
+                .await
+        });
+        send(
+            &mut client_write,
+            native_init(serde_json::json!({"elicitation":{}})),
+        )
+        .await;
+        assert_eq!(recv(&mut client_lines).await["id"], 1);
+        send(&mut client_write, native_call(&name, 2)).await;
+        let progress = recv(&mut client_lines).await;
+        assert_eq!(progress["method"], "notifications/progress");
+        let prompt = recv(&mut client_lines).await;
+        native_prompt(&progress, &prompt);
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc":"2.0","id":prompt["id"],
+                "result":{"action":"accept","content":{"confirmed":true}}
+            }),
+        )
+        .await;
+        let output = native_result(&recv(&mut client_lines).await);
+        assert_eq!(
+            output["reply"],
+            serde_json::json!({"action":"accept","content":{"confirmed":true}})
+        );
+        let stale = retained.lock().unwrap().take().unwrap();
+        let late_progress = stale
+            .report_progress(1.0, None, Some("late"))
+            .await
+            .unwrap_err();
+        assert_eq!(late_progress.code, apcore::ErrorCode::ExecutionCancelled);
+        let late_elicit = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stale.elicit("Late prompt", None),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(late_elicit.code, apcore::ErrorCode::ExecutionCancelled);
+        send(&mut client_write, native_call(&name, 3)).await;
+        let progress = recv(&mut client_lines).await;
+        let prompt = recv(&mut client_lines).await;
+        native_prompt(&progress, &prompt);
+        send(&mut client_write, cancel_request(3.into())).await;
+        send(
+            &mut client_write,
+            serde_json::json!({
+                "jsonrpc":"2.0","id":4,"method":"tools/list","params":{}
+            }),
+        )
+        .await;
+        // The transport suppresses cancelled responses. The next request
+        // still receives its response while the client ignores the old prompt.
+        let next = recv(&mut client_lines).await;
+        assert_eq!(next["id"], 4);
+        assert!(next["result"]["tools"].is_array());
+        drop(client_write);
+        drop(client_lines);
+        serve.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sse_delivers_native_context_interactions_on_the_calling_session() {
+        let (handler, name, _) = native_interaction_handler();
+        let (app, _) = sse_test_app_parts_with(Arc::new(TransportManager::new(None)), handler);
+        let (mut body, id) = open_sse_session(&app).await;
+        assert_eq!(
+            post_sse_raw(
+                &app,
+                &id,
+                native_init(serde_json::json!({"elicitation":{}}))
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(collect_sse_responses(&mut body, 1).await[0]["id"], 1);
+        assert_eq!(
+            post_sse_raw(&app, &id, native_call(&name, 2)).await,
+            StatusCode::ACCEPTED
+        );
+        let messages = collect_sse_messages(&mut body, 2, |_| true).await;
+        native_prompt(&messages[0], &messages[1]);
+        assert_eq!(
+            post_sse_raw(
+                &app,
+                &id,
+                serde_json::json!({
+                    "jsonrpc":"2.0","id":messages[1]["id"],"result":{"action":"decline"}
+                })
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+        let result = collect_sse_responses(&mut body, 1).await;
+        assert_eq!(
+            native_result(&result[0])["reply"],
+            serde_json::json!({"action":"decline"})
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_without_elicitation_capability_gets_no_native_prompt() {
+        let (handler, name, _) = native_interaction_handler();
+        let tm = TransportManager::new(None);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_lines = BufReader::new(client_read).lines();
+        let serve = tokio::spawn(async move {
+            let (server_read, server_write) = tokio::io::split(server);
+            tm.run_stdio_with_io(server_read, server_write, handler.as_ref())
+                .await
+        });
+        send(&mut client_write, native_init(serde_json::json!({}))).await;
+        assert_eq!(recv(&mut client_lines).await["id"], 1);
+        send(&mut client_write, native_call(&name, 2)).await;
+        assert_eq!(
+            recv(&mut client_lines).await["method"],
+            "notifications/progress"
+        );
+        assert!(native_result(&recv(&mut client_lines).await)["reply"].is_null());
+        drop(client_write);
+        drop(client_lines);
+        serve.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamable_http_does_not_offer_native_callbacks_on_the_shared_session() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (handler, name, _) = native_interaction_handler();
+        let sessions = handler.session_registry().unwrap();
+        let tm = Arc::new(TransportManager::new(None));
+        let app = tm.build_streamable_http_app(handler, None);
+        let post = |message: Value| {
+            let app = app.clone();
+            async move {
+                let request = Request::post("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(message.to_string()))
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+        assert_eq!(
+            post(native_init(serde_json::json!({"elicitation":{}}))).await["id"],
+            1
+        );
+        let result = post(native_call(&name, 2)).await;
+        assert!(native_result(&result)["reply"].is_null());
+        assert!(sessions.is_empty());
     }
 
     #[tokio::test]

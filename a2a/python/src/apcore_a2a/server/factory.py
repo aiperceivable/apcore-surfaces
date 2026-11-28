@@ -52,6 +52,7 @@ from apcore_a2a.adapters.errors import ErrorMapper
 from apcore_a2a.adapters.parts import PartConverter
 from apcore_a2a.adapters.schema import SchemaConverter
 from apcore_a2a.adapters.skill_mapper import SkillMapper
+from apcore_a2a.artifacts import ArtifactLinkPolicy
 from apcore_a2a.server.context import (
     TASK_OWNER_KEY,
     TASK_SKILL_KEY,
@@ -460,6 +461,7 @@ class A2AServerFactory:
         metrics: bool = False,
         sys_modules: bool = False,
         disclose_refusal_reason: bool = False,
+        artifact_links: ArtifactLinkPolicy | None = None,
     ) -> tuple[Starlette, AgentCard]:
         """Build ASGI app and AgentCard. Returns (app, agent_card).
 
@@ -615,6 +617,7 @@ class A2AServerFactory:
             registry,
             execution_timeout,
             on_state_change=on_state_change_cb,
+            artifact_links=artifact_links,
             track_terminal_status=True,
             load_task=load_task,
         )

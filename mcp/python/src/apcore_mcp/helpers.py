@@ -7,11 +7,45 @@ Gracefully no-op when callbacks are absent (non-MCP execution paths).
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, TypeVar
+
+import apcore
 
 # Keys under context.data where MCP callbacks are stored.
 MCP_PROGRESS_KEY = "_mcp_progress"
 MCP_ELICIT_KEY = "_mcp_elicit"
+
+_Context = TypeVar("_Context")
+
+
+def _bind_core_progress(context: _Context) -> _Context:
+    """Attach the existing MCP sink to a native Core context when supported."""
+    callback = getattr(context, "data", {}).get(MCP_PROGRESS_KEY)
+    bind = getattr(context, "with_progress_reporter", None)
+    if callback is None or not callable(bind):
+        return context
+    return bind(callback)
+
+
+def _bind_core_elicitation(context: _Context) -> _Context:
+    """Translate the existing MCP result for a native Core context."""
+    callback = getattr(context, "data", {}).get(MCP_ELICIT_KEY)
+    bind = getattr(context, "with_elicitation_handler", None)
+    result_type = getattr(apcore, "ElicitationResult", None)
+    if callback is None or not callable(bind) or not callable(result_type):
+        return context
+
+    async def handle(message: str, requested_schema: dict[str, Any] | None) -> Any:
+        result = await callback(message, requested_schema)
+        if result is not None:
+            action, content = result["action"], result.get("content")
+            if action == "accept" and isinstance(content, dict):
+                return result_type("accept", content)
+            if action == "decline":
+                return result_type("decline")
+        return result_type("cancel")
+
+    return bind(handle)
 
 
 class ElicitResult(TypedDict):

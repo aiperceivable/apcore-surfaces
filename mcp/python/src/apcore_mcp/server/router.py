@@ -18,10 +18,13 @@ from apcore.errors import ApprovalPendingError
 from apcore.registry.types import ModuleDescriptor
 from apcore.registry.version import matches_version_hint
 from apcore.trace_context import TraceContext, TraceParent
+from mcp import types as mcp_types
+from mcp.server.lowlevel.server import request_ctx
+from mcp.server.session import ServerSession
 
 from apcore_mcp.adapters.approval import _capture_pending_error
 from apcore_mcp.adapters.errors import ErrorMapper
-from apcore_mcp.helpers import MCP_ELICIT_KEY, MCP_PROGRESS_KEY
+from apcore_mcp.helpers import MCP_ELICIT_KEY, MCP_PROGRESS_KEY, _bind_core_elicitation, _bind_core_progress
 
 logger = logging.getLogger(__name__)
 
@@ -561,6 +564,10 @@ class ExecutionRouter:
         # Inject elicitation callback if session available
         if session is not None:
             _session = session
+            request = request_ctx.get(None)
+            related = {}
+            if request is not None and request.session is session:
+                related["related_request_id"] = request.request_id
 
             async def _elicit_callback(
                 message: str,
@@ -570,6 +577,7 @@ class ExecutionRouter:
                     result = await _session.elicit_form(
                         message=message,
                         requestedSchema=requested_schema or {},
+                        **related,
                     )
                     return {
                         "action": result.action,
@@ -610,6 +618,15 @@ class ExecutionRouter:
             trace_parent=trace_parent,
             cancel_token=cancel_token,
         )
+
+        context = _bind_core_progress(context)
+        if session is not None and (
+            not isinstance(session, ServerSession)
+            or session.check_client_capability(
+                mcp_types.ClientCapabilities(elicitation=mcp_types.ElicitationCapability())
+            )
+        ):
+            context = _bind_core_elicitation(context)
 
         # Explicit SDK hint, then MCP metadata, then descriptor default.
         version_hint = _request_version_hint(extra)

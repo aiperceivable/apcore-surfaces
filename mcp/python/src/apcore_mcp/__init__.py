@@ -30,6 +30,7 @@ from apcore_mcp.apcore_mcp import (
     _load_config_bus_overrides as _load_config_bus_overrides,  # noqa: F401 - re-export for tests
 )
 from apcore_mcp.approval_store import ApprovalScope, ApprovalStore, InMemoryApprovalStore, ScopedApprovalStore
+from apcore_mcp.artifacts import MCPArtifactStore
 from apcore_mcp.auth import (
     Authenticator,
     AuthMiddleware,
@@ -68,6 +69,7 @@ register_mcp_namespace()
 register_mcp_formatter()
 
 __all__ = [
+    "MCPArtifactStore",
     # Public API
     "APCoreMCP",
     "serve",

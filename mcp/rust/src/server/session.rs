@@ -249,6 +249,10 @@ impl McpSession {
 
 #[async_trait]
 impl SessionHandle for McpSession {
+    fn supports_elicitation(&self) -> bool {
+        McpSession::supports_elicitation(self)
+    }
+
     async fn elicit_form(
         &self,
         message: &str,

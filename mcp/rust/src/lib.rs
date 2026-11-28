@@ -15,6 +15,9 @@ pub mod acl_builder;
 pub mod adapters;
 pub mod apcore_mcp;
 pub mod approval_store;
+#[cfg(test)]
+mod artifact_wire_tests;
+mod artifacts;
 pub mod auth;
 pub mod cli;
 pub mod config;
@@ -40,6 +43,7 @@ pub use crate::apcore_mcp::{
 };
 pub use crate::apcore_mcp::{AsyncServeConfig, OpenAIToolsConfig, ServeConfig};
 pub use crate::apcore_mcp::{AsyncServeOptions, ExplorerOptions, ServeOptions};
+pub use crate::artifacts::{ArtifactStoreError, MCPArtifactStore, ARTIFACT_URI_PREFIX};
 
 // ---- Re-exports: top-level convenience functions ----------------------------
 pub use crate::apcore_mcp::{async_serve, serve, to_openai_tools};

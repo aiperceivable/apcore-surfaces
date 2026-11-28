@@ -31,6 +31,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 
 # Imported at module level — no circular dependency (middleware.py does not import executor.py)
 from apcore_a2a.adapters.errors import GOVERNANCE_REFUSAL_CODES, carries_caller_detail, sanitize_message
+from apcore_a2a.artifacts import ArtifactLinkPolicy, _artifact_declaration, _ArtifactDeclaration, _validated_output
 from apcore_a2a.auth.middleware import auth_identity_var
 from apcore_a2a.server.context import TASK_OWNER_KEY, TASK_SKILL_KEY, identity_of, scoped_owner
 
@@ -93,6 +94,7 @@ class ApCoreAgentExecutor(AgentExecutor):
         execution_timeout: int = 300,
         on_state_change: Callable[[str, str], None] | None = None,
         *,
+        artifact_links: ArtifactLinkPolicy | None = None,
         track_terminal_status: bool = False,
         load_task: Callable[[str, Any], Awaitable[Task | None]] | None = None,
     ) -> None:
@@ -102,6 +104,7 @@ class ApCoreAgentExecutor(AgentExecutor):
         self._registry = registry
         self._execution_timeout = execution_timeout
         self._on_state_change = on_state_change
+        self._artifact_links = artifact_links
         # Cache inspect.signature results keyed by stable method qualified name
         self._context_accepts_cache: dict[str, bool] = {}
         self._running: dict[_TaskKey, _TaskExecution] = {}
@@ -287,7 +290,10 @@ class ApCoreAgentExecutor(AgentExecutor):
                 and (inspect.isasyncgenfunction(stream_fn) or inspect.iscoroutinefunction(stream_fn))
             )
 
-            if _can_stream:
+            declaration = None
+            if self._artifact_links is not None and isinstance(identity, Identity) and apcore_ctx is not None:
+                declaration = _artifact_declaration(self._registry, self._executor, skill_id, identity)
+            if _can_stream and declaration is None:
                 await self._run_with_timeout(
                     self._execute_streaming(context, event_queue, skill_id, inputs, apcore_ctx, context_id, stopped),
                     context.task_id,
@@ -295,7 +301,15 @@ class ApCoreAgentExecutor(AgentExecutor):
                 )
             else:
                 await self._run_with_timeout(
-                    self._send_single(context, event_queue, skill_id, inputs, apcore_ctx, stopped),
+                    self._send_single(
+                        context,
+                        event_queue,
+                        skill_id,
+                        inputs,
+                        apcore_ctx,
+                        stopped,
+                        declaration=declaration,
+                    ),
                     context.task_id,
                     run,
                 )
@@ -474,15 +488,31 @@ class ApCoreAgentExecutor(AgentExecutor):
         inputs: Any,
         apcore_ctx: Any,
         stopped: asyncio.Event,
+        *,
+        declaration: _ArtifactDeclaration | None = None,
     ) -> None:
-        output = await self._execute_single(skill_id, inputs, apcore_ctx)
+        trace = None
+        if declaration is not None:
+            output, trace = await self._executor.call_async_with_trace(skill_id, inputs, apcore_ctx)
+        else:
+            output = await self._execute_single(skill_id, inputs, apcore_ctx)
+        if stopped.is_set():
+            return
+        artifact = self._part_converter.output_to_parts(output, context.task_id)
+        if (
+            declaration is not None
+            and self._artifact_links is not None
+            and trace is not None
+            and _validated_output(trace)
+        ):
+            await self._part_converter.add_artifact_links(artifact, output, declaration, self._artifact_links)
         if stopped.is_set():
             return
         await event_queue.enqueue_event(
             TaskArtifactUpdateEvent(
                 task_id=context.task_id,
                 context_id=context.context_id or context.task_id,
-                artifact=self._part_converter.output_to_parts(output, context.task_id),
+                artifact=artifact,
                 last_chunk=True,
             )
         )

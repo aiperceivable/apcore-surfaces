@@ -85,6 +85,9 @@ fn matches_output_schema(value: &Value, schema: &Value) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct CallToolResult {
     pub content: Vec<TextContent>,
+    /// Additional resource links for the MCP wire result.
+    #[serde(skip)]
+    pub resource_links: Vec<ResourceLink>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     pub is_error: bool,
@@ -129,10 +132,40 @@ impl CallToolResult {
     pub fn new(content: Vec<TextContent>, is_error: bool) -> Self {
         Self {
             content,
+            resource_links: Vec::new(),
             structured_content: None,
             is_error,
             meta: None,
         }
+    }
+
+    pub(crate) fn to_wire(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {
+            content.extend(self.resource_links.iter().map(ResourceLink::to_wire));
+        }
+        value
+    }
+}
+
+/// A readable artifact link carried alongside a normal tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceLink {
+    pub uri: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size: usize,
+}
+
+impl ResourceLink {
+    fn to_wire(&self) -> Value {
+        serde_json::json!({
+            "type": "resource_link",
+            "uri": self.uri,
+            "name": self.name,
+            "mimeType": self.mime_type,
+            "size": self.size,
+        })
     }
 }
 
@@ -151,6 +184,20 @@ pub struct Resource {
 pub struct ReadResourceContents {
     pub content: String,
     pub mime_type: String,
+    /// For an artifact, content is the encoded blob at this URI.
+    #[serde(skip)]
+    pub artifact_uri: Option<String>,
+}
+
+impl ReadResourceContents {
+    pub(crate) fn to_wire(&self) -> Value {
+        match &self.artifact_uri {
+            Some(uri) => {
+                serde_json::json!({"uri":uri,"blob":self.content,"mimeType":self.mime_type})
+            }
+            None => serde_json::json!({"content":self.content,"mimeType":self.mime_type}),
+        }
+    }
 }
 
 /// An MCP Resource Template definition exposed via `resources/templates/
@@ -596,6 +643,7 @@ mod tests {
     #[test]
     fn test_call_tool_result_serialization() {
         let result = CallToolResult {
+            resource_links: Vec::new(),
             structured_content: None,
             content: vec![TextContent::new("result text")],
             is_error: false,
@@ -612,6 +660,7 @@ mod tests {
     #[test]
     fn test_read_resource_contents_serialization() {
         let contents = ReadResourceContents {
+            artifact_uri: None,
             content: "# Documentation".to_string(),
             mime_type: "text/plain".to_string(),
         };

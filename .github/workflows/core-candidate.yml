@@ -181,7 +181,7 @@ jobs:
               text = manifest.read_text()
               if text.count("1.0.0a5") != 1:
                   raise ValueError(f"Unexpected Core dependency in {manifest}")
-              manifest.write_text(text.replace("1.0.0a5", "1.0.0a6"))
+              manifest.write_text(text.replace("1.0.0a5", "1.0.0b1"))
           PY
           fi
           args=(-e '.[dev]')
@@ -204,7 +204,7 @@ jobs:
 
           import apcore
           import apcore_toolkit
-          from apcore import APCore, Executor
+          from apcore import APCore, Context, Executor
           from apcore.events import CircuitBreakerWrapper
 
           installed = distribution("apcore")
@@ -216,12 +216,13 @@ jobs:
           assert core_path == installed.locate_file("apcore/__init__.py").resolve()
           assert toolkit_path == toolkit_expected.resolve()
           if os.environ["CORE_MODE"] == "candidate":
-              assert installed.version == "1.0.0a6"
+              assert installed.version == "1.0.0b1"
               origin = json.loads(installed.read_text("direct_url.json") or "{}")
               assert origin.get("url") == Path(os.environ["CORE_INSTALL"]).resolve().as_uri()
               assert callable(getattr(Executor, "stream_with_completion", None))
               assert callable(getattr(APCore, "stream_with_completion", None))
               assert hasattr(CircuitBreakerWrapper, "retry")
+              assert callable(Context.report_progress) and callable(Context.elicit)
           else:
               assert installed.version == "0.33.0"
           PY
@@ -342,7 +343,7 @@ jobs:
           import { readFileSync, realpathSync } from 'node:fs';
           import { resolve, sep } from 'node:path';
           import { fileURLToPath } from 'node:url';
-          import { APCore, Executor } from 'apcore-js';
+          import { APCore, Context, Executor } from 'apcore-js';
 
           const core = realpathSync('./node_modules/apcore-js');
           const coreEntry = realpathSync(fileURLToPath(import.meta.resolve('apcore-js')));
@@ -355,9 +356,11 @@ jobs:
           assert.ok(coreEntry.startsWith(core + sep));
           assert.equal(toolkitEntry, realpathSync(resolve(process.env.TOOLKIT_ROOT, 'dist/index.js')));
           if (process.env.CORE_MODE === 'candidate') {
-            assert.equal(coreVersion, '1.0.0-alpha.6');
+            assert.equal(coreVersion, '1.0.0-beta.1');
             assert.equal(typeof Executor.prototype.streamWithCompletion, 'function');
             assert.equal(typeof APCore.prototype.streamWithCompletion, 'function');
+            assert.equal(typeof Context.prototype.reportProgress, 'function');
+            assert.equal(typeof Context.prototype.elicit, 'function');
           } else {
             assert.equal(coreVersion, '0.33.0');
           }
@@ -446,8 +449,8 @@ jobs:
           crate="${crates[0]}"
           version="${crate##*/apcore-}"
           version="${version%.crate}"
-          if [[ "$version" != 1.0.0-alpha.6 ]]; then
-            echo "Expected the alpha.6 Core crate." >&2
+          if [[ "$version" != 1.0.0-beta.1 ]]; then
+            echo "Expected the beta.1 Core crate." >&2
             exit 1
           fi
           if [[ "$CORE_MODE" == candidate && -n "$EXPECTED_SHA256" ]]; then

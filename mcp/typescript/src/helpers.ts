@@ -70,3 +70,32 @@ export async function elicit(
   }
   return null;
 }
+
+type CoreElicitationReply =
+  | { action: "accept"; content: Record<string, unknown> }
+  | { action: "decline" | "cancel" };
+
+interface InteractionBindings<T> {
+  withProgressReporter?(reporter: (progress: number, total?: number, message?: string) => Promise<void>): T & InteractionBindings<T>;
+  withElicitationHandler?(handler: (message: string, schema?: Record<string, unknown>) => Promise<CoreElicitationReply>): T & InteractionBindings<T>;
+}
+
+/** @internal Install Core's interaction slots when present through the same detachable callback data. */
+export function withCoreInteractions<T extends HasData>(context: T): T {
+  const legacy = { data: context.data };
+  let bound = context as T & InteractionBindings<T>;
+  if (typeof bound.withProgressReporter === "function" && typeof legacy.data[MCP_PROGRESS_KEY] === "function") {
+    bound = bound.withProgressReporter((progress, total, message) => reportProgress(legacy, progress, total, message));
+  }
+  if (typeof bound.withElicitationHandler === "function" && typeof legacy.data[MCP_ELICIT_KEY] === "function") {
+    bound = bound.withElicitationHandler(async (message, schema) => {
+      const result = await elicit(legacy, message, schema);
+      // A detached session can no longer interact. Native Core represents it as a cancelled request.
+      if (result === null || result.action === "cancel") return { action: "cancel" };
+      if (result.action === "decline") return { action: "decline" };
+      if (result.action === "accept" && result.content !== undefined) return { action: "accept", content: result.content };
+      throw new Error("MCP elicitation did not return accepted content");
+    });
+  }
+  return bound;
+}

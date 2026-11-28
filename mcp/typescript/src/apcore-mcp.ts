@@ -35,6 +35,7 @@ import type {
 import type { Authenticator } from "./auth/types.js";
 import type { MetricsExporter } from "./server/transport.js";
 import type { ObservabilityFlag } from "./server/observability.js";
+import type { MCPArtifactStore } from "./artifacts.js";
 import type { ApprovalStore } from "./approval-store.js";
 import { withStdioOutput } from "./server/stdio-output.js";
 import {
@@ -85,6 +86,7 @@ export interface APCoreMCPOptions {
    * approval handler.
    */
   approvalStore?: ApprovalStore;
+  artifactStore?: MCPArtifactStore;
   /**
    * Optional callback invoked when a new approval is requested.
    * Used together with `approvalStore` to fan out to Slack/email/webhooks.
@@ -288,6 +290,7 @@ export class APCoreMCP {
       exemptPaths: this._options.exemptPaths,
       approvalHandler: this._options.approvalHandler,
       approvalStore: this._options.approvalStore,
+      artifactStore: this._options.artifactStore,
       approvalNotify: this._options.approvalNotify,
       outputFormatter: this._options.outputFormatter,
       middleware: this._options.middleware,
@@ -382,6 +385,7 @@ export class APCoreMCP {
       exemptPaths: this._options.exemptPaths,
       approvalHandler: this._options.approvalHandler,
       approvalStore: this._options.approvalStore,
+      artifactStore: this._options.artifactStore,
       approvalNotify: this._options.approvalNotify,
       endpoint: options.endpoint,
       outputFormatter: this._options.outputFormatter,

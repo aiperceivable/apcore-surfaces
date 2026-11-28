@@ -532,7 +532,20 @@ Bidirectional converter between A2A Parts and apcore module inputs/outputs.
 > discriminator. Reading inspects the active oneof case (Python:
 > `part.WhichOneof("content")`; TypeScript: `part.content.$case`; Rust: the
 > `Part` enum variant). A "FilePart" corresponds to the `raw` (bytes) or `url`
-> oneof case and is rejected as unsupported.
+> oneof case and is rejected as unsupported on input.
+
+#### Hosted artifact links pilot
+
+Python hosts enable this pilot by passing `artifact_links=ArtifactLinkPolicy(resolve, {"downloads.example.com"})`
+to `async_serve`, `serve`, or `A2AServerFactory.create`. Declare a direct, non-sensitive string property with
+`x-a2a-artifact: true` in a unary module's output schema and return an opaque ID. The trusted asynchronous
+resolver receives that ID and a snapshot of the authenticated `Identity`. It returns `HostedArtifact`
+metadata for a download the caller is authorized to access, or `None` to omit the link.
+
+The adapter checks the exact HTTPS host allowlist, expiry in Unix seconds, and the link's size before
+adding an A2A URL `Part` with filename and media type alongside the final validated data part. The size
+cap defaults to 8 MiB and is configurable with `max_bytes`. The download host serves the bytes and
+enforces the caller's authorization, expiry, and byte limit, including access from previously stored tasks.
 
 ## File Structure
 

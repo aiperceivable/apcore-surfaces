@@ -4,6 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from apcore_a2a._serve import async_serve, serve
 from apcore_a2a.adapters import AgentCardBuilder, ErrorMapper, PartConverter, SchemaConverter, SkillMapper
+from apcore_a2a.artifacts import ArtifactLinkPolicy, ArtifactResolver, HostedArtifact
 from apcore_a2a.auth import (
     Authenticator,
     AuthMiddleware,
@@ -42,6 +43,9 @@ __all__ = [
     "SchemaConverter",
     "ErrorMapper",
     "PartConverter",
+    "ArtifactLinkPolicy",
+    "ArtifactResolver",
+    "HostedArtifact",
     # Server
     "A2AServerFactory",
     "ApCoreAgentExecutor",

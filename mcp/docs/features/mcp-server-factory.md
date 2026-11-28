@@ -157,6 +157,39 @@ adapts the router result into the protocol `CallToolResult`; Rust's optional
 See the normative [MCP tool result contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
 and [HTTP protocol version contract](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
 
+### Runtime Progress and Elicitation
+
+When the Core context exposes interaction callbacks, an executing module
+can report progress or request an elicitation response using that context.
+The adapter sends progress when the tool request supplies a progress token,
+and attaches elicitation when the client session supports it. Existing MCP
+helper functions continue to work. In Rust the native callbacks are available
+on Stdio and SSE, where the adapter can address a specific client session.
+
+### Bounded Media Resource Links
+
+An application can opt into media links by providing an `MCPArtifactStore`.
+Use `APCoreMCP(..., artifact_store=store)` in Python, the `artifactStore`
+option in TypeScript, or the Rust builder's `artifact_store(Arc::new(store))`.
+Use the `put` method to store the bytes, a display filename, a MIME type, and
+the authenticated owner. Return the opaque ID from a top-level string property
+whose output schema includes `"x-mcp-artifact": true`.
+
+The adapter appends a native `resource_link` for a successful, validated
+structured tool result on supported MCP versions. The same result still
+contains its text and structured data. Fields marked sensitive and references
+that are expired, unavailable, or owned by a different authority produce no
+link. Clients fetch the bytes using `resources/read`. That request checks
+the current authenticated authority again, including its active scopes.
+
+The in-process store defaults to 8 MiB per entry, 16 entries, and 300 seconds
+of retention. A full store rejects new entries until room is available.
+The store accepts only bytes supplied by the embedding application. It never
+opens filesystem paths or fetches remote URLs. Links expire on process exit.
+
+Rust callers constructing a `CallToolResult` struct literal include a
+`resource_links` vector. Use an empty vector for a text-only result.
+
 ### Custom Middleware Injection
 The public `serve()` entry point accepts an optional user-supplied middleware list:
 

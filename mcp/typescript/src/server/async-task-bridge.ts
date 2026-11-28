@@ -14,7 +14,7 @@
 
 import { InvalidInputError } from "apcore-js";
 import { markBackgroundApprovalContext } from "../approval-reply.js";
-import { MCP_ELICIT_KEY, MCP_PROGRESS_KEY } from "../helpers.js";
+import { MCP_ELICIT_KEY, MCP_PROGRESS_KEY, withCoreInteractions } from "../helpers.js";
 import type { ModuleDescriptor } from "../types.js";
 import { ErrorCodes } from "../types.js";
 
@@ -366,11 +366,12 @@ export class AsyncTaskBridge {
       if (contextData && typeof contextData === "object") {
         (contextData as Record<string, unknown>)[MCP_PROGRESS_KEY] = async (
           progress: number,
-          total: number,
+          total?: number,
+          message?: string,
         ) => {
           await sendNotification({
             method: "notifications/progress",
-            params: { progressToken, progress, total },
+            params: { progressToken, progress, total: total ?? 0, ...(message !== undefined ? { message } : {}) },
           });
         };
       }
@@ -380,17 +381,19 @@ export class AsyncTaskBridge {
     // The marker carries no approval state or credentials.
     const callbackSessionKey = options?.callbackSessionKey ?? options?.sessionKey;
     let detach: (() => void) | undefined;
+    let invocationContext = context;
     if (context && typeof context === "object" && "data" in context
         && context.data && typeof context.data === "object") {
-      markBackgroundApprovalContext(context.data);
+      const data = context.data as Record<string, unknown>;
+      markBackgroundApprovalContext(data);
       if (callbackSessionKey !== undefined) {
-        const data = context.data as Record<string, unknown>;
         const detachProgress = makeDetachableCallback(data, MCP_PROGRESS_KEY, undefined);
         const detachElicit = makeDetachableCallback(data, MCP_ELICIT_KEY, null);
         if (detachProgress || detachElicit) detach = () => { detachProgress?.(); detachElicit?.(); };
       }
+      invocationContext = withCoreInteractions(context as { data: Record<string, unknown> });
     }
-    const taskId = await this._submitOwnedTask(moduleId, inputs, context ?? null, owner);
+    const taskId = await this._submitOwnedTask(moduleId, inputs, invocationContext ?? null, owner);
     if (options?.progressToken !== undefined || detach) {
       this._taskNotifications.set(taskId, { progressToken: options?.progressToken, detach, sessionKey: callbackSessionKey });
     }

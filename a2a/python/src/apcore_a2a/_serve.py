@@ -11,6 +11,7 @@ from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
 from starlette.applications import Starlette
 
 from apcore_a2a._config import resolve_execution_timeout
+from apcore_a2a.artifacts import ArtifactLinkPolicy
 from apcore_a2a.server.factory import A2AServerFactory
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ async def async_serve(
     metrics: bool = False,
     sys_modules: bool = False,
     disclose_refusal_reason: bool = False,
+    artifact_links: ArtifactLinkPolicy | None = None,
 ) -> Starlette:
     """Build and return a Starlette ASGI app for an A2A agent.
 
@@ -188,6 +190,7 @@ async def async_serve(
         metrics=metrics,
         sys_modules=sys_modules,
         disclose_refusal_reason=disclose_refusal_reason,
+        artifact_links=artifact_links,
     )
 
     # Step 7: Return the Starlette app
@@ -216,6 +219,7 @@ def serve(
     metrics: bool = False,
     sys_modules: bool = False,
     disclose_refusal_reason: bool = False,
+    artifact_links: ArtifactLinkPolicy | None = None,
 ) -> None:
     """Launch an A2A agent server (blocking).
 
@@ -284,6 +288,7 @@ def serve(
             metrics=metrics,
             sys_modules=sys_modules,
             disclose_refusal_reason=disclose_refusal_reason,
+            artifact_links=artifact_links,
         )
         config = uvicorn.Config(
             app,

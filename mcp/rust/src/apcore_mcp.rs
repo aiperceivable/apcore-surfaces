@@ -441,6 +441,7 @@ pub struct APCoreMCP {
     /// serve entry points can start its TTL sweep
     /// ([`ApprovalStore::start_sweep`]). [H-1]
     approval_store: Option<Arc<dyn crate::approval_store::ApprovalStore>>,
+    artifact_store: Option<Arc<crate::MCPArtifactStore>>,
     /// Pre-resolved pipeline execution strategy (from builder/Config Bus).
     /// Threaded into the executor adapter so trace-path calls honour it. [L-3]
     resolved_strategy: Option<Arc<apcore::ExecutionStrategy>>,
@@ -570,7 +571,7 @@ impl APCoreMCP {
             self.executor.enable_nested_calls();
         }
 
-        let factory = MCPServerFactory::new();
+        let factory = MCPServerFactory::new().with_artifact_store(self.artifact_store.clone());
         let mut server = factory
             .create_server(&self.config.name, &version)
             .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?;
@@ -1426,6 +1427,7 @@ pub struct APCoreMCPBuilder {
     output_formatter: Option<OutputFormatter>,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
     approval_store: Option<Arc<dyn crate::approval_store::ApprovalStore>>,
+    artifact_store: Option<Arc<crate::MCPArtifactStore>>,
     approval_notify_callback: Option<crate::adapters::approval::ApprovalNotifyCallback>,
     /// apcore `Middleware` instances to install via `executor.use_middleware()`
     /// after the backend Executor is resolved. Appended to any middleware
@@ -1438,6 +1440,12 @@ pub struct APCoreMCPBuilder {
 }
 
 impl APCoreMCPBuilder {
+    /// Enable authenticated resource links from this host-owned artifact store.
+    pub fn artifact_store(mut self, store: Arc<crate::MCPArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
     /// Set the backend source (required).
     pub fn backend(mut self, source: impl Into<BackendSource>) -> Self {
         self.backend = Some(source.into());
@@ -2007,6 +2015,7 @@ impl APCoreMCPBuilder {
             output_formatter: self.output_formatter,
             approval_handler,
             approval_store: retained_store,
+            artifact_store: self.artifact_store,
             resolved_strategy,
         })
     }
@@ -3789,6 +3798,7 @@ mod tests {
             approval_handler: None,
             approval_store: None,
             resolved_strategy: None,
+            artifact_store: None,
         }
     }
 
@@ -3811,6 +3821,7 @@ mod tests {
             approval_handler: None,
             approval_store: None,
             resolved_strategy: None,
+            artifact_store: None,
         }
     }
 
@@ -3841,6 +3852,7 @@ mod tests {
             approval_handler: None,
             approval_store: None,
             resolved_strategy: None,
+            artifact_store: None,
         }
     }
 
@@ -3867,6 +3879,7 @@ mod tests {
             approval_handler: None,
             approval_store: None,
             resolved_strategy: None,
+            artifact_store: None,
         }
     }
 
@@ -3889,6 +3902,7 @@ mod tests {
             approval_handler: None,
             approval_store: None,
             resolved_strategy: None,
+            artifact_store: None,
         }
     }
 
@@ -4650,6 +4664,7 @@ mod tests {
             approval_handler: None,
             approval_store: None,
             resolved_strategy: None,
+            artifact_store: None,
         }
     }
 
