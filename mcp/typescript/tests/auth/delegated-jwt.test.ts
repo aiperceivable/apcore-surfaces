@@ -128,7 +128,7 @@ describe("delegated MCP JWT", () => {
     }
   });
 
-  it("reclaims idle scoped HTTP sessions without cancelling their background work", async () => {
+  it.each(["hinted", "explicit"])("reclaims idle scoped HTTP sessions with %s background work", async (entry) => {
     const moduleId = "sample.slow";
     const backgroundId = "sample.detached";
     let notifyStarted!: () => void;
@@ -194,7 +194,10 @@ describe("delegated MCP JWT", () => {
         finishCall();
         await active;
       }
-      const submission = await first.callTool({ name: backgroundId, arguments: {} }, undefined, { onprogress: vi.fn() });
+      const request = entry === "hinted"
+        ? { name: backgroundId, arguments: {} }
+        : { name: META_TOOL_NAMES.SUBMIT, arguments: { module_id: backgroundId, arguments: {} } };
+      const submission = await first.callTool(request, undefined, { onprogress: vi.fn() });
       const text = (result: { content?: unknown }) => JSON.parse((result.content as { text: string }[])[0].text);
       const task = text(submission);
       expect(task).toMatchObject({ task_id: expect.any(String), status: "pending" });

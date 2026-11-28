@@ -614,6 +614,7 @@ export class ExecutionRouter {
             toolName,
             args,
             context,
+            extra?.sessionId,
           );
           const content: TextContentDict[] = [
             { type: "text", text: await this._formatResult(metaResult) },

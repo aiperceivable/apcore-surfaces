@@ -245,7 +245,11 @@ export class AsyncTaskBridge {
    * Tracks notification tokens and callbacks bound to each task's transport.
    * [A-D-018]
    */
-  private readonly _taskNotifications = new Map<string, { progressToken?: string | number; detach?: () => void }>();
+  private readonly _taskNotifications = new Map<string, {
+    progressToken?: string | number;
+    detach?: () => void;
+    sessionKey?: string;
+  }>();
   /**
    * Maps session/connection key → list of task ids launched from that
    * session so {@link cancelSessionTasks} can cancel them on transport
@@ -319,6 +323,8 @@ export class AsyncTaskBridge {
     options?: {
       /** Optional MCP progress token (recorded for fan-out). [A-D-018] */
       progressToken?: string | number;
+      /** Bind callbacks without binding the task itself to disconnect cancellation. */
+      callbackSessionKey?: string;
       /** Optional session/connection key (recorded for cancelSessionTasks). [A-D-018] */
       sessionKey?: string;
       /**
@@ -372,11 +378,12 @@ export class AsyncTaskBridge {
 
     // Core preserves Context.data when it clones a context for the background job.
     // The marker carries no approval state or credentials.
+    const callbackSessionKey = options?.callbackSessionKey ?? options?.sessionKey;
     let detach: (() => void) | undefined;
     if (context && typeof context === "object" && "data" in context
         && context.data && typeof context.data === "object") {
       markBackgroundApprovalContext(context.data);
-      if (options?.sessionKey !== undefined) {
+      if (callbackSessionKey !== undefined) {
         const data = context.data as Record<string, unknown>;
         const detachProgress = makeDetachableCallback(data, MCP_PROGRESS_KEY, undefined);
         const detachElicit = makeDetachableCallback(data, MCP_ELICIT_KEY, null);
@@ -385,7 +392,7 @@ export class AsyncTaskBridge {
     }
     const taskId = await this._submitOwnedTask(moduleId, inputs, context ?? null, owner);
     if (options?.progressToken !== undefined || detach) {
-      this._taskNotifications.set(taskId, { progressToken: options?.progressToken, detach });
+      this._taskNotifications.set(taskId, { progressToken: options?.progressToken, detach, sessionKey: callbackSessionKey });
     }
     if (options?.sessionKey !== undefined) {
       const list = this._sessionTasks.get(options.sessionKey) ?? [];
@@ -439,8 +446,8 @@ export class AsyncTaskBridge {
     // would drop the newly-tracked task. Mirrors Python's `pop()` and Rust's
     // `remove()` — both detach before yielding to manager.cancel.
     const taskIds = this._sessionTasks.get(sessionKey);
+    this.detachSessionTasks(sessionKey);
     if (!taskIds || taskIds.length === 0) return 0;
-    this._sessionTasks.delete(sessionKey);
     let cancelled = 0;
     for (const taskId of taskIds) {
       try {
@@ -449,17 +456,16 @@ export class AsyncTaskBridge {
       } catch {
         // Cancel may fail if the task has already completed; swallow.
       }
-      this._taskNotifications.delete(taskId);
     }
     return cancelled;
   }
 
   /** Remove transport-specific state when an idle HTTP session is reclaimed. */
   detachSessionTasks(sessionKey: string): void {
-    const taskIds = this._sessionTasks.get(sessionKey) ?? [];
     this._sessionTasks.delete(sessionKey);
-    for (const taskId of taskIds) {
-      this._taskNotifications.get(taskId)?.detach?.();
+    for (const [taskId, notification] of this._taskNotifications) {
+      if (notification.sessionKey !== sessionKey) continue;
+      notification.detach?.();
       this._taskNotifications.delete(taskId);
     }
   }
@@ -573,6 +579,7 @@ export class AsyncTaskBridge {
     toolName: string,
     args: Record<string, unknown>,
     context?: unknown | null,
+    callbackSessionKey?: string,
   ): Promise<Record<string, unknown>> {
     switch (toolName) {
       case META_TOOL_NAMES.SUBMIT: {
@@ -629,7 +636,7 @@ export class AsyncTaskBridge {
         // but bridges that call handleMetaTool directly (toolkit/library
         // use) saw a raw Error without errorType or retryable hints.
         try {
-          return (await this.submit(moduleId, inputs, context)) as unknown as Record<string, unknown>;
+          return (await this.submit(moduleId, inputs, context, { callbackSessionKey })) as unknown as Record<string, unknown>;
         } catch (err: unknown) {
           if (_isTaskLimitExceeded(err)) {
             const e = err as Error & { details?: Record<string, unknown> | null };
