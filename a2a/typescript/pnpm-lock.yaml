@@ -657,7 +657,7 @@ packages:
     resolution: {integrity: sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==}
 
   apcore-js@1.0.0-alpha.4:
-    resolution: {integrity: sha512-Ix49EPRQBVezM4mp59wGNW3AI7RFvD1I9iwPoYp/F81/gUZQIJ1CLjQkcFsiNME14EIGmcLL+noa/ttVg6qIcQ==}
+    resolution: {integrity: sha512-APFaeBqZ0u0BCmeDzGOJ05Byt16zY96NAlqUiRtIEDY51lzLNP4mfr6B6aicBvFZ1Lg4UQDmVKumpkxjXaOiyA==}
     engines: {node: '>=20.0.0'}
     peerDependencies:
       typescript: ^5.5.0

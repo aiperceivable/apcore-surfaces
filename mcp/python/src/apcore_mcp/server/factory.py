@@ -782,6 +782,9 @@ class MCPServerFactory:
                 else:
                     text_contents.append(mcp_types.TextContent(type="text", text=item["text"]))
             output_schema = published.outputSchema if published is not None else None
+            if output_schema is not None and "_mcp_live_output_schema" in extra:
+                schema = extra["_mcp_live_output_schema"]
+                output_schema = schema if isinstance(schema, dict) and schema.get("type") == "object" else None
             return _build_call_result(text_contents, is_error, output_schema, approval=pending_approval)
 
         sdk_call_tool = server.request_handlers[mcp_types.CallToolRequest]

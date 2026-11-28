@@ -2694,12 +2694,23 @@ mod tests {
         }
     }
 
-    struct DiscoveryFixtureModule(String);
+    struct DiscoveryFixtureModule {
+        property: String,
+        annotations: ModuleAnnotations,
+    }
 
     #[async_trait::async_trait]
     impl Module for DiscoveryFixtureModule {
         fn description(&self) -> &str {
             "Governed tool"
+        }
+
+        fn annotations(&self) -> ModuleAnnotations {
+            self.annotations.clone()
+        }
+
+        fn as_streaming(&self) -> Option<&dyn apcore::StreamingModule> {
+            self.annotations.streaming.then_some(self)
         }
 
         fn input_schema(&self) -> Value {
@@ -2709,8 +2720,8 @@ mod tests {
         fn output_schema(&self) -> Value {
             json!({
                 "type": "object",
-                "properties": {(&self.0): {"type": "string", "x-sensitive": true}},
-                "required": [&self.0],
+                "properties": {(&self.property): {"type": "string", "x-sensitive": true}},
+                "required": [&self.property],
                 "additionalProperties": false
             })
         }
@@ -2720,12 +2731,28 @@ mod tests {
             _: Value,
             _: &apcore::Context<Value>,
         ) -> Result<Value, apcore::ModuleError> {
-            Ok(json!({(&self.0): "local-redaction-fixture"}))
+            Ok(json!({(&self.property): "local-redaction-fixture"}))
         }
     }
 
-    fn register_discovery_fixture(registry: &Registry, id: &str, property: &str) {
-        let module = DiscoveryFixtureModule(property.to_owned());
+    impl apcore::StreamingModule for DiscoveryFixtureModule {
+        fn stream_typed(&self, _: Value, _: &apcore::Context<Value>) -> apcore::ChunkStream {
+            Box::pin(futures::stream::iter([Ok(
+                json!({(&self.property): "local-redaction-fixture"}),
+            )]))
+        }
+    }
+
+    fn register_discovery_fixture(
+        registry: &Registry,
+        id: &str,
+        property: &str,
+        annotations: ModuleAnnotations,
+    ) {
+        let module = DiscoveryFixtureModule {
+            property: property.to_owned(),
+            annotations,
+        };
         let descriptor = ModuleDescriptor {
             module_id: id.into(),
             name: None,
@@ -2739,7 +2766,7 @@ mod tests {
             output_schema: module.output_schema(),
             version: "1.0.0".into(),
             tags: vec![],
-            annotations: Some(ModuleAnnotations::default()),
+            annotations: Some(module.annotations()),
             examples: vec![],
             metadata: std::collections::HashMap::new(),
             display: None,
@@ -2781,7 +2808,42 @@ mod tests {
     #[tokio::test]
     async fn test_http_discovery_filters_tools_and_resources_for_each_identity() {
         let registry = Arc::new(Registry::new());
-        register_discovery_fixture(&registry, "demo.governed", "stale");
+        register_discovery_fixture(
+            &registry,
+            "demo.governed",
+            "stale",
+            ModuleAnnotations::default(),
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.conditional",
+            "mode",
+            ModuleAnnotations::default(),
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.hidden",
+            "secret",
+            ModuleAnnotations {
+                discoverable: false,
+                ..Default::default()
+            },
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.requires_approval",
+            "mode",
+            ModuleAnnotations {
+                requires_approval: true,
+                ..Default::default()
+            },
+        );
+        let mut conditional_deny = apcore::ACLRule::new(
+            vec!["@external".into()],
+            vec!["demo.conditional".into()],
+            "deny",
+        );
+        conditional_deny.conditions = Some(json!({"arguments":{"has_key":["mode"]}}));
         let mut rule = apcore::ACLRule::new(
             vec!["@external".into()],
             vec!["demo.*".into(), "system.manifest.search".into()],
@@ -2789,7 +2851,7 @@ mod tests {
         );
         rule.conditions = Some(json!({"roles":["reader"]}));
         let mut executor = Executor::new(Arc::clone(&registry), Config::default());
-        executor.set_acl(apcore::ACL::new(vec![rule], "deny", None));
+        executor.set_acl(apcore::ACL::new(vec![conditional_deny, rule], "deny", None));
         let mut sys_config = Config::default();
         sys_config.set("sys_modules.enabled", json!(true));
         apcore::register_sys_modules(Arc::clone(&registry), &executor, &sys_config, None).unwrap();
@@ -2820,6 +2882,16 @@ mod tests {
             assert!(tools.iter().any(|tool| tool["name"]
                 .as_str()
                 .is_some_and(|name| name.starts_with("__apcore_task_"))));
+            assert!(!tools.iter().any(|tool| {
+                tool["name"] == "demo.conditional" || tool["name"] == "demo.hidden"
+            }));
+            let approval_tool = tools
+                .iter()
+                .find(|tool| tool["name"] == "demo.requires_approval");
+            assert_eq!(approval_tool.is_some(), role == "reader");
+            if let Some(tool) = approval_tool {
+                assert_eq!(tool["_meta"]["requiresApproval"], true);
+            }
             let resources = discovery_http_request(&app, role, "resources/list", json!({})).await;
             assert_eq!(
                 resources["result"]["resources"]
@@ -2837,6 +2909,16 @@ mod tests {
             )
             .await;
             assert_eq!(doc.get("result").is_some(), role == "reader");
+            for uri in ["docs://demo.conditional", "docs://demo.hidden"] {
+                assert!(!resources["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|resource| resource["uri"] == uri));
+                let rejected =
+                    discovery_http_request(&app, role, "resources/read", json!({"uri":uri})).await;
+                assert!(rejected.get("error").is_some());
+            }
             let called = discovery_http_request(
                 &app,
                 role,
@@ -2864,13 +2946,34 @@ mod tests {
                     searched["result"]["content"][0]["text"].as_str().unwrap(),
                 )
                 .unwrap();
+                assert_eq!(page["items"].as_array().unwrap().len(), 2);
                 assert_eq!(page["items"][0]["module_id"], "demo.governed");
+                assert_eq!(page["items"][1]["module_id"], "demo.requires_approval");
+                assert_eq!(page["items"][1]["access_hint"], "requires_approval");
                 assert_eq!(page["next_cursor"], Value::Null);
+                let approval = discovery_http_request(
+                    &app,
+                    role,
+                    "tools/call",
+                    json!({"name":"demo.requires_approval","arguments":{}}),
+                )
+                .await;
+                assert_eq!(approval["result"]["isError"], true);
             }
         }
         assert!(registry.unregister("demo.governed").unwrap());
-        register_discovery_fixture(&registry, "demo.governed", "fresh");
-        register_discovery_fixture(&registry, "demo.unpublished", "new");
+        register_discovery_fixture(
+            &registry,
+            "demo.governed",
+            "fresh",
+            ModuleAnnotations::default(),
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.unpublished",
+            "new",
+            ModuleAnnotations::default(),
+        );
         let listing = discovery_http_request(&app, "reader", "tools/list", json!({})).await;
         let tools = listing["result"]["tools"].as_array().unwrap();
         assert!(!tools.iter().any(|tool| tool["name"] == "demo.unpublished"));
@@ -2924,6 +3027,114 @@ mod tests {
         assert_eq!(
             doc["result"]["contents"][0]["content"],
             "Current documentation: fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_discovery_uses_stream_and_background_strategies_when_tracing() {
+        verify_traced_discovery(true).await;
+        verify_traced_discovery(false).await;
+    }
+
+    async fn verify_traced_discovery(default_allows_stream: bool) {
+        let registry = Arc::new(Registry::new());
+        register_discovery_fixture(
+            &registry,
+            "demo.streaming",
+            "label",
+            ModuleAnnotations {
+                streaming: true,
+                ..Default::default()
+            },
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.unary",
+            "label",
+            ModuleAnnotations::default(),
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.background",
+            "label",
+            ModuleAnnotations {
+                extra: std::collections::HashMap::from([("mcp_async".into(), json!(true))]),
+                ..Default::default()
+            },
+        );
+        let mut rule =
+            apcore::ACLRule::new(vec!["@external".into()], vec!["demo.*".into()], "allow");
+        rule.conditions = Some(json!({"roles":["reader"], "$not":{"max_call_depth":0}}));
+        let default_strategy = if default_allows_stream {
+            apcore::builtin_steps::build_standard_strategy()
+        } else {
+            apcore::pipeline_config::build_strategy_from_config(&json!({
+                "configure": {"context_creation": {"match_modules": ["demo.unary"]}}
+            }))
+            .unwrap()
+        };
+        let trace_override = if default_allows_stream {
+            "internal"
+        } else {
+            "standard"
+        };
+        let mut executor = Executor::with_strategy(registry, Config::default(), default_strategy);
+        executor.set_acl(apcore::ACL::new(vec![rule], "deny", None));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(Arc::new(executor)))
+            .strategy(trace_override)
+            .trace(true)
+            .build()
+            .unwrap();
+        let (server, _, _, options, _, _) = mcp.build_server_components().unwrap();
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+        let app = Arc::new(TransportManager::new(None))
+            .build_streamable_http_app(Arc::new(handler), None)
+            .layer(crate::auth::middleware::AuthMiddlewareLayer::new(Arc::new(
+                DiscoveryFixtureAuth,
+            )));
+
+        let initialized = discovery_http_request(
+            &app, "reader", "initialize",
+            json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}),
+        ).await;
+        assert!(initialized.get("result").is_some());
+        let stream = discovery_http_request(
+            &app,
+            "reader",
+            "tools/call",
+            json!({"name":"demo.streaming","arguments":{}}),
+        )
+        .await;
+        assert_eq!(
+            stream["result"]["isError"], !default_allows_stream,
+            "{stream}",
+        );
+        let background = discovery_http_request(
+            &app,
+            "reader",
+            "tools/call",
+            json!({"name":"demo.background","arguments":{}}),
+        )
+        .await;
+        assert_eq!(background["result"]["isError"], false, "{background}");
+        let task: Value =
+            serde_json::from_str(background["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert!(task["task_id"].is_string());
+
+        let listing = discovery_http_request(&app, "reader", "tools/list", json!({})).await;
+        let tools = listing["result"]["tools"].as_array().unwrap();
+        for name in ["demo.streaming", "demo.background"] {
+            assert_eq!(
+                tools.iter().any(|tool| tool["name"] == name),
+                default_allows_stream,
+                "{name}",
+            );
+        }
+        assert_eq!(
+            tools.iter().any(|tool| tool["name"] == "demo.unary"),
+            !default_allows_stream,
         );
     }
 

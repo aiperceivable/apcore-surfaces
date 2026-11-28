@@ -427,18 +427,45 @@ pub struct ContentItem {
 
 pub(crate) struct CoreDiscovery<'a> {
     executor: &'a apcore::Executor,
-    strategy: &'a apcore::ExecutionStrategy,
+    unary_strategy: &'a apcore::ExecutionStrategy,
+    has_async_bridge: bool,
     context: apcore::Context<Value>,
 }
 
 impl CoreDiscovery<'_> {
     pub(crate) fn descriptor(&self, module_id: &str) -> Option<apcore::registry::ModuleDescriptor> {
-        self.executor.get_callable_descriptor_for_strategy(
-            module_id,
-            None,
-            Some(&self.context),
-            self.strategy,
-        )
+        let default_strategy = self.executor.strategy();
+        let project = |strategy| {
+            self.executor.get_callable_descriptor_for_strategy(
+                module_id,
+                None,
+                Some(&self.context),
+                strategy,
+            )
+        };
+        if std::ptr::eq(default_strategy, self.unary_strategy) {
+            return project(default_strategy);
+        }
+
+        let registry = self.executor.registry();
+        let module = registry.get(module_id).ok()??;
+        // Core native streams and the async-task bridge both use the default
+        // pipeline. Only the unary call can take the traced override.
+        let descriptor = if module.as_streaming().is_some() {
+            project(default_strategy)
+        } else if self.has_async_bridge {
+            project(default_strategy)
+                .filter(AsyncTaskBridge::is_async_module_descriptor)
+                .or_else(|| {
+                    project(self.unary_strategy).filter(|descriptor| {
+                        !AsyncTaskBridge::is_async_module_descriptor(descriptor)
+                    })
+                })
+        } else {
+            project(self.unary_strategy)
+        }?;
+        let current = registry.get(module_id).ok()??;
+        Arc::ptr_eq(&module, &current).then_some(descriptor)
     }
 
     pub(crate) fn documentation(&self, module_id: &str) -> Option<String> {
@@ -553,7 +580,8 @@ impl ExecutionRouter {
             .map_or_else(apcore::Context::anonymous, apcore::Context::new);
         Some(CoreDiscovery {
             executor,
-            strategy,
+            unary_strategy: strategy,
+            has_async_bridge: self.async_bridge.is_some(),
             context,
         })
     }

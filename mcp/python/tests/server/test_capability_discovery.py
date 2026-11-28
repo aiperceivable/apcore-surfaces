@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
-from apcore import ACL, ACLRule, Executor, Identity, Registry
+import pytest
+from apcore import ACL, ACLRule, Executor, Identity, ModuleAnnotations, Registry
 
 from apcore_mcp import APCoreMCP
 from tests.server.test_scoped_approval_wire import _HttpSession
@@ -128,3 +130,91 @@ async def test_discovery_reads_the_current_same_version_registration() -> None:
         assert not result.isError
         assert result.structuredContent is not None
         assert "private fixture output" not in result.model_dump_json()
+
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_in_flight_replacement_withholds_unbound_output(streaming: bool) -> None:
+    class StreamingReport(Report):
+        annotations = ModuleAnnotations(streaming=True)
+
+        async def stream(self, inputs, context):
+            yield await self.execute(inputs, context)
+
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+
+    class PausedLookup:
+        async def before_step(self, name, state):
+            if name == "module_lookup":
+                entered.set()
+                await resume.wait()
+
+    module_id = "fixture.report"
+    registry = Registry()
+    report_class = StreamingReport if streaming else Report
+    original = report_class()
+    registry.register(module_id, original, version="1.0.0")
+    executor = Executor(registry)
+    executor.current_strategy.add_step_middleware(PausedLookup())
+    progress: list[str | None] = []
+
+    async def record_progress(_progress, _total, message):
+        progress.append(message)
+
+    async with connected_client(executor, async_tasks=False) as session, asyncio.timeout(4):
+        call = asyncio.create_task(session.call_tool(module_id, {"count": 3}, progress_callback=record_progress))
+        try:
+            await entered.wait()
+            registry.unregister(module_id)
+            replacement = report_class()
+            replacement.output_schema = {
+                "type": "object",
+                "properties": {"count": {"type": "integer", "x-sensitive": True}},
+            }
+            registry.register(module_id, replacement, version="1.0.0")
+        finally:
+            resume.set()
+        result = await call
+
+    assert original.calls == 0 and replacement.calls == 1
+    assert result.isError
+    assert "registration changed" in result.content[0].text.lower()
+    assert result.structuredContent is None
+    assert progress == []
+
+
+async def test_http_discovery_filters_conditional_and_hidden_and_marks_definite_approval() -> None:
+    registry = Registry()
+    registry.register("demo.conditional", Report(), metadata={"documentation": "Conditional example."})
+
+    class Hidden(Report):
+        annotations = ModuleAnnotations(discoverable=False)
+
+    class Approval(Report):
+        annotations = ModuleAnnotations(requires_approval=True)
+
+    registry.register("demo.hidden", Hidden(), metadata={"documentation": "Hidden example."})
+    registry.register("demo.approval", Approval())
+    acl = ACL([
+        ACLRule(callers=["@external"], targets=["demo.conditional"], effect="deny", conditions={
+            "arguments": {"has_key": ["count"]},
+        }),
+        ACLRule(callers=["@external"], targets=["demo.*"], effect="allow"),
+    ])
+
+    class Authenticator:
+        def authenticate(self, headers):
+            return Identity(id="viewer") if headers.get("authorization") == "Bearer viewer" else None
+
+    mcp = APCoreMCP(Executor(registry, acl=acl), authenticator=Authenticator(), async_tasks=False)
+    async with mcp.async_serve() as app, httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://localhost",
+    ) as client:
+        session = _HttpSession(client, "Bearer viewer")
+        await session.initialize()
+        tools = (await session.request("tools/list", {}))["tools"]
+        assert [tool["name"] for tool in tools] == ["demo.approval"]
+        assert tools[0]["_meta"]["requiresApproval"] is True
+        resources = (await session.request("resources/list", {}))["resources"]
+        assert {resource["uri"] for resource in resources}.isdisjoint({"docs://demo.conditional", "docs://demo.hidden"})
