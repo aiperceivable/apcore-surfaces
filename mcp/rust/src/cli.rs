@@ -116,8 +116,8 @@ pub fn init_tracing(level: &LogLevel) {
     about = "Launch an MCP server that exposes apcore modules as tools."
 )]
 pub struct CliArgs {
-    /// Path to apcore extensions directory. Required unless --from-openapi
-    /// is given, or mcp.openapi.spec is configured on the Config Bus.
+    /// Directory backend placeholder. Native Rust modules require a compiled host.
+    /// Use --from-openapi or mcp.openapi.spec for a standalone backend.
     #[arg(long)]
     pub extensions_dir: Option<PathBuf>,
 
@@ -475,19 +475,14 @@ async fn run_with_args(args: CliArgs) -> Result<(), CliError> {
     // mistaken for a second, explicit backend source and wrongly require
     // `--openapi-prefix`.
     let mut builder = crate::APCoreMCPBuilder::default();
-    if let Some(ref dir) = args.extensions_dir {
-        builder = builder.backend(dir.clone());
-    }
     if let Some(ref spec) = args.from_openapi {
-        // `BackendSource::ExtensionsDir` always builds an EMPTY registry in
-        // Rust ([L-1]: no runtime directory discovery via apcore's public
-        // API) — so when `--extensions-dir` was also given, its own
-        // `.backend(dir)` call above contributed zero real modules, and
-        // replacing it here with the OpenAPI-populated registry unions
-        // correctly rather than dropping anything. In the two-flag case this
-        // is therefore observably a union of "nothing" and "the OpenAPI
-        // operations", which is why Rust has no separate `--extensions-dir`
-        // module count to merge in, unlike Python/TypeScript.
+        if let Some(ref dir) = args.extensions_dir {
+            tracing::warn!(
+                "--extensions-dir loads no Rust modules from '{}'; \
+                 only the OpenAPI backend supplies modules.",
+                dir.display()
+            );
+        }
         let base_registry = Arc::new(apcore::registry::registry::Registry::new());
         let mut headers = std::collections::HashMap::new();
         for raw in &args.openapi_header {
@@ -522,6 +517,8 @@ async fn run_with_args(args: CliArgs) -> Result<(), CliError> {
                 .await
                 .map_err(|e| CliError::StartupFailure(format!("{e}")))?;
         builder = builder.backend(registry);
+    } else if let Some(ref dir) = args.extensions_dir {
+        builder = builder.backend(dir.clone());
     }
 
     let mut builder = builder

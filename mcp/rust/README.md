@@ -6,23 +6,9 @@
 
 Automatic MCP Server & OpenAI Tools Bridge for apcore (Rust edition).
 
-**apcore-mcp** turns any [apcore](https://github.com/aiperceivable/apcore)-based project into an MCP Server and OpenAI tool provider — with **zero code changes** to your existing project.
-
-```
-┌──────────────────┐
-│  axum-apcore     │  ← your existing apcore project (unchanged)
-│  project         │
-└────────┬─────────┘
-         │  extensions directory
-         ▼
-┌──────────────────┐
-│  apcore-mcp-rust │  ← just install & point to extensions dir
-└───┬──────────┬───┘
-    │          │
-    ▼          ▼
-  MCP       OpenAI
- Server      Tools
-```
+**apcore-mcp** exposes a Rust application's APCore registry as an MCP server
+and an OpenAI tool provider. The standalone binary can serve operations from
+an OpenAPI document.
 
 ## MCP input schemas
 
@@ -33,13 +19,6 @@ additional-property restrictions still apply. Factory `strict` options are retai
 for compatibility and do not project OpenAI strict schemas onto MCP. OpenAI tool
 exports and standalone SchemaConverter APIs retain their existing behavior.
 
-
-## Design Philosophy
-
-- **Zero intrusion** — your apcore project needs no code changes, no imports, no dependencies on apcore-mcp
-- **Zero configuration** — point to an extensions directory, everything is auto-discovered
-- **Pure adapter** — apcore-mcp reads from the apcore Registry; it never modifies your modules
-- **Works with any apcore project** — if it uses the apcore Module Registry, apcore-mcp can serve it
 
 ## Documentation
 
@@ -74,15 +53,15 @@ for process and platform boundaries.
 
 ## Quick Start
 
-### Zero-code approach (CLI)
-
-If you already have an apcore-based project with an extensions directory, just run:
+### Standalone OpenAPI server
 
 ```sh
-apcore-mcp --extensions-dir /path/to/your/extensions
+apcore-mcp --from-openapi ./openapi.yaml --openapi-base-url https://api.example.com
 ```
 
-All modules are auto-discovered and exposed as MCP tools. No code needed.
+For compiled Rust modules, build a host using the APCore registry. The
+`--extensions-dir` directory backend starts with an empty registry and emits a
+diagnostic on stderr. When both flags are present, only OpenAPI supplies modules.
 
 ### Programmatic approach (Rust API)
 
@@ -120,11 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-> **Backend note (v0.15.0):** The Rust SDK's `BackendSource::Executor` is the
-> functional path. `BackendSource::ExtensionsDir` (string path) and
-> `BackendSource::Registry` are reserved variants that currently return a
-> `BackendResolution` error from `build()` — wrap your registry in an
-> `Executor` first, as shown above.
+You can also pass an `Arc<Registry>` directly. Pass the shared `Arc<Executor>`
+when your host installs ACL rules, approval handlers, or other executor policy.
 
 <details>
 <summary>Function-based API (still supported)</summary>
@@ -132,56 +108,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use apcore_mcp::{serve, to_openai_tools, ServeConfig, OpenAIToolsConfig};
 
-// Pass an Arc<Executor> as the backend (same constraint as the builder API).
+// Share the Arc<Executor> that runs your application's modules.
 serve(executor.clone(), ServeConfig::default())?;
 
 let tools = to_openai_tools(executor, OpenAIToolsConfig::default())?;
 ```
 </details>
 
-## Integration with Existing Projects
-
-### Typical apcore project structure
-
-```
-your-project/
-├── extensions/          ← modules live here
-│   ├── image_resize/
-│   ├── text_translate/
-│   └── ...
-├── src/main.rs          ← your existing code (untouched)
-└── ...
-```
-
-### Adding MCP support
-
-No changes to your project. Just run apcore-mcp alongside it:
-
-```sh
-# Install (one time)
-cargo install apcore-mcp
-
-# Run
-apcore-mcp --extensions-dir ./extensions
-```
-
-Your existing application continues to work exactly as before. apcore-mcp operates as a separate process that reads from the same extensions directory.
-
-### Adding OpenAI tools support
-
-For OpenAI integration, a thin script is needed — but still **no changes to your existing modules**:
-
-```rust
-use apcore_mcp::{to_openai_tools, OpenAIToolsConfig};
-
-let tools = to_openai_tools("./extensions", OpenAIToolsConfig {
-    strict: true,
-    ..Default::default()
-})?;
-// Use with the OpenAI API
-```
-
 ## MCP Client Configuration
+
+Use the executable built by your host with the MCP builder and stdio transport,
+or launch the standalone binary with an OpenAPI document.
 
 ### Claude Desktop
 
@@ -192,7 +129,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "apcore": {
       "command": "apcore-mcp",
-      "args": ["--extensions-dir", "/path/to/your/extensions"]
+      "args": ["--from-openapi", "/path/to/openapi.yaml"]
     }
   }
 }
@@ -207,7 +144,7 @@ Add to `.mcp.json` in your project root:
   "mcpServers": {
     "apcore": {
       "command": "apcore-mcp",
-      "args": ["--extensions-dir", "./extensions"]
+      "args": ["--from-openapi", "./openapi.yaml"]
     }
   }
 }
@@ -222,7 +159,7 @@ Add to `.cursor/mcp.json` in your project root:
   "mcpServers": {
     "apcore": {
       "command": "apcore-mcp",
-      "args": ["--extensions-dir", "./extensions"]
+      "args": ["--from-openapi", "./openapi.yaml"]
     }
   }
 }
@@ -231,7 +168,7 @@ Add to `.cursor/mcp.json` in your project root:
 ### Remote HTTP access
 
 ```sh
-apcore-mcp --extensions-dir ./extensions \
+apcore-mcp --from-openapi ./openapi.yaml \
     --transport streamable-http \
     --host 0.0.0.0 \
     --port 9000
@@ -273,12 +210,13 @@ Two consequences worth knowing:
 ## CLI Reference
 
 ```
-apcore-mcp --extensions-dir PATH [OPTIONS]
+apcore-mcp --from-openapi SPEC [OPTIONS]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--extensions-dir` | *(required)* | Path to apcore extensions directory |
+| `--from-openapi` | — | OpenAPI file or URL for a standalone backend |
+| `--extensions-dir` | — | Compatibility directory backend that starts with an empty registry |
 | `--transport` | `stdio` | Transport: `stdio`, `streamable-http`, or `sse` |
 | `--host` | `127.0.0.1` | Host for HTTP-based transports |
 | `--port` | `8000` | Port for HTTP-based transports (1-65535) |
@@ -352,10 +290,8 @@ let executor = mcp.executor();    // underlying Executor
 use apcore_mcp::{serve, ServeConfig};
 use std::sync::Arc;
 
-// As noted in the builder caveat above, BackendSource::ExtensionsDir
-// (string path) currently returns a BackendResolution error. Build an
-// Executor first and pass it as the backend.
-let registry: Arc<apcore::Registry> = /* load extensions, e.g. via apcore::load_extensions("./extensions")? */;
+// Register compiled modules on the registry before wrapping it in an Executor.
+let registry = Arc::new(apcore::Registry::new());
 let executor: Arc<apcore::Executor> = Arc::new(apcore::Executor::new(registry, apcore::Config::default()));
 
 serve(executor, ServeConfig {
@@ -444,7 +380,7 @@ let auth = JWTAuthenticator::new("my-secret", None, None, None, None, None, Some
 **Path exemption** — bypass auth for specific paths via CLI:
 
 ```sh
-apcore-mcp --extensions-dir ./extensions --jwt-secret my-secret --exempt-paths /health,/metrics
+apcore-mcp --from-openapi ./openapi.yaml --transport streamable-http --jwt-secret my-secret --exempt-paths /health,/metrics
 ```
 
 ### Approval Mechanism
@@ -473,7 +409,7 @@ let mcp = APCoreMCP::builder()
 CLI usage:
 
 ```sh
-apcore-mcp --extensions-dir ./extensions --approval elicit
+apcore-mcp --from-openapi ./openapi.yaml --approval elicit
 ```
 
 For Phase B, configure the builder with `approval_store`. The store supports
@@ -498,7 +434,7 @@ By default, tool execution results are serialized as JSON. You can customize thi
 
 ```rust
 // Via CLI
-// apcore-mcp --extensions-dir ./extensions --output-format csv
+// apcore-mcp --from-openapi ./openapi.yaml --output-format csv
 
 // Via API
 let mcp = APCoreMCP::builder()
@@ -545,7 +481,7 @@ use apcore_mcp::{to_openai_tools, OpenAIToolsConfig};
 use std::sync::Arc;
 
 // Same backend constraint as serve(): pass an Arc<Executor>, not a
-// path string (BackendSource::ExtensionsDir currently errors out).
+// directory backend, which contains no native Rust modules.
 let registry: Arc<apcore::Registry> = /* load extensions, e.g. via apcore::load_extensions("./extensions")? */;
 let executor: Arc<apcore::Executor> = Arc::new(apcore::Executor::new(registry, apcore::Config::default()));
 
@@ -565,7 +501,7 @@ let tools = to_openai_tools(executor, OpenAIToolsConfig {
 
 ## Features
 
-- **Auto-discovery** — all modules in the extensions directory are found and exposed automatically
+- **Tool discovery** — expose registered modules or OpenAPI operations as MCP tools
 - **Display overlay** — `metadata["display"]["mcp"]` controls MCP tool names, descriptions, and guidance per module (§5.13)
 - **Markdown tool descriptions** (`MCPServerFactory::with_rich_description(true)`, v0.15+) — render `Tool.description` as canonical apcore-toolkit Markdown so LLMs get more decision-relevant signal per token; backed by `apcore_toolkit::format_module(ModuleStyle::Markdown)`.
 - **Module preview meta-tool** (`__apcore_module_preview`, v0.15+) — drives `executor.validate()` to predict state changes WITHOUT executing the module (apcore PROTOCOL_SPEC §5.6). Returns `{valid, requires_approval, predicted_changes, checks}` so AI orchestrators can ask "what would change?" before invoking.
@@ -657,9 +593,8 @@ Module IDs with dots are normalized to dashes for OpenAI compatibility (bijectiv
 ### Architecture
 
 ```
-Your apcore project (unchanged)
+APCore registry, shared executor, or OpenAPI document
     │
-    │  extensions directory
     ▼
 apcore-mcp-rust (separate process / library call)
     │

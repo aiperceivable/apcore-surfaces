@@ -1821,23 +1821,10 @@ impl APCoreMCPBuilder {
 
         let (standalone_registry, mut executor) = match backend {
             BackendSource::ExtensionsDir(path) => {
-                // [L-1] Runtime directory discovery has a structural limitation
-                // in Rust: modules are compiled in at build time (unlike
-                // Python/TS where `Registry.discover(dir)` imports module files
-                // at runtime). apcore's `Registry::discover` invokes the
-                // discoverer with empty roots and `register_discovered` is
-                // private, so a directory path cannot be threaded through the
-                // public API to register executable modules. We therefore build
-                // an empty Registry + Executor and warn, rather than failing
-                // outright — callers that genuinely need discovered modules
-                // should construct a `Registry`/`Executor` themselves (wiring a
-                // `DefaultDiscoverer` with their own module factory) and pass it
-                // via [`BackendSource::Registry`] or [`BackendSource::Executor`].
                 tracing::warn!(
-                    "ExtensionsDir backend ('{}'): Rust modules are compiled in at \
-                     build time; runtime directory discovery is not supported via the \
-                     apcore public API. Building an empty registry. Pass a pre-built \
-                     Registry or Executor for non-empty backends.",
+                    "--extensions-dir loads no Rust modules from '{}'. \
+                     Pass a compiled registry or executor to serve native modules, \
+                     or use --from-openapi for the standalone server.",
                     path.display()
                 );
                 let registry = Arc::new(Registry::new());

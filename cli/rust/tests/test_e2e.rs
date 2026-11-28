@@ -307,6 +307,23 @@ fn test_version_flag_format() {
 }
 
 #[test]
+fn test_empty_extensions_dir_reports_no_executable_modules_on_stderr() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run_apcore(&[
+        "--extensions-dir",
+        directory.path().to_str().unwrap(),
+        "apcli",
+        "list",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "[]");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No executable modules found"), "{stderr}");
+    assert!(stderr.contains("compiled modules"), "{stderr}");
+}
+
+#[test]
 fn test_extensions_dir_missing_exits_47() {
     let out = run_apcore(&[
         "--extensions-dir",
