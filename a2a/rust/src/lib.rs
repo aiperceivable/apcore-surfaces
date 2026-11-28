@@ -31,7 +31,7 @@ pub use crate::apcore_a2a::{
 };
 
 // Re-exports: auth
-pub use crate::auth::jwt::{ClaimMapping, JWTAuthenticator};
+pub use crate::auth::jwt::{ClaimMapping, DelegatedClaims, JWTAuthenticator};
 pub use crate::auth::middleware::{AuthMiddlewareLayer, AuthMiddlewareService, AUTH_IDENTITY};
 pub use crate::auth::protocol::Authenticator;
 

@@ -16,6 +16,11 @@ pub use apcore::Identity;
 /// an [`Identity`] if authentication succeeds, or `None` if it fails.
 #[async_trait]
 pub trait Authenticator: Send + Sync {
+    /// Reject a present invalid credential even when authentication is optional.
+    fn rejects_invalid_credentials(&self) -> bool {
+        false
+    }
+
     /// Authenticate a request based on its headers.
     ///
     /// Returns `Some(Identity)` on success, `None` on failure.

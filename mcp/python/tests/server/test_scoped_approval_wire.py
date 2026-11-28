@@ -9,7 +9,17 @@ from typing import Any
 
 import httpx
 import pytest
-from apcore import AlwaysDenyHandler, Executor, Identity, Middleware, ModuleAnnotations, PolicyVerdict, Registry
+from apcore import (
+    ACL,
+    ACLRule,
+    AlwaysDenyHandler,
+    Executor,
+    Identity,
+    Middleware,
+    ModuleAnnotations,
+    PolicyVerdict,
+    Registry,
+)
 from mcp.server.lowlevel import Server
 from mcp.shared import session as mcp_session
 from starlette.responses import JSONResponse
@@ -18,6 +28,7 @@ from apcore_mcp import APCoreMCP
 from apcore_mcp.adapters.approval import _CORE_SCOPED_APPROVAL
 from apcore_mcp.approval_store import InMemoryApprovalStore
 from apcore_mcp.server.approval_bridge import _ApprovalLogMiddleware, _protect_sdk_approval_logs
+from tests.auth.test_delegated_jwt import _auth, _token
 from tests.server.test_versioned_tool_wire import connected_client
 
 _TOOL = "fixture.approved_report"
@@ -204,6 +215,57 @@ async def test_streamable_http_poll_and_resume_are_bound_to_the_authenticated_id
         pytest.fail("Approval credential entered debug logs")
     assert report.inputs == [{"count": 1}]
     assert "chunk:" in caplog.text  # Unrelated HTTP debug logging remains available.
+
+
+@_requires_scoped_core
+async def test_delegated_jwt_binds_session_and_pending_approval() -> None:
+    registry = Registry()
+    report = Report()
+    registry.register(_TOOL, report)
+    acl = ACL(rules=[ACLRule(
+        callers=["@external"], targets=[_TOOL], effect="allow", conditions={"scopes": ["reports:read"]},
+    )])
+    store = InMemoryApprovalStore()
+    mcp = APCoreMCP(Executor(registry, acl=acl), approval_store=store, authenticator=_auth())
+
+    def credentials(subject: str, scope: str) -> str:
+        return f"Bearer {_token(sub=subject, scope=scope, act={'sub': 'reports-agent'})}"
+
+    async with mcp.async_serve() as app, httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://localhost",
+    ) as client, asyncio.timeout(5):
+        writer = _HttpSession(client, credentials("owner", "reports:read reports:write"))
+        other = _HttpSession(client, credentials("reader", "reports:read reports:write"))
+        await writer.initialize()
+        await other.initialize()
+        request = {"name": _TOOL, "arguments": {"count": 1}}
+        pending = await writer.request("tools/call", request)
+        approval = pending["_meta"]["apcore"]["approval"]
+        public_id, credential = approval["approvalId"], approval["resumeToken"]
+        poll = {"name": "__apcore_approval_check", "arguments": {"approval_id": public_id}}
+        denied = await client.post(
+            "/mcp/", headers={**writer.headers, "authorization": other.headers["authorization"]},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert denied.status_code == 404
+
+        assert await store.resolve(public_id, approved=True)
+        retry = {**request, "_meta": {"approvalId": credential}}
+        assert (await other.request("tools/call", retry))["isError"]
+        narrow_credential = credentials("owner", "reports:read")
+        rejected_reuse = await client.delete(
+            "/mcp/", headers={**writer.headers, "authorization": narrow_credential},
+        )
+        assert rejected_reuse.status_code == 404
+        narrowed = _HttpSession(client, narrow_credential)
+        await narrowed.initialize()
+        status = await narrowed.request("tools/call", poll)
+        assert json.loads(status["content"][0]["text"])["status"] == "rejected"
+        assert (await narrowed.request("tools/call", retry))["isError"]
+
+        writer.headers["authorization"] = credentials("owner", "reports:write reports:read")
+        assert not (await writer.request("tools/call", retry))["isError"]
+        assert report.inputs == [{"count": 1}]
 
 
 @pytest.mark.skipif(_CORE_SCOPED_APPROVAL, reason="exercises the minimum Core compatibility path")

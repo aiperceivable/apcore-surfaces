@@ -190,8 +190,12 @@ where
                 AUTH_IDENTITY.scope(identity, inner.call(req)).await
             } else {
                 let identity = authenticator.authenticate(&headers).await;
+                let invalid_credential = req
+                    .headers()
+                    .contains_key(axum::http::header::AUTHORIZATION)
+                    && authenticator.rejects_invalid_credentials();
 
-                if identity.is_none() && require_auth {
+                if identity.is_none() && (require_auth || invalid_credential) {
                     warn!("Authentication failed for {}", path);
                     return Ok(build_401_response());
                 }

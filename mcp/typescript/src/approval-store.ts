@@ -19,6 +19,7 @@ export interface ApprovalRecord {
 export interface ApprovalPrincipal {
   readonly type: string;
   readonly id: string;
+  readonly authorityKey?: string;
 }
 
 export interface ApprovalScope {
@@ -30,6 +31,8 @@ export interface ApprovalScope {
 
 /** Pluggable storage for Phase B approval state. */
 export interface ApprovalStore {
+  /** The scoped methods compare authority as well as the legacy principal. */
+  readonly supportsAuthorityScope?: boolean;
   savePending(approvalId: string, moduleId: string, arguments_: Record<string, unknown>): Promise<void>;
   getResult(approvalId: string): Promise<ApprovalRecord | null>;
   resolve(approvalId: string, options: { approved: boolean; reason?: string }): Promise<boolean>;
@@ -69,7 +72,8 @@ interface InternalRecord extends ApprovalRecord {
 }
 
 function samePrincipal(left: ApprovalPrincipal | null, right: ApprovalPrincipal | null): boolean {
-  return left === null || right === null ? left === right : left.type === right.type && left.id === right.id;
+  return left === null || right === null ? left === right :
+    left.type === right.type && left.id === right.id && left.authorityKey === right.authorityKey;
 }
 
 function sameScope(left: ApprovalScope, right: ApprovalScope): boolean {
@@ -86,6 +90,8 @@ function publicRecord({ status, moduleId, reason, createdAt, resolvedAt }: Inter
  * between processes and lasts only until restart.
  */
 export class InMemoryApprovalStore implements ScopedApprovalStore {
+  readonly supportsAuthorityScope = true;
+
   private readonly resolvedTtlMs: number;
   private readonly pendingTtlMs: number;
   private readonly sweepIntervalMs: number;

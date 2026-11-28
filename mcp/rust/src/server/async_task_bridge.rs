@@ -25,7 +25,7 @@
 // used elsewhere in this crate (see src/server/router.rs).
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use apcore::async_task::{AsyncTaskManager, TaskInfo, TaskStatus};
@@ -101,6 +101,9 @@ pub struct AsyncTaskBridge {
     /// session, so [`AsyncTaskBridge::cancel_session_tasks`] can cancel
     /// them cooperatively when the transport detects disconnect.
     session_tasks: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Prevent readers from seeing a new task until its scoped owner is recorded.
+    scoped_task_owners: tokio::sync::RwLock<HashMap<String, String>>,
+    task_capacity: usize,
 }
 
 impl AsyncTaskBridge {
@@ -126,6 +129,8 @@ impl AsyncTaskBridge {
             progress_tokens: Arc::new(Mutex::new(HashMap::new())),
             progress_senders: Arc::new(Mutex::new(HashMap::new())),
             session_tasks: Arc::new(Mutex::new(HashMap::new())),
+            scoped_task_owners: tokio::sync::RwLock::default(),
+            task_capacity: max_tasks,
         }
     }
 
@@ -239,15 +244,27 @@ impl AsyncTaskBridge {
                 "Background tasks do not support approval resumption",
             ));
         }
+        let owner = identity.as_ref().and_then(Identity::owner_key);
         let context: Context<Value> = identity.map_or_else(Context::anonymous, Context::new);
         context.data.write().insert(
             crate::adapters::approval::BACKGROUND_APPROVAL_CONTEXT_KEY.into(),
             Value::Bool(true),
         );
+        let mut owners = self.scoped_task_owners.write().await;
         let task_id = self
             .manager
             .submit(module_id, inputs, Some(context))
             .await?;
+        if let Some(owner) = owner {
+            if owners.len() >= self.task_capacity.saturating_mul(2) {
+                if let Ok(tasks) = self.manager.list_tasks(None) {
+                    let live: HashSet<_> = tasks.into_iter().map(|task| task.task_id).collect();
+                    owners.retain(|id, _| live.contains(id));
+                }
+            }
+            owners.insert(task_id.clone(), owner);
+        }
+        drop(owners);
 
         // Store progress sink: token + sender pair, mirroring the Python
         // `_install_progress_sink` and TS inline-closure patterns. [A-D-220]
@@ -371,6 +388,11 @@ impl AsyncTaskBridge {
         let Some(mut info) = self.manager.get_status(task_id)? else {
             return Ok(None);
         };
+        self.redact_task_result(&mut info);
+        Ok(Some(info))
+    }
+
+    fn redact_task_result(&self, info: &mut TaskInfo) {
         if info.status == TaskStatus::Completed {
             if let Some(result) = &info.result {
                 if let Some(schema) = self.output_schemas.get(&info.module_id) {
@@ -386,7 +408,7 @@ impl AsyncTaskBridge {
                         }
                         Err(_) => {
                             tracing::debug!(
-                                task_id = %task_id,
+                                task_id = %info.task_id,
                                 module_id = %info.module_id,
                                 "task-result redactor panicked; falling back to unredacted result"
                             );
@@ -395,7 +417,6 @@ impl AsyncTaskBridge {
                 }
             }
         }
-        Ok(Some(info))
     }
 
     /// Cancel a running or pending task.
@@ -461,6 +482,70 @@ impl AsyncTaskBridge {
             }
         }
         n
+    }
+
+    /// Handle a cancellation notification from a client, applying current authority.
+    pub(crate) async fn cancel_for_request(&self, key: &str, identity: Option<&Identity>) {
+        let session_tasks = self
+            .session_tasks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
+        let mut cancelled = false;
+        for id in session_tasks {
+            if self
+                .task_for_request(&id, identity)
+                .await
+                .is_ok_and(|task| task.is_some())
+            {
+                cancelled |= self.cancel(&id).await.unwrap_or(false);
+            }
+        }
+        if !cancelled
+            && self
+                .task_for_request(key, identity)
+                .await
+                .is_ok_and(|task| task.is_some())
+        {
+            let _ = self.cancel(key).await;
+        }
+    }
+
+    fn may_access_task(
+        &self,
+        task: &TaskInfo,
+        context: &Context<Value>,
+        current_owner: Option<&str>,
+        stored_owner: Option<&str>,
+    ) -> bool {
+        stored_owner == current_owner
+            && (stored_owner.is_none()
+                || self
+                    .executor
+                    .get_callable_descriptor(&task.module_id, None, Some(context))
+                    .is_some())
+    }
+
+    async fn task_for_request(
+        &self,
+        task_id: &str,
+        identity: Option<&Identity>,
+    ) -> Result<Option<TaskInfo>, apcore::errors::ModuleError> {
+        let owners = self.scoped_task_owners.read().await;
+        let current_owner = identity.and_then(Identity::owner_key);
+        let context = identity
+            .cloned()
+            .map_or_else(Context::anonymous, Context::new);
+        Ok(self.manager.get_status(task_id)?.filter(|task| {
+            self.may_access_task(
+                task,
+                &context,
+                current_owner.as_deref(),
+                owners.get(task_id).map(String::as_str),
+            )
+        }))
     }
 
     /// List all tracked tasks, optionally filtered by status.
@@ -613,9 +698,9 @@ impl AsyncTaskBridge {
                 )
                 .await,
             ),
-            META_TOOL_STATUS => Some(self.handle_status(arguments)),
-            META_TOOL_CANCEL => Some(self.handle_cancel(arguments).await),
-            META_TOOL_LIST => Some(self.handle_list(arguments)),
+            META_TOOL_STATUS => Some(self.handle_status(arguments, identity.as_ref()).await),
+            META_TOOL_CANCEL => Some(self.handle_cancel(arguments, identity.as_ref()).await),
+            META_TOOL_LIST => Some(self.handle_list(arguments, identity.as_ref()).await),
             META_TOOL_PREVIEW => Some(self.handle_preview(arguments, identity).await),
             _ => None,
         }
@@ -703,7 +788,11 @@ impl AsyncTaskBridge {
         }))
     }
 
-    fn handle_status(&self, arguments: &Value) -> Result<Value, apcore::errors::ModuleError> {
+    async fn handle_status(
+        &self,
+        arguments: &Value,
+        identity: Option<&Identity>,
+    ) -> Result<Value, apcore::errors::ModuleError> {
         // [A-D-AT-3] Reject an empty task_id up front; without this it
         // reached the registry and came back as ASYNC_TASK_NOT_FOUND instead of
         // an invalid-argument error, unlike Python and TypeScript.
@@ -717,8 +806,11 @@ impl AsyncTaskBridge {
                     "__apcore_task_status requires a non-empty 'task_id'",
                 )
             })?;
-        match self.get_status(task_id)? {
-            Some(info) => Ok(serde_json::to_value(info).unwrap_or(Value::Null)),
+        match self.task_for_request(task_id, identity).await? {
+            Some(mut info) => {
+                self.redact_task_result(&mut info);
+                Ok(serde_json::to_value(info).unwrap_or(Value::Null))
+            }
             // [D11-014] Align with Python's `_text_response({"error":
             // "ASYNC_TASK_NOT_FOUND", "task_id": ...}, is_error=True)` — return
             // Ok(json_envelope) with an error payload rather than Err(...).
@@ -732,7 +824,11 @@ impl AsyncTaskBridge {
         }
     }
 
-    async fn handle_cancel(&self, arguments: &Value) -> Result<Value, apcore::errors::ModuleError> {
+    async fn handle_cancel(
+        &self,
+        arguments: &Value,
+        identity: Option<&Identity>,
+    ) -> Result<Value, apcore::errors::ModuleError> {
         // [A-D-AT-3] Same non-empty requirement as handle_status.
         let task_id = arguments
             .get("task_id")
@@ -748,7 +844,7 @@ impl AsyncTaskBridge {
         // Without this, unknown task_ids silently return `{cancelled: false}` —
         // callers can't distinguish "task existed and is uncancellable" from
         // "task never existed". Mirrors handle_status's existence-check path.
-        if self.get_status(task_id)?.is_none() {
+        if self.task_for_request(task_id, identity).await?.is_none() {
             return Ok(json!({
                 "error": "ASYNC_TASK_NOT_FOUND",
                 "task_id": task_id,
@@ -759,7 +855,11 @@ impl AsyncTaskBridge {
         Ok(json!({ "task_id": task_id, "cancelled": cancelled }))
     }
 
-    fn handle_list(&self, arguments: &Value) -> Result<Value, apcore::errors::ModuleError> {
+    async fn handle_list(
+        &self,
+        arguments: &Value,
+        identity: Option<&Identity>,
+    ) -> Result<Value, apcore::errors::ModuleError> {
         // [D11-102] Inspect the raw `status` value so non-string variants
         // (numbers, bools, arrays, objects) are rejected instead of silently
         // ignored by `as_str() → None`.
@@ -785,10 +885,28 @@ impl AsyncTaskBridge {
                 ));
             }
         };
+        let owners = self.scoped_task_owners.read().await;
+        let current_owner = identity.and_then(Identity::owner_key);
+        let context = identity
+            .cloned()
+            .map_or_else(Context::anonymous, Context::new);
         let tasks = self.list_tasks(status_filter)?;
         let tasks_json: Vec<Value> = tasks
             .into_iter()
-            .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+            .filter(|task| {
+                self.may_access_task(
+                    task,
+                    &context,
+                    current_owner.as_deref(),
+                    owners.get(&task.task_id).map(String::as_str),
+                )
+            })
+            .map(|mut task| {
+                if current_owner.is_some() {
+                    self.redact_task_result(&mut task);
+                }
+                serde_json::to_value(task).unwrap_or(Value::Null)
+            })
             .collect();
         Ok(json!({ "tasks": tasks_json }))
     }
@@ -1166,6 +1284,75 @@ mod tests {
             status_result.get("task_id").and_then(|v| v.as_str()),
             Some(task_id)
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_tasks_require_both_current_grant_and_owner() {
+        fn identity(subject: &str, scopes: Vec<String>) -> Identity {
+            let root = Identity::new(subject.into(), "user".into(), vec![], HashMap::new())
+                .with_authority(
+                    Some(vec!["run".into(), "read".into()]),
+                    Some("issuer".into()),
+                )
+                .unwrap();
+            let actor = Identity::new("worker".into(), "agent".into(), vec![], HashMap::new());
+            root.delegate(actor, scopes).unwrap()
+        }
+        let mut executor = make_executor_with_async("sample.run");
+        Arc::get_mut(&mut executor)
+            .unwrap()
+            .set_acl(apcore::ACL::new(
+                serde_json::from_value(json!([{
+                    "callers": ["@external"], "targets": ["sample.run"], "effect": "allow",
+                    "conditions": {"scopes": ["run"]}
+                }]))
+                .unwrap(),
+                "deny",
+                None,
+            ));
+        let bridge = AsyncTaskBridge::new(executor);
+        let owner = identity("alice", vec!["run".into(), "read".into()]);
+        let submitted = bridge
+            .handle_meta_tool(
+                META_TOOL_SUBMIT,
+                &json!({"module_id": "sample.run"}),
+                Some(owner.clone()),
+                None,
+                None,
+                Some("session"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let task_id = submitted["task_id"].as_str().unwrap();
+        let task = json!({"task_id": task_id});
+        for principal in [
+            None,
+            Some(identity("bob", vec!["run".into()])),
+            Some(identity("alice", vec!["read".into()])),
+        ] {
+            for tool in [META_TOOL_STATUS, META_TOOL_CANCEL] {
+                let reply = bridge
+                    .handle_meta_tool(tool, &task, principal.clone(), None, None, None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reply["error"], "ASYNC_TASK_NOT_FOUND", "{tool}");
+            }
+            let reply = bridge
+                .handle_meta_tool(META_TOOL_LIST, &json!({}), principal, None, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply["tasks"], json!([]));
+        }
+        let refreshed = identity("alice", vec!["run".into()]);
+        let result = bridge
+            .handle_meta_tool(META_TOOL_STATUS, &task, Some(refreshed), None, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["task_id"], task_id);
     }
 
     #[tokio::test]

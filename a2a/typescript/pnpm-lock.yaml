@@ -12,8 +12,8 @@ importers:
         specifier: '>=1.0.1'
         version: 1.0.1(express@5.2.1)
       apcore-js:
-        specifier: 1.0.0-alpha.4
-        version: 1.0.0-alpha.4(typescript@5.9.3)
+        specifier: 1.0.0-alpha.5
+        version: 1.0.0-alpha.5(typescript@5.9.3)
       apcore-toolkit:
         specifier: 0.15.1-alpha.2
         version: 0.15.1-alpha.2(@sinclair/typebox@0.34.48)(typescript@5.9.3)
@@ -656,8 +656,8 @@ packages:
   ajv@8.20.0:
     resolution: {integrity: sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==}
 
-  apcore-js@1.0.0-alpha.4:
-    resolution: {integrity: sha512-APFaeBqZ0u0BCmeDzGOJ05Byt16zY96NAlqUiRtIEDY51lzLNP4mfr6B6aicBvFZ1Lg4UQDmVKumpkxjXaOiyA==}
+  apcore-js@1.0.0-alpha.5:
+    resolution: {integrity: sha512-KByhP3vIfWv2KxGqFWATwr8NDIXEAqhLCZdQ6h9Z8W0kjIlGlEvdbIbCDb5d3b8AyUjzJqpXW+XsyaVVOOgtQA==}
     engines: {node: '>=20.0.0'}
     peerDependencies:
       typescript: ^5.5.0
@@ -1951,7 +1951,7 @@ snapshots:
       json-schema-traverse: 1.0.0
       require-from-string: 2.0.2
 
-  apcore-js@1.0.0-alpha.4(typescript@5.9.3):
+  apcore-js@1.0.0-alpha.5(typescript@5.9.3):
     dependencies:
       '@sinclair/typebox': 0.34.48
       js-yaml: 4.3.2
@@ -1963,7 +1963,7 @@ snapshots:
     dependencies:
       '@sinclair/typebox': 0.34.48
       ajv: 8.20.0
-      apcore-js: 1.0.0-alpha.4(typescript@5.9.3)
+      apcore-js: 1.0.0-alpha.5(typescript@5.9.3)
       js-yaml: 4.3.2
     transitivePeerDependencies:
       - typescript

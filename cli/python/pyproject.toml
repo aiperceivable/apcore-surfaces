@@ -26,7 +26,7 @@ classifiers = [
     "Environment :: Console",
 ]
 dependencies = [
-    "apcore[config,discovery]==1.0.0a4",
+    "apcore[config,discovery]==1.0.0a5",
     "apcore-toolkit[http-proxy]==0.15.1a2",
     "click>=8.1",
     "jsonschema>=4.20",

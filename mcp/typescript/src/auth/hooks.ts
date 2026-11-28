@@ -53,7 +53,8 @@ export function buildExplorerAuthHook(
     const identity = await authenticator.authenticate(headersMap);
     if (!identity) {
       const requireAuth = options.requireAuth ?? authenticator.requireAuth ?? true;
-      if (requireAuth) {
+      const badCredential = authenticator.rejectInvalidCredentials === true && Object.hasOwn(headersMap, "authorization");
+      if (requireAuth || badCredential) {
         throw new Error("Unauthorized");
       }
     }

@@ -39,7 +39,8 @@ export function createAuthMiddleware(opts: AuthMiddlewareOptions) {
 
     const identity = authenticator.authenticate(headers);
 
-    if (identity === null && requireAuth) {
+    const badCredential = authenticator.rejectInvalidCredentials === true && Object.hasOwn(req.headers, "authorization");
+    if (identity === null && (requireAuth || badCredential)) {
       res.status(401).set("WWW-Authenticate", "Bearer").json({
         error: "Unauthorized",
         detail: "Missing or invalid Bearer token",

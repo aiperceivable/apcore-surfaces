@@ -1,15 +1,24 @@
 import type { Request } from "express";
+import { createHash } from "node:crypto";
 import { ServerCallContext, UnauthenticatedUser } from "@a2a-js/sdk/server";
 import type { User } from "@a2a-js/sdk/server";
 import type { Identity } from "apcore-js";
 import { getAuthIdentity } from "../auth/storage.js";
 
+export const TASK_OWNER_KEY = "apcoreOwner";
+export const TASK_SKILL_KEY = "apcoreSkill";
+const OWNER_PREFIX = "apcore:";
+
+export function scopedOwner(identity: Identity | null): string | null {
+  const owner = identity?.ownerKey?.() ?? null;
+  return owner === null ? null : createHash("sha256").update("apcore-a2a-owner-v1\0" + owner).digest("hex");
+}
+
 /**
  * Adapts an apcore `Identity` to a2a-js's `User` interface.
  *
- * `userName` is the identity id, which is what a2a-js's `resolveUserScope` uses
- * as the owner key -- the same principal the executor puts on the apcore
- * `Context`, so governance and task scoping name the same caller.
+ * `userName` identifies the owner's bucket in a2a-js. The scoped namespace
+ * binds the actor and effective subject while staying stable on scope refresh.
  */
 export class IdentityUser implements User {
   constructor(readonly identity: Identity) {}
@@ -19,7 +28,10 @@ export class IdentityUser implements User {
   }
 
   get userName(): string {
-    return this.identity.id;
+    const owner = scopedOwner(this.identity);
+    if (owner !== null) return `${OWNER_PREFIX}scoped:${owner}`;
+    const legacy = this.identity.id;
+    return legacy.startsWith(OWNER_PREFIX) ? `${OWNER_PREFIX}legacy:${legacy}` : legacy;
   }
 }
 
@@ -79,7 +91,7 @@ export function anonymousContext(): ServerCallContext {
  * Returns `null` for `UnauthenticatedUser`, which is the value the card filter
  * treats as the anonymous principal.
  */
-export function identityOf(context: ServerCallContext): Identity | null {
-  const user = context.user as { identity?: Identity } | undefined;
+export function identityOf(context: ServerCallContext | undefined): Identity | null {
+  const user = context?.user as { identity?: Identity } | undefined;
   return user?.identity ?? null;
 }

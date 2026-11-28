@@ -3,12 +3,13 @@
 //! Provides JWT-based authentication, a Tower middleware layer for protecting
 //! HTTP endpoints, and task-local identity propagation.
 
+mod delegation;
 pub mod jwt;
 pub mod middleware;
 pub mod protocol;
 
 // ---- Re-exports: public API surface -----------------------------------------
-pub use jwt::{ClaimMapping, JWTAuthenticator};
+pub use jwt::{ClaimMapping, DelegatedClaims, JWTAuthenticator};
 // [D9-009] extract_headers is pub(crate) — not exported as part of public API.
 pub use middleware::{AuthMiddlewareLayer, AuthMiddlewareService, AUTH_IDENTITY};
 pub use protocol::{Authenticator, Identity};

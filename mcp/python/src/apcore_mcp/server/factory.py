@@ -31,7 +31,7 @@ from apcore_mcp.auth.middleware import _REQUEST_IDENTITY_KEY, auth_identity_var
 from apcore_mcp.server.approval_bridge import ApprovalBridge, _approval_response_log, _protect_sdk_approval_logs
 from apcore_mcp.server.async_task_bridge import RESERVED_PREFIX, AsyncTaskBridge
 from apcore_mcp.server.router import ExecutionRouter, _descriptor_version_hint, _matches_registered_version
-from apcore_mcp.server.transport import _protocol_source_var, transport_session_var
+from apcore_mcp.server.transport import _protocol_source_var, _scoped_sse_request, transport_session_var
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,12 @@ def _request_identity() -> Identity | None:
     scope = getattr(ctx.request, "scope", None) if ctx is not None else None
     if isinstance(scope, dict) and _REQUEST_IDENTITY_KEY in scope:
         identity = scope[_REQUEST_IDENTITY_KEY]
-        return identity if isinstance(identity, Identity) else None
+        if isinstance(identity, Identity):
+            return identity
+        if not _scoped_sse_request.get():
+            return None
+    if _scoped_sse_request.get():
+        raise RuntimeError("Missing authenticated request identity for the scoped SSE session")
     return auth_identity_var.get()
 
 

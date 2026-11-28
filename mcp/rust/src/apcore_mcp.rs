@@ -1013,16 +1013,11 @@ impl APCoreMCP {
                     // Cancel any task whose session_key matches, plus also
                     // try treating the key as a direct task_id.
                     let key = key.to_string();
+                    let identity = crate::AUTH_IDENTITY.try_with(Clone::clone).ok().flatten();
                     let output_lease = output_lease.clone();
                     let task = tokio::spawn(async move {
                         let _output_lease = output_lease;
-                        let n = b.cancel_session_tasks(&key).await;
-                        if n == 0 {
-                            // Best-effort direct-cancel fallback on client
-                            // disconnect; a store error here has no caller
-                            // left to report it to (apcore 0.31.0, D-81).
-                            let _ = b.cancel(&key).await;
-                        }
+                        b.cancel_for_request(&key, identity.as_ref()).await;
                     });
                     let mut tasks = cancellation_tasks
                         .lock()
@@ -1220,14 +1215,9 @@ impl APCoreMCP {
             server_handler = server_handler.with_cancel_handler(Arc::new(move |key: &str| {
                 if let Some(b) = bridge_weak.upgrade() {
                     let key = key.to_string();
+                    let identity = crate::AUTH_IDENTITY.try_with(Clone::clone).ok().flatten();
                     tokio::spawn(async move {
-                        let n = b.cancel_session_tasks(&key).await;
-                        if n == 0 {
-                            // Best-effort direct-cancel fallback on client
-                            // disconnect; a store error here has no caller
-                            // left to report it to (apcore 0.31.0, D-81).
-                            let _ = b.cancel(&key).await;
-                        }
+                        b.cancel_for_request(&key, identity.as_ref()).await;
                     });
                 }
             }));
@@ -3203,6 +3193,92 @@ mod tests {
                 verify_wire_phase_b(native_stream, final_scope).await;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn signed_delegation_controls_live_mcp_discovery_and_invocation() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use jsonwebtoken::{EncodingKey, Header};
+        use tower::ServiceExt;
+
+        const SECRET: &str = "mcp-delegation-wire-test";
+        let mut executor = Executor::new(
+            make_test_registry(vec![("demo.echo", "Echo", vec![])]),
+            Config::default(),
+        );
+        let mut grant =
+            apcore::ACLRule::new(vec!["@external".into()], vec!["demo.echo".into()], "allow");
+        grant.conditions =
+            Some(json!({"scopes": ["echo"], "roles": ["worker"], "subject_roles": ["reviewer"]}));
+        executor.set_acl(apcore::ACL::new(vec![grant], "deny", None));
+        let auth = crate::JWTAuthenticator::new(
+            SECRET,
+            None,
+            Some("mcp".into()),
+            Some("issuer".into()),
+            None,
+            None,
+            None,
+        )
+        .with_delegated_claims(crate::DelegatedClaims {
+            actor_roles_claim: Some("roles".into()),
+            ..Default::default()
+        });
+        let app = APCoreMCP::builder()
+            .backend(Arc::new(executor))
+            .authenticator(auth)
+            .require_auth(false)
+            .build()
+            .unwrap()
+            .async_serve(AsyncServeOptions::default())
+            .await
+            .unwrap();
+        let token = |scope, actor_roles| {
+            jsonwebtoken::encode(&Header::default(), &json!({
+            "sub": "alice", "iss": "issuer", "aud": "mcp", "exp": jsonwebtoken::get_current_timestamp() + 120,
+            "scope": scope, "roles": ["reviewer"], "act": {"sub": "worker", "roles": actor_roles, "act": {"sub": "prior", "roles": ["worker"]}}
+        }), &EncodingKey::from_secret(SECRET.as_bytes())).unwrap()
+        };
+        let rpc = |bearer: String, method, params| {
+            let request = Request::post("/mcp")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+                        .to_string(),
+                ))
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+        let call = json!({"name": "demo.echo", "arguments": {"q": "hello"}, "_meta": {"identity": {"id": "forged", "type": "user", "scopes": ["echo"]}}});
+        for (bearer, allowed) in [
+            (token("echo other", vec!["worker"]), true),
+            (token("other", vec!["worker"]), false),
+            (token("echo", vec![]), false),
+        ] {
+            let response = rpc(bearer.clone(), "tools/list", json!({})).await.unwrap();
+            let result: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                result["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "demo.echo"),
+                allowed
+            );
+            let response = rpc(bearer, "tools/call", call.clone()).await.unwrap();
+            let result: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert_eq!(result["result"]["isError"], !allowed, "{result}");
+        }
+        let invalid = rpc("invalid".into(), "tools/list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

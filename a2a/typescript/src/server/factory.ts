@@ -22,6 +22,7 @@ import { AgentCardBuilder, type Registry } from "../adapters/agent-card.js";
 import {
   buildExtendedCard,
   buildPublicCard,
+  scopedSkillCallable,
   type RegistryLike,
 } from "../adapters/card-visibility.js";
 import { getAuthIdentity } from "../auth/storage.js";
@@ -338,7 +339,10 @@ export class A2AServerFactory {
             Promise.resolve(buildExtendedCard(fullCard, executor, identityOf(context)))
         : undefined;
 
-    const requestHandler = new A2ATaskRequestHandler(agentCard, taskStore, apcoreExecutor, extendedAgentCardProvider);
+    const requestHandler = new A2ATaskRequestHandler(
+      agentCard, taskStore, apcoreExecutor, extendedAgentCardProvider,
+      (skillId, identity) => scopedSkillCallable(executor, skillId, identity),
+    );
 
     // Build Express app
     const app = express();

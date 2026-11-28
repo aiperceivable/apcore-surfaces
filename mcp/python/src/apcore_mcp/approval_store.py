@@ -48,7 +48,9 @@ class ApprovalStore(Protocol):
         ...
 
 
-ApprovalPrincipal = tuple[str, str] | None
+# Scoped records carry the opaque native authority key. Legacy records retain
+# the actor tuple, so the two forms cannot match one another.
+ApprovalPrincipal = str | tuple[str, str] | None
 
 
 @dataclass(frozen=True)

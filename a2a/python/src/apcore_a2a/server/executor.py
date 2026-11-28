@@ -26,11 +26,13 @@ from a2a.types import (
     TaskStatus,
     TaskStatusUpdateEvent,
 )
+from apcore import Identity
 from google.protobuf.timestamp_pb2 import Timestamp
 
 # Imported at module level — no circular dependency (middleware.py does not import executor.py)
 from apcore_a2a.adapters.errors import GOVERNANCE_REFUSAL_CODES, carries_caller_detail, sanitize_message
 from apcore_a2a.auth.middleware import auth_identity_var
+from apcore_a2a.server.context import TASK_OWNER_KEY, TASK_SKILL_KEY, identity_of, scoped_owner
 
 logger = logging.getLogger(__name__)
 _Result = TypeVar("_Result")
@@ -177,20 +179,27 @@ class ApCoreAgentExecutor(AgentExecutor):
     async def _execute(self, context: RequestContext, event_queue: EventQueue, run: _TaskExecution) -> None:
         # a2a-sdk 1.0: Establish the Task in the store before any TaskStatusUpdateEvent
         context_id = context.context_id or context.task_id
+        request_identity = identity_of(getattr(context, "call_context", None))
+        identity = request_identity if isinstance(request_identity, Identity) else auth_identity_var.get()
+        raw_metadata = context.message.metadata if context.message else None
+        metadata: dict = dict(raw_metadata) if raw_metadata else {}
+        skill_id = metadata.get("skillId")
+        owner = scoped_owner(identity)
         initial_task = Task(
             id=context.task_id,
             context_id=context_id,
             status=_make_status(TaskState.TASK_STATE_SUBMITTED),
         )
+        if owner is not None:
+            initial_task.metadata.update({TASK_OWNER_KEY: owner})
+            if isinstance(skill_id, str):
+                initial_task.metadata.update({TASK_SKILL_KEY: skill_id})
         await event_queue.enqueue_event(initial_task)
         if run.stopped.is_set():
             return
 
         # 1. Get skill_id from message metadata
         # metadata is a protobuf Struct; convert to dict for .get() access
-        raw_metadata = context.message.metadata if context.message else None
-        metadata: dict = dict(raw_metadata) if raw_metadata else {}
-        skill_id = metadata.get("skillId")
         if not skill_id:
             self._notify("submitted", "failed")
             await self._fail(context, event_queue, "Missing required parameter: metadata.skillId")
@@ -231,7 +240,6 @@ class ApCoreAgentExecutor(AgentExecutor):
             return
 
         # 4. Build apcore Identity context with CancelToken (P0-B)
-        identity = auth_identity_var.get()
         apcore_ctx = None
         token = None
         try:

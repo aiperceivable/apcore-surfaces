@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Protocol selection belongs to the active transport, never client metadata.
 _protocol_source_var: ContextVar[str | None] = ContextVar("apcore_mcp_protocol_source", default=None)
+_scoped_sse_request: ContextVar[bool] = ContextVar("apcore_mcp_scoped_sse_request", default=False)
 
 # [TM-4] Module-level ContextVar carrying the active transport session id.
 # The transport sets it inside :meth:`TransportManager._scoped_session` so
@@ -63,9 +64,20 @@ class MetricsExporter(Protocol):
 
 @dataclass
 class _HTTPSessionOpening:
-    principal: tuple[str, str] | None
+    principal: str | tuple[str, str] | None
+    authority: str | None
     session_id: str | None = None
     closed: bool = False
+
+
+@dataclass
+class _SSEOwnerSessions:
+    transport: SseServerTransport
+    connections: int = 0
+
+
+def _current_authority() -> str | None:
+    return getattr(auth_identity_var.get(), "authority_key", lambda: None)()
 
 
 class _ScopedHTTPServer(Server):
@@ -82,11 +94,13 @@ class _ScopedHTTPServer(Server):
         self, sessions: StreamableHTTPSessionManager, scope: Scope, receive: Receive, send: Send
     ) -> None:
         identity = auth_identity_var.get()
-        principal = (identity.type, identity.id) if identity is not None else None
+        owner = getattr(identity, "owner_key", lambda: None)()
+        authority = _current_authority()
+        principal = owner if owner is not None else (identity.type, identity.id) if identity is not None else None
         session_id = Headers(scope=scope).get("mcp-session-id")
         if session_id is not None:
             opening = self._owners.get(session_id)
-            if opening is None or opening.principal != principal:
+            if opening is None or opening.principal != principal or opening.authority != authority:
                 response = JSONResponse(
                     {"jsonrpc": "2.0", "id": "server-error", "error": {"code": -32600, "message": "Session not found"}},
                     status_code=404,
@@ -100,7 +114,7 @@ class _ScopedHTTPServer(Server):
             await sessions.handle_request(scope, receive, send)
             return
 
-        opening = _HTTPSessionOpening(principal)
+        opening = _HTTPSessionOpening(principal, authority)
 
         async def bind_session(message: Message) -> None:
             if message["type"] == "http.response.start" and message["status"] == 200 and not opening.closed:
@@ -355,18 +369,46 @@ class TransportManager:
         logger.warning("SSE transport is deprecated. Use Streamable HTTP instead.")
 
         sse_transport = SseServerTransport("/messages/")
+        scoped_sessions: dict[str, _SSEOwnerSessions] = {}
 
         async def handle_sse(request: Any) -> Response:
-            # [TM-4] Each SSE connection is an independent protocol session;
-            # synthesize a per-connection id so its async tasks are tracked
-            # and cancelled when the SSE stream closes.
-            session_id = uuid.uuid4().hex
-            async with sse_transport.connect_sse(request.scope, request.receive, request._send) as (
-                read_stream,
-                write_stream,
-            ):
-                await self._run_scoped(server, read_stream, write_stream, init_options, session_id)
+            owner = _current_authority()
+            transport = sse_transport
+            bucket = None
+            if owner is not None:
+                bucket = scoped_sessions.get(owner)
+                if bucket is None:
+                    bucket = _SSEOwnerSessions(SseServerTransport("/messages/"))
+                    scoped_sessions[owner] = bucket
+                transport = bucket.transport
+                bucket.connections += 1
+
+            scoped_request = _scoped_sse_request.set(bucket is not None)
+            try:
+                session_id = uuid.uuid4().hex
+                async with transport.connect_sse(request.scope, request.receive, request._send) as (
+                    read_stream,
+                    write_stream,
+                ):
+                    await self._run_scoped(server, read_stream, write_stream, init_options, session_id)
+            finally:
+                _scoped_sse_request.reset(scoped_request)
+                if bucket is not None and owner is not None:
+                    bucket.connections -= 1
+                    if bucket.connections == 0:
+                        scoped_sessions.pop(owner, None)
             return Response()
+
+        async def handle_messages(scope: Scope, receive: Receive, send: Send) -> None:
+            owner = _current_authority()
+            if owner is None:
+                await sse_transport.handle_post_message(scope, receive, send)
+                return
+            bucket = scoped_sessions.get(owner)
+            if bucket is None:
+                await Response("Could not find session", status_code=404)(scope, receive, send)
+                return
+            await bucket.transport.handle_post_message(scope, receive, send)
 
         async def _health(request: Any) -> JSONResponse:
             return JSONResponse(self._build_health_response())
@@ -383,7 +425,7 @@ class TransportManager:
         routes.extend(
             [
                 Route("/sse", endpoint=handle_sse, methods=["GET"]),
-                Mount("/messages/", app=sse_transport.handle_post_message),
+                Mount("/messages/", app=handle_messages),
             ]
         )
 

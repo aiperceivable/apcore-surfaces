@@ -9,4 +9,9 @@ use std::collections::HashMap;
 pub trait Authenticator: Send + Sync {
     async fn authenticate(&self, headers: &HashMap<String, String>) -> Option<Identity>;
     fn security_schemes(&self) -> Option<Value>;
+
+    /// Refuse a supplied invalid credential even when authentication is optional.
+    fn rejects_invalid_credentials(&self) -> bool {
+        false
+    }
 }

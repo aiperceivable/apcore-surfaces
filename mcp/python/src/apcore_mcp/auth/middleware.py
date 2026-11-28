@@ -91,7 +91,10 @@ class AuthMiddleware:
         headers = extract_headers(scope)
         identity = await call_authenticator(self._authenticator, headers)
 
-        if identity is None and self._require_auth:
+        invalid_credential = (
+            "authorization" in headers and getattr(self._authenticator, "rejects_invalid_credentials", False) is True
+        )
+        if identity is None and (self._require_auth or invalid_credential):
             logger.warning("Authentication failed for %s", path)
             await self._send_401(send)
             return

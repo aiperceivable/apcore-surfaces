@@ -134,6 +134,16 @@ function aclContext(identity: Identity | null): unknown {
   }
 }
 
+/** Check the active Core invocation gate before a scoped skill is disclosed. */
+export function scopedSkillCallable(executor: unknown, skillId: string, identity: Identity): boolean {
+  const backend = executor as { getCallableDescriptor?(id: string, context: Context): unknown } | null;
+  try {
+    return backend?.getCallableDescriptor?.(skillId, Context.create(identity)) != null;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * `[authorized, approvalRequired]` for one skill, from apcore's ACL.
  *
@@ -186,6 +196,12 @@ export function skillAccess(
   identity: Identity | null,
 ): Map<string, boolean> {
   const access = new Map<string, boolean>();
+  if (identity?.scopes !== undefined) {
+    for (const skillId of skillIds) {
+      if (scopedSkillCallable(executor, skillId, identity)) access.set(skillId, false);
+    }
+    return access;
+  }
   const acl = executorAcl(executor);
   if (acl === null) {
     for (const skillId of skillIds) access.set(skillId, false);

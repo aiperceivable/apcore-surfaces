@@ -24,4 +24,6 @@ export interface Authenticator {
   authenticate(headers: Record<string, string>): Promise<Identity | null>;
   /** Whether unauthenticated requests should be rejected. Default true. */
   readonly requireAuth?: boolean;
+  /** Reject a provided credential that did not authenticate even in permissive mode. */
+  readonly rejectInvalidCredentials?: boolean;
 }

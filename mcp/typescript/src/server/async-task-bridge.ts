@@ -140,6 +140,7 @@ export interface AsyncTaskManagerLike {
  * `predicted_changes` populated from `Module.preview()`.
  */
 export interface ExecutorLike {
+  getCallableDescriptor?(moduleId: string, context?: unknown): unknown;
   validate(
     moduleId: string,
     inputs?: Record<string, unknown> | null,
@@ -170,6 +171,8 @@ export interface AsyncMetaTool {
 export interface AsyncTaskBridgeOptions {
   /** When false, `isAsyncModule()` always returns false — meta-tools are disabled. */
   enabled?: boolean;
+  /** The task manager and bridge share an in-process task lifetime. */
+  scopedTasks?: boolean;
   /**
    * Optional output-redactor invoked on completed task results before they are
    * returned from `__apcore_task_status`. Signature matches apcore-js's
@@ -208,6 +211,8 @@ export class AsyncTaskBridge {
   private readonly _outputSchemaMap: Record<string, Record<string, unknown>>;
   private readonly _descriptorLookup?: AsyncTaskBridgeOptions["descriptorLookup"];
   private readonly _executor?: ExecutorLike;
+  private readonly _scopedTasks: boolean;
+  private readonly _scopedTaskOwners = new Map<string, string>();
   /**
    * Maps task_id → progressToken recorded at submit time so terminal-
    * state notifications can be fanned out via the original token.
@@ -228,6 +233,7 @@ export class AsyncTaskBridge {
     this._outputSchemaMap = options?.outputSchemaMap ?? {};
     this._descriptorLookup = options?.descriptorLookup;
     this._executor = options?.executor;
+    this._scopedTasks = options?.scopedTasks === true;
   }
 
   /** Whether async routing and meta-tools are enabled. */
@@ -291,6 +297,17 @@ export class AsyncTaskBridge {
       sendNotification?: (notification: Record<string, unknown>) => Promise<void> | void;
     },
   ): Promise<{ task_id: string; status: "pending" }> {
+    const owner = this._scopedOwner(context);
+    if (owner !== null && (!this._scopedTasks || !this._canDisclose(moduleId, context))) {
+      throw new Error("Async module is unavailable to this authority");
+    }
+    if (this._scopedTaskOwners.size > 0) {
+      const tracked = [...this._scopedTaskOwners.keys()];
+      const live = new Set((await this._manager.listTasks()).map(info => info.taskId));
+      for (const taskId of tracked) {
+        if (!live.has(taskId)) this._scopedTaskOwners.delete(taskId);
+      }
+    }
     // [D11-015] Install progress sink on the context BEFORE submitting, so the
     // module can emit mid-execution progress via context.data[MCP_PROGRESS_KEY].
     // Mirrors Python's async_task_bridge.py _install_progress_sink() pattern.
@@ -324,6 +341,7 @@ export class AsyncTaskBridge {
       markBackgroundApprovalContext(context.data);
     }
     const taskId = await this._manager.submit(moduleId, inputs, { context: context ?? null });
+    if (owner !== null) this._scopedTaskOwners.set(taskId, owner);
     if (options?.progressToken !== undefined) {
       this._progressTokens.set(taskId, options.progressToken);
     }
@@ -562,7 +580,7 @@ export class AsyncTaskBridge {
           throw new Error("__apcore_task_status requires task_id (string)");
         }
         const info = await this._manager.getStatus(taskId);
-        if (!info) {
+        if (!info || !this._canReadTask(info, context)) {
           // [D10-003] Return envelope (matching Python's `(content, is_error=True, None)`
           // and Rust's `Ok(envelope)`). Throwing here would force the caller's catch path
           // to diverge from Python+Rust, breaking cross-SDK error handling.
@@ -603,8 +621,11 @@ export class AsyncTaskBridge {
         // Without this, unknown task_ids silently return `{cancelled: false}` —
         // callers can't distinguish "task existed and is uncancellable" from
         // "task never existed".
-        if (!(await this._manager.getStatus(taskId))) {
+        const info = await this._manager.getStatus(taskId);
+        if (!info) {
           this._progressTokens.delete(taskId);
+        }
+        if (!info || !this._canReadTask(info, context)) {
           return {
             error: "ASYNC_TASK_NOT_FOUND",
             task_id: taskId,
@@ -728,11 +749,29 @@ export class AsyncTaskBridge {
           filter = status;
         }
         const tasks = await this._manager.listTasks(filter);
-        return { tasks: tasks.map((t) => this._projectTaskInfo(t)) };
+        return { tasks: tasks.filter(t => this._canReadTask(t, context)).map(t => this._projectTaskInfo(t)) };
       }
       default:
         throw new Error(`Unknown meta-tool: ${toolName}`);
     }
+  }
+
+  private _scopedOwner(context: unknown): string | null {
+    const bound = context as { identity?: { ownerKey?(): string | null } | null } | null;
+    return bound?.identity?.ownerKey?.() ?? null;
+  }
+
+  private _canDisclose(moduleId: string, context: unknown): boolean {
+    try {
+      return this._executor?.getCallableDescriptor?.(moduleId, context) != null;
+    } catch {
+      return false;
+    }
+  }
+
+  private _canReadTask(info: { taskId: string; moduleId: string }, context: unknown): boolean {
+    const owner = this._scopedTaskOwners.get(info.taskId) ?? null;
+    return owner === this._scopedOwner(context) && (owner === null || this._canDisclose(info.moduleId, context));
   }
 
   private _projectTaskInfo(info: {
@@ -795,6 +834,7 @@ export async function createAsyncTaskBridge(
         : undefined;
     return new AsyncTaskBridge(manager, {
       enabled: true,
+      scopedTasks: true,
       redactSensitive: typeof redactSensitive === "function" ? redactSensitive : () => {
         throw new Error("Output redaction failed");
       },

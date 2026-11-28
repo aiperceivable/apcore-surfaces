@@ -1276,6 +1276,11 @@ impl ExecutionRouter {
         if let Some(approval_bridge) = &self.approval_bridge {
             if ApprovalBridge::is_meta_tool(tool_name) {
                 let (value, is_error) = if approval_bridge.supports_scoped_approval()
+                    || apcore_ctx
+                        .identity
+                        .as_ref()
+                        .and_then(apcore::Identity::authority_key)
+                        .is_some()
                     || crate::server::approval_bridge::has_tool_response_context()
                 {
                     approval_bridge

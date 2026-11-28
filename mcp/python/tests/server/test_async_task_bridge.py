@@ -459,3 +459,41 @@ async def test_submit_tool_accepts_null_and_empty_arguments(value: object) -> No
     )
 
     assert is_error is False
+
+
+@pytest.mark.asyncio
+async def test_scoped_background_task_rechecks_owner_and_current_access() -> None:
+    from apcore import Context, Executor, Identity, Registry
+    from apcore.acl import ACL, ACLRule
+
+    class Module:
+        description = "Return the operation result"
+        input_schema = {"type": "object"}
+        output_schema = {"type": "object"}
+
+        async def execute(self, inputs, context):
+            return {"result": "ok"}
+
+    registry = Registry()
+    registry.register("task.run", Module())
+    acl = ACL([ACLRule(["@external"], ["task.run"], "allow", conditions={"scopes": ["run"]})])
+    actor = Identity("actor", issuer="issuer")
+    subject = Identity("subject", scopes=["read", "run"], issuer="issuer")
+    original = subject.delegate(actor, ["run"])
+    narrowed = subject.delegate(actor, ["read"])
+    different = Identity("other", scopes=["run"], issuer="issuer").delegate(actor, ["run"])
+    with Executor(registry, acl=acl) as executor:
+        bridge = AsyncTaskBridge.with_limits(executor)
+        task_id = (await bridge.submit("task.run", {}, Context.create(original)))["task_id"]
+        try:
+            for identity in (None, narrowed, different):
+                _, denied, _ = await bridge.handle_meta_tool(
+                    "__apcore_task_status", {"task_id": task_id}, router_extra={"identity": identity}
+                )
+                assert denied
+            content, denied, _ = await bridge.handle_meta_tool(
+                "__apcore_task_status", {"task_id": task_id}, router_extra={"identity": original}
+            )
+            assert not denied and json.loads(content[0]["text"])["task_id"] == task_id
+        finally:
+            await bridge.shutdown()

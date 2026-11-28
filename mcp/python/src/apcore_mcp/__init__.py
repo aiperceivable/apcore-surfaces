@@ -34,6 +34,7 @@ from apcore_mcp.auth import (
     Authenticator,
     AuthMiddleware,
     ClaimMapping,
+    DelegatedClaims,
     JWTAuthenticator,
     auth_identity_var,
     get_current_identity,
@@ -95,6 +96,7 @@ __all__ = [
     "Authenticator",
     "JWTAuthenticator",
     "ClaimMapping",
+    "DelegatedClaims",
     "AuthMiddleware",
     # Per-request identity context (cross-SDK parity with TS
     # ``getCurrentIdentity``/``identityStorage`` and Rust ``AUTH_IDENTITY``)

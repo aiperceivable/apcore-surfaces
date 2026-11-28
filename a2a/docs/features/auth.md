@@ -18,6 +18,20 @@ description: "Auth module spec: JWT/Bearer authentication for the A2A server, va
 
 JWT/Bearer authentication for the A2A server. Validates tokens, maps claims to apcore `Identity`, bridges identity to the Executor via ASGI ContextVar. Mirrors apcore-mcp's auth module pattern.
 
+## Delegated JWT Authority
+
+JWT scope projection is opt-in. Configure the expected issuer and audience alongside the signature verification key and algorithm allowlist. The authenticator requires `sub`, `iss`, `aud`, and `exp` and validates `nbf` and `iat` when supplied. In permissive mode a request without credentials retains anonymous access. A supplied credential must verify and satisfy the configured claim mapping.
+
+In Python, pass `delegated_claims=DelegatedClaims(...)` to `JWTAuthenticator`. In TypeScript, pass `delegatedClaims` in the authenticator options. In Rust, call `with_delegated_claims(DelegatedClaims { ... })` on the authenticator. The optional provider and outer actor roles fields are `scp_claim` and `actor_roles_claim`, with camelCase names in TypeScript.
+
+The standard `scope` claim is a space-delimited scope-token string. An explicitly configured provider claim such as `scp` can contain a scope string or an array of scope tokens. If both claims are present, their normalized sets must agree. An empty provider array grants zero scopes.
+
+The top-level `sub` identifies the root subject. The outermost `act` identifies the current actor and contributes one active delegation link. Actor roles come from a configured field on that outer object. Further nested `act` claims are bounded history and do not participate in the ACL or ownership. Configure a nonempty top-level `scopes` condition on each ACL rule that grants access to a scoped identity. Use `subject_types` and `subject_roles` to evaluate the root subject.
+
+A scoped task is owned by the issuer-qualified actor and subject. Access to the task and its results is evaluated with the current authority. A token refresh for the same actor and subject retains ownership.
+
+The `apcore:` owner prefix is reserved for scope-aware storage. When migrating an existing task or push-notification store that uses literal legacy IDs with this prefix, update those owner keys to `apcore:legacy:` followed by the original ID.
+
 ## Components
 
 ### 1. `Authenticator` Protocol — `auth/protocol.py`

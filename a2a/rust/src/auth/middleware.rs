@@ -105,20 +105,11 @@ where
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
 
-            // Exempt paths (discovery, health) are never rejected, but a caller
-            // that does present valid credentials is still identified: the Agent
-            // Card is ACL-filtered per caller, so serving it anonymously to an
-            // authenticated client would hide skills that client may invoke.
-            if exempt {
-                if let Some(identity) = authenticator.authenticate(&headers).await {
-                    req.extensions_mut().insert(identity);
-                }
-                return inner.call(req).await;
-            }
-
+            let invalid_credential_is_fatal = headers.contains_key("authorization")
+                && authenticator.rejects_invalid_credentials();
             match authenticator.authenticate(&headers).await {
                 None => {
-                    if require_auth {
+                    if (!exempt && require_auth) || invalid_credential_is_fatal {
                         // JSON body + headers match Python/TS middleware so clients
                         // get a consistent error shape across all three SDKs.
                         let body = serde_json::json!({
@@ -240,6 +231,37 @@ mod tests {
         let resp = svc.oneshot(req).await.unwrap();
         // Permissive mode: unauthenticated non-exempt request runs downstream.
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn permissive_scoped_auth_rejects_a_supplied_invalid_credential() {
+        use crate::{DelegatedClaims, JWTAuthenticator};
+
+        let layer = AuthMiddlewareLayer::with_require_auth(
+            Arc::new(
+                JWTAuthenticator::new("key")
+                    .with_issuer("issuer")
+                    .with_audience("a2a")
+                    .with_delegated_claims(DelegatedClaims::default()),
+            ),
+            vec![],
+            false,
+        );
+        let endpoint = layer.layer(ok_service());
+        let anonymous = Request::builder()
+            .uri("/jsonrpc")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            endpoint.clone().oneshot(anonymous).await.unwrap().status(),
+            200
+        );
+        let invalid = Request::builder()
+            .uri("/jsonrpc")
+            .header("authorization", "Bearer invalid")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(endpoint.oneshot(invalid).await.unwrap().status(), 401);
     }
 
     #[tokio::test]

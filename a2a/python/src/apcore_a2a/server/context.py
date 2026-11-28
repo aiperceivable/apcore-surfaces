@@ -25,17 +25,28 @@ from typing import Any
 from a2a.auth.user import UnauthenticatedUser, User
 from a2a.server.context import ServerCallContext
 from a2a.server.routes import DefaultServerCallContextBuilder
+from apcore import Identity
 from starlette.requests import Request
 
 from apcore_a2a.auth.middleware import auth_identity_var
+
+TASK_OWNER_KEY = "apcoreOwner"
+TASK_SKILL_KEY = "apcoreSkill"
+_OWNER_PREFIX = "apcore:"
+
+def scoped_owner(identity: Any) -> str | None:
+    if not isinstance(identity, Identity):
+        return None
+    owner = identity.owner_key()
+    return owner if isinstance(owner, str) else None
 
 
 class IdentityUser(User):
     """Adapts an apcore ``Identity`` to a2a-sdk's ``User`` interface.
 
-    ``user_name`` is the identity id, which is what ``resolve_user_scope`` uses
-    as the owner key — the same principal the executor puts on the apcore
-    ``Context``, so governance and task scoping name the same caller.
+    ``user_name`` exposes the task owner key resolved by the SDK. Scoped
+    identities use the Core owner binding. Ordinary identities use their
+    identity ID outside the reserved owner namespace.
     """
 
     def __init__(self, identity: Any) -> None:
@@ -47,7 +58,11 @@ class IdentityUser(User):
 
     @property
     def user_name(self) -> str:
-        return str(self._identity.id)
+        owner = scoped_owner(self._identity)
+        if owner is not None:
+            return f"{_OWNER_PREFIX}scoped:{owner}"
+        legacy = str(self._identity.id)
+        return f"{_OWNER_PREFIX}legacy:{legacy}" if legacy.startswith(_OWNER_PREFIX) else legacy
 
     @property
     def identity(self) -> Any:

@@ -170,3 +170,31 @@ class TestElicitationApprovalHandler:
 
         handler = ElicitationApprovalHandler()
         assert isinstance(handler, ApprovalHandler)
+
+
+@pytest.mark.asyncio
+async def test_storage_approval_binds_current_delegated_authority() -> None:
+    from apcore import Context, Identity, ModuleAnnotations
+    from apcore.approval import ApprovalRequest
+
+    from apcore_mcp.adapters.approval import StorageBackedApprovalHandler
+    from apcore_mcp.approval_store import InMemoryApprovalStore
+
+    store = InMemoryApprovalStore()
+    handler = StorageBackedApprovalHandler(store)
+    root = Identity("subject", scopes=["read", "write"], issuer="issuer")
+    actor = Identity("actor", issuer="issuer")
+    original = root.delegate(actor, ["read", "write"])
+    narrowed = root.delegate(actor, ["read"])
+
+    def request(identity: Identity) -> ApprovalRequest:
+        return ApprovalRequest(
+            "test.run", {}, Context.create(identity), ModuleAnnotations(requires_approval=True),
+            authority_key=identity.authority_key(),
+        )
+
+    pending = await handler.request_approval(request(original))
+    assert pending.approval_id is not None and pending.audit_id is not None
+    assert await store.resolve(pending.audit_id, approved=True)
+    assert (await handler.check_approval_for_call(pending.approval_id, request(narrowed))).status == "rejected"
+    assert (await handler.check_approval_for_call(pending.approval_id, request(original))).status == "approved"

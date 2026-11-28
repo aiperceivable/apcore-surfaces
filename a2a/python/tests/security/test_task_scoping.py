@@ -249,3 +249,41 @@ def test_without_an_authenticator_every_caller_shares_one_owner_bucket():
     # A second, differently-credentialed caller sees it, because with no
     # authenticator configured there is only one principal.
     assert _rpc(client, "someone-else", "tasks/get", {"id": task_id})["result"]["id"] == task_id
+
+
+def test_delegated_task_ownership_uses_subject_and_current_scope():
+    from apcore import Executor, Registry
+    from apcore.acl import ACL, ACLRule
+
+    class Module:
+        description = "Return the operation result"
+        input_schema = {"type": "object"}
+        output_schema = {"type": "object"}
+
+        def execute(self, inputs, context):
+            return {"result": "ok"}
+
+    class Auth(_BearerIsPrincipal):
+        def authenticate(self, headers):
+            principal = super().authenticate(headers)
+            if principal is None:
+                return None
+            subject, scope = principal.id.split("/")
+            root = Identity(subject, scopes=[scope], issuer="issuer")
+            return root.delegate(Identity("same-actor", issuer="issuer"), [scope])
+
+    registry = Registry()
+    registry.register("echo", Module())
+    acl = ACL([ACLRule(["@external"], ["echo"], "allow", conditions={"scopes": ["run"]})])
+    with Executor(registry, acl=acl) as executor:
+        app, _ = A2AServerFactory().create(
+            registry, executor, name="Task scoping", description="d", version="1", url="http://localhost", auth=Auth()
+        )
+        with TestClient(app) as client:
+            task_id = _submit(client, "alice/run", "m-delegated")
+            assert _rpc(client, "alice/run", "GetTask", {"id": task_id}, v1=True)["result"]["id"] == task_id
+            for principal in ("bob/run", "alice/read"):
+                failure = _rpc(client, principal, "GetTask", {"id": task_id}, v1=True)["error"]
+                assert failure["message"] == "Task not found"
+                listing = _rpc(client, principal, "ListTasks", {}, v1=True)["result"]
+                assert not listing.get("tasks")

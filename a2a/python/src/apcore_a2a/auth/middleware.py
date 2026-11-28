@@ -81,7 +81,10 @@ class AuthMiddleware:
         headers = extract_headers(scope)
         identity = self._authenticator.authenticate(headers)
 
-        if identity is None and self._require_auth:
+        invalid_credential = (
+            "authorization" in headers and getattr(self._authenticator, "rejects_invalid_credentials", False) is True
+        )
+        if identity is None and (self._require_auth or invalid_credential):
             method = scope.get("method", "UNKNOWN")
             client = scope.get("client")
             remote = f"{client[0]}:{client[1]}" if client else "unknown"

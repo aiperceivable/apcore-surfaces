@@ -72,6 +72,18 @@ graph TD
 ### Claim Mapping
 The authenticator supports a `claim_mapping` configuration that defines which JWT claims correspond to identity fields. By default, `sub` maps to `id`, `roles` to `roles`, and `type` to `type`.
 
+### Delegated JWT Authority
+
+JWT scope projection is opt-in. Configure the expected issuer and audience alongside the signature verification key and algorithm allowlist. The authenticator requires `sub`, `iss`, `aud`, and `exp` and validates `nbf` and `iat` when supplied. In permissive mode a request without credentials retains anonymous access. A supplied credential must verify and satisfy the configured claim mapping.
+
+In Python, pass `delegated_claims=DelegatedClaims(...)` to `JWTAuthenticator`. In TypeScript, pass `delegatedClaims` in the authenticator options. In Rust, call `with_delegated_claims(DelegatedClaims { ... })` on the authenticator. The optional provider and outer actor roles fields are `scp_claim` and `actor_roles_claim`, with camelCase names in TypeScript.
+
+The standard `scope` claim is a space-delimited scope-token string. An explicitly configured provider claim such as `scp` can contain a scope string or an array of scope tokens. If both claims are present, their normalized sets must agree. An empty provider array grants zero scopes.
+
+The top-level `sub` identifies the root subject. The outermost `act` identifies the current actor and contributes one active delegation link. Actor roles come from a configured field on that outer object. Further nested `act` claims are bounded history and do not participate in the ACL or ownership. Configure a nonempty top-level `scopes` condition on each ACL rule that grants access to a scoped identity. Use `subject_types` and `subject_roles` to evaluate the root subject.
+
+A live scoped session binds to the authority that opened it. A refreshed token with equivalent authority can reuse the session. Open a new session when the effective scopes or roles change. Scoped tasks retain owner identity across a refresh and are checked against current authority. Approvals issued for one effective scope cannot be polled or resumed from another scope.
+
 ### Permissive Mode
 If `require_auth=False` is configured, the middleware will attempt to authenticate but will allow the request to proceed even if no token is provided. In this case, the tool will execute with an `Anonymous` identity, and the Executor's ACL will decide if the call is permitted.
 

@@ -1244,6 +1244,125 @@ async fn advertised_skills(router: axum::Router, bearer: &str) -> Vec<String> {
     skill_ids(&body_json(router.oneshot(req).await.unwrap()).await)
 }
 
+#[tokio::test]
+async fn delegated_jwt_rechecks_current_skill_access_for_cards_and_task_operations() {
+    use apcore::acl::{ACLRule, ACL};
+    use apcore::config::Config;
+    use apcore::executor::Executor;
+    use apcore_a2a::{
+        A2AServerFactory, ApCoreAgentExecutor, CreateOptions, DelegatedClaims,
+        InMemoryPushConfigStore, InMemoryTaskStore, JWTAuthenticator, PartConverter,
+        SchemaConverter,
+    };
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const KEY: &str = "a2a-test-key";
+    let auth = JWTAuthenticator::new(KEY)
+        .with_issuer("tenant-issuer")
+        .with_audience("a2a")
+        .with_delegated_claims(DelegatedClaims::default());
+    let mut rule = ACLRule::new(vec!["@external".into()], vec!["test.echo".into()], "allow");
+    rule.conditions = Some(json!({"scopes": ["echo:read"], "subject_roles": ["allowed"]}));
+    let auth = Arc::new(auth);
+    let tasks = Arc::new(InMemoryTaskStore::new());
+    let push = Arc::new(InMemoryPushConfigStore::new());
+    let make_app = || {
+        let registry = echo_registry();
+        let mut executor = Executor::new(registry.clone(), Config::default());
+        executor.set_acl(ACL::new(vec![rule.clone()], "deny", None));
+        let agent = Arc::new(ApCoreAgentExecutor::new(
+            Arc::new(executor),
+            PartConverter::new(SchemaConverter::new()),
+            300,
+        ));
+        let options = CreateOptions::new(agent, "agent", "Test agent", "0.1", "http://localhost")
+            .with_auth(auth.clone())
+            .with_task_store(tasks.clone())
+            .with_push_config_store(push.clone());
+        A2AServerFactory::new().create(&registry, options).0
+    };
+    let app = make_app();
+
+    let sign = |subject, scope, history| {
+        encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "sub": subject, "iss": "tenant-issuer", "aud": "a2a",
+                "exp": jsonwebtoken::get_current_timestamp() + 120,
+                "roles": ["allowed"], "scope": scope,
+                "act": {"sub": "shared-actor", "act": {"sub": history, "roles": ["allowed"]}}
+            }),
+            &EncodingKey::from_secret(KEY.as_bytes()),
+        )
+        .unwrap()
+    };
+    let broad = sign("alice", "echo:read echo:write", "old-actor");
+    let refreshed = sign("alice", "echo:read", "new-actor");
+    let narrowed = sign("alice", "echo:write", "new-actor");
+    let other_subject = sign("bob", "echo:read echo:write", "old-actor");
+    assert_eq!(advertised_skills(app.clone(), &broad).await, ["test.echo"]);
+    assert!(advertised_skills(app.clone(), &narrowed).await.is_empty());
+
+    let rpc = |method: &str, params: Value| json!({"jsonrpc": "2.0", "id": "1", "method": method, "params": params});
+    let send_params = json!({
+        "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"data": {"result": "alice-only"}}]},
+        "metadata": {"skillId": "test.echo"}
+    });
+    let submitted = post_rpc_as(
+        app.clone(),
+        &broad,
+        rpc("message/send", send_params.clone()),
+    )
+    .await;
+    assert_eq!(
+        submitted["result"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+    let task_id = submitted["result"]["id"].as_str().unwrap();
+    let set = post_rpc_as(app.clone(), &broad, rpc("tasks/pushNotificationConfig/set", json!({"id": task_id, "pushNotificationConfig": {"url": "https://example.test/events"}}))).await;
+    assert_eq!(set["result"]["taskId"], task_id);
+    drop(app);
+    let app = make_app();
+
+    for bearer in [&narrowed, &other_subject] {
+        for method in [
+            "tasks/get",
+            "tasks/cancel",
+            "tasks/pushNotificationConfig/get",
+            "tasks/pushNotificationConfig/delete",
+        ] {
+            let reply = post_rpc_as(app.clone(), bearer, rpc(method, json!({"id": task_id}))).await;
+            assert_eq!(reply["error"]["code"], -32001, "{method}: {reply}");
+        }
+        let listing = post_rpc_as(app.clone(), bearer, rpc("ListTasks", json!({}))).await;
+        assert_eq!(listing["result"]["tasks"], json!([]));
+        let mut continuation = send_params.clone();
+        continuation["message"]["taskId"] = json!(task_id);
+        let reply = post_rpc_as(app.clone(), bearer, rpc("message/send", continuation)).await;
+        assert_eq!(reply["error"]["code"], -32001);
+    }
+
+    let owned = post_rpc_as(
+        app.clone(),
+        &refreshed,
+        rpc("tasks/get", json!({"id": task_id})),
+    )
+    .await;
+    assert_eq!(owned["result"], submitted["result"]);
+    let listing = post_rpc_as(app.clone(), &refreshed, rpc("ListTasks", json!({}))).await;
+    assert_eq!(listing["result"]["tasks"], json!([submitted["result"]]));
+    let config = post_rpc_as(
+        app,
+        &refreshed,
+        rpc("tasks/pushNotificationConfig/get", json!({"id": task_id})),
+    )
+    .await;
+    assert_eq!(
+        config["result"]["pushNotificationConfig"]["url"],
+        "https://example.test/events"
+    );
+}
+
 /// Skills the **public** card advertises (srs FR-AGC-003) — no credentials,
 /// resolved for the anonymous principal at build time.
 async fn public_skills(router: axum::Router) -> Vec<String> {
