@@ -46,6 +46,11 @@ fn stdio_lifecycle_diagnostics_never_use_stdout() {
     response_ids.sort_unstable();
     assert_eq!(response_ids, [1, 2, 3], "{stdout}");
     let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--extensions-dir loads no Rust modules"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("compiled registry"), "{stderr}");
     assert!(stderr.contains("Starting stdio transport"), "{stderr}");
     assert!(stderr.contains("invalid JSON"), "{stderr}");
     assert!(stderr.contains("EOF"), "{stderr}");

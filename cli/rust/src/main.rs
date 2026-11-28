@@ -764,6 +764,17 @@ async fn main() {
         }
     }
 
+    if matches.get_one::<String>("extensions-dir").is_some()
+        && discovered_names.is_empty()
+        && std::path::Path::new(&extensions_dir_for_discovery).is_dir()
+    {
+        tracing::warn!(
+            "No executable modules found in '{}'. Use executable sidecar modules here \
+             or register compiled modules in a Rust host.",
+            extensions_dir_for_discovery
+        );
+    }
+
     // Optional toolkit integration (requires --features toolkit)
     {
         let binding_path = extract_binding_path(&raw_args[1..]);

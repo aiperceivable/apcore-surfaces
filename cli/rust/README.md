@@ -86,7 +86,7 @@ bash examples/run_examples.sh
 
 See [Examples](#examples) for the full list of example modules and usage patterns.
 
-### Zero-code approach
+### Standalone executable sidecars
 
 If you already have an apcore-based project with an extensions directory:
 
@@ -99,7 +99,10 @@ export APCORE_EXTENSIONS_ROOT=./extensions
 apcore-cli math.add --a 42 --b 58
 ```
 
-All modules are auto-discovered. CLI flags are auto-generated from each module's JSON Schema.
+The standalone binary discovers executable sidecar modules and generates flags
+from each module's JSON Schema. An explicitly supplied directory with no
+executable modules produces a diagnostic on stderr. For compiled Rust modules,
+register them in the APCore registry used by your host command tree.
 
 ### Programmatic approach (Rust library)
 

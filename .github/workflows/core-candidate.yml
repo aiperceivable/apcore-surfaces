@@ -169,6 +169,21 @@ jobs:
               exit 1
             fi
           fi
+          if [[ "$CORE_MODE" == candidate ]]; then
+            # Test the candidate against this Surface release's source. The
+            # ordinary CI manifests remain pinned to their reviewed Core.
+            python - "$GITHUB_WORKSPACE" "$PWD" <<'PY'
+          import sys
+          from pathlib import Path
+
+          root, component = (Path(value) for value in sys.argv[1:])
+          for manifest in {component / "pyproject.toml", root / "toolkit/python/pyproject.toml"}:
+              text = manifest.read_text()
+              if text.count("1.0.0a5") != 1:
+                  raise ValueError(f"Unexpected Core dependency in {manifest}")
+              manifest.write_text(text.replace("1.0.0a5", "1.0.0a6"))
+          PY
+          fi
           args=(-e '.[dev]')
           if [[ "$COMPONENT" != toolkit ]]; then
             args+=(-e "$GITHUB_WORKSPACE/toolkit/python[http-proxy]")
@@ -201,7 +216,7 @@ jobs:
           assert core_path == installed.locate_file("apcore/__init__.py").resolve()
           assert toolkit_path == toolkit_expected.resolve()
           if os.environ["CORE_MODE"] == "candidate":
-              assert installed.version == "1.0.0a5"
+              assert installed.version == "1.0.0a6"
               origin = json.loads(installed.read_text("direct_url.json") or "{}")
               assert origin.get("url") == Path(os.environ["CORE_INSTALL"]).resolve().as_uri()
               assert callable(getattr(Executor, "stream_with_completion", None))
@@ -340,7 +355,7 @@ jobs:
           assert.ok(coreEntry.startsWith(core + sep));
           assert.equal(toolkitEntry, realpathSync(resolve(process.env.TOOLKIT_ROOT, 'dist/index.js')));
           if (process.env.CORE_MODE === 'candidate') {
-            assert.equal(coreVersion, '1.0.0-alpha.5');
+            assert.equal(coreVersion, '1.0.0-alpha.6');
             assert.equal(typeof Executor.prototype.streamWithCompletion, 'function');
             assert.equal(typeof APCore.prototype.streamWithCompletion, 'function');
           } else {
@@ -353,6 +368,22 @@ jobs:
         if: matrix.component != 'toolkit'
       - run: pnpm typecheck
       - run: pnpm test
+      - name: Check out the typed TypeScript Golden Path
+        if: matrix.component == 'mcp' && matrix.core == 'candidate'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aiperceivable/apcore
+          ref: ${{ needs.verify-source.outputs.example_sha }}
+          path: core-source
+          persist-credentials: false
+      - name: Verify typed invocation through MCP
+        if: matrix.component == 'mcp' && matrix.core == 'candidate'
+        shell: bash
+        run: |
+          mkdir .candidate
+          cp "$GITHUB_WORKSPACE/core-source/examples/typescript/golden-path/verify.ts" .candidate/verify.ts
+          pnpm exec tsc --strict --module NodeNext --target ES2022 --rootDir . --outDir .candidate/compiled .candidate/verify.ts
+          node .candidate/compiled/.candidate/verify.js
 
   rust:
     name: Rust / ${{ matrix.component }} / ${{ matrix.core }}
@@ -388,6 +419,14 @@ jobs:
           github-token: ${{ secrets.APCORE_ARTIFACT_READ_TOKEN || github.token }}
           name: core-rust-distribution
           path: ${{ runner.temp }}/apcore-crate
+      - name: Check out the typed Rust Golden Path
+        if: matrix.component == 'mcp' && matrix.core == 'candidate'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aiperceivable/apcore
+          ref: ${{ needs.verify-source.outputs.example_sha }}
+          path: core-source
+          persist-credentials: false
       - name: Verify resolution and run real Executor tests
         shell: bash
         env:
@@ -398,20 +437,25 @@ jobs:
             exit 0
           fi
           shopt -s nullglob
-          crates=("$RUNNER_TEMP"/apcore-crate/apcore-*.crate)
-          if (( ${#crates[@]} != 1 )); then
-            echo "Expected exactly one APCore crate." >&2
+          crates=("$RUNNER_TEMP"/apcore-crate/apcore-[0-9]*.crate)
+          macros=("$RUNNER_TEMP"/apcore-crate/apcore-macros-[0-9]*.crate)
+          if (( ${#crates[@]} != 1 || ${#macros[@]} != 1 )); then
+            echo "Expected one APCore crate and one APCore macro crate." >&2
             exit 1
           fi
           crate="${crates[0]}"
           version="${crate##*/apcore-}"
           version="${version%.crate}"
-          if [[ "$version" != 1.0.0-alpha.5 ]]; then
-            echo "Expected the alpha.3 Core crate." >&2
+          if [[ "$version" != 1.0.0-alpha.6 ]]; then
+            echo "Expected the alpha.6 Core crate." >&2
             exit 1
           fi
           if [[ "$CORE_MODE" == candidate && -n "$EXPECTED_SHA256" ]]; then
             digest=$(sha256sum "$crate" | cut -d ' ' -f 1)
             [[ "$digest" == "${EXPECTED_SHA256,,}" ]]
           fi
-          python scripts/verify-rust-core-candidate.py "$COMPONENT" "$version" --archive "$crate"
+          args=(--archive "$crate" --macro-archive "${macros[0]}")
+          if [[ "$COMPONENT" == mcp ]]; then
+            args+=(--typed-example "$GITHUB_WORKSPACE/core-source/examples/rust/golden-path/verify.rs")
+          fi
+          python scripts/verify-rust-core-candidate.py "$COMPONENT" "$version" "${args[@]}"
