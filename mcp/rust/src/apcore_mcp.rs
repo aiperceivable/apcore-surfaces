@@ -250,6 +250,20 @@ struct ApcoreExecutorAdapter {
 
 #[async_trait::async_trait]
 impl crate::server::router::Executor for ApcoreExecutorAdapter {
+    fn discovery_executor(
+        &self,
+        want_trace: bool,
+    ) -> Option<(&Executor, &apcore::ExecutionStrategy)> {
+        let strategy = if want_trace {
+            self.strategy
+                .as_deref()
+                .unwrap_or_else(|| self.inner.strategy())
+        } else {
+            self.inner.strategy()
+        };
+        Some((&self.inner, strategy))
+    }
+
     async fn call_async(
         &self,
         module_id: &str,
@@ -551,6 +565,11 @@ impl APCoreMCP {
             .clone()
             .unwrap_or_else(|| crate::VERSION.to_string());
 
+        // Enable manifest search on raw Core executors as well as APCore.
+        if self.reg().has("system.manifest.search") {
+            self.executor.enable_nested_calls();
+        }
+
         let factory = MCPServerFactory::new();
         let mut server = factory
             .create_server(&self.config.name, &version)
@@ -564,9 +583,11 @@ impl APCoreMCP {
             .map(|t| t.iter().map(|s| s.as_str()).collect());
         let tags_slice: Option<&[&str]> = tags_refs.as_deref();
         let prefix = self.config.prefix.as_deref();
-        let tools = factory
-            .build_tools(self.reg(), tags_slice, prefix)
-            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?;
+        let (tool_ids, tools): (Vec<_>, Vec<_>) = factory
+            .build_tools_with_ids(self.reg(), tags_slice, prefix)
+            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?
+            .into_iter()
+            .unzip();
 
         // Build output schema map for output redaction.
         let output_schema_map: std::collections::HashMap<String, Value> = {
@@ -635,6 +656,8 @@ impl APCoreMCP {
 
         // Register handlers
         factory.register_handlers(&mut server, tools.clone(), Arc::clone(&router));
+
+        factory.register_governed_tools(&mut server, Arc::clone(&router), &tools, tool_ids);
 
         // Register resource handlers. Reads dispatch through `router` so the
         // system.* resources added by #15(a) get the same ACL / approval /
@@ -2651,6 +2674,468 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    struct DiscoveryFixtureAuth;
+
+    #[async_trait::async_trait]
+    impl crate::auth::protocol::Authenticator for DiscoveryFixtureAuth {
+        async fn authenticate(
+            &self,
+            headers: &std::collections::HashMap<String, String>,
+        ) -> Option<apcore::Identity> {
+            let role = headers.get("x-test-role")?.clone();
+            Some(apcore::Identity::new(
+                role.clone(),
+                "user".into(),
+                vec![role],
+                std::collections::HashMap::new(),
+            ))
+        }
+    }
+
+    struct DiscoveryFixtureModule {
+        property: String,
+        annotations: ModuleAnnotations,
+    }
+
+    #[async_trait::async_trait]
+    impl Module for DiscoveryFixtureModule {
+        fn description(&self) -> &str {
+            "Governed tool"
+        }
+
+        fn annotations(&self) -> ModuleAnnotations {
+            self.annotations.clone()
+        }
+
+        fn as_streaming(&self) -> Option<&dyn apcore::StreamingModule> {
+            self.annotations.streaming.then_some(self)
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+
+        fn output_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {(&self.property): {"type": "string", "x-sensitive": true}},
+                "required": [&self.property],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(
+            &self,
+            _: Value,
+            _: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::ModuleError> {
+            Ok(json!({(&self.property): "local-redaction-fixture"}))
+        }
+    }
+
+    impl apcore::StreamingModule for DiscoveryFixtureModule {
+        fn stream_typed(&self, _: Value, _: &apcore::Context<Value>) -> apcore::ChunkStream {
+            Box::pin(futures::stream::iter([Ok(
+                json!({(&self.property): "local-redaction-fixture"}),
+            )]))
+        }
+    }
+
+    fn register_discovery_fixture(
+        registry: &Registry,
+        id: &str,
+        property: &str,
+        annotations: ModuleAnnotations,
+    ) {
+        let module = DiscoveryFixtureModule {
+            property: property.to_owned(),
+            annotations,
+        };
+        let descriptor = ModuleDescriptor {
+            module_id: id.into(),
+            name: None,
+            description: format!("Current tool uses {property}"),
+            documentation: Some(format!("Current documentation: {property}")),
+            input_schema: json!({
+                "type":"object",
+                "properties": {(property): {"$ref":"#/$defs/Text"}},
+                "$defs": {"Text": {"type":"string"}}
+            }),
+            output_schema: module.output_schema(),
+            version: "1.0.0".into(),
+            tags: vec![],
+            annotations: Some(module.annotations()),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry.register(id, Box::new(module), descriptor).unwrap();
+    }
+
+    async fn discovery_http_request(
+        app: &axum::Router,
+        role: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("x-test-role", role)
+            .body(Body::from(
+                json!({
+                    "jsonrpc":"2.0","id":1,"method":method,"params":params
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_http_discovery_filters_tools_and_resources_for_each_identity() {
+        let registry = Arc::new(Registry::new());
+        register_discovery_fixture(
+            &registry,
+            "demo.governed",
+            "stale",
+            ModuleAnnotations::default(),
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.conditional",
+            "mode",
+            ModuleAnnotations::default(),
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.hidden",
+            "secret",
+            ModuleAnnotations {
+                discoverable: false,
+                ..Default::default()
+            },
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.requires_approval",
+            "mode",
+            ModuleAnnotations {
+                requires_approval: true,
+                ..Default::default()
+            },
+        );
+        let mut conditional_deny = apcore::ACLRule::new(
+            vec!["@external".into()],
+            vec!["demo.conditional".into()],
+            "deny",
+        );
+        conditional_deny.conditions = Some(json!({"arguments":{"has_key":["mode"]}}));
+        let mut rule = apcore::ACLRule::new(
+            vec!["@external".into()],
+            vec!["demo.*".into(), "system.manifest.search".into()],
+            "allow",
+        );
+        rule.conditions = Some(json!({"roles":["reader"]}));
+        let mut executor = Executor::new(Arc::clone(&registry), Config::default());
+        executor.set_acl(apcore::ACL::new(vec![conditional_deny, rule], "deny", None));
+        let mut sys_config = Config::default();
+        sys_config.set("sys_modules.enabled", json!(true));
+        apcore::register_sys_modules(Arc::clone(&registry), &executor, &sys_config, None).unwrap();
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(Arc::new(executor)))
+            .build()
+            .unwrap();
+        let (server, _, _, options, _, _) = mcp.build_server_components().unwrap();
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+        let app = Arc::new(TransportManager::new(None))
+            .build_streamable_http_app(Arc::new(handler), None)
+            .layer(crate::auth::middleware::AuthMiddlewareLayer::new(Arc::new(
+                DiscoveryFixtureAuth,
+            )));
+        for role in ["observer", "reader"] {
+            let initialized = discovery_http_request(&app, role, "initialize", json!({
+                "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+            })).await;
+            assert!(initialized.get("result").is_some());
+        }
+        for role in ["observer", "reader", "observer"] {
+            let response = discovery_http_request(&app, role, "tools/list", json!({})).await;
+            let tools = response["result"]["tools"].as_array().unwrap();
+            assert_eq!(
+                tools.iter().any(|tool| tool["name"] == "demo.governed"),
+                role == "reader"
+            );
+            assert!(tools.iter().any(|tool| tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("__apcore_task_"))));
+            assert!(!tools.iter().any(|tool| {
+                tool["name"] == "demo.conditional" || tool["name"] == "demo.hidden"
+            }));
+            let approval_tool = tools
+                .iter()
+                .find(|tool| tool["name"] == "demo.requires_approval");
+            assert_eq!(approval_tool.is_some(), role == "reader");
+            if let Some(tool) = approval_tool {
+                assert_eq!(tool["_meta"]["requiresApproval"], true);
+            }
+            let resources = discovery_http_request(&app, role, "resources/list", json!({})).await;
+            assert_eq!(
+                resources["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|resource| resource["uri"] == "docs://demo.governed"),
+                role == "reader"
+            );
+            let doc = discovery_http_request(
+                &app,
+                role,
+                "resources/read",
+                json!({"uri":"docs://demo.governed"}),
+            )
+            .await;
+            assert_eq!(doc.get("result").is_some(), role == "reader");
+            for uri in ["docs://demo.conditional", "docs://demo.hidden"] {
+                assert!(!resources["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|resource| resource["uri"] == uri));
+                let rejected =
+                    discovery_http_request(&app, role, "resources/read", json!({"uri":uri})).await;
+                assert!(rejected.get("error").is_some());
+            }
+            let called = discovery_http_request(
+                &app,
+                role,
+                "tools/call",
+                json!({"name":"demo.governed", "arguments":{}}),
+            )
+            .await;
+            assert_eq!(called["result"]["isError"], role != "reader");
+            assert_eq!(
+                tools
+                    .iter()
+                    .any(|tool| tool["name"] == "system.manifest.search"),
+                role == "reader"
+            );
+            let searched = discovery_http_request(
+                &app,
+                role,
+                "tools/call",
+                json!({"name":"system.manifest.search","arguments":{"prefix":"demo."}}),
+            )
+            .await;
+            assert_eq!(searched["result"]["isError"], role != "reader");
+            if role == "reader" {
+                let page: Value = serde_json::from_str(
+                    searched["result"]["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(page["items"].as_array().unwrap().len(), 2);
+                assert_eq!(page["items"][0]["module_id"], "demo.governed");
+                assert_eq!(page["items"][1]["module_id"], "demo.requires_approval");
+                assert_eq!(page["items"][1]["access_hint"], "requires_approval");
+                assert_eq!(page["next_cursor"], Value::Null);
+                let approval = discovery_http_request(
+                    &app,
+                    role,
+                    "tools/call",
+                    json!({"name":"demo.requires_approval","arguments":{}}),
+                )
+                .await;
+                assert_eq!(approval["result"]["isError"], true);
+            }
+        }
+        assert!(registry.unregister("demo.governed").unwrap());
+        register_discovery_fixture(
+            &registry,
+            "demo.governed",
+            "fresh",
+            ModuleAnnotations::default(),
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.unpublished",
+            "new",
+            ModuleAnnotations::default(),
+        );
+        let listing = discovery_http_request(&app, "reader", "tools/list", json!({})).await;
+        let tools = listing["result"]["tools"].as_array().unwrap();
+        assert!(!tools.iter().any(|tool| tool["name"] == "demo.unpublished"));
+        let docs = discovery_http_request(&app, "reader", "resources/list", json!({})).await;
+        assert!(!docs["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resource| resource["uri"] == "docs://demo.unpublished"));
+        let unknown_doc = discovery_http_request(
+            &app,
+            "reader",
+            "resources/read",
+            json!({"uri":"docs://demo.unpublished"}),
+        )
+        .await;
+        assert!(unknown_doc.get("error").is_some());
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "demo.governed")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["fresh"]["$ref"],
+            "#/$defs/Text"
+        );
+        assert!(tool["inputSchema"]["properties"].get("stale").is_none());
+        assert_eq!(tool["outputSchema"]["required"], json!(["fresh"]));
+        let response = discovery_http_request(
+            &app,
+            "reader",
+            "tools/call",
+            json!({"name":"demo.governed","arguments":{}}),
+        )
+        .await;
+        let result = &response["result"];
+        let safe = json!({"fresh": apcore::executor::REDACTED_VALUE});
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"], safe);
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            safe
+        );
+        assert!(!response.to_string().contains("local-redaction-fixture"));
+        let doc = discovery_http_request(
+            &app,
+            "reader",
+            "resources/read",
+            json!({"uri":"docs://demo.governed"}),
+        )
+        .await;
+        assert_eq!(
+            doc["result"]["contents"][0]["content"],
+            "Current documentation: fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_discovery_uses_stream_and_background_strategies_when_tracing() {
+        verify_traced_discovery(true).await;
+        verify_traced_discovery(false).await;
+    }
+
+    async fn verify_traced_discovery(default_allows_stream: bool) {
+        let registry = Arc::new(Registry::new());
+        register_discovery_fixture(
+            &registry,
+            "demo.streaming",
+            "label",
+            ModuleAnnotations {
+                streaming: true,
+                ..Default::default()
+            },
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.unary",
+            "label",
+            ModuleAnnotations::default(),
+        );
+        register_discovery_fixture(
+            &registry,
+            "demo.background",
+            "label",
+            ModuleAnnotations {
+                extra: std::collections::HashMap::from([("mcp_async".into(), json!(true))]),
+                ..Default::default()
+            },
+        );
+        let mut rule =
+            apcore::ACLRule::new(vec!["@external".into()], vec!["demo.*".into()], "allow");
+        rule.conditions = Some(json!({"roles":["reader"], "$not":{"max_call_depth":0}}));
+        let default_strategy = if default_allows_stream {
+            apcore::builtin_steps::build_standard_strategy()
+        } else {
+            apcore::pipeline_config::build_strategy_from_config(&json!({
+                "configure": {"context_creation": {"match_modules": ["demo.unary"]}}
+            }))
+            .unwrap()
+        };
+        let trace_override = if default_allows_stream {
+            "internal"
+        } else {
+            "standard"
+        };
+        let mut executor = Executor::with_strategy(registry, Config::default(), default_strategy);
+        executor.set_acl(apcore::ACL::new(vec![rule], "deny", None));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(Arc::new(executor)))
+            .strategy(trace_override)
+            .trace(true)
+            .build()
+            .unwrap();
+        let (server, _, _, options, _, _) = mcp.build_server_components().unwrap();
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+        let app = Arc::new(TransportManager::new(None))
+            .build_streamable_http_app(Arc::new(handler), None)
+            .layer(crate::auth::middleware::AuthMiddlewareLayer::new(Arc::new(
+                DiscoveryFixtureAuth,
+            )));
+
+        let initialized = discovery_http_request(
+            &app, "reader", "initialize",
+            json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}),
+        ).await;
+        assert!(initialized.get("result").is_some());
+        let stream = discovery_http_request(
+            &app,
+            "reader",
+            "tools/call",
+            json!({"name":"demo.streaming","arguments":{}}),
+        )
+        .await;
+        assert_eq!(
+            stream["result"]["isError"], !default_allows_stream,
+            "{stream}",
+        );
+        let background = discovery_http_request(
+            &app,
+            "reader",
+            "tools/call",
+            json!({"name":"demo.background","arguments":{}}),
+        )
+        .await;
+        assert_eq!(background["result"]["isError"], false, "{background}");
+        let task: Value =
+            serde_json::from_str(background["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert!(task["task_id"].is_string());
+
+        let listing = discovery_http_request(&app, "reader", "tools/list", json!({})).await;
+        let tools = listing["result"]["tools"].as_array().unwrap();
+        for name in ["demo.streaming", "demo.background"] {
+            assert_eq!(
+                tools.iter().any(|tool| tool["name"] == name),
+                default_allows_stream,
+                "{name}",
+            );
+        }
+        assert_eq!(
+            tools.iter().any(|tool| tool["name"] == "demo.unary"),
+            !default_allows_stream,
+        );
     }
 
     #[tokio::test]

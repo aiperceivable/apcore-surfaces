@@ -10,9 +10,10 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from contextlib import aclosing
+from copy import deepcopy
 from typing import Any
 
-from apcore import APCore, CancelToken, Context, Executor, ModuleError, StreamingModule
+from apcore import APCore, CancelToken, Context, Executor, Identity, ModuleError, StreamingModule
 from apcore.errors import ApprovalPendingError
 from apcore.registry.types import ModuleDescriptor
 from apcore.registry.version import matches_version_hint
@@ -224,6 +225,23 @@ class ExecutionRouter:
             logger.warning("redact_sensitive failed for %s, returning unredacted output", tool_name, exc_info=True)
             return result
 
+    @property
+    def supports_capability_discovery(self) -> bool:
+        return self._core_backend and callable(getattr(self._executor, "get_callable_descriptor", None))
+
+    def callable_descriptor(
+        self, module_id: str, identity: Identity | None, *, tool_default: bool = False
+    ) -> ModuleDescriptor | None:
+        """Project from the same caller frame and Executor as tool invocation."""
+        context = Context.create(identity=identity)
+        descriptor = self._executor.get_callable_descriptor(module_id, context)
+        if descriptor is None or not tool_default:
+            return descriptor
+        version_hint = _descriptor_version_hint(descriptor)
+        if version_hint is None:
+            return descriptor
+        return self._executor.get_callable_descriptor(module_id, context, version_hint=version_hint)
+
     def _select_wire_version(
         self, tool_name: str, extra: dict[str, Any]
     ) -> tuple[ModuleDescriptor, ModuleDescriptor | None, bool] | None:
@@ -244,18 +262,31 @@ class ExecutionRouter:
 
     def _output_projection(
         self, tool_name: str, version_hint: str | None
-    ) -> tuple[str | None, dict[str, Any] | None]:
-        if not self._redact_output or not self._core_backend or version_hint is None:
-            return version_hint, None
+    ) -> tuple[str | None, dict[str, Any] | None, Callable[[], None] | None]:
+        if not self._core_backend:
+            return version_hint, None, None
         registry = self._executor.registry
-        definition = registry.get_definition(tool_name, version_hint)
-        if definition is None:
+        selected = registry._resolve_registration(tool_name, version_hint)
+        if selected is None and version_hint is not None:
             raise ModuleError("MODULE_NOT_FOUND", f"Module '{tool_name}' not found")
-        # Pin only when Core can report the actual selected version. Direct
-        # router callers can still pass the original range to older Core.
-        if _matches_registered_version(registry, tool_name, version_hint, definition.version):
+        definition = registry._describe_registration(tool_name, selected, warn_deprecation=False) if selected else None
+        if definition is not None and version_hint is not None and _matches_registered_version(
+            registry, tool_name, version_hint, definition.version,
+        ):
             version_hint = definition.version
-        return version_hint, definition.output_schema
+
+        def check_registration() -> None:
+            current = registry._resolve_registration(tool_name, version_hint)
+            if (
+                selected is None
+                or current is None
+                or current.module is not selected.module
+                or current.metadata is not selected.metadata
+            ):
+                raise ModuleError("MODULE_EXECUTE_ERROR", "Tool registration changed during invocation")
+
+        schema = deepcopy(definition.output_schema) if definition is not None else {}
+        return version_hint, schema or {}, check_registration
 
     def _format_result(self, result: Any) -> str:
         """Format an execution result into text for LLM consumption.
@@ -659,7 +690,7 @@ class ExecutionRouter:
 
             if use_stream:
                 return await self._handle_completed_stream(
-                    tool_name, arguments, progress_token, send_notification, context, version_hint
+                    tool_name, arguments, progress_token, send_notification, context, version_hint, wire_response=extra
                 )
 
         # Raw chunk executors predate the completion API. Keep the public
@@ -676,7 +707,9 @@ class ExecutionRouter:
             )
 
         # Non-streaming path
-        return await self._handle_call_async(tool_name, arguments, context=context, version_hint=version_hint)
+        return await self._handle_call_async(
+            tool_name, arguments, context=context, version_hint=version_hint, wire_response=extra,
+        )
 
     def _resolve_identity(self, extra: dict[str, Any] | None) -> Any:
         """[A-D-211] Resolve identity with extras-then-ContextVar fallback.
@@ -808,10 +841,12 @@ class ExecutionRouter:
         arguments: dict[str, Any],
         context: Any | None = None,
         version_hint: str | None = None,
+        *,
+        wire_response: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], bool, str | None]:
         """Non-streaming execution via executor.call_async()."""
         try:
-            version_hint, output_schema = self._output_projection(tool_name, version_hint)
+            version_hint, output_schema, check_registration = self._output_projection(tool_name, version_hint)
             call_kwargs = {"version_hint": version_hint} if version_hint is not None else {}
             call_args = (tool_name, arguments, context) if self._call_async_accepts_context else (tool_name, arguments)
             if self._trace and (version_hint is None or self._core_backend):
@@ -832,6 +867,10 @@ class ExecutionRouter:
             else:
                 result = await self._executor.call_async(*call_args, **call_kwargs)
                 trace_dict = None
+            if check_registration is not None:
+                check_registration()
+                if wire_response is not None:
+                    wire_response["_mcp_live_output_schema"] = output_schema
             result = self._maybe_redact(tool_name, result, output_schema)
             text_output = self._format_result(result)
             content: list[dict[str, Any]] = [{"type": "text", "text": text_output}]
@@ -855,21 +894,29 @@ class ExecutionRouter:
         send_notification: Callable[[dict[str, Any]], Coroutine[Any, Any, None]] | None,
         context: Context,
         version_hint: str | None,
+        *,
+        wire_response: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], bool, str | None]:
         """Stream progress and take final output from the same execution."""
         try:
-            version_hint, output_schema = self._output_projection(tool_name, version_hint)
+            version_hint, output_schema, check_registration = self._output_projection(tool_name, version_hint)
             kwargs = {"version_hint": version_hint} if version_hint is not None else {}
             async with aclosing(self._open_completed_stream(tool_name, arguments, context, **kwargs)) as execution:
                 index = 0
                 async for chunk in execution.chunks:
                     index += 1
                     if progress_token is not None and send_notification is not None:
+                        if check_registration is not None:
+                            check_registration()
                         await self._send_chunk(
                             tool_name, chunk, index, progress_token, send_notification, output_schema
                         )
                 completion = await execution.completion()
             result = self._require_completed_output(completion)
+            if check_registration is not None:
+                check_registration()
+                if wire_response is not None:
+                    wire_response["_mcp_live_output_schema"] = output_schema
             formatted = self._format_result(self._maybe_redact(tool_name, result, output_schema))
             content: list[dict[str, Any]] = [{"type": "text", "text": formatted}]
             self._attach_traceparent(content, context)

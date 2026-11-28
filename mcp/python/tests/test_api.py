@@ -231,7 +231,7 @@ class TestServe:
             serve(registry, transport="stdio", name="test-server", version="1.0.0")
 
             mock_factory.create_server.assert_called_once_with(name="test-server", version="1.0.0")
-            mock_factory.build_tools.assert_called_once_with(registry, tags=None, prefix=None)
+            mock_factory.build_tools.assert_called_once_with(registry, tags=None, prefix=None, discovery_sources={})
             mock_factory.register_handlers.assert_called_once()
             mock_factory.build_init_options.assert_called_once()
 
@@ -345,4 +345,6 @@ class TestServe:
                 trace=False,
             )
             # Factory should receive the extracted registry
-            mock_factory.build_tools.assert_called_once_with(executor.registry, tags=None, prefix=None)
+            mock_factory.build_tools.assert_called_once_with(
+                executor.registry, tags=None, prefix=None, discovery_sources={},
+            )

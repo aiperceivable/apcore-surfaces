@@ -203,6 +203,14 @@ pub trait Executor: Send + Sync {
         None
     }
 
+    /// Return the Core executor and strategy in use for a governed projection.
+    fn discovery_executor(
+        &self,
+        _want_trace: bool,
+    ) -> Option<(&apcore::Executor, &apcore::ExecutionStrategy)> {
+        None
+    }
+
     /// Return the descriptor-default version hint for `module_id`, if any.
     ///
     /// Used by [`ExecutionRouter::handle_call`] as the lowest-priority
@@ -417,6 +425,80 @@ pub struct ContentItem {
     pub data: Value,
 }
 
+pub(crate) struct CoreDiscovery<'a> {
+    executor: &'a apcore::Executor,
+    unary_strategy: &'a apcore::ExecutionStrategy,
+    has_async_bridge: bool,
+    context: apcore::Context<Value>,
+}
+
+impl CoreDiscovery<'_> {
+    pub(crate) fn descriptor(&self, module_id: &str) -> Option<apcore::registry::ModuleDescriptor> {
+        let default_strategy = self.executor.strategy();
+        let project = |strategy| {
+            self.executor.get_callable_descriptor_for_strategy(
+                module_id,
+                None,
+                Some(&self.context),
+                strategy,
+            )
+        };
+        if std::ptr::eq(default_strategy, self.unary_strategy) {
+            return project(default_strategy);
+        }
+
+        let registry = self.executor.registry();
+        let module = registry.get(module_id).ok()??;
+        // Core native streams and the async-task bridge both use the default
+        // pipeline. Only the unary call can take the traced override.
+        let descriptor = if module.as_streaming().is_some() {
+            project(default_strategy)
+        } else if self.has_async_bridge {
+            project(default_strategy)
+                .filter(AsyncTaskBridge::is_async_module_descriptor)
+                .or_else(|| {
+                    project(self.unary_strategy).filter(|descriptor| {
+                        !AsyncTaskBridge::is_async_module_descriptor(descriptor)
+                    })
+                })
+        } else {
+            project(self.unary_strategy)
+        }?;
+        let current = registry.get(module_id).ok()??;
+        Arc::ptr_eq(&module, &current).then_some(descriptor)
+    }
+
+    pub(crate) fn documentation(&self, module_id: &str) -> Option<String> {
+        self.descriptor(module_id)?
+            .documentation
+            .filter(|text| !text.is_empty())
+    }
+}
+
+struct LiveCallOutput {
+    registration: Option<Arc<dyn apcore::Module>>,
+    schema: Option<Value>,
+    advertise: bool,
+}
+
+tokio::task_local! {
+    static LIVE_CALL_OUTPUT: Option<Arc<LiveCallOutput>>;
+}
+
+pub(crate) enum WireOutputSchema {
+    Configured,
+    Live(Option<Value>),
+}
+
+impl WireOutputSchema {
+    pub(crate) fn select<'a>(&'a self, configured: Option<&'a Value>) -> Option<&'a Value> {
+        match self {
+            Self::Configured => configured,
+            Self::Live(schema) => schema.as_ref(),
+        }
+    }
+}
+
 /// Routes incoming MCP tool calls to the underlying apcore executor.
 pub struct ExecutionRouter {
     executor: Option<Box<dyn Executor>>,
@@ -489,6 +571,21 @@ impl Drop for CancelGuard {
 }
 
 impl ExecutionRouter {
+    pub(crate) fn core_discovery(&self) -> Option<CoreDiscovery<'_>> {
+        let (executor, strategy) = self.executor.as_ref()?.discovery_executor(self.trace)?;
+        let context = AUTH_IDENTITY
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .map_or_else(apcore::Context::anonymous, apcore::Context::new);
+        Some(CoreDiscovery {
+            executor,
+            unary_strategy: strategy,
+            has_async_bridge: self.async_bridge.is_some(),
+            context,
+        })
+    }
+
     /// Create a stub router for testing.
     ///
     /// The stub router does not execute any modules. Its `handle_call`
@@ -805,6 +902,48 @@ impl ExecutionRouter {
         redacted
     }
 
+    fn live_call_output(&self, name: &str) -> Option<LiveCallOutput> {
+        if AsyncTaskBridge::is_reserved_id(name) {
+            return None;
+        }
+        let (executor, _) = self.executor.as_ref()?.discovery_executor(self.trace)?;
+        let registry = executor.registry();
+        // This is internal execution metadata. A caller may know and invoke an
+        // unlisted ID, in which case Core still makes the actual ACL decision.
+        let registration = registry.get(name).ok().flatten();
+        let descriptor = registry.get_definition(name).ok().flatten();
+        let advertise = descriptor.as_ref().is_some_and(|descriptor| {
+            descriptor.output_schema["type"] == "object"
+                && !AsyncTaskBridge::is_async_module_descriptor(descriptor)
+        });
+        let schema = descriptor.map(|descriptor| descriptor.output_schema);
+        Some(LiveCallOutput {
+            registration,
+            schema,
+            advertise,
+        })
+    }
+
+    fn current_call_output(&self, name: &str) -> bool {
+        LIVE_CALL_OUTPUT
+            .try_with(|binding| {
+                let Some(binding) = binding else {
+                    return true;
+                };
+                let current = self
+                    .executor
+                    .as_ref()
+                    .and_then(|executor| executor.discovery_executor(self.trace))
+                    .and_then(|(executor, _)| executor.registry().get(name).ok().flatten());
+                binding
+                    .registration
+                    .as_ref()
+                    .zip(current.as_ref())
+                    .is_some_and(|(selected, current)| Arc::ptr_eq(selected, current))
+            })
+            .unwrap_or(true)
+    }
+
     /// Redact sensitive fields from tool output before formatting.
     ///
     /// If `redact_output` is enabled and an output schema is registered for
@@ -814,6 +953,16 @@ impl ExecutionRouter {
     fn redact_output(&self, tool_name: &str, result: &Value) -> Value {
         if !self.redact_output {
             return result.clone();
+        }
+        if let Ok(Some(redacted)) = LIVE_CALL_OUTPUT.try_with(|output| {
+            output.as_ref().map(|output| {
+                output.schema.as_ref().map_or_else(
+                    || result.clone(),
+                    |schema| apcore::redact_sensitive(result, schema),
+                )
+            })
+        }) {
+            return redacted;
         }
         match self.output_schemas.get(tool_name) {
             Some(schema) => apcore::redact_sensitive(result, schema),
@@ -969,6 +1118,50 @@ impl ExecutionRouter {
         arguments: &Value,
         extra: Option<&Value>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
+        self.handle_call_with_output_schema(tool_name, arguments, extra)
+            .await
+            .0
+    }
+
+    pub(crate) async fn handle_call_with_output_schema(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        extra: Option<&Value>,
+    ) -> (StreamOutcome, WireOutputSchema) {
+        let dispatch = Box::pin(self.dispatch_call(tool_name, arguments, extra));
+        self.with_call_output(tool_name, dispatch).await
+    }
+
+    // Keep the dispatch state on the heap before task-local wrappers capture it.
+    // Inline propagation exhausts the default Windows main stack in debug builds.
+    async fn with_call_output(
+        &self,
+        tool_name: &str,
+        dispatch: Pin<Box<impl Future<Output = StreamOutcome>>>,
+    ) -> (StreamOutcome, WireOutputSchema) {
+        let output = self.live_call_output(tool_name).map(Arc::new);
+        let result = LIVE_CALL_OUTPUT
+            .scope(output.clone(), async {
+                let outcome = dispatch.await;
+                if !outcome.1 && !self.current_call_output(tool_name) {
+                    return Self::changed_registration();
+                }
+                outcome
+            })
+            .await;
+        let schema = output.map_or(WireOutputSchema::Configured, |output| {
+            WireOutputSchema::Live(output.schema.as_ref().filter(|_| output.advertise).cloned())
+        });
+        (result, schema)
+    }
+
+    async fn dispatch_call(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        extra: Option<&Value>,
+    ) -> StreamOutcome {
         if Self::has_approval_input(tool_name, arguments) {
             return Self::stream_error("Approval credentials belong in request metadata".into());
         }
@@ -1396,18 +1589,20 @@ impl ExecutionRouter {
             }
         }
 
-        self.dispatch_stream_or_call(
-            tool_name,
-            arguments,
-            &context_value,
-            None,
-            &apcore_ctx,
-            extra
-                .progress_token
-                .as_ref()
-                .zip(extra.send_notification.as_ref()),
-        )
-        .await
+        let dispatch = Box::pin(
+            self.dispatch_stream_or_call(
+                tool_name,
+                arguments,
+                &context_value,
+                None,
+                &apcore_ctx,
+                extra
+                    .progress_token
+                    .as_ref()
+                    .zip(extra.send_notification.as_ref()),
+            ),
+        );
+        self.with_call_output(tool_name, dispatch).await.0
     }
 
     // -----------------------------------------------------------------------
@@ -1714,6 +1909,9 @@ impl ExecutionRouter {
     ) -> (Vec<ContentItem>, bool, Option<String>) {
         match outcome {
             Ok((result, trace)) => {
+                if !self.current_call_output(tool_name) {
+                    return Self::changed_registration();
+                }
                 let redacted_result = self.redact_output(tool_name, &result);
                 let text = self.format_result(&redacted_result);
                 let mut content = vec![ContentItem {
@@ -2075,6 +2273,9 @@ impl ExecutionRouter {
                     // value is later redacted. Mirrors Python's
                     // _handle_stream invariant. [A-D-003]
                     if let Some((progress_token, send_notification)) = progress {
+                        if !self.current_call_output(tool_name) {
+                            return Self::changed_registration();
+                        }
                         let safe_chunk = self.redact_output(tool_name, &chunk);
                         let notification = serde_json::json!({
                             "method": "notifications/progress",
@@ -2131,6 +2332,9 @@ impl ExecutionRouter {
             };
             accumulated = output;
         }
+        if !self.current_call_output(tool_name) {
+            return Self::changed_registration();
+        }
         let redacted_accumulated = self.redact_output(tool_name, &accumulated);
         let text = self.format_result(&redacted_accumulated);
         let content = vec![ContentItem {
@@ -2173,6 +2377,10 @@ impl ExecutionRouter {
                     .unwrap_or("MODULE_EXECUTE_ERROR"),
             ),
         }
+    }
+
+    fn changed_registration() -> StreamOutcome {
+        Self::stream_error("The tool registration changed during this call.".into())
     }
 
     fn stream_error(text: String) -> StreamOutcome {

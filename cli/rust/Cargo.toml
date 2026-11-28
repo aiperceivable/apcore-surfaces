@@ -21,7 +21,7 @@ name = "apcore_cli"
 path = "src/lib.rs"
 
 [dependencies]
-apcore = { version = "=1.0.0-alpha.3", default-features = false, features = ["config"] }
+apcore = { version = "=1.0.0-alpha.4", default-features = false, features = ["config"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env", "string"] }
 serde = { version = "1", features = ["derive"] }

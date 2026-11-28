@@ -92,9 +92,9 @@ dependencies = [
 
 [[package]]
 name = "apcore"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2813101192ceac629d58114dfafd4f6b519eb7dea2313cb253e1410a2ac52f65"
+checksum = "7d5e08c5bbc5cddf5c72b121cbec90c1c551993dbee7c7cc88e30950941b63ad"
 dependencies = [
  "async-stream",
  "async-trait",

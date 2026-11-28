@@ -204,9 +204,11 @@ class TestEndToEndWithRealApcore:
         ext = dumped["extensions"]["com.aiperceivable/management"]
         assert set(ext["surfaces"]) == {"health", "usage", "manifest", "control"}
 
-        # Read-only system.* modules must not appear as tools.
+        # The caller-scoped search is a tool; the administrative reads are resources.
         tool_names = {t.name for t in tools}
-        assert not any(name.startswith(("system.health.", "system.usage.", "system.manifest.")) for name in tool_names)
+        assert "system.manifest.search" in tool_names
+        admin_tools = tool_names - {"system.manifest.search"}
+        assert not any(name.startswith(("system.health.", "system.usage.", "system.manifest.")) for name in admin_tools)
         assert "system.control.reload_module" in tool_names
 
     def test_acl_protected_control_surface_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:

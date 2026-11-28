@@ -1,8 +1,8 @@
 {
-  "description": "The nine canonical system.* modules -> exact MCP primitive, name/URI. Pins aiperceivable/apcore-mcp#15's classification table (system.health.*/system.usage.*/system.manifest.* are resources or resource templates; system.control.* stays a tool) and operationalizes the issue's 'byte-identical tools/list, resources/list, resources/templates/list across TypeScript, Python and Rust' acceptance criterion: given a registry produced by the SAME real registerSysModules()/register_sys_modules() call (sys_modules.enabled=true, sys_modules.events.enabled=true), each adapter's own tool/resource projection MUST produce exactly the entries below -- not merely an equivalent shape. A single-language fix (e.g. only one adapter emitting the RFC 6570 '{?period}' query-expansion on a template) is exactly the drift this fixture exists to catch.",
+  "description": "The ten canonical system.* modules -> exact MCP primitive, name/URI. Pins aiperceivable/apcore-mcp#15's classification table (administrative system.health, system.usage, and system.manifest reads are resources; control modules and system.manifest.search are tools) and operationalizes the issue's 'byte-identical tools/list, resources/list, resources/templates/list across TypeScript, Python and Rust' acceptance criterion: given a registry produced by the SAME real registerSysModules()/register_sys_modules() call (sys_modules.enabled=true, sys_modules.events.enabled=true), each adapter's own tool/resource projection MUST produce exactly the entries below -- not merely an equivalent shape. A single-language fix (e.g. only one adapter emitting the RFC 6570 '{?period}' query-expansion on a template) is exactly the drift this fixture exists to catch.",
   "spec": "PROTOCOL_SPEC.md#6.6.2 (classification by module_id prefix only), aiperceivable/apcore-mcp#15 (URI convention table), aiperceivable/apcore-mcp#16 Phase A (surfaces grouping)",
   "setup": {
-    "description": "Build the registry that produces all nine module ids: sys_modules.enabled=true AND sys_modules.events.enabled=true. Without the events flag only the six read-only modules register and 'system.control.*' matches nothing -- see aiperceivable/apcore-mcp#15's registration-ladder table (0 / 6 / 9 modules).",
+    "description": "Build the registry that produces all ten module ids: sys_modules.enabled=true AND sys_modules.events.enabled=true. Without the events flag only the seven read-only modules register and 'system.control.*' matches nothing -- see aiperceivable/apcore-mcp#15's registration-ladder table (0 / 7 / 10 modules).",
     "config": {
       "sys_modules": {
         "enabled": true,
@@ -13,7 +13,8 @@
   "tools": [
     { "module_id": "system.control.update_config", "name": "system.control.update_config" },
     { "module_id": "system.control.reload_module", "name": "system.control.reload_module" },
-    { "module_id": "system.control.toggle_feature", "name": "system.control.toggle_feature" }
+    { "module_id": "system.control.toggle_feature", "name": "system.control.toggle_feature" },
+    { "module_id": "system.manifest.search", "name": "system.manifest.search" }
   ],
   "not_tools": [
     "system.health.summary",
@@ -33,7 +34,7 @@
     {
       "module_id": "system.usage.module",
       "uri_template": "apcore://system.usage.module/{module_id}{?period}",
-      "note": "The only one of the nine modules whose declared template carries the RFC 6570 form-style query expansion '{?period}' -- system.usage.summary's optional ?period= is accepted at read time but is NOT part of its (non-template) resource's declared uri, since a concrete Resource.uri cannot carry template syntax."
+      "note": "The only one module whose declared template carries the RFC 6570 form-style query expansion '{?period}' -- system.usage.summary's optional ?period= is accepted at read time but is NOT part of its (non-template) resource's declared uri, since a concrete Resource.uri cannot carry template syntax."
     },
     { "module_id": "system.manifest.module", "uri_template": "apcore://system.manifest.module/{module_id}" }
   ],

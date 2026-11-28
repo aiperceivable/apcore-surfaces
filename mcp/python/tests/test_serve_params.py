@@ -122,28 +122,30 @@ class TestServeTagsPrefix:
         with self._patch_server() as mock_factory:
             serve(registry, tags=["image"], prefix="image.")
 
-            mock_factory.build_tools.assert_called_once_with(registry, tags=["image"], prefix="image.")
+            mock_factory.build_tools.assert_called_once_with(
+                registry, tags=["image"], prefix="image.", discovery_sources={},
+            )
 
     def test_build_tools_called_with_tags_only(self, registry):
         """When only tags is provided, prefix defaults to None."""
         with self._patch_server() as mock_factory:
             serve(registry, tags=["text"])
 
-            mock_factory.build_tools.assert_called_once_with(registry, tags=["text"], prefix=None)
+            mock_factory.build_tools.assert_called_once_with(registry, tags=["text"], prefix=None, discovery_sources={})
 
     def test_build_tools_called_with_prefix_only(self, registry):
         """When only prefix is provided, tags defaults to None."""
         with self._patch_server() as mock_factory:
             serve(registry, prefix="text")
 
-            mock_factory.build_tools.assert_called_once_with(registry, tags=None, prefix="text")
+            mock_factory.build_tools.assert_called_once_with(registry, tags=None, prefix="text", discovery_sources={})
 
     def test_build_tools_called_without_tags_or_prefix(self, registry):
         """When neither tags nor prefix is provided, both default to None."""
         with self._patch_server() as mock_factory:
             serve(registry)
 
-            mock_factory.build_tools.assert_called_once_with(registry, tags=None, prefix=None)
+            mock_factory.build_tools.assert_called_once_with(registry, tags=None, prefix=None, discovery_sources={})
 
 
 # ===========================================================================

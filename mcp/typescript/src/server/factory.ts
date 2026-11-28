@@ -105,9 +105,16 @@ export interface MCPServerFactoryOptions {
   richDescription?: boolean;
 }
 
+function outputSchemaForTool(descriptor: ModuleDescriptor): Tool["outputSchema"] {
+  return descriptor.outputSchema.type === "object" && !AsyncTaskBridge.isAsyncModuleDescriptor(descriptor)
+    ? descriptor.outputSchema as Tool["outputSchema"]
+    : undefined;
+}
+
 export class MCPServerFactory {
   private readonly _annotationMapper: AnnotationMapper;
   private readonly _richDescription: boolean;
+  private readonly _toolSources = new WeakMap<Tool, { moduleId: string; versionHint?: string }>();
   private _warnedToolkitMissing = false;
 
   constructor(options: MCPServerFactoryOptions = {}) {
@@ -315,9 +322,8 @@ export class MCPServerFactory {
       },
     };
 
-    if (descriptor.outputSchema.type === "object" && !AsyncTaskBridge.isAsyncModuleDescriptor(descriptor)) {
-      tool.outputSchema = structuredClone(descriptor.outputSchema) as Tool["outputSchema"];
-    }
+    const outputSchema = outputSchemaForTool(descriptor);
+    if (outputSchema !== undefined) tool.outputSchema = structuredClone(outputSchema);
 
     const hasStreaming = descriptor.annotations?.streaming === true;
 
@@ -332,6 +338,11 @@ export class MCPServerFactory {
       (tool as Tool & { _meta?: Record<string, unknown> })._meta = meta;
     }
 
+    const hint = metadata.versionHint;
+    this._toolSources.set(tool, {
+      moduleId: descriptor.moduleId,
+      versionHint: typeof hint === "string" ? hint : undefined,
+    });
     return tool;
   }
 
@@ -421,7 +432,7 @@ export class MCPServerFactory {
    *   for the three per-module read-only management modules
    *   ({@link SYSTEM_TEMPLATE_RESOURCE_MODULES}) — only when registered,
    *   and only registered at all when at least one is present.
-   * - resources/read: dispatches `docs://` by static lookup (unchanged),
+   * - resources/read: resolves `docs://` through the caller-aware backend,
    *   and `apcore://` management URIs by parsing the module id + params
    *   ({@link parseSystemResourceUri}) and calling `router.handleCall()` —
    *   the SAME ACL/approval/audit pipeline as `tools/call`. Management
@@ -476,7 +487,9 @@ export class MCPServerFactory {
     // Handle resources/list requests
     server.setRequestHandler(ListResourcesRequestSchema, async () => {
       const resources: Resource[] = [];
-      for (const [moduleId, _doc] of docsMap) {
+      const resolve = router?.discoveryResolver?.();
+      for (const moduleId of docsMap.keys()) {
+        if (resolve && !resolve(moduleId)?.documentation) continue;
         resources.push({
           uri: `docs://${moduleId}`,
           name: `${moduleId} documentation`,
@@ -590,8 +603,11 @@ export class MCPServerFactory {
         throw new Error(`Unsupported URI scheme: ${uri}`);
       }
       const moduleId = uri.slice(prefix.length);
-      const documentation = docsMap.get(moduleId);
-      if (documentation === undefined) {
+      const resolve = router?.discoveryResolver?.();
+      const documentation = docsMap.has(moduleId)
+        ? (resolve ? resolve(moduleId)?.documentation : docsMap.get(moduleId))
+        : undefined;
+      if (!documentation) {
         throw new Error(`Resource not found: ${uri}`);
       }
       const result: ReadResourceResult = {
@@ -605,6 +621,29 @@ export class MCPServerFactory {
       };
       return result;
     });
+  }
+
+  private _visibleTools(
+    tools: readonly Tool[],
+    resolve: (moduleId: string, versionHint?: string) => ModuleDescriptor | null,
+  ): Tool[] {
+    const visible: Tool[] = [];
+    for (const tool of tools) {
+      const source = this._toolSources.get(tool);
+      if (!source && tool.name.startsWith(APCORE_META_TOOL_PREFIX)) {
+        visible.push(tool);
+        continue;
+      }
+      const descriptor = resolve(source?.moduleId ?? tool.name, source?.versionHint);
+      if (descriptor === null) continue;
+      try {
+        // Keep the registered MCP name while projecting the live definition.
+        visible.push({ ...this.buildTool(descriptor), name: tool.name });
+      } catch {
+        // A replacement may no longer have an MCP-compatible schema.
+      }
+    }
+    return visible;
   }
 
   /**
@@ -639,7 +678,9 @@ export class MCPServerFactory {
 
     // Handle tools/list requests
     server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
-      const listedTools = supportsStructuredOutput(server, extra) ? allTools : allTools.map(tool => {
+      const resolve = router.discoveryResolver?.();
+      const visibleTools = resolve ? this._visibleTools(allTools, resolve) : allTools;
+      const listedTools = supportsStructuredOutput(server, extra) ? visibleTools : visibleTools.map(tool => {
         const { outputSchema: _outputSchema, ...legacyTool } = tool;
         return legacyTool;
       });
@@ -655,10 +696,15 @@ export class MCPServerFactory {
       if (!tool) {
         throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
       }
+      const moduleId = this._toolSources.get(tool)?.moduleId ?? name;
       const toolArgs = (args ?? {}) as Record<string, unknown>;
 
+      let responseTool = tool;
       // Build HandleCallExtra from MCP SDK extra
       const handleCallExtra: HandleCallExtra = {
+        onOutputDescriptor(descriptor) {
+          responseTool = { ...tool, outputSchema: outputSchemaForTool(descriptor) };
+        },
         signal: extra?.signal,
         sendNotification: extra?.sendNotification
           ? (notification: Record<string, unknown>) =>
@@ -731,13 +777,13 @@ export class MCPServerFactory {
       }
 
       const reply: ApprovalReplyCapture | undefined = approvalBridge
-        ? { moduleId: name, confirmed: false }
+        ? { moduleId, confirmed: false }
         : undefined;
       handleCallExtra.approvalReply = reply;
       let approval: PendingApprovalReply | undefined;
       let callResult: Awaited<ReturnType<ExecutionRouter["handleCall"]>>;
       try {
-        callResult = await router.handleCall(name, toolArgs, handleCallExtra);
+        callResult = await router.handleCall(moduleId, toolArgs, handleCallExtra);
         if (reply?.confirmed) approval = reply.candidate;
       } finally {
         if (reply) delete reply.candidate;
@@ -771,7 +817,7 @@ export class MCPServerFactory {
       }
 
       return supportsStructuredOutput(server, extra)
-        ? addStructuredOutput(result, tool)
+        ? addStructuredOutput(result, responseTool)
         : result;
     });
   }

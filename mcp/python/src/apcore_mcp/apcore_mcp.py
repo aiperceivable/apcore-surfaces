@@ -717,7 +717,10 @@ class APCoreMCP:
 
         factory = MCPServerFactory()
         server = factory.create_server(name=self._name, version=version)
-        tools = factory.build_tools(self._registry, tags=self._tags, prefix=self._prefix)
+        discovery_sources: dict[int, str] = {}
+        tools = factory.build_tools(
+            self._registry, tags=self._tags, prefix=self._prefix, discovery_sources=discovery_sources,
+        )
 
         router = ExecutionRouter(
             self._executor,
@@ -757,6 +760,7 @@ class APCoreMCP:
             async_bridge=async_bridge,
             approval_bridge=approval_bridge,
             descriptor_lookup=descriptor_lookup,
+            discovery_sources=discovery_sources,
         )
         factory.register_resource_handlers(server, self._registry, router)
 

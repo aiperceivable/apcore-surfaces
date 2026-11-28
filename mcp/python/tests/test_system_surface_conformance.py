@@ -1,4 +1,4 @@
-"""Cross-language conformance: the nine canonical system.* modules -> exact MCP primitive.
+"""Cross-language conformance: the canonical system.* modules -> exact MCP primitive.
 
 Drives ``MCPServerFactory.build_tools`` / ``register_resource_handlers`` from
 the shared fixture at ``apcore-mcp/conformance/fixtures/system_surface.json``,
@@ -45,7 +45,7 @@ def real_registry() -> Registry:
     return registry
 
 
-def test_control_modules_are_tools(real_registry: Registry) -> None:
+def test_control_and_search_modules_are_tools(real_registry: Registry) -> None:
     """The `system.*` tool set must equal the fixture's exactly — not merely contain it.
 
     A subset assertion would let an adapter emit an *extra* management tool and
@@ -63,7 +63,7 @@ def test_control_modules_are_tools(real_registry: Registry) -> None:
     )
 
 
-def test_readonly_system_modules_are_not_tools(real_registry: Registry) -> None:
+def test_administrative_read_modules_are_resources(real_registry: Registry) -> None:
     tools = MCPServerFactory().build_tools(real_registry)
     tool_names = {t.name for t in tools}
 

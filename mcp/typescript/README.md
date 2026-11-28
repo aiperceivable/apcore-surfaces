@@ -17,6 +17,13 @@ additional-property restrictions still apply. Factory `strict` options are retai
 for compatibility and do not project OpenAI strict schemas onto MCP. OpenAI tool
 exports and standalone SchemaConverter APIs retain their existing behavior.
 
+Core-backed MCP servers apply caller-aware discovery to `tools/list` and
+`docs://` resource listing and reads. The server uses each request's trusted
+identity and the active Core ACL. A known tool call still goes through normal
+execution authorization. A custom executor can opt into this projection by
+implementing `getCallableDescriptor`; custom executors without this API keep
+their existing catalog behavior.
+
 
 ## Features
 
